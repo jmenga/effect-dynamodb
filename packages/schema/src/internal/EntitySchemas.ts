@@ -3541,6 +3541,8 @@ export const makePathValueEncoder = (
    * sent as given ({@link operand}).
    */
   storable?: (encoded: unknown) => boolean,
+  /** The entity's READ schemas of the model's fields, which a row is decoded by (`readsAsGiven`). */
+  readFields: SchemaFields = {},
 ): {
   /**
    * A condition's or filter's operand as the attribute at `segments` holds it (#242): the one
@@ -3580,6 +3582,25 @@ export const makePathValueEncoder = (
   readonly reads: (clauses: ReadonlyArray<UnionClause>, strict: boolean) => boolean
   /** Whether a path passes a union of several members. */
   readonly passesUnion: (segments: ReadonlyArray<string | number>) => boolean
+  /**
+   * Whether a value written at a path is checked exactly against the schema there (`validate` for
+   * a `"value"`, `validateElements` for a list's `"elements"`): not where the walk can't follow the
+   * path (an opaque class, a dynamic key), nor a list operation's elements where the path holds no
+   * list, or a list with checks or a transformation of its own, which checking each element
+   * doesn't judge (#238).
+   */
+  readonly checks: (segments: ReadonlyArray<string | number>, kind: "value" | "elements") => boolean
+  /**
+   * Whether a read takes a value written as given at a path (`"value"`), or each element added as
+   * given to the list there (`"elements"`): whether the READ schema there decodes it, by some
+   * member of each union on the way (#238). A read takes more than a write stores: the domain form
+   * earlier releases left on a field stored as text, for one.
+   */
+  readonly readsAsGiven: (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "elements",
+  ) => boolean
 } => {
   const recordFields = writeFields
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
@@ -4157,6 +4178,49 @@ export const makePathValueEncoder = (
     const below = clauses.map((clause) => ({ rest: clause.segments.slice(1), clause }))
     return judge(start, below, false, "other", strict)
   }
+  const readDecoders = new WeakMap<Schema.Top, (value: unknown) => boolean>()
+  const readDecoder = (schema: Schema.Top): ((value: unknown) => boolean) => {
+    const found = readDecoders.get(schema)
+    if (found !== undefined) return found
+    const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
+    const fn = (value: unknown) => decode(asStored(value))._tag === "Success"
+    readDecoders.set(schema, fn)
+    return fn
+  }
+  /**
+   * A class as a read decodes it: from the struct of its fields (`from`), which a path into it
+   * walks. Any other schema as it is.
+   */
+  const readSide = (schema: Schema.Top): Schema.Top => {
+    const { from, to } = schema as unknown as { readonly from?: unknown; readonly to?: unknown }
+    return schemaFieldsOf(schema) === undefined &&
+      isSchemaLike(from) &&
+      schemaFieldsOf(from) !== undefined &&
+      isSchemaLike(to) &&
+      SchemaAST.isDeclaration(to.ast)
+      ? from
+      : schema
+  }
+  /** The READ schema's nodes at the end of a path: one by each member of each union on the way. */
+  const readNodesAt = (segments: ReadonlyArray<string | number>): ReadonlyArray<Schema.Top> => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string" || !Object.hasOwn(readFields, head)) return []
+    const nodes: Array<Schema.Top> = []
+    const walk = (schema: Schema.Top, depth: number): void => {
+      const opt = optionalField(schema)
+      const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+      if (depth === rest.length) {
+        nodes.push(...members)
+        return
+      }
+      for (const member of members) {
+        const child = childAtSegment(readSide(member), rest[depth]!)
+        if (child !== undefined) walk(child, depth + 1)
+      }
+    }
+    walk(readFields[head]!, 0)
+    return nodes
+  }
   return {
     operand: (segments, value, kind) => {
       const forms = formsAt(segments)
@@ -4170,6 +4234,15 @@ export const makePathValueEncoder = (
         chosen = stored
       }
       return chosen === undefined ? value : chosen.stored
+    },
+    readsAsGiven: (segments, value, kind) => {
+      const nodes = readNodesAt(segments)
+      if (kind === "value") return nodes.some((node) => readDecoder(node)(value))
+      if (!Array.isArray(value)) return false
+      return nodes.some((node) => {
+        const element = listElementOf(node)
+        return element !== undefined && value.every((each) => readDecoder(element)(each))
+      })
     },
     pathSet: (segments, value) => {
       const first = schemaAt(segments)
@@ -4197,6 +4270,23 @@ export const makePathValueEncoder = (
     },
     reads,
     passesUnion: (segments) => waysTo(segments).some((way) => way.choices.size > 0),
+    checks: (segments, kind) => {
+      const at = schemaAt(segments)
+      if (at === undefined) return false
+      if (kind === "value") return true
+      // Elements are checked one by one: only a list that checks nothing of its own, and isn't
+      // transformed as a whole, reads what they leave as they're checked.
+      const opt = optionalField(at.stored)
+      const lists = opt?.union !== undefined ? membersOf(opt.union) : [opt?.inner ?? at.stored]
+      return (
+        listElementOf(at.stored) !== undefined &&
+        lists.every(
+          (list) =>
+            !SchemaAST.isArrays(list.ast) ||
+            (plainNode(list.ast) && list.ast.encoding === undefined),
+        )
+      )
+    },
     validate: (segments, encoded) => {
       const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)
       return fn === null ? undefined : fn(encoded)

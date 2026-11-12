@@ -26,8 +26,18 @@ import { it } from "@effect/vitest"
 import { Effect } from "effect"
 import { afterEach, beforeEach, describe, expect, vi } from "vitest"
 import * as Lib from "../src/index.js"
-import { expectAs139, type Outcome, refusedOperand, wrote } from "./helpers/Against139.js"
+import {
+  expectAs139,
+  type Outcome,
+  refusedOperand,
+  type Since139,
+  wrote,
+} from "./helpers/Against139.js"
 import { capture, matrix, nameOf, RESOLVED } from "./helpers/UpdateOperandRequests.js"
+
+/** Whether a case's label is a `pathIfNotExists` operand's, refused only where it's stored. */
+const fallbackLabel = (label: Since139 | undefined): boolean =>
+  label === "refused where stored" || label === "kept where present"
 
 const fixture = JSON.parse(
   readFileSync(new URL("./fixtures/update-operand-requests-1.39.0.json", import.meta.url), "utf8"),
@@ -66,8 +76,12 @@ describe("an update with an operand does what 1.39.0 did, and refuses what it re
           fixture.cases[each.key]!,
           each.key.includes("a property named as a renamed field")
             ? "names the property"
-            : resolved?.[0],
-          ...(resolved?.[1] === undefined ? [] : [resolved[1]]),
+            : // A path naming a sparse map's entry: its value is checked and encoded as a field's
+              // is (#238), but for a `pathIfNotExists` operand, refused only where stored (#236).
+              /(^|: )entry: /.test(each.key) && !fallbackLabel(resolved?.[0])
+              ? "checks the entry"
+              : resolved?.[0],
+          ...(resolved?.[1] === undefined || /(^|: )entry: /.test(each.key) ? [] : [resolved[1]]),
         )
       }),
     )

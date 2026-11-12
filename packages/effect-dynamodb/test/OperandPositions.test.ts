@@ -19,6 +19,9 @@
  * - a `pathIfNotExists` operand either of those refuses is refused only where the row lacks its
  *   path, where it would be stored: the row a case seeds lacks the position, but for a leaf
  *   without an `absent` one, which the seed holds (`"refused where stored"`, `"kept where present"`);
+ * - a sparse map's entry named by its attribute has its value checked and encoded against the
+ *   map's value schema, as a field's is (#238; the kinds marked `entryChecked`, compared as
+ *   `"checks the entry"`), but for a `pathIfNotExists` operand, refused only where stored as above;
  * - nothing else changes: no other position 1.39.0 didn't check is checked, and no operand is
  *   encoded otherwise than 1.39.0 encoded it.
  */
@@ -78,6 +81,20 @@ const RESOLVED: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["a sparse map's entry keyed `hasOwnProperty`", invalid],
 ])
 
+/**
+ * The kinds of sparse map entry whose `pathIfNotExists` operands the entry's check refuses (#238)
+ * where `RESOLVED` doesn't name them: the key absent from the seed of a struct whose index
+ * signature also checks its fixed property, where no operand reads (`m`, text less than 5), and
+ * an entry keyed `__proto__`, which 1.39.0's read dropped. Each is refused only where stored.
+ */
+const ENTRY_REFUSED: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  [
+    "a fixed property an index signature also checks, in a sparse map's entry",
+    new Set(["valid as given", "valid only encoded", "invalid"]),
+  ],
+  ["a sparse map's entry keyed `__proto__`", invalid],
+])
+
 /** Whether the row a case seeds holds the path its operation names (`field#entry` an entry). */
 const holdsPath = (each: Case): boolean => {
   const own = (at: unknown, key: string | number): { readonly at: unknown } | undefined =>
@@ -100,12 +117,23 @@ const since = (each: Case, was: Outcome): Since139 | undefined => {
   const unreadable = RESOLVED.get(kind)?.has(operand) === true && wrote(was) && !was.reads
   if (
     each.op === "pathIfNotExists" &&
-    (refusedOperand(was) || (unreadable && operand === "invalid"))
+    (refusedOperand(was) ||
+      (unreadable && operand === "invalid") ||
+      (each.kind.entryChecked === true && ENTRY_REFUSED.get(kind)?.has(operand) === true))
   ) {
-    return holdsPath(each) ? "kept where present" : "refused where stored"
+    if (holdsPath(each)) return "kept where present"
+    return kind.endsWith("keyed `__proto__`") && !refusedOperand(was)
+      ? "refused where stored, keyed `__proto__`"
+      : "refused where stored"
   }
   // The release branch reads a row 1.39.0 wrote here and then couldn't decode.
   if (kind === "a decoding default" && operand === "valid only encoded") return "reads"
+  // An entry's value is checked and encoded as a field's (#238).
+  if (each.kind.entryChecked === true) {
+    return kind.endsWith("keyed `__proto__`")
+      ? "checks the entry keyed `__proto__`"
+      : "checks the entry"
+  }
   // It reads an entry keyed `__proto__`, which 1.39.0's read dropped.
   if (kind.endsWith("keyed `__proto__`") && operand === "invalid") return "reads the entry"
   if (unreadable) {
@@ -162,7 +190,10 @@ describe("the matrix of operand positions against published 1.39.0", () => {
   it("a pathIfNotExists operand a check refuses: refused where the row lacks its path, else kept", () => {
     // The cases `since` names, so a change to the rule shows here as well as in each case.
     const outcomes = matrix.map((each) => since(each, fixture.cases[each.key]!))
-    expect(outcomes.filter((outcome) => outcome === "refused where stored").length).toBe(93)
+    expect(outcomes.filter((outcome) => outcome === "refused where stored").length).toBe(102)
+    expect(
+      outcomes.filter((outcome) => outcome === "refused where stored, keyed `__proto__`").length,
+    ).toBe(3)
     expect(outcomes.filter((outcome) => outcome === "kept where present").length).toBe(6)
   })
 

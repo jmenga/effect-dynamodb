@@ -2823,6 +2823,32 @@ const makeImpl = <
       ? undefined
       : { field: entry.field, key: entry.key, rest: segments.slice(1) }
   }
+  /**
+   * The entry of a sparse map a path names by the entry's own attribute (#238): one `.entry()`
+   * built, or an entry's attribute (`counts#a`) where no model field is named so. A path through
+   * the map's field (`["counts", "a"]`) is a path of the model already. The one place such a path is
+   * told from a field's, for the names below the entry ({@link storedBelow}) and the schema a value
+   * written there is checked against ({@link modelPathOf}).
+   */
+  const sparseEntryNamedBy = (
+    segments: ReadonlyArray<string | number>,
+  ): { readonly field: string; readonly key: string } | undefined => {
+    const head = segments[0]
+    if (typeof head !== "string") return undefined
+    return entryOfPath(segments) ?? (isModelField(head) ? undefined : sparseEntries.entryOf(head))
+  }
+  /**
+   * A path as the model holds it (#238): below an entry a sparse map's attribute names, the map's
+   * field, the entry's key and the rest; any other path as it is. A value written into an entry is
+   * checked against the map's value schema there, as one written into a field is against the
+   * field's.
+   */
+  const modelPathOf = (
+    segments: ReadonlyArray<string | number>,
+  ): ReadonlyArray<string | number> => {
+    const entry = sparseEntryNamedBy(segments)
+    return entry === undefined ? segments : [entry.field, entry.key, ...segments.slice(1)]
+  }
   /** The attribute entry `key` of sparse map `field` is stored under (`_sparseEntryAttribute`). */
   const sparseEntryAttribute = (field: string, key: string): string =>
     `${sparseFields[field]!.prefix}#${key}`
@@ -2906,25 +2932,31 @@ const makeImpl = <
     ),
     // An operand DynamoDB can't store in its stored form is sent as given (`operand`).
     (encoded) => unstorableIn({ stored: encoded }) === undefined,
+    (schemas.modelSchema as unknown as { readonly fields: globalThis.Record<string, Schema.Top> })
+      .fields,
   )
   /**
    * Encode a path-addressed update value and check it against the write schema
-   * at its path — container checks included (#133). `undefined` issue = valid.
+   * at its path — container checks included (#133). `undefined` issue = valid. A
+   * value written into a sparse map's entry is checked against the map's value
+   * schema, by the path the model holds it at ({@link modelPathOf}, #238), where
+   * that schema checks it exactly, and written as given, as
+   * through 1.40.0, elsewhere in an entry or where a read takes it as given
+   * ({@link entryAsGiven}).
    */
   const encodePathValue = (
     segments: ReadonlyArray<string | number>,
     value: unknown,
     kind: "value" | "elements",
   ): { readonly encoded: unknown; readonly issue: unknown } => {
-    // A sparse map's entry `.entry()` built has no field's schema to encode by, as any entry's
-    // attribute hasn't, whatever field its name spells (#238).
-    if (entryOfPath(segments) !== undefined) return { encoded: value, issue: undefined }
+    const path = modelPathOf(segments)
+    if (entryAsGiven(segments, value, kind)) return { encoded: value, issue: undefined }
     if (kind === "value") {
-      const encoded = pathValues.value(segments, value)
-      return { encoded, issue: pathValues.validate(segments, encoded) }
+      const encoded = pathValues.value(path, value)
+      return { encoded, issue: pathValues.validate(path, encoded) }
     }
-    const encoded = pathValues.elements(segments, value)
-    return { encoded, issue: pathValues.validateElements(segments, encoded) }
+    const encoded = pathValues.elements(path, value)
+    return { encoded, issue: pathValues.validateElements(path, encoded) }
   }
   /**
    * DynamoDB's refusal of an update expression (`#f - :v`, `list_append(#f, :v)`, `ADD`, `DELETE`)
@@ -2965,14 +2997,33 @@ const makeImpl = <
   }
 
   /**
-   * A `pathSet` value as it's written ({@link PathSetValue}): by the schema at its path, or, where
-   * that refuses it, by another member of a union on the way that takes it (#238), which
-   * {@link unionRefusal} judges with the update's other clauses.
+   * A `pathSet` value as it's written ({@link PathSetValue}): by the schema at its path (an
+   * entry's, the map's value schema: {@link modelPathOf}), or, where that refuses it, by another
+   * member of a union on the way that takes it (#238), which {@link unionRefusal} judges with the
+   * update's other clauses.
    */
   const encodePathSet = (segments: ReadonlyArray<string | number>, value: unknown): PathSetValue =>
-    entryOfPath(segments) !== undefined
+    entryAsGiven(segments, value, "value")
       ? { encoded: value, issue: undefined, otherWay: false, check: () => undefined }
-      : pathValues.pathSet(segments, value)
+      : pathValues.pathSet(modelPathOf(segments), value)
+  /**
+   * Whether a value a path operation writes into a sparse map's entry, by a path the entry's
+   * attribute names, is written as given, as through 1.40.0 (#238): where the map's value schema
+   * doesn't check it exactly (`checks`: below an opaque class, or a list's elements where the list
+   * checks or transforms itself), or where a read takes it as given (`readsAsGiven`: a number on a
+   * field stored as text, which a read takes as earlier releases left it). Anywhere else it's
+   * checked and encoded as a value written into a field is, and refused where the schema refuses
+   * it. A path of the model is never written as given.
+   */
+  const entryAsGiven = (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "elements",
+  ): boolean => {
+    if (sparseEntryNamedBy(segments) === undefined) return false
+    const path = modelPathOf(segments)
+    return !pathValues.checks(path, kind) || pathValues.readsAsGiven(path, value, kind)
+  }
   /**
    * A `pathSet` or `pathSubtract` that names another attribute in place of a value: it has no
    * operand of its own. The other path operations always write their `value`, whatever else the
@@ -3291,10 +3342,8 @@ const makeImpl = <
    */
   const storedBelow: StoredBelow = (segments) => {
     const rest = segments.slice(1)
-    const head = segments[0]
-    if (rest.length === 0 || typeof head !== "string") return rest
-    const entry =
-      entryOfPath(segments) ?? (isModelField(head) ? undefined : sparseEntries.entryOf(head))
+    if (rest.length === 0 || typeof segments[0] !== "string") return rest
+    const entry = sparseEntryNamedBy(segments)
     if (entry !== undefined) return modelBelow([entry.field, entry.key, ...rest]).slice(1)
     return modelBelow(segments)
   }
@@ -4060,21 +4109,27 @@ const makeImpl = <
         // A copy writes another attribute's value: it holds no value of its own to read back.
         if (op === "pathSet of" && isCopy(operand)) continue
         const { segments, value } = operand
-        // An untyped position is looked through where the operand is marshalled (`unstorableOperand`).
-        if (!customFields.has(String(segments[0])) || entryOfPath(segments) !== undefined) continue
+        // An untyped position is looked through where the operand is marshalled (`unstorableOperand`),
+        // and an entry of a sparse map is read back as the map's value schema reads it (#238).
+        const path = modelPathOf(segments)
+        if (!customFields.has(String(path[0])) || entryAsGiven(segments, value, kind)) continue
+        // A value its schema refuses is refused as an operand is (`refusedOperand`), naming what
+        // the schema refuses: not as a declaration's value no read takes.
         if (op === "pathSet of") {
           // Read back by the way the value is written by (#238).
           const written = encodePathSet(segments, value)
+          if (written.issue !== undefined) continue
           const issue = written.check(asRead(written.encoded))
           if (issue !== undefined) return notReadBack(`${op} "${segments.join(".")}"`, issue)
           continue
         }
-        const { encoded } = encodePathValue(segments, value, kind)
+        const { encoded, issue: refused } = encodePathValue(segments, value, kind)
+        if (refused !== undefined) continue
         const read = asRead(encoded)
         const issue =
           kind === "value"
-            ? pathValues.validate(segments, read)
-            : pathValues.validateElements(segments, read)
+            ? pathValues.validate(path, read)
+            : pathValues.validateElements(path, read)
         if (issue !== undefined) return notReadBack(`${op} "${segments.join(".")}"`, issue)
       }
     }
@@ -4486,10 +4541,12 @@ const makeImpl = <
 
   /**
    * A path write into a union's member, judged with every other clause of the update in the same
-   * field (#238), by one judgement (`reads`) for every path operation: a `pathSet` or a removal
-   * where the schema says what each member reads after it, and anything else — an increment, an
-   * append, a `pathIfNotExists`, a copy, a write of all of the field — as a clause the schema can't
-   * judge.
+   * field, or the same entry of a sparse map (#238), by one judgement (`reads`) for every path
+   * operation: a `pathSet` or a removal where the schema says what each member reads after it, and
+   * anything else — an increment, an append, a `pathIfNotExists`, a copy, a write of all of the
+   * field or the entry — as a clause the schema can't judge. An entry is judged by the path the
+   * model holds it at ({@link modelPathOf}), however the path names it, against the map's value
+   * schema: each entry is an attribute of its own, as each field is.
    *
    * Where a value is taken only by another member than the schema at its path (`refusedBefore`,
    * which 1.40.0 refused), it's sent only where what the update leaves is read whatever the row
@@ -4510,10 +4567,22 @@ const makeImpl = <
     refusedBefore: RefusedOperand | undefined,
   ): RefusedOperand | undefined => {
     const sets = uState.pathSets ?? []
-    const judgedPath = (segments: ReadonlyArray<string | number>) =>
-      segments.length > 1 && entryOfPath(segments) === undefined
+    /**
+     * Where a path writes, as the model holds it: its model path and the part of it judged as one
+     * (a field, or a sparse map's field and an entry's key).
+     */
+    const unitOf = (segments: ReadonlyArray<string | number>) => {
+      const path = modelPathOf(segments)
+      const head = path[0]
+      const depth = typeof head === "string" && Object.hasOwn(sparseFields, head) ? 2 : 1
+      return { path, root: path.slice(0, depth), key: JSON.stringify(path.slice(0, depth)) }
+    }
+    const judgedPath = (segments: ReadonlyArray<string | number>) => {
+      const { path, root } = unitOf(segments)
+      return path.length > root.length
+    }
     const passes = (segments: ReadonlyArray<string | number>) =>
-      judgedPath(segments) && pathValues.passesUnion(segments)
+      judgedPath(segments) && pathValues.passesUnion(modelPathOf(segments))
     // A path through a union written by other names than its own: the names a member that renames
     // its keys stores them under. 1.40.0 wrote the names given, beside what the row held, where no
     // read took them; the write is one it never made, judged as a value only another member takes.
@@ -4533,41 +4602,62 @@ const makeImpl = <
         ] as const
       ).flatMap(([name, ops]) => (ops ?? []).map((op) => [name, op.segments] as const)),
     ]
-    // Each field so written, by the first operation that does.
-    const renamedFields = new Map<string, string>()
+    // Each unit so written, by the first operation that does.
+    const renamedUnits = new Map<string, string>()
     for (const [name, segments] of everyPath) {
-      const field = String(segments[0])
-      if (renamed(segments) && !renamedFields.has(field)) renamedFields.set(field, name)
+      const { key } = unitOf(segments)
+      if (renamed(segments) && !renamedUnits.has(key)) renamedUnits.set(key, name)
     }
-    const fields = new Set([
-      ...sets
-        .filter((op) => !isCopy(op) && passes(op.segments))
-        .map((op) => String(op.segments[0])),
-      ...renamedFields.keys(),
-    ])
-    if (fields.size === 0) return undefined
-    const clauses = clausesOf(uState)
+    // Each unit judged, by its key: its root.
+    const units = new Map<string, ReadonlyArray<string | number>>()
+    for (const [, segments] of everyPath) {
+      const { key, root } = unitOf(segments)
+      if (renamedUnits.has(key)) units.set(key, root)
+    }
+    for (const op of sets) {
+      if (isCopy(op) || !passes(op.segments)) continue
+      const { key, root } = unitOf(op.segments)
+      units.set(key, root)
+    }
+    if (units.size === 0) return undefined
+    // Every record operation (a write of all of a field or an entry, an increment, …), by the part
+    // of the model it writes all of: a field, a sparse map's entry, or every entry of a map. A
+    // renamed map's attribute beside the entries a `.set()` of it names is those entries.
+    const recordRoots = clausesOf(uState).flatMap(
+      (clause): ReadonlyArray<ReadonlyArray<string>> => {
+        if (clause.record !== true) return []
+        const colon = clause.at.indexOf(":")
+        const kind = clause.at.slice(0, colon)
+        const name = clause.at.slice(colon + 1)
+        if (kind === "map") return [[name]]
+        if (kind === "field") return Object.hasOwn(sparseFields, name) ? [] : [[name]]
+        const entry = sparseEntries.entryOf(name)
+        return entry === undefined ? [[name]] : [[entry.field, entry.key]]
+      },
+    )
     let refusal: RefusedOperand | undefined
-    for (const field of fields) {
-      const inField = (segments: ReadonlyArray<string | number>) =>
-        clauseAt(segments) === `field:${field}`
+    for (const [unit, root] of units) {
+      const inUnit = (segments: ReadonlyArray<string | number>) => unitOf(segments).key === unit
       const judged: Array<UnionClause> = []
       let otherWay = false
       for (const [index, op] of sets.entries()) {
-        if (!inField(op.segments)) continue
+        if (!inUnit(op.segments)) continue
         if (otherWays.has(index)) otherWay = true
+        const path = modelPathOf(op.segments)
         judged.push(
           isCopy(op) || !judgedPath(op.segments)
-            ? { _tag: "Other", segments: op.segments }
-            : { _tag: "Value", segments: op.segments, encoded: pathSets[index] },
+            ? { _tag: "Other", segments: path }
+            : { _tag: "Value", segments: path, encoded: pathSets[index] },
         )
       }
-      const removals = (uState.pathRemoves ?? []).filter(inField)
-      for (const segments of removals) {
-        judged.push({ _tag: judgedPath(segments) ? "Removal" : "Other", segments })
+      for (const segments of uState.pathRemoves ?? []) {
+        if (!inUnit(segments)) continue
+        judged.push({
+          _tag: judgedPath(segments) ? "Removal" : "Other",
+          segments: modelPathOf(segments),
+        })
       }
-      // Every other path operation in the field, where it writes.
-      let pathOps = judged.length
+      // Every other path operation in the unit, where it writes.
       for (const ops of [
         uState.pathAdds,
         uState.pathSubtracts,
@@ -4577,26 +4667,32 @@ const makeImpl = <
         uState.pathDeletes,
       ]) {
         for (const { segments } of ops ?? []) {
-          if (!inField(segments)) continue
-          pathOps++
-          judged.push({ _tag: "Other", segments: judgedPath(segments) ? segments : [field] })
+          if (!inUnit(segments)) continue
+          judged.push({
+            _tag: "Other",
+            segments: judgedPath(segments) ? modelPathOf(segments) : root,
+          })
         }
       }
-      // Every record operation in the field (a write of all of it, an increment, …).
-      const rest = clauses.filter((clause) => clause.at === `field:${field}`).length
-      for (let i = pathOps; i < rest; i++) judged.push({ _tag: "Other", segments: [field] })
-      const strict = otherWay || renamedFields.has(field)
+      for (const written of recordRoots) {
+        if (written.length <= root.length && written.every((segment, i) => segment === root[i])) {
+          judged.push({ _tag: "Other", segments: root })
+        }
+      }
+      const strict = otherWay || renamedUnits.has(unit)
       if (pathValues.reads(judged, strict)) continue
       // A value only another member takes, where what the update leaves isn't read whatever the
       // row held: refused as 1.40.0 refused the update.
       if (otherWay) return refusedBefore
+      const name =
+        root.length === 1 ? `"${root[0]}"` : `entry "${root[1]}" of the sparse map "${root[0]}"`
       refusal ??= {
-        operation: `update.${renamedFields.get(field) ?? "pathSet"}`,
+        operation: `update.${renamedUnits.get(unit) ?? "pathSet"}`,
         issue: strict
-          ? `the path operations on "${field}" write into its union's members by the names they ` +
+          ? `the path operations on ${name} write into its union's members by the names they ` +
             "store their keys under, and leave a value not every member reads: write every " +
-            `property of one member, or all of "${field}". Nothing was sent.`
-          : `the path operations on "${field}" leave a value no member of its union reads: what ` +
+            `property of one member, or all of ${name}. Nothing was sent.`
+          : `the path operations on ${name} leave a value no member of its union reads: what ` +
             "one of them needs a member to hold, another removes or refuses. Nothing was sent.",
       }
     }
@@ -4709,7 +4805,7 @@ const makeImpl = <
    * Every clause of an update: where it writes or removes ({@link clauseAt},
    * {@link recordClausesAt}), and the path inside there (`[]` for all of it), by the names it's
    * sent with ({@link storedBelow}). A `pathRemove` carries its index, so a removal's judgement
-   * leaves itself out.
+   * leaves itself out, and a record operation's clause says it's one.
    */
   const clausesOf = (
     uState: UpdateState,
@@ -4717,15 +4813,17 @@ const makeImpl = <
     readonly at: string
     readonly path: ReadonlyArray<string | number>
     readonly removal?: number
+    readonly record?: true
   }> => {
     const out: Array<{
       readonly at: string
       readonly path: ReadonlyArray<string | number>
       readonly removal?: number
+      readonly record?: true
     }> = []
     const record = (entries: ReadonlyArray<readonly [string, unknown]>) => {
       for (const [name, value] of entries) {
-        for (const at of recordClausesAt(name, value)) out.push({ at, path: [] })
+        for (const at of recordClausesAt(name, value)) out.push({ at, path: [], record: true })
       }
     }
     const updates = uState.updates
@@ -4755,9 +4853,13 @@ const makeImpl = <
     }
     for (const { field, keys } of uState.sparseRemoveEntries ?? []) {
       const prefix = Object.hasOwn(sparseFields, field) ? sparseFields[field]!.prefix : field
-      for (const key of keys) out.push({ at: `attribute:${prefix}#${key}`, path: [] })
+      for (const key of keys) {
+        out.push({ at: `attribute:${prefix}#${key}`, path: [], record: true })
+      }
     }
-    for (const field of uState.sparseClearFields ?? []) out.push({ at: `map:${field}`, path: [] })
+    for (const field of uState.sparseClearFields ?? []) {
+      out.push({ at: `map:${field}`, path: [], record: true })
+    }
     return out
   }
 
@@ -10631,13 +10733,29 @@ const makeImpl = <
       const wholeEntryPath = (field: string, key: string, rest: ReadonlyArray<string | number>) =>
         compilePath([renamedMapAttribute(field)!, key, ...rest], names, "m", mapCounter)
       /**
+       * Whether an operation writing a value into an entry of a renamed map writes it as 1.40.0
+       * wrote it, as the path names it, unguarded (#238): where no schema checks the value
+       * (`checks`: below an opaque class, say), so a row holding the map whole never gets a value
+       * inside it that no read may take, and the write lands, or DynamoDB refuses it, as through
+       * 1.40.0. A value a schema checks, and every other operation, goes where the row holds the
+       * map.
+       */
+      const asNamed = (
+        segments: ReadonlyArray<string | number>,
+        written: "value" | "elements" | undefined,
+      ): boolean => written !== undefined && !pathValues.checks(modelPathOf(segments), written)
+      /**
        * The expression path of an attribute a record operation names (`.add({ "counts#a": 1 })`):
        * inside its map's attribute for an entry of a renamed map the row holds whole, else
-       * `undefined` (the attribute, as before).
+       * `undefined` (the attribute, as before). `written`: the kind of value it writes there.
        */
-      const recordEntryPath = (attr: string): string | undefined => {
+      const recordEntryPath = (
+        attr: string,
+        written?: "value" | "elements",
+      ): string | undefined => {
         const entry = renamedEntryAt([attr])
-        if (entry === undefined || entryForm(entry.field) !== "whole") return undefined
+        if (entry === undefined || asNamed([attr], written)) return undefined
+        if (entryForm(entry.field) !== "whole") return undefined
         return wholeEntryPath(entry.field, entry.key, entry.rest)
       }
       // Build UpdateExpression
@@ -10786,7 +10904,7 @@ const makeImpl = <
         for (const attr of Object.keys(uState.append)) {
           const nameKey = `#u${counter}`
           const valKey = `:u${counter}`
-          const path = recordEntryPath(attr) ?? nameKey
+          const path = recordEntryPath(attr, "elements") ?? nameKey
           if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(operands.append[attr])
           setClauses.push(`${path} = list_append(${path}, ${valKey})`)
@@ -10934,9 +11052,13 @@ const makeImpl = <
        * is where the row this update holds holds the map ({@link entryForm}): inside its attribute,
        * or as the entry's own (#238). Any other path as before.
        */
-      const pathOf = (segments: ReadonlyArray<string | number>, prefix: string): string => {
+      const pathOf = (
+        segments: ReadonlyArray<string | number>,
+        prefix: string,
+        written?: "value" | "elements",
+      ): string => {
         const entry = renamedEntryAt(segments)
-        if (entry === undefined) {
+        if (entry === undefined || asNamed(segments, written)) {
           return compilePath(segments, names, prefix, pathCounter, resolveDbName, storedBelow)
         }
         return entryPath(entry, entryForm(entry.field)!, prefix)
@@ -10988,7 +11110,7 @@ const makeImpl = <
       // Path SET operations
       if (uState.pathSets) {
         for (const [i, op] of uState.pathSets.entries()) {
-          const pathExpr = pathOf(op.segments, "ps")
+          const pathExpr = pathOf(op.segments, "ps", isCopy(op) ? undefined : "value")
           if (op.isPath && op.valueSegments) {
             const srcExpr = sourceOf(op.valueSegments, "ps")
             setClauses.push(`${pathExpr} = ${srcExpr}`)
@@ -11018,7 +11140,7 @@ const makeImpl = <
       // Path APPEND operations
       if (uState.pathAppends) {
         for (const [i, op] of uState.pathAppends.entries()) {
-          const pathExpr = pathOf(op.segments, "pa")
+          const pathExpr = pathOf(op.segments, "pa", "elements")
           const valKey = `:pa${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathAppends[i])
           setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
@@ -11028,7 +11150,7 @@ const makeImpl = <
       // Path PREPEND operations
       if (uState.pathPrepends) {
         for (const [i, op] of uState.pathPrepends.entries()) {
-          const pathExpr = pathOf(op.segments, "pp")
+          const pathExpr = pathOf(op.segments, "pp", "elements")
           const valKey = `:pp${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathPrepends[i])
           setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
@@ -11038,7 +11160,7 @@ const makeImpl = <
       // Path if_not_exists operations
       if (uState.pathIfNotExists) {
         for (const [i, op] of uState.pathIfNotExists.entries()) {
-          const pathExpr = pathOf(op.segments, "pi")
+          const pathExpr = pathOf(op.segments, "pi", "value")
           const valKey = `:pi${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathIfNotExists[i])
           setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)

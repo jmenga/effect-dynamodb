@@ -79,6 +79,12 @@ export interface Kind {
   /** The schema of the field `target`. */
   readonly field: Schema.Top
   readonly config?: (api: Api) => Record<string, unknown>
+  /**
+   * A sparse map's entry named by its attribute, whose value schema checks the operand exactly
+   * (#238): 1.39.0 and 1.40.0 wrote it as given, and the head checks and encodes it there as it
+   * does a field's (`Since139` `"checks the entry"`).
+   */
+  readonly entryChecked?: true
   /** What `target` is seeded with. */
   readonly seed: unknown
   /** The path to the wrapped value: its `n`, `list` and `maybe` sit below. */
@@ -131,6 +137,7 @@ export const kinds: ReadonlyArray<Kind> = [
   },
   {
     name: "a sparse map's entry",
+    entryChecked: true,
     field: Schema.Record(Schema.String, Leafy),
     config: (api) => ({ storedAs: api.DynamoModel.SparseMap() }),
     seed: { a: seeded },
@@ -138,6 +145,7 @@ export const kinds: ReadonlyArray<Kind> = [
   },
   {
     name: "a sparse map's entry that is the value",
+    entryChecked: true,
     field: Schema.Record(Schema.String, Text),
     config: (api) => ({ storedAs: api.DynamoModel.SparseMap() }),
     seed: { a: 1 },
@@ -153,6 +161,7 @@ export const kinds: ReadonlyArray<Kind> = [
   },
   {
     name: "a sparse map's entry that is a list",
+    entryChecked: true,
     field: Schema.Record(Schema.String, Schema.Array(Text)),
     config: (api) => ({ storedAs: api.DynamoModel.SparseMap() }),
     seed: { a: [1] },
@@ -199,6 +208,7 @@ export const kinds: ReadonlyArray<Kind> = [
   },
   {
     name: "a union in a sparse map's entry",
+    entryChecked: true,
     field: Schema.Record(Schema.String, Schema.Union([A, B])),
     config: (api) => ({ storedAs: api.DynamoModel.SparseMap() }),
     seed: { a: { k: "a", ...seeded } },
@@ -212,6 +222,7 @@ export const kinds: ReadonlyArray<Kind> = [
   },
   {
     name: "a Schema.Class in a sparse map's entry",
+    entryChecked: true,
     field: Schema.Record(Schema.String, LeafyClass),
     config: (api) => ({ storedAs: api.DynamoModel.SparseMap() }),
     seed: { a: new LeafyClass(seeded) },
@@ -362,6 +373,7 @@ export const kinds: ReadonlyArray<Kind> = [
   },
   {
     name: "a fixed property an index signature also checks, in a sparse map's entry",
+    entryChecked: true,
     field: Schema.Record(
       Schema.String,
       Schema.StructWithRest(Schema.Struct({ n: Schema.suspend(() => Text) }), [
@@ -460,6 +472,7 @@ export const kinds: ReadonlyArray<Kind> = [
     (name): ReadonlyArray<Kind> => [
       {
         name: `a sparse map's entry keyed \`${name}\``,
+        entryChecked: true,
         field: Schema.Record(Schema.String, Text),
         config: (api) => ({ storedAs: api.DynamoModel.SparseMap() }),
         seed: { a: 1 },

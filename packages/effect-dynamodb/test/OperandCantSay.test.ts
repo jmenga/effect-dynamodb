@@ -9,8 +9,10 @@
  *   below a struct and in an `.append()`, positions 1.39.0 already checked, both releases died
  *   ("Option adapter can only return none for schema issues"). A schema issue is still a refusal.
  * - **An entry of a sparse map stored under a `field:` rename.** Such a map is read whole from the
- *   renamed attribute, so no read takes `<field>#<key>` as its entry: the operand is sent as on
- *   1.40.0, whatever the map's value schema says.
+ *   renamed attribute, so no read takes `<field>#<key>` as its own attribute: the operand check
+ *   doesn't judge it. The entry is written where the row holds the map, and its value is checked
+ *   against the map's value schema as one written into a field is (#238): a value that schema
+ *   refuses is refused, with nothing written.
  */
 
 import { it } from "@effect/vitest"
@@ -217,16 +219,22 @@ describe("a schema that can't run synchronously: the operand is sent (#236)", ()
   }
 })
 
-describe("an entry of a sparse map stored under a field: rename: sent as on 1.40.0 (#236)", () => {
+describe("an entry of a sparse map stored under a field: rename: checked by the map's value schema (#238)", () => {
   for (const transaction of [false, true]) {
     it.effect(transaction ? "in a transaction" : "alone", () =>
       Effect.gen(function* () {
         const got = yield* run(renamedEntity(), transaction, (u) =>
           u.pathSet({ segments: ["counts#a"], value: "note", isPath: false }),
         )
-        if (Exit.isFailure(got.exit)) expect(Cause.pretty(got.exit.cause)).toBe("")
-        expect(got.commands.some((command) => !command.includes("Get"))).toBe(true)
-        // The map is read whole from `sr`, which the update didn't touch.
+        expect(Exit.isFailure(got.exit)).toBe(true)
+        if (Exit.isFailure(got.exit)) {
+          const error = Cause.squash(got.exit.cause) as any
+          expect(error._tag).toBe("ValidationError")
+          expect(error.operation).toBe("update.pathSet")
+          expect(String(error.cause)).toContain("Expected number")
+        }
+        expect(got.commands.some((command) => !command.includes("Get"))).toBe(false)
+        // The map is read whole from `sr`, which nothing touched.
         expect(Exit.isSuccess(got.read)).toBe(true)
         if (Exit.isSuccess(got.read)) expect(got.read.value.counts).toEqual({ a: 1 })
       }),

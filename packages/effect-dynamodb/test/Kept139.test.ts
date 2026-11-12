@@ -41,6 +41,7 @@ import {
 import { renamedSparseMapZOrderSuite } from "./helpers/RenamedSparseMapZOrder.js"
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
+import { sparseEntryValuesSuite } from "./helpers/SparseEntryValues.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
 import { unionPathWritesPassedSuite, unionPathWritesSuite } from "./helpers/UnionPathWrites.js"
 import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
@@ -143,6 +144,10 @@ describe("a clearMap beside every other kind of write to the map", () => {
 
 describe("a retained entity's removal of a sparse map's entries", () => {
   retainedEntryRemovalsSuite(openRecordingTable)
+})
+
+describe("a value a path operation writes into a sparse map's entry", () => {
+  sparseEntryValuesSuite(openRecordingTable)
 })
 
 describe("a path below a struct that renames its keys as they're stored", () => {

@@ -45,12 +45,17 @@ export const expectDiffersOnly = (was: unknown, got: unknown, named: ReadonlyArr
  */
 export const comparedCases = <C>(file: string, cases: Record<string, C>) => {
   const taken = new Set<string>()
+  const asserted = new Set<string>()
   return {
     compared: (name: string): C => {
       if (!Object.hasOwn(cases, name))
         throw new Error(`${file} holds no case ${JSON.stringify(name)}`)
       taken.add(name)
       return cases[name]!
+    },
+    /** Marks case `name` asserted: a test calls it after its assertions on the case passed. */
+    asserted: (name: string): void => {
+      asserted.add(name)
     },
     everyCaseCompared: () =>
       it(`${file}: every case is compared`, () => {

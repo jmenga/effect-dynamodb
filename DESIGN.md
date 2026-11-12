@@ -4128,7 +4128,8 @@ alone and in a transaction, each beside what 1.40.0 did there.
 
 **Where the read resolves the position (#236): exact or absent.** The write
 schema's walk above doesn't know every position: a sparse map's entry (named by
-its stored name, `target#a`), a union's members past the first, a list of a
+its stored name, `target#a`) its value schema can't check exactly (#238, below),
+a union's members past the first, a list of a
 union, a suspended or branded schema. There the operand used to be sent as
 given, and a row could be left that no read decodes. After the check above,
 `operandAsRead` (`Entity.ts`) asks where a row's read takes the operand:
@@ -4146,7 +4147,8 @@ checked node above the position, a decoding default, a hidden, packed or
 non-model attribute, an entry keyed `__proto__`, an entry of a sparse map stored
 under a `field:` rename, which a read takes whole from that attribute, a tuple
 position whose element depends on the list's length) gives no readers, and the
-operand is sent as 1.40.0 sent it. Where it resolves, `judgeOperand` (`internal/OperandReaders.ts`)
+operand is sent as 1.40.0 sent it (past the check of a value written into a
+sparse map's entry against the map's value schema, #238, below). Where it resolves, `judgeOperand` (`internal/OperandReaders.ts`)
 decides: what 1.40.0 sends is sent when one of the readers reads it back as
 stored, so no operand a row holding it reads is refused or changed; otherwise no
 row holding it reads, and it is written in the one other stored form the readers
@@ -4166,6 +4168,29 @@ the second can't check is an operand some readers read and others don't, at a
 position a union's members read differently: whether a row holding it reads
 depends on the member the row holds, which the readers don't see, so it may still
 be wrong for that member, as it always was.
+
+**A value written into a sparse map's entry by its attribute (#238).** A path
+naming an entry's own attribute (`["counts#z"]`, `["objs#k", "n"]`, one
+`.entry()` built) is held at the path the model holds it at (`modelPathOf`:
+the map's field, the key, the rest) and its value encoded and checked there,
+against the map's value schema, as a field's is against the field's, so a
+value the schema refuses fails with the same `ValidationError` before anything
+is read or sent (a `pathIfNotExists` value only where the row lacks the path,
+where it would be stored, as above). Through 1.40.0 it was written as given: into an entry the row
+held, where every read of the row then failed; beside a map a `field:` rename
+stores whole, where no read took it and the update reported success; or
+DynamoDB refused it. Two places keep 1.40.0's bytes (`entryAsGiven`): where the
+map's value schema can't check the value exactly (`checks`: below an opaque
+class, or a list's elements where the list checks or transforms itself), and
+where a read takes the value as given (`readsAsGiven`: the entity's READ schema
+at the path decodes it, by some member of each union on the way and through a
+class by the struct of its fields), such as a
+number on a map stored as text, which a read takes as earlier releases left it.
+Encoding such a value would change bytes 1.40.0 wrote and read correctly, and
+inside a union pick one member's stored form for a row another member holds. A
+value its schema refuses is reported as that operand (`update.pathSet`, …)
+ahead of a declaration's value no read takes (`EDD-9126`), which 1.40.0
+reported for a field holding a declaration whatever the schema refused.
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to
