@@ -2631,13 +2631,15 @@ export const makeEngine = (config: EngineConfig) => {
 
   /**
    * Whether a write over the live `row` storing `item` stores every data attribute the row holds
-   * (#237), judged on what's stored: the row's attributes as read against the item as the entity
-   * will write it (encoded, renamed, as sparse entries, packed: `validateAndBuildPutItem`, the
-   * transaction's own), each sparse entry on its own. Their values may change. The data is every
-   * model field no projection keeps as bookkeeping. A value whose encoding stores nothing (an
-   * `Option.none()`, an emptied sparse map) drops its attributes. The row records who wrote it,
-   * not which data each wrote, so any dropped attribute counts. An item the entity refuses keeps
-   * nothing: the write then fails as it would have.
+   * (#237), judged on exactly the attribute map the request carries: the row's attributes as read
+   * against the item's marshalled attributes (encoded, renamed, as sparse entries, packed, then
+   * marshalled: `validateAndBuildPutItem`, the transaction's own), each sparse entry on its own.
+   * Their values, and their types, may change. The data is every model field no projection keeps
+   * as bookkeeping. A value that stores nothing drops its attributes, whatever drops it: an
+   * `Option.none()`, an emptied sparse map, an empty set (the marshaller stores none), or anything
+   * else the marshaller leaves out. The row records who wrote it, not which data each wrote, so
+   * any dropped attribute counts. An item the entity or the marshaller refuses keeps nothing: the
+   * write then fails as it would have.
    */
   const keepsData = (
     row: Option.Option<Row>,
@@ -2652,8 +2654,8 @@ export const makeEngine = (config: EngineConfig) => {
         validateAndBuildPutItem(readModel as any, item, `${config.label}.write`),
       )
       if (Option.isNone(built)) return false
-      const written = built.value.item
-      return held.every((name) => Object.hasOwn(written, name) && written[name] !== undefined)
+      const written = built.value.marshalled
+      return held.every((name) => Object.hasOwn(written, name))
     })
 
   /** The fields the library owns, re-applied after `toItem`. */

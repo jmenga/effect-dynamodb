@@ -114,7 +114,24 @@ const Races = Entity.make({
   entityType: "Race",
   primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
 })
-const ReadTable = Table.make({ schema: AppSchema, entities: { Rows, Races } })
+/** Rows whose data B keeps in a set (`tags`) or a map (`m`). */
+const Tagged = Schema.Struct({
+  id: Schema.String,
+  orders: Schema.Number,
+  tags: Schema.ReadonlySet(Schema.String),
+  m: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
+  a: Schema.optional(Schema.Number),
+  ra: Schema.optional(Schema.Number),
+  b: Schema.optional(Schema.Number),
+  rb: Schema.optional(Schema.Number),
+})
+type Tagged = typeof Tagged.Type
+const Tags = Entity.make({
+  model: Tagged,
+  entityType: "Tagged",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+const ReadTable = Table.make({ schema: AppSchema, entities: { Rows, Races, Tags } })
 const evolve = (state: Row, event: { readonly data: Placed }) =>
   Effect.succeed({ ...state, total: state.total + event.data.amount })
 const A = EventStore.projection({
@@ -154,6 +171,58 @@ const raced = (from: typeof Orders, checkpoint: "a" | "b", retry?: number) =>
 const RaceA2 = raced(Orders, "a", 2)
 const RaceADefault = raced(Orders, "a")
 const RaceB = raced(Invoices, "b", 0)
+
+/**
+ * A and B over `Tags`. With `"an empty set"`, B adds to the tags and A resets the row to its
+ * initial value, the tags an empty set. With `"an empty map key"`, B adds to `m` and A gives `m`
+ * an entry whose key is the empty string, which DynamoDB refuses.
+ */
+const tagged = (outbox: boolean, a: "an empty set" | "an empty map key") => {
+  const initial = (id: { readonly id: string }): Tagged => ({
+    id: id.id,
+    orders: 0,
+    tags: new Set<string>(),
+  })
+  const define = (
+    from: typeof Orders,
+    checkpoint: "a" | "b",
+    evolve: (state: Tagged, event: { readonly data: Placed }) => Tagged,
+  ) =>
+    EventStore.projection({
+      stream: from,
+      readModel: Tags,
+      key: (id: { readonly id: string }) => ({ id: id.id }),
+      initial,
+      evolve: (state: Tagged, event: { readonly data: Placed }) =>
+        Effect.succeed(evolve(state, event)),
+      checkpoint,
+      revision: checkpoint === "a" ? "ra" : "rb",
+      retry: 0,
+      ...(outbox && { outbox: { schema: Schema.Number, effects: () => [1] } }),
+    })
+  return a === "an empty set"
+    ? {
+        A: define(Orders, "a", (state, event) => ({
+          ...initial({ id: state.id }),
+          orders: state.orders + event.data.amount,
+        })),
+        B: define(Invoices, "b", (state, event) => ({
+          ...state,
+          tags: new Set([...state.tags, `invoice-${event.data.amount}`]),
+        })),
+      }
+    : {
+        A: define(Orders, "a", (state, event) => ({
+          ...state,
+          orders: state.orders + event.data.amount,
+          m: { "": 0 },
+        })),
+        B: define(Invoices, "b", (state, event) => ({
+          ...state,
+          m: { ...state.m, x: (state.m?.x ?? 0) + event.data.amount },
+        })),
+      }
+}
 
 const TestLayer = Layer.mergeAll(
   HookedClient,
@@ -337,6 +406,85 @@ describeConnected("the row token on DynamoDB Local (#237)", () => {
           ConsistentRead: true,
         })
         expect(fromAttributeMap(after!)).toMatchObject({ a: 1, b: retries + 2 })
+      }).pipe(Effect.provide(TestLayer))
+    },
+  )
+
+  const taggedRow = (id: string) => {
+    const taggedKey = {
+      pk: { S: `$rowtoken#v1#tagged#id_${id}` },
+      sk: { S: "$rowtoken#v1#tagged" },
+    }
+    return Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: tables.read,
+        Key: taggedKey,
+        ConsistentRead: true,
+      })
+      return Item!
+    })
+  }
+
+  it.effect.each([
+    ["standalone", false],
+    ["in the outbox's transaction", true],
+  ] as const)(
+    "a write that empties a set stores no attribute, so the other's bookkeeping goes with it (%s)",
+    ([, outbox]) => {
+      const { A, B } = tagged(outbox, "an empty set")
+      const id = `set-${outbox ? "outbox" : "standalone"}`
+      const stored = taggedRow(id)
+      return Effect.gen(function* () {
+        yield* Orders.append({ id }, [new Placed({ amount: 1 })], 0)
+        yield* Invoices.append({ id }, [new Placed({ amount: 5 }), new Placed({ amount: 7 })], 0)
+        const invoices = yield* Invoices.read({ id })
+        yield* B.apply(invoices[0]!)
+        expect((yield* stored).tags).toEqual({ SS: ["invoice-5"] })
+        // A resets the tags to an empty set: DynamoDB has none, so the attribute is gone, and
+        // B's checkpoint and revision with it, as on 1.40.0.
+        yield* A.apply((yield* Orders.read({ id }))[0]!)
+        const afterA = yield* stored
+        expect(afterA.tags).toBeUndefined()
+        expect(afterA.b).toBeUndefined()
+        expect(afterA.rb).toBeUndefined()
+        expect(afterA).toMatchObject({ a: { N: "1" }, ra: { N: "1" } })
+        // B's redelivered event applies again, and its next one: its tags come back whole.
+        expect((yield* B.apply(invoices[0]!)).applied).toHaveLength(1)
+        yield* B.apply(invoices[1]!)
+        const final = yield* stored
+        expect([...(final.tags?.SS ?? [])].sort()).toEqual(["invoice-5", "invoice-7"])
+        expect(final).toMatchObject({ b: { N: "2" }, rb: { N: "2" } })
+      }).pipe(Effect.provide(TestLayer))
+    },
+  )
+
+  it.effect.each([
+    ["standalone", false],
+    ["in the outbox's transaction", true],
+  ] as const)(
+    "a write giving a map an empty key is refused by DynamoDB, as on 1.40.0, and writes nothing (%s)",
+    ([, outbox]) => {
+      const { A, B } = tagged(outbox, "an empty map key")
+      const id = `key-${outbox ? "outbox" : "standalone"}`
+      const stored = taggedRow(id)
+      return Effect.gen(function* () {
+        yield* Orders.append({ id }, [new Placed({ amount: 1 })], 0)
+        yield* Invoices.append({ id }, [new Placed({ amount: 5 }), new Placed({ amount: 7 })], 0)
+        const invoices = yield* Invoices.read({ id })
+        yield* B.apply(invoices[0]!)
+        const afterB = yield* stored
+        // The marshaller stores the entry, and DynamoDB refuses the write ("Empty attribute name").
+        const exit = yield* Effect.exit(A.apply((yield* Orders.read({ id }))[0]!))
+        expect(Exit.isFailure(exit) && (exit.cause as any).reasons?.[0]?.error?._tag).toBe(
+          "DynamoValidationError",
+        )
+        expect(String(Exit.isFailure(exit) && exit.cause)).toContain("Empty attribute name")
+        expect(yield* stored).toEqual(afterB)
+        // B's bookkeeping is the row's own: its redelivery is recognised, its next event applies.
+        expect((yield* B.apply(invoices[0]!)).alreadyApplied).toHaveLength(1)
+        yield* B.apply(invoices[1]!)
+        expect(yield* stored).toMatchObject({ m: { M: { x: { N: "12" } } }, b: { N: "2" } })
       }).pipe(Effect.provide(TestLayer))
     },
   )

@@ -7440,10 +7440,22 @@ instance).
     A write over a live row carries the others' bookkeeping into what it left
     out only when it stores every data attribute the row holds (`keepsData`;
     the data is every model field no projection keeps as bookkeeping). That is
-    judged on what's stored: the row's attributes as read against the item as
-    the entity will write it (encoded, renamed, packed, a sparse map as its
-    entries, each entry on its own), so an `Option.none()` or an emptied
-    sparse map drops what the row held. The rule: each event is applied once,
+    judged on exactly the attribute map the write's request carries: the row's
+    attributes as read against the item as the entity writes it (encoded,
+    renamed, packed, a sparse map as its entries, each entry on its own, then
+    marshalled; `validateAndBuildPutItem`'s `marshalled`, the transaction's
+    own). There is no second model of what the marshaller keeps: anything it
+    leaves out is a dropped attribute, whatever leaves it out, an
+    `Option.none()`, an emptied sparse map, an empty set (DynamoDB has none, so
+    an emptied set, or a sparse entry holding one, is an absent attribute) or
+    a function; anything it stores under the attribute's name is kept, whatever
+    its value or type (an empty string, binary, map or list, a map or list
+    whose `undefined` members it removed, a class instance it stores as a map,
+    a date another deployment stores as another type). A value it refuses (an
+    empty set in a list) fails the write, as on 1.40.0
+    (`test/EventStore.projection-stored-data.test.ts`, each kind standalone and
+    in the outbox's transaction under both `escapeKeys` settings;
+    `test/connected.projection-row-token.test.ts` on DynamoDB Local). The rule: each event is applied once,
     in the order processed, and a write that keeps an attribute keeps the
     checkpoints of the projections that wrote the row, whatever value it gives
     the attribute. It has two consequences. A value overwritten stays

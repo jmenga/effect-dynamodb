@@ -785,6 +785,8 @@ describe("a write over a live row the other projections have written (#237)", ()
  * nothing for it (#237): an `Option.none()`, or an emptied sparse map. What the row stores is what
  * counts: the data attribute is dropped, so the other projection's bookkeeping goes with it, as on
  * 1.40.0, and it folds its stream again (B's events are 5 and 7: its part is 12 at the end).
+ * Sets, and every other value the marshaller drops, keeps or refuses:
+ * `EventStore.projection-stored-data.test.ts`.
  */
 describe("a write over a live row that stores nothing for the other's data (#237)", () => {
   type Kind = "OptionFromOptional" | "OptionFromOptionalKey" | "packed" | "sparse map"
