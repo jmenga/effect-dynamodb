@@ -11,10 +11,16 @@
  * `resolvedId`. {@link givenZoneReading} is the row's key-form record with each such value's key
  * text under the name it was given: a reading of the row whose key text is the one those releases
  * composed, which `rekey` recognises as an earlier position of the row and moves it from.
+ *
+ * Each zone is read where it sits: the key-form value is walked as every text naming a zone walks it
+ * (`walkLeaves`), and each zone, or each text, is taken under the name the stored value holds at the
+ * same place (the same index, property, `Option` value, zoned date's zone). So a list holding zones
+ * given two names that resolve to one (`[Etc/UTC, GMT]`, keyed `[UTC, UTC]` now) reads as each was
+ * given, wherever the schema puts them.
  */
 import { DateTime } from "effect"
 import { serializeValue } from "../KeyComposer.js"
-import { ZONE_MARKER, zoneNameOf } from "./StoredForm.js"
+import { isNamedZone, UNNAMED_STEP, walkLeaves, ZONE_MARKER, zoneNameOf } from "./StoredForm.js"
 
 /** The name a zone made from `name` is keyed under now, or `undefined` for no zone. */
 const resolvedNameOf = (name: string): string | undefined => {
@@ -28,65 +34,71 @@ const resolvedNameOf = (name: string): string | undefined => {
 /** A zoned date's ISO text's zone name: the text in its closing brackets. */
 const ISO_ZONE = /\[([^\]]+)\]$/
 
-type Given = ReadonlyArray<readonly [resolved: string, given: string]>
-
 /**
- * The zones a stored value names by a name other than the one it's keyed under now, as pairs of the
- * name keyed now and the name given: the zone of a zoned date's ISO text, a zone's name stored as
- * text (`top`: the value itself, whose key text a field's codec took to another text), and a zone's
- * map holding `resolvedId` beside the `id` it was given, wherever it sits.
+ * Text naming a zone, with the zone under the name it's keyed under now: the zone in a zoned date's
+ * ISO text, or the text itself. `undefined` for text naming no zone, or naming it so already.
  */
-const givenNames = (
-  stored: unknown,
-  found: Array<readonly [string, string]>,
-  open: Set<object>,
-  top: boolean,
-) => {
-  if (typeof stored === "string") {
-    const given = ISO_ZONE.exec(stored)?.[1] ?? (top ? stored : undefined)
-    if (given === undefined || given.length === 0 || given.length > 64) return
-    const resolved = resolvedNameOf(given)
-    if (resolved !== undefined && resolved !== given) found.push([resolved, given])
-    return
-  }
-  if (typeof stored !== "object" || stored === null || open.has(stored)) return
-  open.add(stored)
-  if (Array.isArray(stored)) {
-    for (const element of stored) givenNames(element, found, open, false)
-    return
-  }
-  const map = stored as Record<string, unknown>
-  if (Object.hasOwn(map, ZONE_MARKER) && map._tag === "Named") {
-    const { id, resolvedId } = map
-    if (typeof id === "string" && typeof resolvedId === "string" && id !== resolvedId) {
-      found.push([resolvedId, id])
-      const now = resolvedNameOf(resolvedId)
-      if (now !== undefined && now !== resolvedId) found.push([now, id])
-    }
-  }
-  for (const key of Object.keys(map)) givenNames(map[key], found, open, false)
+const keyedNow = (text: string): string | undefined => {
+  const bracketed = ISO_ZONE.exec(text)?.[1]
+  const given = bracketed ?? text
+  if (given.length === 0 || given.length > 64) return undefined
+  const resolved = resolvedNameOf(given)
+  if (resolved === undefined || resolved === given) return undefined
+  return bracketed === undefined
+    ? resolved
+    : `${text.slice(0, text.length - given.length - 2)}[${resolved}]`
 }
 
-/** A value's key text with each zone under the name it was given. */
-const givenText = (text: string, given: Given): string => {
-  let out = text
-  for (const [resolved, name] of given) {
-    if (out === resolved) return name
-    out = out
-      .split(`[${resolved}]`)
-      .join(`[${name}]`)
-      .split(`TimeZone.Named(${resolved})`)
-      .join(`TimeZone.Named(${name})`)
+/** What the stored value holds at `path` ({@link walkLeaves}' steps); `undefined` where nothing is. */
+const storedAt = (stored: unknown, path: ReadonlyArray<PropertyKey>): unknown => {
+  let at = stored
+  for (const step of path) {
+    if (step === UNNAMED_STEP || typeof at !== "object" || at === null) return undefined
+    const key = typeof step === "symbol" ? step : String(step)
+    if (!Object.hasOwn(at, key)) return undefined
+    at = (at as Record<PropertyKey, unknown>)[key]
   }
-  return out
+  return at
+}
+
+/**
+ * A zone under the name it was given, `id`, as 1.38.0 to 1.40.0 held it on Effect 4.1.3: its text,
+ * and the text of a date zoned in it, name `id`. Built on the zone's own prototype, without a
+ * `resolvedId`, so nothing names it again.
+ */
+const zoneGiven = (zone: DateTime.TimeZone.Named, id: string): DateTime.TimeZone => {
+  const given = Object.create(Object.getPrototypeOf(zone))
+  given.id = id
+  given.format = (zone as unknown as { readonly format: unknown }).format
+  return given
+}
+
+/**
+ * A leaf of a key-form value as those releases held it, from what the row stores at its place: a
+ * zone whose stored map holds `resolvedId` (written on 4.1.3) beside another `id`, under that `id`;
+ * text the row stores naming a zone by another name, which the key form named again, as stored.
+ */
+const leafGiven = (leaf: unknown, stored: unknown): unknown => {
+  if (typeof leaf === "string") {
+    return typeof stored === "string" && stored !== leaf && keyedNow(stored) === leaf
+      ? stored
+      : leaf
+  }
+  if (!isNamedZone(leaf) || typeof stored !== "object" || stored === null) return leaf
+  const map = stored as Record<string, unknown>
+  if (!Object.hasOwn(map, ZONE_MARKER) || map._tag !== "Named") return leaf
+  const { id, resolvedId } = map
+  if (typeof id !== "string" || typeof resolvedId !== "string") return leaf
+  return id === (leaf as unknown as { readonly id: unknown }).id ? leaf : zoneGiven(leaf, id)
 }
 
 /**
  * The row's key-form record `keyForm` with each value whose stored form (`stored`, the row's values
  * as read) names a zone by a name other than the one it's keyed under now, as the key text 1.38.0 to
- * 1.40.0 composed for it on Effect 4.1.3: under the name it was given. Only the attributes `reads`
- * names are looked at, when it's given: those a key is composed from. `undefined` when no value
- * does, so a row of any other kind costs one look at its key values and no other reading.
+ * 1.40.0 composed for it on Effect 4.1.3: under the name it was given, zone by zone. Only the
+ * attributes `reads` names are looked at, when it's given: those a key is composed from. `undefined`
+ * when no value does, so a row of any other kind costs one look at its key values and no other
+ * reading.
  */
 export const givenZoneReading = (
   keyForm: Record<string, unknown>,
@@ -101,17 +113,12 @@ export const givenZoneReading = (
     if (typeof value === "bigint" || typeof value === "boolean") continue
     if (!Object.hasOwn(stored, attr)) continue
     const held = stored[attr]
-    // Text the key form keeps as it is names no zone another way: a field's codec took a zone's
-    // text to its name keyed now, or there's nothing to read.
-    if (typeof held === "string" && (typeof value !== "string" || value === held)) continue
-    const found: Array<readonly [string, string]> = []
-    givenNames(held, found, new Set(), true)
-    if (found.length === 0) continue
-    const text = serializeValue(value)
-    const given = givenText(text, found)
-    if (given === text) continue
+    const given = walkLeaves(value, (leaf, path) => leafGiven(leaf, storedAt(held, path)))
+    if (given === value) continue
+    const text = serializeValue(given)
+    if (text === serializeValue(value)) continue
     reading ??= { ...keyForm }
-    reading[attr] = given
+    reading[attr] = text
   }
   return reading
 }

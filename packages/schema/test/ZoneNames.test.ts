@@ -5,9 +5,10 @@
  * every assertion holds on either version.
  */
 import { describe, expect, it } from "@effect/vitest"
-import { DateTime, Effect, Option, Result, Schema } from "effect"
+import { Chunk, DateTime, Effect, Option, Result, Schema } from "effect"
 import * as DynamoModel from "../src/DynamoModel.js"
 import {
+  namesZone,
   rewrittenZoneId,
   storedFormOf,
   storedZoneName,
@@ -126,7 +127,77 @@ describe("a 4.1.3 zone's stored forms are 4.1.2's", () => {
     expect(zonesAsStored(held)).toBe(held)
     const london = madeAs413("Europe/London", "Europe/London")
     expect(zonesAsStored(london)).toBe(london)
-    const map = { zone: madeAs413("Etc/UTC", "UTC") }
+    const map = { zone, list: [zone, held], set: new Set([zone]), other: new Map([["a", zone]]) }
     expect(zonesAsStored(map)).toBe(map)
+  })
+})
+
+describe("a zone at any depth (#242)", () => {
+  const etc = () => madeAs413("Etc/UTC", "UTC") as DateTime.TimeZone.Named
+  const nameIn = (value: unknown): string => (value as { id: string }).id
+
+  it("through a list, a tuple, a record, a Set, a Map, a class instance and an Effect collection", () => {
+    expect(KeyComposer.serializeValue([etc()])).toBe("TimeZone.Named(UTC)")
+    expect(KeyComposer.serializeValue(["x", [etc()]])).toBe("x,TimeZone.Named(UTC)")
+    expect(KeyComposer.serializeValue(Option.some({ a: etc() }))).toBe(
+      'some({"a":TimeZone.Named(UTC)})',
+    )
+    expect(KeyComposer.serializeValue(Result.fail([at(etc())]))).toBe(
+      String(Result.fail([at(madeAs412("UTC"))])),
+    )
+    class Located extends Schema.Class<Located>("Located")({ z: Schema.TimeZoneNamed }) {}
+    const located = zonesAsStored(new Located({ z: etc() })) as Located
+    expect(located).toBeInstanceOf(Located)
+    expect(nameIn(located.z)).toBe("UTC")
+    expect(KeyComposer.serializeValue(Chunk.make(etc()))).toBe("Chunk([TimeZone.Named(UTC)])")
+    const set = zonesAsStored(new Set([etc()])) as Set<unknown>
+    expect([...set].map(nameIn)).toEqual(["UTC"])
+    const map = zonesAsStored(new Map([[etc(), [etc()]]])) as Map<unknown, Array<unknown>>
+    expect([...map].map(([key, value]) => [nameIn(key), value.map(nameIn)])).toEqual([
+      ["UTC", ["UTC"]],
+    ])
+  })
+
+  it("keeps a list's holes and length, and its kind", () => {
+    class Listed extends Array<unknown> {}
+    const sparse = new Listed(3)
+    sparse[1] = etc()
+    const renamed = zonesAsStored(sparse) as Array<unknown>
+    expect(renamed).toBeInstanceOf(Listed)
+    expect(renamed.length).toBe(3)
+    expect(0 in renamed).toBe(false)
+    expect(nameIn(renamed[1])).toBe("UTC")
+  })
+
+  it("calls no getter, and leaves a zone behind one as it is", () => {
+    let reads = 0
+    const held = {
+      get zone() {
+        reads++
+        return etc()
+      },
+      list: [etc()],
+    }
+    const renamed = zonesAsStored(held) as { zone: unknown; list: Array<unknown> }
+    expect(reads).toBe(0)
+    expect(nameIn(renamed.list[0])).toBe("UTC")
+    expect(Object.getOwnPropertyDescriptor(renamed, "zone")?.get).toBeDefined()
+  })
+
+  it("leaves a cycle where it is, and an object keeping its content in slots", () => {
+    const cycle: Array<unknown> = [etc()]
+    cycle.push(cycle)
+    const renamed = zonesAsStored(cycle) as Array<unknown>
+    expect(nameIn(renamed[0])).toBe("UTC")
+    expect(renamed[1]).toBe(cycle)
+    const date = Object.assign(new Date(0), { zone: etc() })
+    expect(zonesAsStored(date)).toBe(date)
+  })
+
+  it("namesZone finds one at any depth", () => {
+    expect(namesZone([[{ a: Option.some(etc()) }]])).toBe(true)
+    expect(namesZone(new Map([["a", new Set([etc()])]]))).toBe(true)
+    expect(namesZone([[{ a: Option.some("UTC") }]])).toBe(false)
+    expect(namesZone([DateTime.zoneMakeOffset(0)])).toBe(false)
   })
 })

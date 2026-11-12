@@ -225,53 +225,170 @@ const namedZone = (name: string): DateTime.TimeZone | undefined => {
 }
 
 /**
- * A value whose text names a zone, with each of Effect's named zones in it under the name
- * {@link storedZoneName} gives it, so its text is the text 4.1.2 gave it, and two values Effect holds
- * equal have one text: a zone itself, the zone of a zoned date, and the value of an `Option` or a
- * `Result`, whose text is their content's. The same reference when nothing in it changes.
+ * Objects whose content lives in internal slots, not in properties: rebuilt from their properties,
+ * one would lose it, so nothing in them is walked.
  */
-export const zonesAsStored = (value: unknown): unknown => {
-  if (typeof value !== "object" || value === null || isPlainObject(value)) return value
-  if (isZoneInstance(value)) {
-    if (!DateTime.isTimeZoneNamed(value)) return value
-    const name = zoneNameOf(value)
-    return name === undefined || ownData(value, "id") === name ? value : (namedZone(name) ?? value)
+const SLOTTED: ReadonlyArray<abstract new (...args: never) => object> = [
+  Date,
+  RegExp,
+  ArrayBuffer,
+  Promise,
+  WeakMap,
+  WeakSet,
+  Number,
+  String,
+  Boolean,
+  Intl.DateTimeFormat,
+]
+
+const isSlotted = (value: object): boolean =>
+  ArrayBuffer.isView(value) || SLOTTED.some((type) => value instanceof type)
+
+/** A step into a `Set`'s element, or a `Map`'s key: nothing stored is reached by name there. */
+export const UNNAMED_STEP: unique symbol = Symbol.for("effect-dynamodb/StoredForm/unnamedStep")
+
+/**
+ * Every value in a value, at any depth, each given as `leaf` returns it, with the path to it: the
+ * one walk every text naming a zone takes, so the key form ({@link zonesAsStored}), the sentinel
+ * text, what decides whether a value names a zone at all ({@link namesZone}) and `rekey`'s reading of
+ * the name a zone was given (`ZoneKeyText`) reach the same zones. A leaf is a zone itself, a
+ * primitive, a date in UTC, an empty `Option` or an object keeping its content in internal slots (a
+ * `Date`, a typed array), which isn't walked. Everything else is walked: a zoned date's zone (`zone`),
+ * an `Option`'s value (`value`), a `Result`'s (`success` / `failure`), a list or tuple (each index), a
+ * `Set` (each element, {@link UNNAMED_STEP}), a `Map` (each key, {@link UNNAMED_STEP}, and each
+ * value, under its key's text), a record or struct, and any other object's own properties (a `Schema.Class`
+ * instance, one of Effect's collections): every container a value's text can show a zone through,
+ * and the ones it can't, so a zone is named alike wherever a schema puts it. Each step is the name the
+ * marshaller stores what it reaches under. A property is read from its descriptor, so no getter is
+ * called, and what's behind one stays as it is. The same reference when `leaf` changes nothing in it;
+ * otherwise a copy, each container rebuilt as the kind it is, on its own prototype. An object met
+ * again inside itself is left as it is.
+ */
+export const walkLeaves = (
+  value: unknown,
+  leaf: (value: unknown, path: ReadonlyArray<PropertyKey>) => unknown,
+): unknown => walk(value, leaf, new Set(), [])
+
+const walk = (
+  value: unknown,
+  leaf: (value: unknown, path: ReadonlyArray<PropertyKey>) => unknown,
+  open: Set<object>,
+  path: Array<PropertyKey>,
+): unknown => {
+  if (typeof value !== "object" || value === null) return leaf(value, path)
+  if (open.has(value)) return value
+  if (isZoneInstance(value)) return leaf(value, path)
+  const at = (step: PropertyKey, held: unknown): unknown => {
+    path.push(step)
+    try {
+      return walk(held, leaf, open, path)
+    } finally {
+      path.pop()
+    }
   }
   if (isRealDate(value)) {
-    if (!DateTime.isZoned(value)) return value
-    const zone = zonesAsStored(value.zone) as DateTime.TimeZone
+    if (!DateTime.isZoned(value)) return leaf(value, path)
+    const zone = at("zone", value.zone) as DateTime.TimeZone
     return zone === value.zone
       ? value
       : DateTime.makeZonedUnsafe(value.epochMilliseconds, { timeZone: zone })
   }
-  if (inherits(value, OPTION_MARKER) && Option.isOption(value) && Option.isSome(value)) {
-    const held = zonesAsStored(value.value)
-    return held === value.value ? value : Option.some(held)
+  if (isSlotted(value)) return leaf(value, path)
+  open.add(value)
+  try {
+    if (inherits(value, OPTION_MARKER) && Option.isOption(value)) {
+      if (Option.isNone(value)) return leaf(value, path)
+      const held = at("value", value.value)
+      return held === value.value ? value : Option.some(held)
+    }
+    if (inherits(value, RESULT_MARKER) && Result.isResult(value)) {
+      if (Result.isSuccess(value)) {
+        const held = at("success", value.success)
+        return held === value.success ? value : Result.succeed(held)
+      }
+      const held = at("failure", value.failure)
+      return held === value.failure ? value : Result.fail(held)
+    }
+    if (value instanceof Set) {
+      const elements = [...value]
+      const walked = elements.map((element) => at(UNNAMED_STEP, element))
+      return walked.every((element, index) => element === elements[index]) ? value : new Set(walked)
+    }
+    if (value instanceof Map) {
+      const entries = [...value]
+      const walked = entries.map(
+        ([key, held]) =>
+          [at(UNNAMED_STEP, key), at(typeof key === "symbol" ? key : String(key), held)] as const,
+      )
+      return walked.every(([key, held], index) => {
+        const entry = entries[index]
+        return entry !== undefined && key === entry[0] && held === entry[1]
+      })
+        ? value
+        : new Map(walked)
+    }
+    if (Array.isArray(value)) {
+      let copy: Array<unknown> | undefined
+      for (let index = 0; index < value.length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, index)
+        if (descriptor === undefined || !("value" in descriptor)) continue
+        const walked = at(index, descriptor.value)
+        if (walked === descriptor.value) continue
+        copy ??= value.slice()
+        copy[index] = walked
+      }
+      return copy ?? value
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value) as Record<
+      PropertyKey,
+      PropertyDescriptor
+    >
+    let changed = false
+    for (const key of Reflect.ownKeys(descriptors)) {
+      const descriptor = descriptors[key]
+      if (descriptor === undefined || !("value" in descriptor)) continue
+      const walked = at(key, descriptor.value)
+      if (walked === descriptor.value) continue
+      descriptors[key] = { ...descriptor, value: walked }
+      changed = true
+    }
+    return changed ? Object.create(Object.getPrototypeOf(value), descriptors) : value
+  } finally {
+    open.delete(value)
   }
-  if (inherits(value, RESULT_MARKER) && Result.isResult(value)) {
-    const held = Result.isSuccess(value) ? value.success : value.failure
-    const stored = zonesAsStored(held)
-    if (stored === held) return value
-    return Result.isSuccess(value) ? Result.succeed(stored) : Result.fail(stored)
-  }
-  return value
+}
+
+/** Whether a value is one of Effect's named zones itself. */
+export const isNamedZone = (value: unknown): value is DateTime.TimeZone.Named =>
+  typeof value === "object" &&
+  value !== null &&
+  isZoneInstance(value) &&
+  DateTime.isTimeZoneNamed(value)
+
+/** A named zone under the name {@link storedZoneName} gives it: the same zone when it's held so. */
+const asStoredZone = (zone: DateTime.TimeZone): DateTime.TimeZone => {
+  const name = zoneNameOf(zone)
+  return name === undefined || ownData(zone, "id") === name ? zone : (namedZone(name) ?? zone)
 }
 
 /**
- * Whether a value names a zone ({@link zonesAsStored} takes it): a named zone, a date zoned in one, or
- * an `Option` or a `Result` holding one.
+ * A value with each of Effect's named zones in it, at any depth ({@link walkLeaves}), under the name
+ * {@link storedZoneName} gives it, so its text is the text 4.1.2 gave it, and two values Effect holds
+ * equal have one text: a zone itself, a zoned date, a list of zones (`TimeZone.Named(UTC)`), an
+ * `Option`, a `Result` or a class instance whose text shows one. The same reference when nothing in it
+ * changes.
  */
+export const zonesAsStored = (value: unknown): unknown =>
+  walkLeaves(value, (leaf) => (isNamedZone(leaf) ? asStoredZone(leaf) : leaf))
+
+/** Whether a value holds a named zone anywhere {@link zonesAsStored} reaches one. */
 export const namesZone = (value: unknown): boolean => {
-  if (typeof value !== "object" || value === null || isPlainObject(value)) return false
-  if (isZoneInstance(value)) return DateTime.isTimeZoneNamed(value)
-  if (isRealDate(value)) return DateTime.isZoned(value) && DateTime.isTimeZoneNamed(value.zone)
-  if (inherits(value, OPTION_MARKER) && Option.isOption(value)) {
-    return Option.isSome(value) && namesZone(value.value)
-  }
-  if (inherits(value, RESULT_MARKER) && Result.isResult(value)) {
-    return namesZone(Result.isSuccess(value) ? value.success : value.failure)
-  }
-  return false
+  let met = false
+  walkLeaves(value, (leaf) => {
+    if (isNamedZone(leaf)) met = true
+    return leaf
+  })
+  return met
 }
 
 /** A zoned date as ISO text with its zone's name, the name 4.1.2 gave it ({@link zonesAsStored}). */

@@ -215,13 +215,24 @@ export const makeCompositeKeyForm = (
           : declared === undefined
             ? onlyNumericKind(storedNumericKinds(field))
             : undefined
-      const fn =
+      // A field encoding a zone to text inside it (a list of `TimeZoneNamedFromString`) is keyed by
+      // the value it stores, with each zone named as every key names one (`storedZoneText`).
+      const zoneText = storedZoneText(field)
+      const numeric =
         kind === undefined
-          ? null
+          ? undefined
           : (value: unknown): unknown =>
               typeof value === "number" || typeof value === "bigint"
                 ? exactly(attr, kind, value)
                 : value
+      const fn =
+        zoneText === undefined
+          ? (numeric ?? null)
+          : (value: unknown): unknown => {
+              const named = zoneText(value)
+              const keyed = named === undefined ? value : named
+              return numeric === undefined ? keyed : numeric(keyed)
+            }
       cache.set(attr, fn)
       return fn
     }
@@ -411,16 +422,44 @@ const holdsZone = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): bo
 }
 
 /**
+ * Whether a schema encodes anywhere: at its top, or in a member, property, element, type parameter
+ * or suspension. `Schema.Array(Schema.TimeZoneNamedFromString)` has no encoding of its own, and its
+ * elements do.
+ */
+const holdsEncoding = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (ast.encoding !== undefined) return true
+  if (SchemaAST.isDeclaration(ast)) {
+    return ast.typeParameters.some((type) => holdsEncoding(type, seen))
+  }
+  if (SchemaAST.isSuspend(ast)) return holdsEncoding(ast.thunk(), seen)
+  if (SchemaAST.isUnion(ast)) return ast.types.some((member) => holdsEncoding(member, seen))
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((property) => holdsEncoding(property.type, seen)) ||
+      ast.indexSignatures.some((index) => holdsEncoding(index.type, seen))
+    )
+  }
+  if (SchemaAST.isArrays(ast)) {
+    return [...ast.elements, ...ast.rest].some((element) => holdsEncoding(element, seen))
+  }
+  return false
+}
+
+/**
  * For a field encoding a zone, or a date zoned in one, to text (Effect's `TimeZoneNamedFromString`,
- * `TimeZoneFromString`, `DateTimeZonedFromString`, or an application's own): the text it stores, or
- * one read back, with the zone named as the key form names it (case 3b, `zonesAsStored`). A unique
- * sentinel and a time-series event's sort key are composed from the text stored, and Effect's codecs
- * write the name a zone was made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`), so these take
- * this text instead, which is the same on both. `undefined` for any other field, and from the function
- * returned for text already so named, text naming no zone, and text the field doesn't decode.
+ * `TimeZoneFromString`, `DateTimeZonedFromString`, or an application's own), at its top or anywhere
+ * in it (a list of them, an `Option` of one): the value it stores, or one read back, with each zone
+ * named as the key form names it (`zonesAsStored`). A key is composed from the value stored (case 3a,
+ * a list of them) or from the field's text (case 3b, which names it itself), a unique sentinel and a
+ * time-series event's sort key from the value stored, and Effect's codecs write the name a zone was
+ * made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`), so these take this value instead, which is
+ * the same on both. `undefined` for any other field, and from the function returned for a value
+ * already so named, a value naming no zone, and one the field doesn't decode.
  */
 export const storedZoneText = (field: Schema.Top): ((value: unknown) => unknown) | undefined => {
-  if (!hasEncodingTransformation(field) || !holdsZone(SchemaAST.toType(field.ast))) return undefined
+  if (!holdsEncoding(field.ast) || !holdsZone(SchemaAST.toType(field.ast))) return undefined
   const codec = field as unknown as Schema.Codec<unknown, unknown>
   const decode = Schema.decodeUnknownOption(codec)
   const encode = Schema.encodeUnknownOption(codec)

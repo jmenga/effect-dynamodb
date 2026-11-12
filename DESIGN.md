@@ -5184,17 +5184,36 @@ names a zone and one rule writes it, whichever Effect is installed.
   it holds one as text, otherwise its `id`. That is the resolved name on either Effect,
   for a zone made fresh or read back from a map of either form, and it's what 4.1.3's
   `Equal` compares (`resolvedId` against `resolvedId ?? id`; 4.1.2's compares `id`), so
-  two zones Effect holds equal have one name. Key text (`zonesAsStored`, also for a zone
-  in an `Option`, a `Result` or a zoned date, and in the key form's case 3b, so a field
-  of a codec that encodes a zone to text keys the name too), a unique sentinel and a
-  time-series event's sort key (composed from the text stored, which `storedZoneText`
-  names again: `storedSentinelValue`, `readSentinelValue`, `append`, and a
-  `history().where()` bound), the ISO text of `DynamoModel.DateTimeZoned` and of a date
-  stored as text (`zonedIsoText`), an aggregate's comparison and every write take it
-  from there. The
-  property test in `ZoneNames.test.ts` builds zones every way (fresh, as each Effect
-  makes one, read back from either map) and holds equal ones to one key text, sentinel
-  and ISO text.
+  two zones Effect holds equal have one name. Key text (`zonesAsStored`), a unique
+  sentinel and a time-series event's sort key (composed from the value stored, which
+  `storedZoneText` names again: `storedSentinelValue`, `readSentinelValue`, `append`,
+  and a `history().where()` bound), the ISO text of `DynamoModel.DateTimeZoned` and of
+  a date stored as text (`zonedIsoText`), an aggregate's comparison and every write take
+  it from there.
+- *One walk reaches every zone.* `walkLeaves` (`internal/StoredForm.ts`) is the walk
+  every text naming a zone takes: `zonesAsStored`, `namesZone` (which decides whether
+  `storedZoneText` looks at a field's value) and `rekey`'s `givenZoneReading`. It goes
+  through a zoned date's zone, an `Option`, a `Result`, a list or tuple, a `Set`, a
+  `Map`, a record or struct and any other object's own properties (a `Schema.Class`
+  instance, one of Effect's collections), so a list of zones keys `timezone.named(utc)`
+  on either Effect, as does a tuple, an `Option` of a list, a struct or a record in an
+  `Option`, a `Result`, a union and a class instance in an `Option`. It reads each
+  property from its descriptor, so no getter is called (a zone behind one keeps the
+  text its getter gives), and leaves an object keeping its content in internal slots
+  (a `Date`, a typed array) unwalked. A field holding one of Effect's string codecs
+  inside it (`Schema.Array(Schema.TimeZoneNamedFromString)`, an `Option` of one) has no
+  encoding of its own, so the key form's case 3a keys its stored value: `storedZoneText`
+  now takes any field encoding somewhere inside it (`holdsEncoding`), and case 3a keys
+  that value with its zones named (`utc,utc`, `some("utc")`). A sentinel read back takes
+  the form `put` stored first (`storedFormOfRead`, an `Option` handed back as a map) and
+  then names its zones (`thenForm`). The stored form is the marshaller's own walk, which
+  reaches every map it writes and names each zone's map where it builds it
+  (`zoneEntriesWritten`). `ZoneDepth.test.ts` holds each container, on either Effect,
+  to one key text per resolved name (a literal table), one sentinel, and stored zones
+  under the resolved name, natively and packed, for zones made fresh, as each Effect
+  makes one, decoded from 4.1.3's form and read back from either Effect's map; the
+  property test in `ZoneNames.test.ts` does the same for a zone itself, with the ISO
+  text.
 - *The write* is `rewrittenZoneId` / `zoneEntriesWritten`: a named zone's map holding
   `resolvedId` is written with `id` under the name and without `resolvedId`, which is
   what 1.40.0 stored on 4.1.2. It's decided on the entries a write obtained, never by
@@ -5246,10 +5265,15 @@ any key holding nothing: `get` and `update` report `ItemNotFound` (an aggregate'
 (`ItemNotFound` where it reads the item first: a unique constraint, soft delete), a `put`
 writes a second row, which `rekey` reports as `bothKeys` and leaves, and its unique value
 isn't enforced. The upgrade note says to run `rekey` first. `rekey` alone looks: `givenZoneReading`
-(`internal/ZoneKeyText.ts`) takes a row's key-form record and its stored values, finds
-each value naming a zone by another name (a zone's text a codec stored, the zone in a
-zoned date's ISO text, a zone's map holding `resolvedId` beside the `id` it was given),
-and gives the record with that value's key text under the given name. It joins the
+(`internal/ZoneKeyText.ts`) takes a row's key-form record and its stored values, walks
+each key-form value as `walkLeaves` walks it, and takes each zone, or each text, under
+the name the row stores at the same place (the same index, property, `Option` value or
+zoned date's zone): a zone whose stored map holds `resolvedId` beside another `id` under
+that `id`, and text a codec or the library stored naming a zone by another name (a
+zone's name, a zoned date's ISO text) as stored. So a list holding `Etc/UTC` and `GMT`,
+both `UTC` now, reads `timezone.named(etc/utc),timezone.named(gmt)`, and a list through a
+codec `etc/utc,gmt`, as 1.40.0 keyed them (`ZoneDepthRekey.test.ts`, on rows published
+1.40.0 wrote on 4.1.3: `zone-depth-keys-1.40.0-effect-4.1.3.json`). It joins the
 readings `rowKeyForms` gives, so an entity row's table key (item, snapshot, tombstone,
 time-series event) and its index keys (`staleIndexKeys`, rewritten with
 `repairIndexKeys`) are recognised under it; `givenSentinelValues` gives a unique

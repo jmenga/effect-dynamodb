@@ -4534,6 +4534,25 @@ const makeImpl = <
           }
 
   /**
+   * `first`'s form of a value, then `second`'s of that: a value read back taken to the form `put`
+   * stored, then its zones named as the key form names them (a zone's text inside an `Option` the
+   * unmarshaller handed back as a map). Whichever takes it; `undefined` when neither does.
+   */
+  const thenForm = (
+    first: ((value: unknown) => unknown) | undefined,
+    second: ((value: unknown) => unknown) | undefined,
+  ): ((value: unknown) => unknown) | undefined =>
+    first === undefined
+      ? second
+      : second === undefined
+        ? first
+        : (value) => {
+            const taken = first(value)
+            const named = second(taken === undefined ? value : taken)
+            return named === undefined ? taken : named
+          }
+
+  /**
    * A unique field's value as `put` stored it, from a row read back: sentinels are composed from
    * the Encoded value, which for a field stored as `N` the unmarshaller may hand back as the other
    * numeric kind (`storedNumericForm`). A zone's text names it as the key form does
@@ -4563,7 +4582,8 @@ const makeImpl = <
    * schema, the value decoded through the field, as a read decodes it, and encoded again
    * (`storedFormOfRead`). `Schema.Unknown` decoded to a `Schema.BigInt` stored `5n`, which reads back
    * as `5`. Only a value read from a row is taken this way: a write's own value is the one it stores.
-   * A zone's text is named as the key form names it (`storedZoneText`), as a write's is.
+   * A zone's text is named as the key form names it (`storedZoneText`), as a write's is, in the form
+   * `put` stored (an `Option` the unmarshaller handed back as a map, taken back to one first).
    */
   const readSentinelValue = (() => {
     const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
@@ -4575,7 +4595,7 @@ const makeImpl = <
           field,
           fieldSchema === undefined
             ? undefined
-            : eitherForm(storedFormOfRead(fieldSchema), storedZoneText(fieldSchema)),
+            : thenForm(storedFormOfRead(fieldSchema), storedZoneText(fieldSchema)),
         )
       }
       return forms.get(field)?.(value)
