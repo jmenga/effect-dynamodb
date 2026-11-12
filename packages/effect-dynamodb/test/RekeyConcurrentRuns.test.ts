@@ -14,11 +14,11 @@ import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
-import { Effect, Layer, Schema } from "effect"
+import { Deferred, Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-import { type Around, gatedLayer } from "./helpers/GatedClient.js"
+import { type Around, gatedLayer, putsAt } from "./helpers/GatedClient.js"
 import {
   jittered,
   type Row,
@@ -512,5 +512,93 @@ describe.each([
         }),
       )
     }
+  }
+})
+
+/**
+ * Two runs at once, to off: `foo%20bar`'s sentinel goes where `foo bar`'s is stored. Run X's pass
+ * for `a` reads that key, holding `b`'s sentinel, and run Y moves the sentinel out of the way before
+ * X does. X's move of it finds it gone and writes nothing; X reads the key again before refusing,
+ * finds it empty and moves `a`'s sentinel there, and Y's move of `a`'s sentinel, held until then,
+ * finds that done. Without that read X reported the key `taken`, which no run alone does.
+ */
+describe("a sentinel moved out of the way by another run between a pass's reads", () => {
+  for (const concurrency of [1, 4]) {
+    it.effect(`the pass reads the key again and moves (${concurrency} at once)`, () =>
+      Effect.gen(function* () {
+        const table = makeRecordingTable()
+        const on = randomWorld(true)
+        yield* Effect.gen(function* () {
+          const db = yield* on.client
+          yield* db.entities.Members.put({ id: "a", email: "foo%20bar", nick: "na" }).asEffect()
+          yield* db.entities.Members.put({ id: "b", email: "foo bar", nick: "nb" }).asEffect()
+        }).pipe(Effect.provide(Layer.merge(table.layer, on.MainTable.layer({ name: "t" }))))
+        const current = "$fz#v1#member.email#foo%20bar"
+        const out = "$fz#v1#member.email#foo bar"
+        const xRead = yield* Deferred.make<void>()
+        const yOut = yield* Deferred.make<void>()
+        const xIn = yield* Deferred.make<void>()
+        let xWaited = false
+        let yWaited = false
+        const orFallBack = (deferred: Deferred.Deferred<void>) =>
+          Effect.raceFirst(
+            Deferred.await(deferred),
+            Effect.forEach(Array.from({ length: 4000 }), () => Effect.yieldNow, { discard: true }),
+          )
+        // X: once its first read of `a`'s current key is answered, the rest waits for Y's move.
+        const x: Around = (command, input, send) => {
+          if (Deferred.isDoneUnsafe(xRead)) {
+            return orFallBack(yOut).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  xWaited ||= Deferred.isDoneUnsafe(yOut)
+                }),
+              ),
+              Effect.andThen(send),
+              Effect.tap(() =>
+                command === "transactWriteItems" && putsAt(input, current)
+                  ? Deferred.succeed(xIn, undefined)
+                  : Effect.void,
+              ),
+            )
+          }
+          if (command !== "getItem" || input?.Key?.pk?.S !== current) return send
+          return Effect.tap(send, () => Deferred.succeed(xRead, undefined))
+        }
+        // Y: starts after that read; its move into `a`'s current key waits for X's.
+        const y: Around = (command, input, send) =>
+          orFallBack(xRead).pipe(
+            Effect.andThen(
+              command === "transactWriteItems" && putsAt(input, current)
+                ? Effect.tap(orFallBack(xIn), () =>
+                    Effect.sync(() => {
+                      yWaited ||= Deferred.isDoneUnsafe(xIn)
+                    }),
+                  )
+                : Effect.void,
+            ),
+            Effect.andThen(send),
+            Effect.tap(() =>
+              command === "transactWriteItems" && putsAt(input, out)
+                ? Deferred.succeed(yOut, undefined)
+                : Effect.void,
+            ),
+          )
+        const [byX, byY] = yield* Effect.all(
+          [
+            rekeyOnce(false, table, { concurrency }, x),
+            rekeyOnce(false, table, { concurrency }, y),
+          ],
+          { concurrency: 2 },
+        )
+        expect({ xWaited, yWaited }).toEqual({ xWaited: true, yWaited: true })
+        expect(byX.conflicts).toEqual([])
+        expect(byY.conflicts).toEqual([])
+        expect(byX.sentinelsMoved + byY.sentinelsMoved).toBe(2)
+        expect(strayed([...table.items.values()])).toEqual([])
+        const again = yield* rekeyOnce(false, table, {})
+        expect(again).toMatchObject({ sentinelsMoved: 0, conflicts: [] })
+      }),
+    )
   }
 })
