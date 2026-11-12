@@ -1077,17 +1077,55 @@ be reported twice, two ways, or counted as `unchanged` after the run moved it.
   So a later decision sees what an earlier one would have done: a dry run's
   report is the run's, chains included, but for `indexKeys.repaired` (a dry run
   writes no key and counts none).
+- **What depends on where a row ends up is counted at the end** (`RekeyRowContext.atEnd`,
+  run after every segment's scan and before each member's `finish`). Without
+  `reservations`, a unique sentinel whose back-pointer names no row that holds it,
+  in a run with nothing judging reservations, is `unrecognizedKey`, as 1.40.0
+  counted it; but under `preserveUnique` a move of a tombstone of that item can
+  take the same sentinel along, so counting it when the scan met it gave one
+  report when the scan met it before the tombstone's move and another after
+  (random tables, `RekeyRandomOrder.test.ts`). It's counted once the scan is
+  over, unless by then a row's pass took it (`vacated`) or put it (`placed`) or
+  a transaction re-pointed it in place (`sendRekeyTransaction` claims
+  `repointed` for each sentinel `Update` it sent; `sentinelTaken`). Nothing more
+  is read, so a quiet table sends what 1.40.0 sent. The deferral takes a journal
+  entry; past the capacity it's counted at once, as before (`skipped` is in
+  `journal.inexact`).
+- **Nor on how its fibers interleave.** A run's segments, and the rows of a page
+  handled at once, meet each other's writes between two reads. A moving row
+  whose sentinel's current key holds another item's sentinel naming a row that
+  is gone reads the key again before refusing (`stillThere`): a move of the run
+  may just have taken that row with its sentinel. And a pass moving a sentinel
+  out of another's way, whose sentinel its own row's move took meanwhile, has
+  nothing left to do (`movedMeanwhile`). Both cost a read, only on the way to
+  refusing. Before them, about one random table in four could end with a row
+  reported `taken` under some interleaving, and a run on DynamoDB Local did;
+  `RekeyInterleavings.test.ts` delays each request at random (`jittered`) and
+  compares report and rows, dry run and real, with the run without delays. An
+  item whose sentinel another unit moves out of the way (`sentinelOut`) can read
+  the sentinel's current key before that move's put lands and its old key after
+  the move's delete: neither read finds it, and the item counted `unchanged` or
+  not by which came first (the chain scenarios with each request delayed 0 to
+  30 ms, on DynamoDB Local: two of their 24 runs, in both of two runs of the
+  file). A sentinel found under no key is read
+  again at its current key when the run has put, or is putting, a row there
+  (`RekeyRowContext.putting`: the journal keeps a put's fingerprint from when it's
+  sent, before its answer), and the run's put found there is the run's work for
+  the item (`worked`), answered or not. The read is never sent over a table the
+  run writes nothing to.
 - **Conflicts are reported one per row** (member, kind, key): the first by
   precedence (`failed`, `unguarded`, `uncomposable`, `bothKeys`, `contended`,
   `taken`), in a fixed order (member, kind, key, reason, target, message).
 
 **What a run remembers is bounded** (`RekeyOptions.journalCapacity`, default
 1,000,000 entries; `RekeyReport.journal`). One `Budget` is shared by the
-journal's keys, the settled units, the claims and an aggregate's known roots and
-rootless rows, and every entry is a 128-bit digest (`internal/Digest.ts`:
-SHA-256 of the text's UTF-16 code units, synchronous and runtime-agnostic) with
-a few flags, never key text and never a row: about 120 bytes an entry, so about
-115 MiB at the default when full. A row the run doesn't move, write or report
+journal's keys, the settled units, the claims, the counts left to the end of the
+run (`atEnd`) and an aggregate's known roots and rootless rows, and every entry
+is a 128-bit digest (`internal/Digest.ts`: SHA-256 of the text's UTF-16 code
+units, synchronous and runtime-agnostic) with a few flags, never key text and
+never a row: about 145 bytes an entry, so about 138 MiB at the default when full
+(measured: with the journal full, 161 MiB more heap after GC than before the
+run, about 23 MiB of it the page in flight). A row the run doesn't move, write or report
 costs nothing: the scan counts it, and a take while its visit runs (`inFlight`)
 is of a row already counted. A visit that leaves its row for another unit to
 take after it — a sentinel its owner moves, an aggregate's row its root moves —
@@ -1114,7 +1152,33 @@ capacity a decision the journal informs (`vacated`, `placed`) can only leave a
 row for a rerun or count it differently: a reservation whose named row is
 missing is `undecided` once the journal is full (`journalFull`), since the run
 can't tell whether it moved that row, so no release is sent that a run with
-room wouldn't send. The journal reads and writes nothing: over a table with nothing to
+room wouldn't send. A sentinel no row holds, counted at the end of the run unless
+a row's pass took or re-pointed it (above), may be counted `unrecognizedKey` though
+one did, when the run had no room to note the re-point (`skipped`); and a real
+run may report a sentinel in another's way `taken`, left for a rerun, where a run
+with room moves both (`sentinelsMoved`, beside `conflicts`).
+
+**A digest stands for its text; a hit is not checked against it.** Every key,
+unit, claim and fingerprint the run keeps is the 128-bit digest of its whole
+text (`identity`: each part JSON-quoted, a key attribute as its type and value;
+`canonicalItem` for a row), and two texts are told apart by digest alone. Of the
+two ways to keep a collision from losing a move, this takes the first, a
+cryptographic digest over the whole text: SHA-256 truncated to 128 bits,
+written out in `internal/Digest.ts` because it must be synchronous and run on
+every runtime (Web Crypto's `digest` returns a promise; `node:crypto` is Node's),
+with no new dependency. The other, keeping enough to check a hit against the row,
+would cost the memory the digest saves. Two keys of a table share a digest only
+as a SHA-256 collision on 128 bits. None is known; finding any colliding pair
+takes about 2^64 SHA-256 evaluations, finding a text colliding with a given key
+about 2^128, and the chance that any two of a billion keys collide by accident is
+about 10^-21. A collision would not misplace or overwrite a row (every write is
+conditioned on what it read): the run would take one of the two for the other,
+passing or settling it, so one row would stay under its old key, unreported,
+until a run with no collision on it. `Digest.test.ts` checks the digest against
+`node:crypto`'s SHA-256 and that texts differing in one code unit anywhere, lone
+surrogates included, have different digests.
+
+The journal reads and writes nothing: over a table with nothing to
 move, a run without `reservations` sends exactly the requests 1.40.0 sent
 (`test/fixtures/rekey-requests-1.40.0.json` and `rekey-requests-reservations-1.40.0.json`,
 from the published package; `RekeyQuietRequests.test.ts` and its connected twin).
@@ -1132,6 +1196,47 @@ long the chain), whichever the scan reached first: `foo%20bar`'s old row to `foo
 row whose holder can't move stops retrying and reports `taken` (`cantMoveHolder`), or `contended`
 when the holder waits on it in a loop, and `RekeyReport.conflicts` lists a row once per run. Up to
 1.40.0 a chain went `DISPLACE_DEPTH` (4) rows deep and the rest were left for the next run.
+
+**Runs at once (#240).** Two or three default runs started together over the same table (nothing
+else writing) must leave no live row's unique sentinel naming a key its row left. Up to 1.40.0
+about one random table in 240 was left so (`fixtures/rekey-two-runs-1.40.0.json` is one, written
+by 1.40.0). The cause was read skew in `sentinelRekeys`: a move read the sentinel at its current
+key and at its old key, wrote only one of them, and held nothing about the other, so another run
+could move or re-point that one in between, and both transactions stood. Each re-point now stands
+only while the owner is where this run read or placed it, or it fails and is judged again from a
+fresh read:
+
+- **A move holds every sentinel key it read and doesn't write** (`sentinelAsRead`): a
+  `ConditionCheck` that the key is still empty, or its sentinel still names the row it named (or
+  still names none). A sentinel brought there in between fails the move, which reads again, so a
+  row never moves away from a sentinel naming it.
+- **Sentinels brought to a row that stays where it is hold that row** (`rekeySentinels`): each of
+  their transactions carries a `ConditionCheck` on the row, as this pass read it (`ownerCheck`:
+  its `__edd_e__`, the stored attributes of every unique field and `__edd_d__`, as read or
+  absent). A row moved, deleted or changed since fails it, and the pass, reading the row again
+  and finding it gone or changed (`sameOwnerValues`), stops: the write that moved or changed it
+  carried its sentinels.
+- **A run repairs what an earlier one left.** A sentinel whose named row is absent while a row of
+  its entity under another text of that key holds its value (`danglingHolder`: the values read
+  back from the named key's text compose the keys of the other forms, one read each) is
+  re-pointed to that row (`toItsRow`), not judged orphaned; with `reservations` it's `held`, or
+  `undecided` when more than one row could be the holder. A row's own pass takes a sentinel
+  naming a key it left as its own (`Adopt`: `"held"` for one under its current sentinel key,
+  `"all"` for one under other key text too) and holds the key it names absent or as read
+  (`ownerCheck`), so a row arriving there in between fails it. A sentinel the sentinel's own visit
+  brings to its row is claimed (`broughtForRow`), so the row's pass doesn't count it as its work.
+
+These checks go only on transactions that move or re-point something: a table with nothing to move
+sends what 1.40.0 sent. On tables with rows to move, a run nobody else writes beside sends fewer
+requests than 1.40.0 and some more `ConditionCheck` items: over 120 random tables, single default
+runs, 6,354 requests against 8,259, 1,536 transactions against 1,475 and 393 `ConditionCheck`
+items against 308.
+
+`RekeyConcurrentRuns.test.ts` runs two and three default runs at once over 40 random tables, then a
+`releaseOrphanedReservations` run, then a put of a value already taken (refused), and runs one
+default run over the 1.40.0 fixture: it re-points the dangling sentinel and leaves the rows one run
+over the original table leaves. 0 of 240 random tables are left with a dangling sentinel, the
+one 1.40.0 left included.
 
 **Resume token.** `rk1.` + base64url JSON `{ t: tableName, s: positions }`, one
 position per segment: `0` not started, `1` done, or the segment's
@@ -1363,15 +1468,24 @@ recording table and on DynamoDB Local.
 The rest can't be closed by a condition on the write `rekey` sends, so with
 writes going on each row moved under a guard that can miss one is counted in
 `report.guardGaps` and each member's (`RekeyGuardGaps`, `Rekey.guardGap`):
-`stamp`, a wide row guarded on its `updatedAt`, held or absent; `sparse`, an
-item of an entity with a sparse map guarded whole (`deleteGuard`'s `by`, `row`:
+`stamp`, a wide row guarded on its `updatedAt`, held or absent; `sparse`, a
+row of an entity with a sparse map guarded whole (`deleteGuard`'s `by`, `row`:
 a library write adding an entry is unseen unless it changes a stamp the guard
 holds, so with timestamps only one within the stamp's resolution); `strongest`,
 a row of a part-moved aggregate or stream finished under the strongest guard
-that fits. A row is counted only where a library write can be missed: a
-tombstone or time-series event guarded on its `updatedAt` isn't (no library
-write changes one), and a write from outside the library, which can land on
-any row, isn't counted for. `report.guardGaps.rows` names the rows counted
+that fits. A row is counted only where a library write can be missed, and every
+move counts the gap of its guard (`moveGap`), a history row's as an item's
+(#240): a tombstone is guarded on what was read like every other row (its whole
+stored item when that fits), not on its timestamp, since a soft delete of the
+item put again within the stamp's resolution replaces it at its key with the
+same `updatedAt`; and a time-series event can be replaced by an `append` made
+after its current item was deleted (the append's condition holds when there is
+no current item, and its event `Put` has none). A versioned entity's history
+row is guarded on its version and incarnation, which a re-put changes. A
+write from outside the library, which can land on any row, isn't counted for.
+`test/RekeyTombstoneGuard.test.ts` races the replaced tombstone: guarded whole,
+the move is cancelled and moves the new one; too wide, it's counted and named.
+`report.guardGaps.rows` names the rows counted
 (`RekeyGuardGapRow`: member, kind, count, stored key, target), at most 100,
 the first by member, kind and key, so the list is the same whatever order the
 run meets them in; the counts stay exact. `Rekey.guardGap` takes the row, so a
@@ -1424,7 +1538,7 @@ substitutions.
 |---|---|
 | Item under other text | `moveItem`: a consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the old item under `deleteGuard`, unique sentinels moved or re-pointed (`sentinelRekeys`). Another value's old row at the target moves first (`clearTarget`). The same item already at the target is `bothKeys` only if it is still at its old key when read again. A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys`. After the move, a half it couldn't recompose (a truncated sort key before a gap a later composite fills, which `preserve` keeps) is rewritten as for an item at its current key, in the same run (`rekeyAfterMove`, reading the item only when the predicted move, `movedRowOf`, leaves one); a dry run counts it from that prediction |
 | Item at its current key | GSI halves and vector partitions whose stored text is exactly another form's text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites the row holds as read (`indexKeysRewritten`). A sharded index's partition key is the exception: it is composed and compared whatever it holds, which is what moves rows into the layout, and one whose values can't compose it is left, the conflict `uncomposable` unless it is already in the current layout. A Z-order sort half keeps its address, one the index policy left behind its values, one kept for a value since cleared, and a table key attribute are not touched. Unique sentinels whose text changed are put at the current key and the old one released (`rekeySentinels`, `sentinelsMoved`) |
-| Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. A moving row whose sentinel's current key holds another item's sentinel under other key text moves that sentinel out first by itself, as a unit of its own, naming its row where the row is (`sentinelOut`); the row's own move re-points it later. So a sentinel waits only on sentinels, whose chains end, and an item only on items and sentinels: no two units wait on each other. Up to 1.40.0 the sentinel moved out with its row, and when that row's key was held by the moving row (or by a row waiting on it), the two waited on each other and were reported `contended` or `taken` on every run: about one table in ten of dense random tables (`RekeyDenseChains.test.ts`) never finished. The cost is the re-point: one more `Update` in the holder row's move, and one more transaction, only in such a chain. Under `preserveUnique` the row named can be the item's live row while the sentinel is one of its tombstones': the row holding it is the one whose values compose it (`sentinelHolderRow`, reading the item's tombstones only when the live row doesn't). A tombstone without `preserveUnique` never re-points a sentinel at its current key that another item's live row holds (the key it names can be the tombstone's item's under other key text and that live row's under the current text; `liveRowHolds`, one read, only then). One no row holds is, with the `reservations` option, an orphaned reservation, and one nothing can judge is `undecided` (both in `report.reservations`, below); without it, `unrecognizedKey`, as 1.40.0 counted it, for the requests 1.40.0 sent. Reading it back costs one or two reads per sentinel on every run. A sentinel of a constraint the entity doesn't declare, or not under the schema's own key prefix, is `unrecognizedKey` |
+| Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. A moving row whose sentinel's current key holds another item's sentinel under other key text moves that sentinel out first by itself, as a unit of its own, naming its row where the row is (`sentinelOut`); the row's own move re-points it later. So a sentinel waits only on sentinels, whose chains end, and an item only on items and sentinels: no two units wait on each other. Up to 1.40.0 the sentinel moved out with its row, and when that row's key was held by the moving row (or by a row waiting on it), the two waited on each other and were reported `contended` or `taken` on every run: about one table in ten of dense random tables (`RekeyDenseChains.test.ts`) never finished. The cost is the re-point: one more `Update` in the holder row's move, and one more transaction, only in such a chain. Under `preserveUnique` the row named can be the item's live row while the sentinel is one of its tombstones': the row holding it is the one whose values compose it (`sentinelHolderRow`, reading the item's tombstones only when the live row doesn't). A tombstone without `preserveUnique` never re-points a sentinel at its current key that another item's live row holds (the key it names can be the tombstone's item's under other key text and that live row's under the current text; `liveRowHolds`, one read, only then). One no row holds is, with the `reservations` option, an orphaned reservation, and one nothing can judge is `undecided` (both in `report.reservations`, below); without it, `unrecognizedKey`, as 1.40.0 counted it, for the requests 1.40.0 sent. Reading it back costs one or two reads per sentinel on every run. A sentinel of a constraint the entity doesn't declare, or not under the schema's own key prefix, is `unrecognizedKey`. A move holds each sentinel key it read and doesn't write as read, sentinels brought to a row that stays hold that row, and a sentinel naming a key its row left is brought to the row (**Runs at once**, above) |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves. The live row and every tombstone of one item name the same key, so a sentinel naming it can be any of theirs, and their values' keys can chain across the settings (a tombstone of `a%20b` holds `a%20b` raw, where the live row's `a b` escapes to). Each row's sentinel is under its current key or under another, so when a row finds one naming the item under both its keys, the first key along the chain holding none says which way each row went (`sameItemHolder`): a gap on the old side means the row's is at its current key (nothing to do), otherwise the one at its current key is the next row's, under its other text, and moves out first. Read only then. A tombstone without `preserveUnique` holds none: a sentinel under its other key text that the item's live row holds is the live row's (`liveRowHolds`, one read, only when such a tombstone finds a sentinel), never moved by the tombstone. 1.40.0 moved it to the tombstone's value, so the live value could be taken again, and in a chain the outcome depended on the scan's order. A sentinel the scan meets that a tombstone of its item may still move (one its live row composes under the current text too, under `preserveUnique`, or one no row its back-pointer names holds) is kept as counted, an entry each, so the move doesn't count it again |
 | Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, whole, `wholeRowGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned the same way); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
@@ -1495,7 +1609,9 @@ the row is gone, or it holds another value or none. That is exactly what a corre
 releases, which is what a `Schema.BigInt` unique field on 1.39 and earlier didn't (a delete composed the
 sentinel from the number DynamoDB handed back, and a soft delete without `preserveUnique` kept it).
 `undecided`: no back-pointer, a row of another type behind it, or values that compose no sentinel key under some
-form, so nothing says what they'd give. Such a run counts both in `report.reservations` and per member, with an
+form, so nothing says what they'd give. A row of another type whose attributes compose the sentinel's key under
+some form is taken to hold it, as 1.40.0 took it (the sentinel moves, or stays, with nothing judged), so only one
+that doesn't is `undecided`. Such a run counts both in `report.reservations` and per member, with an
 entry per sentinel (member, constraint, key, back-pointer, outcome, why): under `preserveUnique` a sentinel whose
 row is gone or holds another value costs a query for that row's tombstones, and one that looks orphaned is read
 again consistently and judged again first, since a move of its row takes it along. Without the option nothing is
@@ -1514,11 +1630,16 @@ Without that option the move is `taken`, as in 1.40.0, and the sentinel is repor
 `rekey({ releaseOrphanedReservations: true, writesStopped: true })`, off by default, implies `reservations`
 and deletes the orphans. It is a maintenance step: without `writesStopped: true` the run fails with a
 `ValidationError` (`EDD-9098`) before anything is read, since a value is only safely free with every writer
-stopped, a second run releasing reservations included. The guards below hold even when that promise is broken: one `TransactWriteItems`
-each, the sentinel's `Delete` conditioned on the back-pointer and the TTL attribute as read (or absent), so a
-claim in between, a TTL'd reservation expired and taken again included, is never deleted, and a
+stopped, a second run releasing reservations included. Each release is one `TransactWriteItems`: the
+sentinel's `Delete` conditioned on the back-pointer and the TTL attribute as read (or absent), so a claim in
+between by another row, or a TTL'd reservation expired and taken again, is never deleted, and a
 `ConditionCheck` on the row it names: absent, or its `__edd_e__`, the constraint's stored attributes (renames
-honoured) and `__edd_d__` as read or absent (`ownerCheck`), so a write making that row hold the value wins. On a
+honoured) and `__edd_d__` as read or absent (`ownerCheck`), so a write making that row hold the value wins.
+These don't make the release safe with writes going on, which is why it needs the promise: the same item can
+release the value and claim it again in between, with the same back-pointer and the same TTL attribute, and
+leave it held by something the guards don't read (put again, then soft-deleted under `preserveUnique`: its
+tombstone holds the value and its live row is absent again), and the release then deletes a reservation in
+use. On a
 cancelled transaction it reads the sentinel once, judges again and tries once more, then counts it `skipped`;
 one held or deleted by then is left and counted `raced`, not `orphaned`: as it is now, no row is missing it.
 `orphaned` counts every one found and still orphaned when released or left, `released` and `skipped` included. A

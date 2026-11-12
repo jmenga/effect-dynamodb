@@ -53,6 +53,7 @@ const INEXACT_REAL = [
   "scanned",
   "unchanged",
   "moved",
+  "sentinelsMoved",
   "indexKeys",
   "reservations",
   "conflicts",

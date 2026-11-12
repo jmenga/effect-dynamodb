@@ -40,6 +40,22 @@ describe("digest", () => {
     expect(hexOf(sha256Words(text))).toBe(reference(text))
   })
 
+  it("covers the whole text: one code unit changed anywhere gives another digest", () => {
+    // What the journal keys by (DESIGN.md "A digest stands for its text"): a long key, as a unit's
+    // identity text, changed at each position in turn, a lone surrogate included.
+    const text = JSON.stringify(["Item", "row", `$app#v1#item#${"id_a%20b".repeat(40)}`, "$app#v1"])
+    const seen = new Set([digest(text)])
+    for (let at = 0; at < text.length; at++) {
+      for (const unit of ["\u0000", "\ud800", String.fromCharCode(text.charCodeAt(at) ^ 1)]) {
+        const changed = text.slice(0, at) + unit + text.slice(at + 1)
+        if (changed === text) continue
+        expect(seen.has(digest(changed)), `at ${at}`).toBe(false)
+        seen.add(digest(changed))
+      }
+    }
+    expect(seen.has(digest(`${text} `))).toBe(false)
+  })
+
   it("is the first 128 bits, as eight code units", () => {
     for (const text of ["", "a", "a\u0000b", "\ud800"]) {
       const full = reference(text)

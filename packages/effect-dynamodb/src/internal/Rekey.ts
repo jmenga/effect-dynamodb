@@ -101,6 +101,8 @@ export interface RekeyRowContext {
    * not kept is `true` again.
    */
   readonly claim: (unit: string) => boolean
+  /** Whether the run has {@link claim}ed `unit`, without claiming it. Past capacity, `false`. */
+  readonly claimed: (unit: string) => boolean
   /**
    * Room for one more thing a handler keeps for the run (a partition it read the root of): taken
    * from the run's journal capacity, or `false` when there is none, and then not kept.
@@ -112,6 +114,13 @@ export interface RekeyRowContext {
    * that take doesn't count it again. A take while the visit runs needs no telling.
    */
   readonly awaitsMove: (row: Item) => void
+  /**
+   * Count what `judge` returns under `member` once the scan is over, when every write of the run
+   * is known (#240): a count that depends on whether another unit's move takes or rewrites a row,
+   * counted at first sight, would depend on the order the run meets the rows in. Kept within the
+   * journal's capacity; past it, judged now.
+   */
+  readonly atEnd: (member: string, judge: () => RekeyTally) => void
   /**
    * Judge `unit` — a stored row, or rows that move together (an aggregate partition, an event
    * stream) — once per run, `work` being its judgment, counted under `member` when it settles. The
@@ -143,6 +152,12 @@ export interface RekeyRowContext {
   readonly journalFull: () => boolean
   /** Whether the row at `key` is one the run put there (a dry run: planned to). */
   readonly placed: (key: Item) => boolean
+  /**
+   * Whether the run has put a row at `key`, or is putting one: its request sent, its answer not yet
+   * back, so {@link placed} doesn't say so yet (a dry run: planned to). A read finding nothing at
+   * `key` can have been answered between such a put landing and the run hearing of it.
+   */
+  readonly putting: (key: Item) => boolean
   /**
    * `row`, read with `rows` (as stored), stands where one of the caller's belongs: judge first
    * what it is part of, when another unit holds it ({@link RekeyMember.holder}), as the scan would
@@ -619,13 +634,16 @@ class Totals {
  * What a real run past its journal's capacity may count wrong ({@link RekeyJournal}): a row it put
  * is met by the scan as a row stored there (`scanned`, `unchanged`, `indexKeys`, as 1.40.0 counted
  * them), a unit reached again is judged again (`unchanged`, `reservations`), a row stored under two
- * old key texts may count as two moves (`moved`), a row in another's way may be reported where a
- * run with room moves both (`conflicts`), and a row with no root found isn't reported (`skipped`).
+ * old key texts may count as two moves (`moved`), a row or sentinel in another's way may be
+ * reported where a run with room moves both (`conflicts`, `sentinelsMoved`), and a row with no root
+ * found may go unreported and a unique sentinel no row holds may be counted though a move took it
+ * (`skipped`).
  */
 const INEXACT_REAL: ReadonlyArray<RekeyCountName> = [
   "scanned",
   "unchanged",
   "moved",
+  "sentinelsMoved",
   "indexKeys",
   "reservations",
   "conflicts",
@@ -1235,6 +1253,16 @@ class Journal {
     return state !== undefined && this.ours(state)
   }
 
+  /** A put of the run's at `key` took effect or is on its way: placed, or sent (its print kept). */
+  putting(key: Item): boolean {
+    const digested = this.keys.size === 0 ? undefined : this.keyOf(key)
+    const state = digested === undefined ? undefined : this.keys.get(digested)
+    return (
+      state !== undefined &&
+      (this.ours(state) || state.any || (state.prints !== undefined && state.prints.length > 0))
+    )
+  }
+
   /** A take of the row at `key` took effect (or was planned). */
   private take(key: string): void {
     const state = this.state(key)
@@ -1749,6 +1777,7 @@ export const run = (args: {
       )
       const units = new Units(totals, budget)
       const claimed = new Set<string>()
+      const atEnd: Array<{ readonly member: string; readonly judge: () => RekeyTally }> = []
       const ctx: RekeyRowContext = {
         tableName,
         dryRun,
@@ -1763,13 +1792,19 @@ export const run = (args: {
           if (budget.admit()) claimed.add(key)
           return true
         },
+        claimed: (unit) => claimed.has(digest(unit)),
         keep: () => budget.admit(),
         awaitsMove: (row) => journal.awaitsMove(row),
+        atEnd: (member, judge) => {
+          if (budget.admit()) atEnd.push({ member, judge })
+          else totals.add(member, judge())
+        },
         judge: (member, unit, work) => units.judge(member, unit, work),
         plan: (items) => journal.plan(items),
         vacated: (key) => journal.vacated(key),
         journalFull: () => budget.full,
         placed: (key) => journal.placed(key),
+        putting: (key) => journal.putting(key),
         yieldTo: (row, rows) =>
           Effect.gen(function* () {
             const type = row.__edd_e__?.S
@@ -1866,6 +1901,7 @@ export const run = (args: {
         scanSegment,
         { concurrency: "unbounded", discard: true },
       )
+      for (const { member, judge } of atEnd) totals.add(member, judge())
       for (const member of members) {
         if (member.finish !== undefined) {
           totals.add(member.name, yield* viaView(member.finish(ctx)))

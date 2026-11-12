@@ -1007,13 +1007,15 @@ export interface RekeyIndexKeys {
  * move puts the row back as it read it, so a write the guard doesn't see is lost (DESIGN.md §7,
  * "What 'as read' proves"):
  *
- * - `stamp` — a row too wide to guard whole, guarded on its `updatedAt` (held, or absent) and what
- *   else fits: a write that leaves `updatedAt` as it was isn't seen when it changes an attribute
- *   the guard leaves out. A library write within the stamp's resolution (the same millisecond, or
- *   second for epoch seconds) is one; so is a `reembed`, which stamps nothing.
- * - `sparse` — an item of an entity with a sparse map (`storedAs: DynamoModel.SparseMap()`),
- *   guarded whole: a write that only adds an entry adds an attribute no declaration names, so the
- *   guard can't hold it absent. A library write stamps `updatedAt`, which the guard holds, so with
+ * - `stamp` — an entity's row too wide to guard whole, guarded on its `updatedAt` (held, or absent)
+ *   and what else fits: a write that leaves `updatedAt` as it was isn't seen when it changes an
+ *   attribute the guard leaves out. A library write within the stamp's resolution (the same
+ *   millisecond, or second for epoch seconds) is one: on an item, an update; on a tombstone, a soft
+ *   delete of the item put again; on a time-series event, an `append` made after its current item
+ *   was deleted. So is a `reembed`, which stamps nothing.
+ * - `sparse` — an entity's row with a sparse map (`storedAs: DynamoModel.SparseMap()`), guarded
+ *   whole: a write that only adds an entry adds an attribute no declaration names, so the guard
+ *   can't hold it absent. A library write stamps `updatedAt`, which the guard holds, so with
  *   timestamps only one within the stamp's resolution goes unseen.
  * - `strongest` — a row of an aggregate or stream already part-moved, too wide to guard whole and
  *   finished under the strongest guard that fits: a write to an attribute it leaves out isn't seen.
@@ -1028,9 +1030,7 @@ export interface RekeyIndexKeys {
  * - on an entity's other rows and an aggregate's rows, one that only adds attributes the member
  *   doesn't declare; on an event stream's row, one that only adds attributes; on a projection's row
  *   tombstone or outbox item, one that only adds attributes other than a drainer's claim;
- * - on a row counted here, what its count says; and on a tombstone or time-series event too wide to
- *   guard whole, guarded on its `updatedAt` and not counted (no library write changes one), one
- *   that leaves `updatedAt` as it was and changes an attribute the guard leaves out.
+ * - on a row counted here, what its count says.
  *
  * Stopping writes and running with `writesStopped: true` closes every one of these.
  */
@@ -1074,7 +1074,8 @@ export interface RekeyGuardGapReport extends RekeyGuardGaps {
  *   sentinel, gave the row it names its value, or deleted it. Read again, it is held or gone, so it
  *   was left, and it isn't counted `orphaned`
  * - `undecided` — left, since nothing says whether a row holds it: it names no row, it names a row
- *   of another type, or that row's values compose no sentinel key
+ *   of another type whose attributes don't compose its key (one whose do is taken to hold it, as
+ *   1.40.0 took it, and isn't counted), or that row's values compose no sentinel key
  */
 export type RekeyReservationOutcome = "orphaned" | "released" | "skipped" | "raced" | "undecided"
 
@@ -1260,9 +1261,12 @@ export interface RekeyOptions {
    * writer to the table stopped — another run releasing reservations counts as one — and fails
    * with a `ValidationError` (`EDD-9098`) before anything is read without it. Each release is one
    * transaction: the sentinel's `Delete`, conditioned on its back-pointer (and TTL, when it has
-   * one) as read, so a reservation claimed in between is never deleted, and a `ConditionCheck`
-   * that the row it names is still absent, or still holds the values read. On a failed condition
-   * the sentinel is read once and judged again. Only a sentinel of a known entity and constraint,
+   * one) as read, so another row's claim in between is never deleted, and a `ConditionCheck`
+   * that the row it names is still absent, or still holds the values read. These don't make it
+   * safe while the application writes, hence `writesStopped`: the row it names can take the value
+   * again in between, put again and soft-deleted under `preserveUnique`, leaving the sentinel as
+   * read and its tombstone holding the value, and the release deletes a reservation in use. On a
+   * failed condition the sentinel is read once and judged again. Only a sentinel of a known entity and constraint,
    * under the schema's own key prefix, is ever judged. An orphaned sentinel holding the current
    * key of another item's sentinel is judged, and released, before that sentinel moves there.
    */
@@ -1285,7 +1289,7 @@ export interface RekeyOptions {
   /**
    * How many entries the run's journal holds at most ({@link RekeyJournal}): one for each key it
    * writes to, unit it judges and row it counts once; a row it doesn't move, write or report costs
-   * none. Default 1,000,000: about 120 bytes an entry, so about 115 MiB when full, and exact counts
+   * none. Default 1,000,000: about 145 bytes an entry, so about 138 MiB when full, and exact counts
    * for about 200,000 moved rows. Past it the run goes on, its counts named in
    * {@link RekeyReport.journal} may be off, and a smaller run (`maxPages`, then `resume`) keeps
    * them exact. A positive integer up to 16,000,000.
