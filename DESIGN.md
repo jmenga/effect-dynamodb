@@ -1095,11 +1095,15 @@ be reported twice, two ways, or counted as `unchanged` after the run moved it.
   handled at once, meet each other's writes between two reads. A moving row
   whose sentinel's current key holds another item's sentinel naming a row that
   is gone reads the key again before refusing (`stillThere`): a move of the run
-  may just have taken that row with its sentinel. And a pass moving a sentinel
-  out of another's way, whose sentinel its own row's move took meanwhile, has
-  nothing left to do (`movedMeanwhile`). Both cost a read, only on the way to
-  refusing. Before them, about one random table in four could end with a row
-  reported `taken` under some interleaving, and a run on DynamoDB Local did;
+  may just have taken that row with its sentinel. Having moved such a sentinel
+  out of its way, it reads the key again unless the journal shows it empty:
+  another run may have moved that sentinel first (two runs at once reported the
+  key `taken` without this read; `RekeyConcurrentRuns.test.ts` forces the order).
+  And a pass moving a sentinel out of another's way, whose sentinel its own row's
+  move took meanwhile, has nothing left to do (`movedMeanwhile`). Each costs a
+  read, only on the way to refusing. Before them, about one random table in four
+  could end with a row reported `taken` under some interleaving, and a run on
+  DynamoDB Local did;
   `RekeyInterleavings.test.ts` delays each request at random (`jittered`) and
   compares report and rows, dry run and real, with the run without delays. An
   item whose sentinel another unit moves out of the way (`sentinelOut`) can read
@@ -1107,8 +1111,10 @@ be reported twice, two ways, or counted as `unchanged` after the run moved it.
   the move's delete: neither read finds it, and the item counted `unchanged` or
   not by which came first (the chain scenarios with each request delayed 0 to
   30 ms, on DynamoDB Local: two of their 24 runs, in both of two runs of the
-  file). A sentinel found under no key is read
-  again at its current key when the run has put, or is putting, a row there
+  file; random delays reach that order only now and then, so
+  `RekeyInterleaving.test.ts` and `connected.rekey-latency.test.ts` force it, the
+  move's answer held until the pass has judged). A sentinel found under no key is
+  read again at its current key when the run has put, or is putting, a row there
   (`RekeyRowContext.putting`: the journal keeps a put's fingerprint from when it's
   sent, before its answer), and the run's put found there is the run's work for
   the item (`worked`), answered or not. The read is never sent over a table the
