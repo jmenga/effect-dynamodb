@@ -950,7 +950,11 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
           parseSimpleShorthand(fnOrShorthand as Record<string, unknown>)
     // Paths name the stored attributes of renamed fields.
     const stored = this._config.renameExpr === undefined ? expr : this._config.renameExpr(expr)
-    return new BoundQueryImpl(Query.filterExpr(this._query, stored), this._config, this._applied)
+    return new BoundQueryImpl(
+      Query.filterExprStored(this._query, stored),
+      this._config,
+      this._applied,
+    )
   }
 
   // --- filterBy ---

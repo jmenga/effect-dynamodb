@@ -232,7 +232,7 @@ import {
   unstorableIn,
 } from "./Marshaller.js"
 import * as Query from "./Query.js"
-import { filterExpr, selectPaths } from "./Query.js"
+import { filterExprStored, selectPaths } from "./Query.js"
 import {
   type RekeyConflict,
   type RekeyReservationOutcome,
@@ -2552,6 +2552,8 @@ const makeImpl = <
           ] as const
         }),
     ),
+    // An operand DynamoDB can't store in its stored form is sent as given (`operand`).
+    (encoded) => unstorableIn({ stored: encoded }) === undefined,
   )
   /**
    * Encode a path-addressed update value and check it against the write schema
@@ -2629,21 +2631,12 @@ const makeImpl = <
     ].some((ops) => ops !== undefined && ops.length > 0)
 
   /**
-   * What a write of `value` at `segments` stores (#242): what `pathSet` (`"value"`) or
-   * `pathAppend` (`"element"`, of a one-element list) writes there. `value` itself where the
-   * path's schema doesn't take it, or what it gives DynamoDB can't store: sent as 1.40.0 sent
-   * it. A condition's or filter's operand that is one of Effect's instances is sent in this form
-   * (`operandsAsStored`), so it compares what a row holds.
+   * A condition's or filter's operand as the attribute at `segments` holds it (#242): the path
+   * encoder's `operand`, the one function that decides it, and the one encoder every operand
+   * position uses (`operandsAsStored`). The stored form only where the schema alone determines
+   * it; anywhere else the operand as 1.40.0 sent it.
    */
-  const storedFormAt: StoredFormAt = (segments, value, kind) => {
-    const { encoded, issue } =
-      kind === "value"
-        ? encodePathValue(segments, value, "value")
-        : encodePathValue(segments, [value], "elements")
-    if (issue !== undefined) return value
-    const stored = kind === "value" ? encoded : Array.isArray(encoded) ? encoded[0] : value
-    return unstorableIn({ stored }) === undefined ? stored : value
-  }
+  const storedFormAt: StoredFormAt = pathValues.operand
 
   // resolvedRefs carries the actual ref-target entity objects; at runtime they
   // are operational Entities (for runtime-authored refs) so write-time hydration
@@ -12922,6 +12915,8 @@ const makeImpl = <
 
     return Query.make({
       tableName: "",
+      // A filter's operands in the form this entity stores them (#242).
+      storedAt: storedFormAt,
       indexName: undefined,
       pkField: primary.pk.field,
       pkValue,
@@ -12984,6 +12979,8 @@ const makeImpl = <
         !zorder && indexDef.sk.composite.some((attr) => pkKeyForm[attr] !== undefined)
       const query = Query.make({
         tableName: "",
+        // A filter's operands in the form this entity stores them (#242).
+        storedAt: storedFormAt,
         indexName: indexDef.index,
         pkField: indexDef.pk.field,
         pkValue,
@@ -13035,6 +13032,8 @@ const makeImpl = <
   const scan = () =>
     Query.makeScan({
       tableName: "",
+      // A filter's operands in the form this entity stores them (#242).
+      storedAt: storedFormAt,
       indexName: undefined,
       entityTypes: [entityType],
       decoder: (raw) => decodeRecord(raw),
@@ -13174,6 +13173,8 @@ const makeImpl = <
 
     return Query.make({
       tableName: "",
+      // A filter's operands in the form this entity stores them (#242).
+      storedAt: storedFormAt,
       indexName: undefined,
       pkField: primary.pk.field,
       pkValue,
@@ -13282,6 +13283,8 @@ const makeImpl = <
 
     return Query.make({
       tableName: "",
+      // A filter's operands in the form this entity stores them (#242).
+      storedAt: storedFormAt,
       indexName: undefined,
       pkField: primary.pk.field,
       pkValue,
@@ -18104,7 +18107,10 @@ const makeImpl = <
         ? cbOrShorthand(entityPathBuilder, entityConditionOps)
         : parseSimpleShorthand(cbOrShorthand)
     refusePackedExpr(expr, "filter")
-    return <A>(q: Query.Query<A>): Query.Query<A> => filterExpr(q, expr)
+    // Each operand that is one of Effect's instances or a `Date` in the form this entity's
+    // attribute holds it (#242), whichever query it's added to.
+    const stored = operandsAsStored(expr, storedFormAt)
+    return <A>(q: Query.Query<A>): Query.Query<A> => filterExprStored(q, stored)
   }
 
   /**

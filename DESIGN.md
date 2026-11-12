@@ -3707,31 +3707,60 @@ caller can compile one by skipping the check — reaching it is a library bug.
 **Operands in the form the attribute holds (#242).** A condition's or filter's
 operand that is one of Effect's instances (its prototype carries one of
 Effect's `~effect/…` markers: a `DateTime`, a zone, a `Duration`, a
-`BigDecimal`, a `Redacted`, an `Option`, …) is sent as a write of it at the path
-it's compared with stores it. `operandsAsStored` (`internal/Expr.ts`) is the one
-place that decides; the stored form is the entity's `_storedFormAt`, which is
-`pathSet`'s encoder (`pathAppend`'s, of one element, for `contains`), and an
-aggregate `list` filter's is the root's attribute encoder for a top-level field
-(anywhere else, as given). Through 1.40.0 the instance was sent as its map, which
-no row holds where the field stores the value another way: `eq(t.at, at)` on a
+`BigDecimal`, a `Redacted`, an `Option`, …) or a `Date` is sent as a write of it
+at the path it's compared with stores it. One function decides: the path
+encoder's `operand` (`makePathValueEncoder`, schema package), which is the
+entity's `_storedFormAt`; `operandAsStored` / `operandsAsStored`
+(`internal/Expr.ts`) hand it every instance operand, and every operand position
+goes through them. Through 1.40.0 the instance was sent as its map, which no row
+holds where the field stores the value another way: `eq(t.at, at)` on a
 `Schema.DateTimeZoned` compared that map with the ISO text the row holds and
 never matched, and a condition naming it always failed; likewise a
 `Schema.DateTimeUtc` (ISO text, or a number under `storedAs`), a `Redacted` (its
-value) and a `Schema.DurationFromMillis` (a number). It covers each comparator,
-`between`, `isIn` and `contains`, in a callback or shorthand, in an entity's
-conditions (put, update, delete, `append`, a planned or transactional op's), a
-query's, scan's, `history`'s and `deleted.list`'s filter, a collection's (members
-that hold the operand in different forms are judged each by its own, in the `OR`
-over `__edd_e__` that renamed fields already use) and an aggregate's `list`
-filter. An instance whose map is the stored form (a zone, a `Duration`, a
-`BigDecimal`, an `Option` of a number, any value of an untyped field) is the
-bytes 1.40.0 sent, and an operand that isn't an instance (a primitive, a
-`Date`, a plain map, a path), a `begins_with` prefix, and one the path's schema
-doesn't take or whose stored form DynamoDB can't store, are sent as given. A
-`.where()` bound composes key text through the key form, as it did.
-`Transaction.check` takes a condition `Expression.condition` compiled with no
-entity, so its operand is still the instance's map. Pinned by
-`OperandsAsStored.test.ts` and `connected.operands-as-stored.test.ts`.
+value), a `Schema.DurationFromMillis` (a number) and a `Date` on a `Schema.Date`
+(an empty map against ISO text or a number).
+
+*Only where the schema alone determines the stored form.* `operand` walks the
+path through EVERY union member that can hold it (a member that can't — a
+string, a literal, `null`, a struct without the field — is left out), and puts
+the operand in its stored form only when every position it reaches that takes
+the value stores it the same; a position that can't take the value holds no row
+it could match. Anywhere else the operand is sent as 1.40.0 sent it: union
+members storing the path differently (`{ kind: "encoded", when:
+DurationFromMillis } | { kind: "raw", when: Duration }`: a raw row holds the
+`Duration`'s map), an `Unknown` or `Any` at or on the path, a suspended schema,
+a declaration the walk doesn't follow (an `Option`, an opaque class), a record of
+such, a value no position takes, and one whose stored form DynamoDB can't store.
+A union AT the path is one schema: its encoding picks a member by the value,
+exactly as a write of that value does, so it is determined.
+
+*`contains` compares an element of what the field stores* (`containedKindOf`,
+`containedOperand`): an element of a list, as a list stores it; a member of a
+set (`Schema.ReadonlySet`, DynamoDB's `SS` / `NS` / `BS`), the single member of a
+write of a set holding it; a substring of text, the text a write of it stores.
+Anything else is sent as given.
+
+*Positions.* Each comparator, `between`, `isIn` and `contains`, in a callback or
+shorthand: an entity's conditions (put, update, delete, `append`, a planned or
+transactional op's), a bound query's, scan's, `history`'s and `deleted.list`'s
+filter, `Entity.filter`, `Query.filterExpr` on a query an entity made (the
+query carries its entity's `storedAt`), a collection's filter (members that hold
+the operand in different forms are judged each by its own, in the `OR` over
+`__edd_e__` that renamed fields already use), a vector search's equality filters,
+and an aggregate's `list` filter (the root's attribute encoder for a top-level
+field, `contains` included; anywhere deeper, as given). An instance whose map is
+the stored form (a zone, a `Duration`, a `BigDecimal`, an `Option` of a number,
+any value of an untyped field) is the bytes 1.40.0 sent, and an operand that
+isn't an instance or a `Date` (a primitive, a plain map or list, even one holding
+instances, a path) and a `begins_with` prefix are sent as given: reading inside
+a plain container would read the caller's values a second time. Finding an
+instance reads the operand's prototype once. A `.where()` bound composes key text
+through the key form, as it did. `Transaction.check` takes a condition
+`Expression.condition` compiled with no entity, and a query no one entity types
+(an event stream's, a collection made by `Collection.make`, one made by hand)
+has no stored form to give: their operands are sent as given. Pinned by
+`OperandsAsStored.test.ts`, `OperandStoredForm.test.ts` and
+`connected.operands-as-stored.test.ts`.
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first

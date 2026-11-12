@@ -51,6 +51,8 @@ import {
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import {
   buildDateTransform,
+  containedKindOf,
+  containedOperand,
   containsWireTransform,
   type DeepSubstitutionOptions,
   matchDateRepresentation,
@@ -1732,24 +1734,38 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const rootEncoders: NodeEncoders = { stored: attrEncoders, key: keyAttrEncoders }
 
   /**
-   * What the root row stores for a value of a top-level field (#242): its encoder's form. The
-   * value itself where the field has none or it doesn't take the value, or what it gives DynamoDB
-   * can't store, and at a nested path or for an element (the encoders are per attribute). A list
-   * filter's operand that is one of Effect's instances is sent in this form (`operandsAsStored`).
+   * What the root row stores for a value of a top-level field (#242): its encoder's form, and for
+   * `contains` an element of what it stores (`containedOperand`: a list's element, a set's member,
+   * a substring of text). A top-level field is the attribute itself, so its stored form is the
+   * schema's. The value itself where the field has no encoder or it doesn't take the value, or
+   * what it gives DynamoDB can't store, and at a nested path (the encoders are per attribute). A
+   * list filter's operand that is one of Effect's instances or a `Date` is sent in this form
+   * (`operandsAsStored`).
    */
   const rootStoredFormAt: StoredFormAt = (segments, value, kind) => {
-    const encode =
-      segments.length === 1 && kind === "value" ? attrEncoders[String(segments[0])] : undefined
-    if (encode === undefined) return value
-    let asGiven = false
-    try {
-      const stored = encode(value, () => {
-        asGiven = true
-      })
-      return asGiven || unstorableIn({ stored }) !== undefined ? value : stored
-    } catch {
-      return value
+    const name = String(segments[0])
+    const encode = segments.length === 1 ? attrEncoders[name] : undefined
+    const field = schemaFields?.[name]
+    if (encode === undefined || field === undefined) return value
+    const storedOf = (given: unknown): { readonly stored: unknown } | undefined => {
+      let asGiven = false
+      try {
+        const stored = encode(given, () => {
+          asGiven = true
+        })
+        return asGiven || unstorableIn({ stored }) !== undefined ? undefined : { stored }
+      } catch {
+        return undefined
+      }
     }
+    const stored =
+      kind === "value"
+        ? storedOf(value)
+        : containedOperand(containedKindOf(field), storedOf, (element) => {
+            const list = storedOf([element])?.stored
+            return Array.isArray(list) && list.length === 1 ? { stored: list[0] } : undefined
+          })(value)
+    return stored === undefined ? value : stored.stored
   }
 
   // Decode schema for read/assemble + input validation. Mirrors the raw `schema`

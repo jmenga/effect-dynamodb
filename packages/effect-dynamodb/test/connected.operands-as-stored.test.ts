@@ -316,3 +316,98 @@ describeConnected("an operand that is one of Effect's instances, against DynamoD
     }),
   )
 })
+
+describeConnected("where the stored form is the schema's alone, and contains (round 3)", () => {
+  const entityOf = (f: Schema.Top) =>
+    Entity.make({
+      model: Schema.Struct({ id: Schema.String, n: Schema.optional(Schema.Number), f }),
+      entityType: "E",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    } as never) as any
+  /** How many rows a scan filter, an update condition and a transaction condition each match. */
+  const verdicts = (db: any, condition: (t: any, ops: any) => unknown) =>
+    Effect.gen(function* () {
+      const scanned = (yield* db.entities.E.scan().filter(condition).collect()).length
+      const updated = yield* Effect.exit(
+        db.entities.E.update({ id: "a" }).set({ n: 1 }).condition(condition).asEffect(),
+      )
+      const transacted = yield* Effect.exit(
+        Transaction.transactWrite([
+          db.entities.E.update({ id: "a" }).set({ n: 2 }).condition(condition),
+        ]),
+      )
+      return [scanned, updated._tag, transacted._tag]
+    })
+  const cases: ReadonlyArray<{
+    readonly name: string
+    readonly f: Schema.Top
+    readonly value: unknown
+    readonly condition: (t: any, ops: any) => unknown
+  }> = [
+    {
+      name: "a union member storing the path as Effect's map (as 1.40.0 sent it)",
+      f: Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("encoded"), when: Schema.DurationFromMillis }),
+        Schema.Struct({ kind: Schema.Literal("raw"), when: Schema.Duration }),
+      ]),
+      value: { kind: "raw", when: Duration.millis(1) },
+      condition: (t, { eq }) => eq(t.f.when, Duration.millis(1)),
+    },
+    {
+      name: "a union member storing the path as a number",
+      f: Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("encoded"), when: Schema.DurationFromMillis }),
+        Schema.Struct({ kind: Schema.Literal("other"), when: Schema.DurationFromMillis }),
+      ]),
+      value: { kind: "encoded", when: Duration.millis(1) },
+      condition: (t, { eq }) => eq(t.f.when, Duration.millis(1)),
+    },
+    {
+      name: "a union member untyped there",
+      f: Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("encoded"), when: Schema.DateTimeUtc }),
+        Schema.Struct({ kind: Schema.Literal("raw"), when: Schema.Unknown }),
+      ]),
+      value: { kind: "raw", when: DateTime.makeUnsafe(1000) },
+      condition: (t, { eq }) => eq(t.f.when, DateTime.makeUnsafe(1000)),
+    },
+    {
+      name: "contains, a set's member (NS)",
+      f: Schema.ReadonlySet(Schema.DurationFromMillis),
+      value: new Set([Duration.millis(1500)]),
+      condition: (t, { contains }) => contains(t.f, Duration.millis(1500)),
+    },
+    {
+      name: "contains, a set's member (SS)",
+      f: Schema.ReadonlySet(Schema.RedactedFromValue(Schema.String)),
+      value: new Set([Redacted.make("x")]),
+      condition: (t, { contains }) => contains(t.f, Redacted.make("x")),
+    },
+    {
+      name: "contains, a substring of text",
+      f: Schema.Redacted(Schema.String),
+      value: Redacted.make("hello"),
+      condition: (t, { contains }) => contains(t.f, Redacted.make("ell")),
+    },
+    {
+      name: "a Date on a Schema.Date",
+      f: Schema.Date,
+      value: new Date(1000),
+      condition: (t, { eq }) => eq(t.f, new Date(1000)),
+    },
+  ]
+  for (const c of cases) {
+    it.effect(c.name, () =>
+      withTable((table) => {
+        const E = entityOf(c.f)
+        const Main = Table.make({ schema, entities: { E } })
+        return bound(table, Main, { entities: { E } }, (db) =>
+          Effect.gen(function* () {
+            yield* db.entities.E.put({ id: "a", f: c.value }).asEffect()
+            expect(yield* verdicts(db, c.condition)).toEqual([1, "Success", "Success"])
+          }),
+        )
+      }),
+    )
+  }
+})

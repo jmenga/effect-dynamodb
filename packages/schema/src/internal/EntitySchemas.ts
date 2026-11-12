@@ -43,6 +43,7 @@ import {
   holdsUndefined,
   isDecodingDefault,
   isSchemaLike,
+  isSetDeclaration,
   lackDecision,
   numericTypeWithStringEncoding,
   ReadsAbsentAs,
@@ -3277,6 +3278,42 @@ const isWalkableObject = (value: unknown): value is object =>
   !Redacted.isRedacted(value)
 
 /**
+ * What `contains` compares in what a field stores (#242): an element of a list (`Schema.Array`, a
+ * tuple), a member of a set (`Schema.ReadonlySet`, stored as DynamoDB's set), and otherwise a
+ * substring of text.
+ *
+ * @internal
+ */
+export const containedKindOf = (field: Schema.Top): "list" | "set" | "text" => {
+  const inner = optionalField(field)?.inner ?? field
+  return SchemaAST.isArrays(inner.ast) ? "list" : isSetDeclaration(inner.ast) ? "set" : "text"
+}
+
+/**
+ * A `contains` operand in the form the field stores what it compares (#242), from what a write of
+ * a whole value there stores (`value`) and of one list element (`element`): the element as a list
+ * stores it; the single member of a write of a set holding it; the text a write of it stores, when
+ * that's text. `undefined` when the field doesn't take it so, and the operand is sent as given.
+ *
+ * @internal
+ */
+export const containedOperand =
+  (
+    kind: "list" | "set" | "text",
+    value: (value: unknown) => { readonly stored: unknown } | undefined,
+    element: (value: unknown) => { readonly stored: unknown } | undefined,
+  ) =>
+  (operand: unknown): { readonly stored: unknown } | undefined => {
+    if (kind === "list") return element(operand)
+    if (kind === "set") {
+      const set = value(new Set([operand]))?.stored
+      return set instanceof Set && set.size === 1 ? { stored: [...set][0] } : undefined
+    }
+    const text = value(operand)
+    return typeof text?.stored === "string" ? text : undefined
+  }
+
+/**
  * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
  * `pathPrepend`, `pathIfNotExists`) and record-based `append` (#133).
  *
@@ -3304,7 +3341,27 @@ export const makePathValueEncoder = (
    * `.fields`), so a path under it is followed through the target model.
    */
   refTargets: globalThis.Record<string, Schema.Top> = {},
+  /**
+   * Whether DynamoDB can store an encoded value: an operand whose stored form it can't store is
+   * sent as given ({@link operand}).
+   */
+  storable?: (encoded: unknown) => boolean,
 ): {
+  /**
+   * A condition's or filter's operand as the attribute at `segments` holds it (#242): the one
+   * function that decides it. `kind` `"value"` compares the value there (a comparison, `between`,
+   * `in`); `"contained"` an element of it (`contains`): an element of the list, a member of the
+   * set, or a substring of the text the field stores. The stored form is used only where the schema
+   * alone determines it — every position a row can hold the path under that takes the value stores
+   * it in the same form (`declaredAt`). Anywhere else (union members that store it differently, an
+   * `Unknown` or `Any`, a suspended schema or a declaration the walk doesn't follow, a value no
+   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it.
+   */
+  readonly operand: (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "contained",
+  ) => unknown
   readonly value: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
   readonly elements: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
   /**
@@ -3513,7 +3570,182 @@ export const makePathValueEncoder = (
     validators.set(key, fn)
     return fn
   }
+  /**
+   * Every schema a row can hold the value at `segments` under (#242), each with whether it's written
+   * as declared ({@link writesFirstMemberOnly}), or `undefined` where the schema alone doesn't
+   * determine what a row holds there. The walk follows EVERY union member that can hold the path,
+   * not only the first: a row holding a later member stores its value there under that member's
+   * schema. A position that can't hold the rest of the path (a string, a number, a literal, `null`,
+   * a struct without the field) is left out. One that could hold it but isn't modelled here (an
+   * `Unknown` or `Any`, a suspended schema, a declaration such as an `Option` or an opaque class, a
+   * container the walk can't read) makes the path undetermined, and so does an `Unknown` or `Any` at
+   * the path itself.
+   */
+  const declaredAt = (
+    segments: ReadonlyArray<string | number>,
+  ): ReadonlyArray<{ readonly schema: Schema.Top; readonly asDeclared: boolean }> | undefined => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string") return undefined
+    const top = refTargets[head] ?? modelFields[head]
+    if (top === undefined) return undefined
+    type Position = { readonly schema: Schema.Top; readonly asDeclared: boolean }
+    const holdsNoPath = new Set([
+      "Null",
+      "Undefined",
+      "Void",
+      "Never",
+      "String",
+      "Number",
+      "Boolean",
+      "BigInt",
+      "Symbol",
+      "UniqueSymbol",
+      "Literal",
+      "TemplateLiteral",
+      "Enum",
+    ])
+    const membersOf = (union: Schema.Top): ReadonlyArray<Schema.Top> | undefined => {
+      const members = (union as unknown as { readonly members?: unknown }).members
+      return Array.isArray(members) ? (members as ReadonlyArray<Schema.Top>) : undefined
+    }
+    const through = (
+      members: ReadonlyArray<Schema.Top>,
+      segment: string | number,
+      asDeclared: (index: number) => boolean,
+    ): ReadonlyArray<Position> | undefined => {
+      const out: Array<Position> = []
+      for (const [index, member] of members.entries()) {
+        const reached = reach(member, segment, asDeclared(index))
+        if (reached === undefined) return undefined
+        out.push(...reached)
+      }
+      return out
+    }
+    const reach = (
+      schema: Schema.Top,
+      segment: string | number,
+      asDeclared: boolean,
+    ): ReadonlyArray<Position> | undefined => {
+      const opt = optionalField(schema)
+      if (opt?.union !== undefined) {
+        // An optional union writes its first member substituted and the later ones as declared.
+        const members = membersOf(opt.union)?.filter((m) => m.ast._tag !== "Undefined")
+        if (members === undefined) return undefined
+        return through(members, segment, (index) => asDeclared || index > 0)
+      }
+      const inner = opt?.inner ?? schema
+      const fields = schemaFieldsOf(inner)
+      if (fields !== undefined) {
+        const child = typeof segment === "string" ? fields[segment] : undefined
+        return child === undefined ? [] : [{ schema: child, asDeclared }]
+      }
+      const ast = inner.ast
+      if (holdsNoPath.has(ast._tag)) return []
+      if (SchemaAST.isUnion(ast)) {
+        const members = membersOf(inner)
+        return members === undefined ? undefined : through(members, segment, () => asDeclared)
+      }
+      if (SchemaAST.isArrays(ast)) {
+        if (typeof segment !== "number") return []
+        const child = childAtSegment(inner, segment)
+        if (child !== undefined) return [{ schema: child, asDeclared }]
+        // A tuple with no element there and no rest holds nothing there.
+        const s = inner as unknown as { readonly elements?: unknown; readonly rest?: unknown }
+        return Array.isArray(s.elements) && ast.rest.length === 0 ? [] : undefined
+      }
+      if (SchemaAST.isObjects(ast)) {
+        if (typeof segment !== "string") return []
+        const child = childAtSegment(inner, segment)
+        return child === undefined ? undefined : [{ schema: child, asDeclared }]
+      }
+      return undefined
+    }
+    let positions: ReadonlyArray<Position> = [{ schema: top, asDeclared: false }]
+    for (const segment of rest) {
+      const next: Array<Position> = []
+      for (const position of positions) {
+        const reached = reach(position.schema, segment, position.asDeclared)
+        if (reached === undefined) return undefined
+        for (const p of reached) {
+          if (!next.some((q) => q.schema === p.schema && q.asDeclared === p.asDeclared))
+            next.push(p)
+        }
+      }
+      positions = next
+    }
+    const holdsAnything = (schema: Schema.Top) => {
+      const tag = (optionalField(schema)?.inner ?? schema).ast._tag
+      return tag === "Unknown" || tag === "Any"
+    }
+    return positions.some((p) => holdsAnything(p.schema)) ? undefined : positions
+  }
+  /**
+   * What `contains` compares at a position: an element of the list it holds, a member of the set, or
+   * a substring of the text.
+   */
+  type OperandForm = {
+    readonly value: (value: unknown) => { readonly stored: unknown } | undefined
+    readonly contained: (value: unknown) => { readonly stored: unknown } | undefined
+  }
+  const operandForms = new Map<string, ReadonlyArray<OperandForm> | null>()
+  const formsAt = (segments: ReadonlyArray<string | number>): ReadonlyArray<OperandForm> | null => {
+    const key = JSON.stringify(segments)
+    const cached = operandForms.get(key)
+    if (cached !== undefined) return cached
+    const declared = declaredAt(segments)
+    const head = segments[0] as string
+    const forms =
+      declared === undefined || declared.length === 0
+        ? null
+        : declared.flatMap((position): ReadonlyArray<OperandForm> => {
+            const original = position.schema
+            const stored =
+              segments.length === 1
+                ? recordFields[head]
+                : position.asDeclared
+                  ? original
+                  : substituteSchemaDeep(original, { enforceChecks: true })
+            if (stored === undefined) return []
+            const formOf = (from: Schema.Top, to: Schema.Top) => {
+              const encode = leafAwareEncoder(from, to)
+              const decode = Schema.decodeUnknownExit(to as Schema.Codec<any>)
+              return (value: unknown): { readonly stored: unknown } | undefined => {
+                const encoded = encode(value)
+                if (decode(asStored(encoded))._tag !== "Success") return undefined
+                if (storable !== undefined && !storable(encoded)) return undefined
+                return { stored: encoded }
+              }
+            }
+            const value = formOf(original, stored)
+            const originalElement = listElementOf(original)
+            const storedElement = listElementOf(stored)
+            const contained = containedOperand(
+              containedKindOf(original),
+              value,
+              originalElement !== undefined && storedElement !== undefined
+                ? formOf(originalElement, storedElement)
+                : () => undefined,
+            )
+            return [{ value, contained }]
+          })
+    const result = forms === null || forms.length === 0 ? null : forms
+    operandForms.set(key, result)
+    return result
+  }
   return {
+    operand: (segments, value, kind) => {
+      const forms = formsAt(segments)
+      if (forms === null) return value
+      let chosen: { readonly stored: unknown } | undefined
+      for (const form of forms) {
+        // A position that can't hold the value holds no row it could match.
+        const stored = kind === "value" ? form.value(value) : form.contained(value)
+        if (stored === undefined) continue
+        if (chosen !== undefined && !sameValue(chosen.stored, stored.stored)) return value
+        chosen = stored
+      }
+      return chosen === undefined ? value : chosen.stored
+    },
     validate: (segments, encoded) => {
       const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)
       return fn === null ? undefined : fn(encoded)

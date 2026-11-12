@@ -3032,6 +3032,7 @@ const makeFromConfig = (config: {
           unpackAttributes: entityLike._dispatchAttributes,
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
+          storedAt: entityLike._storedFormAt,
         }
         accessors[logicalName] = (query: string | ReadonlyArray<number>) =>
           makeBoundVectorQuery(vqConfig, query)
