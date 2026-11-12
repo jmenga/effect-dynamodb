@@ -1110,7 +1110,10 @@ export const inKeyOrder = (rows: ReadonlyArray<Row>): ReadonlyArray<Row> =>
 /** The aggregate of a shape, over one release's modules. */
 export const defineShape = (lib: SweepLib, shape: Shape) => {
   const { Schema } = lib
-  const schema = lib.DynamoSchema.make({ name: SCHEMA_NAME, version: 1 })
+  // 1.40.0's default, which the capture ran under. A `test:escape-on` run turns the default over,
+  // and key text escaped differs from 1.40.0's wherever a composite holds `$` or `#` (a list key's
+  // copy a read handed back, recomposed), which is `rekey`'s to move, not this sweep's to compare.
+  const schema = lib.DynamoSchema.make({ name: SCHEMA_NAME, version: 1, escapeKeys: false })
   const Main = lib.Table.make({ schema, entities: {} })
   const Aside = Schema.Struct({ note: Schema.String, tag: Schema.Struct({ text: Schema.String }) })
   const A = lib.Aggregate.make(
