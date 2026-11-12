@@ -338,6 +338,75 @@ describe("two projections of one read model at one revision", () => {
     )
   })
 
+  it.effect(
+    "a rebuild between them: each item kept or replaced by its own effect, all delivered",
+    () => {
+      const w = one({ projections: 2 })
+      return run(
+        w,
+        Effect.gen(function* () {
+          const events = yield* w.events("rebuilt")
+          yield* w.apply(0, events.slice(0, 1))
+          yield* w.apply(1, events.slice(0, 1))
+          w.routed.take()
+          // The first re-derives the row at its next revision (its effects written again, as on
+          // 1.40.0), where nothing is: the second's item beside its first stays.
+          yield* w.projections[0]!.rebuild({ id: "rebuilt" })
+          const puts = w.sentPuts()
+          expect(puts).toHaveLength(1)
+          expect(puts[0]!.map((put: any) => put.ConditionExpression)).toEqual([PLAIN, PLAIN])
+          expect(w.layout()).toEqual([
+            [AT, 0],
+            [`${AT}#<mark>`, 1],
+            [AT2, 0],
+            ["000000000002#0001", 0],
+          ])
+          // The rebuild dropped the second's checkpoint and revision: it folds both events again
+          // at revision 1, its first effect rewriting its own item beside the first's.
+          yield* w.apply(1, events.slice(1))
+          expect(w.layout()).toEqual([
+            [AT, 0],
+            [`${AT}#<mark>`, 1],
+            ["000000000001#0001", 1],
+            [AT2, 0],
+            ["000000000002#0001", 0],
+          ])
+          expect(yield* w.drained()).toEqual({ delivered: 5, seen: [2, 1002, 1005, 2, 5] })
+        }),
+      )
+    },
+  )
+
+  it.effect("two of one projection's effects beside each other at one key: both delivered", () => {
+    // The second's revision starts again (the first's rebuild drops its bookkeeping) while its
+    // items are pending, and its events fall at other revisions this time: at revision 2 its
+    // earlier item and its later one are both beside the first's, delivered in their marks'
+    // order (1.40.0 kept only the later).
+    const w = one({ projections: 2 })
+    return run(
+      w,
+      Effect.gen(function* () {
+        const events = yield* w.events("restarted", [2, 3, 4])
+        yield* w.apply(0, events.slice(0, 2))
+        yield* w.apply(1, events.slice(0, 2))
+        yield* w.projections[0]!.rebuild({ id: "restarted" })
+        yield* w.apply(1, events.slice(1, 2))
+        yield* w.apply(1, events.slice(2))
+        const beside = w.layout().filter(([at]) => at === `${AT2}#<mark>`)
+        expect(beside).toEqual([
+          [`${AT2}#<mark>`, 1],
+          [`${AT2}#<mark>`, 1],
+        ])
+        const { seen } = yield* w.drained()
+        // Both of the second's effects at revision 2: its second event's (1005) and its third's
+        // (1009, folded again from the first).
+        expect(seen.filter((total) => total === 1005)).toHaveLength(2)
+        expect(seen).toContain(1009)
+        expect(w.outboxItems()).toEqual([])
+      }),
+    )
+  })
+
   it.effect("the first removing the row: each item where it belongs, every one delivered", () => {
     // The first folds 2 then 0, which removes its row (a tombstone at revision 2, with its item);
     // the second folds the same events at its own revisions.

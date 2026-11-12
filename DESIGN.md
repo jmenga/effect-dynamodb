@@ -7523,7 +7523,16 @@ instance).
   applies, else `plain`, `beside`. The key beside sorts right after the
   other's and before the next position's, so each drainer delivers its own in
   order, passing over another read model's, and one read model's drainer
-  delivers both its projections' items, in key order. Nothing is read first,
+  delivers both its projections' items, in key order. Items beside one key go
+  in their marks' order. Two of one projection's own effects are beside one
+  key only after its revision started again (its row lost, or rebuilt by
+  another projection) while its items were pending, its events then falling
+  at other revisions: those two are delivered in their marks' order, not
+  necessarily the order they were applied in (1.40.0 kept only the later).
+  An order-keeping suffix needs either something the writer can't know
+  without reading the key (what is already beside it) or a value that
+  differs between a retry and the write it retries (a clock), which would
+  write a retried effect twice. Nothing is read first,
   an item at a free key is where 1.40.0 wrote it, and only a collision adds a
   request (a cancelled transaction, then the one sent; two for an unmarked
   item of another event). Two projections of one read model at one revision
