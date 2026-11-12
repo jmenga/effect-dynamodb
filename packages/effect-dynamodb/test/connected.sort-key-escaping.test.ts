@@ -582,8 +582,8 @@ describeConnected("#171 sort key escaping and E7 — connected", () => {
     240_000,
   )
 
-  // One test per direction, each 231 queries: as one test they were 462, over its 30 s budget when
-  // other suites shared DynamoDB Local and the machine (#243).
+  // One test per direction, each 232 bounds read with one `.collect()` apiece: as one test they were
+  // 464, over its 30 s budget when other suites shared DynamoDB Local and the machine (#243).
   for (const reverse of [false, true]) {
     it.effect(
       `.history().where() on a string orderBy returns exactly the events it means, ${reverse ? "reversed" : "forward"}`,

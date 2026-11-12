@@ -70,7 +70,9 @@ describe("history .where() bounds compose as append composes the event key", () 
 
       const moved = historyMoved(name, escapeKeys)
       it.effect(
-        `${name}, escapeKeys ${escapeKeys}: append stores the rows 1.39.0 stored${moved ? ", keyed by the value it stores" : ""}`,
+        values.length === 1
+          ? `${name}, escapeKeys ${escapeKeys}: append of an Option orderBy is refused, as on 1.39.0`
+          : `${name}, escapeKeys ${escapeKeys}: append stores the rows 1.39.0 stored${moved ? ", keyed by the value it stores" : ""}`,
         () => {
           const table = makeRecordingTable()
           return on(table, (e) =>
