@@ -4,8 +4,11 @@
  * the stored values say the given name, and the name keyed now is the installed `Intl`'s.
  */
 import { describe, expect, it } from "@effect/vitest"
-import { DateTime, Option } from "effect"
-import { givenZoneReading } from "../src/internal/ZoneKeyText.js"
+import { DateTime, Option, Schema } from "effect"
+import * as DynamoModel from "../src/DynamoModel.js"
+import * as Entity from "../src/Entity.js"
+import { getSchemaFields } from "../src/internal/SchemaAccessors.js"
+import { givenZoneReading, staleZonesOf } from "../src/internal/ZoneKeyText.js"
 
 /** A zone as 4.1.2 held it, its `id` the name `Intl` resolves `name` to. */
 const keyedZone = (name: string): DateTime.TimeZone => {
@@ -121,5 +124,79 @@ describe("givenZoneReading", () => {
     expect(
       givenZoneReading({ other: "UTC" }, { other: "Etc/UTC" }, (attr) => attr === "tz"),
     ).toBeUndefined()
+  })
+})
+
+describe("staleZonesOf", () => {
+  const Placed = Entity.make({
+    model: DynamoModel.configure(
+      Schema.Struct({
+        id: Schema.String,
+        tz: Schema.TimeZoneNamed,
+        tzs: Schema.Array(Schema.TimeZoneNamed),
+        opt: Schema.Option(Schema.TimeZoneNamed),
+        nested: Schema.Struct({ z: Schema.TimeZoneNamed, label: Schema.String }),
+        at: Schema.DateTimeZoned,
+        codec: Schema.TimeZoneNamedFromString,
+        codecs: Schema.Array(Schema.DateTimeZonedFromString),
+        u: Schema.Unknown,
+        label: Schema.String,
+      }),
+      { at: { storedAs: DynamoModel.DateTimeZoned } },
+    ),
+    entityType: "Placed",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const reads = getSchemaFields(Placed.schemas.recordSchema as Schema.Top)!
+  const writes = getSchemaFields(Placed.schemas.inputSchema as Schema.Top)!
+  const stale = (name: string) => staleZonesOf(reads[name]!, writes[name]!)
+  const zoneIn = (value: unknown) => DateTime.zoneToString(value as DateTime.TimeZone)
+
+  it("has nothing to say of a field no zone can be in, or one no schema types", () => {
+    expect(stale("id")).toBeUndefined()
+    expect(stale("label")).toBeUndefined()
+    expect(stale("u")).toBeUndefined()
+  })
+
+  it("finds a zone's map holding resolvedId wherever the schema puts a zone", () => {
+    expect(stale("tz")!(map413("Etc/UTC", "UTC"))!.map(({ path }) => path)).toEqual([[]])
+    expect(stale("tz")!(map413("Etc/UTC", "UTC"))!.map(({ written }) => zoneIn(written))).toEqual([
+      "UTC",
+    ])
+    // One whose given name is the resolved one holds resolvedId all the same, which a write leaves out.
+    expect(stale("tz")!(map413("Europe/London", "Europe/London"))).toHaveLength(1)
+    expect(
+      stale("tzs")!([map413("Etc/UTC", "UTC"), map413("GMT", "UTC")])!.map(({ path }) => path),
+    ).toEqual([[0], [1]])
+    const some = {
+      _op: "Some",
+      "~effect/Option": {},
+      value: map413("Etc/UTC", "UTC"),
+      _tag: "Some",
+    }
+    expect(stale("opt")!(some)!.map(({ path }) => path)).toEqual([["value"]])
+    expect(
+      stale("nested")!({ z: map413("Etc/UTC", "UTC"), label: "Etc/UTC" })!.map(({ path }) => path),
+    ).toEqual([["z"]])
+  })
+
+  it("finds the library's ISO text naming a zone by a name it resolves to another", () => {
+    const places = stale("at")!("2023-11-15T03:43:20.000+05:30[Asia/Kolkata]")
+    expect(places).toEqual([{ path: [], written: "2023-11-15T03:43:20.000+05:30[Asia/Calcutta]" }])
+  })
+
+  it("leaves Effect's string codecs' text, text in a string field, and what a write stores", () => {
+    expect(stale("codec")!("Etc/UTC")).toBeUndefined()
+    expect(stale("codecs")!(["1970-01-01T00:00:00.000+00:00[Etc/UTC]"])).toBeUndefined()
+    const held412 = {
+      format: {},
+      id: "UTC",
+      "~effect/DateTime/TimeZone": "~effect/DateTime/TimeZone",
+      _tag: "Named",
+    }
+    expect(stale("tz")!(held412)).toBeUndefined()
+    expect(stale("nested")!({ z: held412, label: "Etc/UTC" })).toBeUndefined()
+    expect(stale("at")!("2023-11-15T03:43:20.000+05:30[Asia/Calcutta]")).toBeUndefined()
+    expect(stale("tz")!("not a zone")).toBeUndefined()
   })
 })

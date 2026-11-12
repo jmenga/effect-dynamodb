@@ -401,7 +401,7 @@ const ZONE_RUNS = new Set<unknown>(
 )
 
 /** Whether a schema's Type side can hold a value naming a zone, wherever it sits. */
-const holdsZone = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+export const holdsZone = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
   if (seen.has(ast)) return false
   seen.add(ast)
   if (SchemaAST.isDeclaration(ast)) {

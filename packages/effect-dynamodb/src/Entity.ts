@@ -68,6 +68,7 @@ import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacke
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
+import { unpackStoredSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { restoredObjectReading } from "@effect-dynamodb/schema/internal/RestoredKeyText.js"
 import {
   type AbsentReading,
@@ -83,7 +84,11 @@ import {
 import { CANT_SAY } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { sparseKeyRefusal, sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
-import { givenZoneReading } from "@effect-dynamodb/schema/internal/ZoneKeyText.js"
+import {
+  givenZoneReading,
+  type StaleZone,
+  staleZonesOf,
+} from "@effect-dynamodb/schema/internal/ZoneKeyText.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -212,6 +217,7 @@ import {
   decodeSparseFields,
   encodeSparseFields,
   fromAttributeMap,
+  fromAttributeValue,
   hasNoStoredForm,
   isEmptySet,
   toAttributeMap,
@@ -14423,11 +14429,14 @@ const makeImpl = <
           kind === "tombstone"
             ? yield* sentinelRekeys(ctx, kind, values, read!, targets.isLive, targets.live, true)
             : NO_SENTINEL_REKEYS
+        // Its zones as a write stores them, as a moved item's are.
+        const zones = yield* staleZoneSets(read!)
+        const zonesTally = Object.keys(zones.sets).length > 0 ? { zonesRewritten: 1 } : {}
         const items: ReadonlyArray<TransactWriteItem> = [
           {
             Put: {
               TableName: ctx.tableName,
-              Item: { ...read!, ...toAttributeMap(to) },
+              Item: { ...read!, ...zones.sets, ...toAttributeMap(to) },
               ConditionExpression: "attribute_not_exists(#pk)",
               ExpressionAttributeNames: { "#pk": rekeyPk },
             },
@@ -14448,9 +14457,13 @@ const makeImpl = <
         ]
         const done = yield* sendRekeyTransaction(ctx, items)
         if (done) {
-          return Rekey.mergeTallies(countMove(ctx, kind, to, tally), gap, sentinels.tally, {
-            sentinelsMoved: sentinels.count,
-          })
+          return Rekey.mergeTallies(
+            countMove(ctx, kind, to, tally),
+            gap,
+            sentinels.tally,
+            { sentinelsMoved: sentinels.count },
+            zonesTally,
+          )
         }
         // Something changed between the read and the write: read again.
       }
@@ -14730,7 +14743,8 @@ const makeImpl = <
 
   /**
    * What a move writes for `read` at its current key `current`: index keys recomposed as
-   * an update would, so a half that can't compose keeps its text. Reads nothing and
+   * an update would, so a half that can't compose keeps its text, and its zones as a write
+   * stores them ({@link staleZoneSets}; `zonesRewritten` when any wasn't). Reads nothing and
    * writes nothing, so a dry run judges what the real run would leave. The table key is the one
    * `current` names, whatever an index half in one of its attributes composes.
    */
@@ -14738,7 +14752,10 @@ const makeImpl = <
     read: StoredRow,
     current: StoredKey,
     operation: string,
-  ): Effect.Effect<StoredRow, ValidationError> =>
+  ): Effect.Effect<
+    { readonly row: StoredRow; readonly zonesRewritten: boolean },
+    ValidationError
+  > =>
     Effect.gen(function* () {
       const rowKeyForm = keyForm(
         toDomainView(fromAttributeMap(read) as globalThis.Record<string, unknown>),
@@ -14755,8 +14772,10 @@ const makeImpl = <
           { onMissingShardSource: "keep" },
         ),
       )
+      const zones = yield* staleZoneSets(read)
       const moved: StoredRow = {
         ...read,
+        ...zones.sets,
         ...toAttributeMap({ ...gsi.sets, ...current }),
       }
       for (const field of gsi.removes) {
@@ -14777,7 +14796,7 @@ const makeImpl = <
           moved[definition.partitionField] = toAttributeValue(partition)
         }
       }
-      return moved
+      return { row: moved, zonesRewritten: Object.keys(zones.sets).length > 0 }
     })
 
   /**
@@ -14855,7 +14874,11 @@ const makeImpl = <
             rekeyConflict("item", "failed", from, to, String(error.cause ?? error.message)),
           )
         const moved = yield* movedRowOf(read!, to, "rekey").pipe(
-          Effect.map((row) => ({ _tag: "Moved" as const, row })),
+          Effect.map(({ row, zonesRewritten }) => ({
+            _tag: "Moved" as const,
+            row,
+            zones: zonesRewritten ? { zonesRewritten: 1 } : {},
+          })),
           Effect.catchTag("ValidationError", (error) =>
             Effect.succeed({ _tag: "Failed" as const, error }),
           ),
@@ -14893,6 +14916,7 @@ const makeImpl = <
           return Rekey.mergeTallies(
             countMove(ctx, "item", to, tally),
             { sentinelsMoved: sentinels.moved },
+            moved.zones,
             Rekey.guardGap(ctx, moveGap(guard), {
               member: entityType,
               kind: "item",
@@ -14925,6 +14949,7 @@ const makeImpl = <
           return Rekey.mergeTallies(
             countMove(ctx, "item", to, tally),
             { sentinelsMoved: sentinels.moved },
+            moved.zones,
             Rekey.guardGap(ctx, moveGap(guard), {
               member: entityType,
               kind: "item",
@@ -15111,10 +15136,180 @@ const makeImpl = <
         )
 
   /**
+   * Each stored attribute of a model field whose values can name a zone, with what finds the places
+   * a value of it read back names one otherwise than a write of it stores now ({@link staleZonesOf},
+   * #242). Built by the first `rekey` that asks, so nothing else pays for it. A sparse map's entries
+   * are attributes of their own, and are left.
+   */
+  let zoneReaders:
+    | ReadonlyArray<
+        readonly [
+          attribute: string,
+          read: (stored: unknown) => ReadonlyArray<StaleZone> | undefined,
+        ]
+      >
+    | undefined
+  const zoneReadersOf = () => {
+    if (zoneReaders !== undefined) return zoneReaders
+    // A value is read as a row is read, and written as `put` writes it.
+    const reads = getSchemaFields(schemas.recordSchema as unknown as Schema.Top) ?? {}
+    const writes = getSchemaFields(schemas.inputSchema as unknown as Schema.Top) ?? {}
+    const readers: Array<
+      readonly [string, (stored: unknown) => ReadonlyArray<StaleZone> | undefined]
+    > = []
+    for (const name of Object.keys(modelFieldSchemas)) {
+      const read = reads[name]
+      const write = writes[name]
+      if (read === undefined || write === undefined || Object.hasOwn(sparseFields, name)) continue
+      const stale = staleZonesOf(read, write)
+      if (stale !== undefined) readers.push([resolveDbName(name), stale])
+    }
+    zoneReaders = readers
+    return readers
+  }
+
+  /** The attributes {@link staleZoneSets} rewrites, and what each held as read. */
+  type ZoneSets = {
+    readonly sets: globalThis.Record<string, AttributeValue>
+    readonly olds: globalThis.Record<string, AttributeValue>
+  }
+  const NO_ZONES: ZoneSets = { sets: {}, olds: {} }
+
+  /** `held` with `written` at `path` (from `depth`), or `undefined` where nothing is stored there. */
+  const attributeWith = (
+    held: AttributeValue,
+    path: ReadonlyArray<PropertyKey>,
+    depth: number,
+    written: AttributeValue,
+  ): AttributeValue | undefined => {
+    if (depth === path.length) return written
+    const step = path[depth]
+    if (held.M !== undefined && typeof step === "string" && Object.hasOwn(held.M, step)) {
+      const inner = attributeWith(held.M[step]!, path, depth + 1, written)
+      return inner === undefined ? undefined : { M: { ...held.M, [step]: inner } }
+    }
+    if (held.L !== undefined && typeof step === "number" && step < held.L.length) {
+      const inner = attributeWith(held.L[step]!, path, depth + 1, written)
+      if (inner === undefined) return undefined
+      const list = held.L.slice()
+      list[step] = inner
+      return { L: list }
+    }
+    return undefined
+  }
+
+  /** {@link attributeWith} for a packed value read back: plain maps and lists. */
+  const valueWith = (
+    held: unknown,
+    path: ReadonlyArray<PropertyKey>,
+    depth: number,
+    written: unknown,
+  ): unknown => {
+    if (depth === path.length) return written
+    const step = path[depth]
+    if (Array.isArray(held) && typeof step === "number" && step < held.length) {
+      const list = held.slice()
+      list[step] = valueWith(held[step], path, depth + 1, written)
+      return list
+    }
+    if (
+      typeof held === "object" &&
+      held !== null &&
+      !Array.isArray(held) &&
+      typeof step === "string" &&
+      Object.hasOwn(held, step)
+    ) {
+      const map = held as globalThis.Record<string, unknown>
+      return { ...map, [step]: valueWith(map[step], path, depth + 1, written) }
+    }
+    return held
+  }
+
+  const sameAttribute = (a: AttributeValue, b: AttributeValue): boolean =>
+    JSON.stringify(a) === JSON.stringify(b)
+
+  /**
+   * The attributes of a row naming a zone otherwise than a write of its values stores now
+   * ({@link staleZonesOf}, #242): a named zone's map holding `resolvedId`, which 1.38.0 to 1.40.0
+   * stored on Effect 4.1.3 and an equality condition or filter never matches, or a zone's name in a
+   * zoned date's text. Each comes with what a write of its value stores (`sets`) and what was read
+   * (`olds`, which the rewrite is conditioned on). Only the places the schema puts a zone at change,
+   * and the rest of the attribute is as read; a packed attribute is packed again, as a write packs
+   * it. Reads nothing: a row naming no zone so costs a look at its zone fields' values.
+   */
+  const staleZoneSets = (row: StoredRow): Effect.Effect<ZoneSets> => {
+    const readers = zoneReadersOf()
+    if (readers.length === 0) return Effect.succeed(NO_ZONES)
+    const sets: globalThis.Record<string, AttributeValue> = {}
+    const olds: globalThis.Record<string, AttributeValue> = {}
+    const packed: Array<
+      readonly [string, (stored: unknown) => ReadonlyArray<StaleZone> | undefined, AttributeValue]
+    > = []
+    for (const [attribute, read] of readers) {
+      const held = row[attribute]
+      if (held === undefined) continue
+      if (
+        (held.S !== undefined || held.B !== undefined) &&
+        dispatchAttributes.includes(attribute)
+      ) {
+        // Packed: read and written again only where it's packed now.
+        if (Object.hasOwn(packedAttributes, attribute)) packed.push([attribute, read, held])
+        continue
+      }
+      let stale: ReadonlyArray<StaleZone> | undefined
+      try {
+        stale = read(fromAttributeValue(held))
+      } catch {
+        continue
+      }
+      if (stale === undefined) continue
+      let rewritten: AttributeValue | undefined = held
+      for (const place of stale) {
+        let written: AttributeValue
+        try {
+          written = toAttributeValue(place.written)
+        } catch {
+          continue
+        }
+        rewritten = attributeWith(rewritten, place.path, 0, written) ?? rewritten
+      }
+      if (sameAttribute(rewritten, held)) continue
+      sets[attribute] = rewritten
+      olds[attribute] = held
+    }
+    if (packed.length === 0) {
+      return Effect.succeed(Object.keys(sets).length === 0 ? NO_ZONES : { sets, olds })
+    }
+    const ctx = { entityType, operation: "rekey.packed" }
+    return withRegistry((registry) => {
+      for (const [attribute, read, held] of packed) {
+        const wire = unpackStoredSync(held.S ?? held.B!, registry, ctx, attribute)
+        if (wire instanceof ValidationError) continue
+        const stale = read(wire)
+        if (stale === undefined) continue
+        let rewritten = wire
+        for (const place of stale) rewritten = valueWith(rewritten, place.path, 0, place.written)
+        const packedAgain = packAttributeValueSync(
+          packedAttributes[attribute]!,
+          rewritten,
+          registry,
+          ctx,
+          attribute,
+        )
+        if (packedAgain instanceof ValidationError || packedAgain === undefined) continue
+        if (sameAttribute(packedAgain, held)) continue
+        sets[attribute] = packedAgain
+        olds[attribute] = held
+      }
+      return Object.keys(sets).length === 0 ? NO_ZONES : { sets, olds }
+    }).pipe(Effect.orElseSucceed(() => NO_ZONES))
+  }
+
+  /**
    * An item under its current table key: rewrite the index keys {@link staleIndexKeys}
-   * names, in place — `UpdateItem` conditioned on each still holding what was read and
-   * the composites they are composed from unchanged — and move its unique sentinels
-   * whose text changed.
+   * names, and the zones {@link staleZoneSets} names, in place — one `UpdateItem` conditioned
+   * on each still holding what was read and the composites they are composed from unchanged —
+   * and move its unique sentinels whose text changed.
    */
   const rekeyCurrentItem = (
     ctx: Rekey.RekeyRowContext,
@@ -15125,17 +15320,21 @@ const makeImpl = <
       const client = yield* Capacity.client
       let row = scanned
       let rewritten = false
+      let zonesRewritten = false
       let uncomposable: ReadonlyArray<string> = []
       // What the text rewrite leaves on the row, for judging what's left of its index keys.
       let left = scanned
       for (let attempt = 0; ; attempt++) {
         const stale = staleIndexKeys(row)
+        const zones = yield* staleZoneSets(row)
         uncomposable = stale.uncomposable
-        left = { ...row, ...stale.sets }
+        left = { ...row, ...zones.sets, ...stale.sets }
         const fields = Object.keys(stale.sets)
-        if (fields.length === 0) break
+        const zoned = Object.keys(zones.sets)
+        if (fields.length === 0 && zoned.length === 0) break
         if (ctx.dryRun) {
-          rewritten = true
+          rewritten = fields.length > 0
+          zonesRewritten = zoned.length > 0
           break
         }
         if (attempt >= GUARDED_PUT_ATTEMPTS) {
@@ -15158,10 +15357,18 @@ const makeImpl = <
           sets.push(`#k${i} = :n${i}`)
           guards.push(`#k${i} = :o${i}`)
         }
+        for (const [i, attr] of zoned.entries()) {
+          names[`#z${i}`] = attr
+          operands[`:zn${i}`] = zones.sets[attr]!
+          operands[`:zo${i}`] = zones.olds[attr]!
+          sets.push(`#z${i} = :zn${i}`)
+          guards.push(`#z${i} = :zo${i}`)
+        }
         for (const [i, attr] of stale.composites.entries()) {
           // A composite the row lacks (the gap of a truncated sort key) or one derived
           // from another attribute isn't stored: the key's text is what the guard holds on.
-          if (row[attr] === undefined) continue
+          // One whose zones are rewritten is guarded as read already.
+          if (row[attr] === undefined || Object.hasOwn(zones.sets, attr)) continue
           names[`#c${i}`] = attr
           operands[`:c${i}`] = row[attr]!
           guards.push(`#c${i} = :c${i}`)
@@ -15182,7 +15389,8 @@ const makeImpl = <
             ),
           )
         if (updated) {
-          rewritten = true
+          rewritten = fields.length > 0
+          zonesRewritten = zoned.length > 0
           break
         }
         // Written in between: judge the item as it is now.
@@ -15209,6 +15417,7 @@ const makeImpl = <
       const refused = heldBackIndexKeys(at, uncomposable)
       return Rekey.mergeTallies(
         rewritten ||
+          zonesRewritten ||
           repair.wrote ||
           (refused.conflicts ?? []).length > 0 ||
           (sentinels.sentinelsMoved ?? 0) > 0 ||
@@ -15217,9 +15426,74 @@ const makeImpl = <
           ? {}
           : { unchanged: 1 },
         rewritten ? { indexKeysRewritten: 1 } : {},
+        zonesRewritten ? { zonesRewritten: 1 } : {},
         repair.tally,
         sentinels,
         refused,
+      )
+    })
+
+  /**
+   * A snapshot, tombstone or time-series event under its current key: the zones
+   * {@link staleZoneSets} names, rewritten in place by one `UpdateItem` conditioned on each
+   * attribute still holding what was read. `{}` when it has none to rewrite.
+   */
+  const rekeyHistoryZones = (
+    ctx: Rekey.RekeyRowContext,
+    scanned: StoredRow,
+    at: StoredKey,
+    kind: RowKind,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      let row = scanned
+      for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
+        const zones = yield* staleZoneSets(row)
+        const zoned = Object.keys(zones.sets)
+        if (zoned.length === 0) return {}
+        if (ctx.dryRun) return { zonesRewritten: 1 }
+        const client = yield* Capacity.client
+        const names: globalThis.Record<string, string> = { "#pk": rekeyPk }
+        const operands: globalThis.Record<string, AttributeValue> = {}
+        const sets: Array<string> = []
+        const guards: Array<string> = ["attribute_exists(#pk)"]
+        for (const [i, attr] of zoned.entries()) {
+          names[`#z${i}`] = attr
+          operands[`:zn${i}`] = zones.sets[attr]!
+          operands[`:zo${i}`] = zones.olds[attr]!
+          sets.push(`#z${i} = :zn${i}`)
+          guards.push(`#z${i} = :zo${i}`)
+        }
+        const updated = yield* client
+          .updateItem({
+            TableName: ctx.tableName,
+            Key: toAttributeMap(at),
+            UpdateExpression: `SET ${sets.join(", ")}`,
+            ConditionExpression: guards.join(" AND "),
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: operands,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catch((err: DynamoClientError) =>
+              isAwsConditionalCheckFailed(err.cause) ? Effect.succeed(false) : Effect.fail(err),
+            ),
+          )
+        if (updated) return { zonesRewritten: 1 }
+        // Written in between: judge the row as it is now.
+        const { Item: fresh } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(at),
+          ConsistentRead: true,
+        })
+        if (fresh === undefined) return {}
+        row = fresh
+      }
+      return rekeyConflict(
+        kind,
+        "contended",
+        at,
+        at,
+        "Concurrent writes changed its zones on every attempt.",
       )
     })
 
@@ -15237,6 +15511,7 @@ const makeImpl = <
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const predicted = yield* movedRowOf(scanned, at, "rekey").pipe(
+        Effect.map(({ row }) => row),
         Effect.catchTag("ValidationError", () => Effect.succeed(undefined)),
       )
       if (predicted === undefined) return {}
@@ -17239,21 +17514,20 @@ const makeImpl = <
         // Only the scan's visit judges a row under its current key: a move needing a sentinel of
         // it out of its way moves that sentinel alone ({@link holderSentinelOut}).
         if (targets.kind === "item") return yield* rekeyCurrentItem(ctx, row, stored)
-        if (targets.kind !== "tombstone") return { unchanged: 1 }
+        // A snapshot, tombstone or event: its zones as a write stores them, in place.
+        const zones = yield* rekeyHistoryZones(ctx, row, stored, targets.kind)
         // A tombstone under its current key: its sentinels may still hold
         // other key text or name another of the item's keys.
-        const sentinels = yield* rekeySentinels(
-          ctx,
-          "tombstone",
-          row,
-          targets.isLive,
-          targets.live,
-          false,
-        )
-        return (sentinels.sentinelsMoved ?? 0) > 0 ||
-          sentinels.worked === true ||
-          (sentinels.conflicts ?? []).length > 0
-          ? sentinels
+        const sentinels =
+          targets.kind === "tombstone"
+            ? yield* rekeySentinels(ctx, "tombstone", row, targets.isLive, targets.live, false)
+            : {}
+        const acted = Rekey.mergeTallies(zones, sentinels)
+        return (acted.zonesRewritten ?? 0) > 0 ||
+          (acted.sentinelsMoved ?? 0) > 0 ||
+          acted.worked === true ||
+          (acted.conflicts ?? []).length > 0
+          ? acted
           : { unchanged: 1 }
       }
       if (targets.old === undefined) return { skipped: { unrecognizedKey: 1 } }

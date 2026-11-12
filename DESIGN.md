@@ -5290,6 +5290,35 @@ sentinels, snapshots, tombstones, events, an index, an aggregate) and 1.39.0 wro
 4.1.3 (`named-zone-keys-1.39.0-effect-4.1.3.json`: a zone itself), with a case-only
 zone and a zone of one name that don't move.
 
+**Zones those releases stored as values (`rekey`, 1.41.0).** On Effect 4.1.3, 1.38.0 to
+1.40.0 stored every named zone's map with its `resolvedId` (any zone, not only an alias),
+and the library's ISO text of a zoned date under the name the zone was given. A write
+stores neither now, and an equality condition or filter's operand is what a write
+stores, so until `rekey` runs it matches none of those rows; reads are unaffected. No
+fallback is compiled into the expression: `rekey` rewrites them in the pass that moves
+rows. `staleZonesOf` (`internal/ZoneKeyText.ts`) takes a model field's read schema (the
+record schema's) and write schema (the input schema's) and, for a value read back, decodes
+it as a read does and encodes it as `put` does, then walks what that writes (`walkLeaves`)
+and compares each place with what the row holds there: a zone whose stored map holds
+`resolvedId` is a place, and so is the library's ISO text naming a zone by a name the
+runtime resolves to another. Text whose encoding follows the zone's `id` (Effect's string
+codecs, an application's) isn't: a write encodes it again with each zone a probe whose `id`
+differs from its name, and only text that stays the same is the library's. A value no
+schema types (`Schema.Unknown`) has no reader. A cheap look at the value read (a map with
+`resolvedId`, text naming an alias, by a cache of resolved names) gates the decode, so a
+row without one is never decoded. `staleZoneSets` (`Entity.ts`) puts what a write stores at
+each place, leaving the rest of the attribute as read (a packed attribute is packed again,
+as a write packs it), and the row is rewritten: under its current key in place, an item in
+the `UpdateItem` that rewrites its index keys and a snapshot, tombstone or event by one of
+its own (`rekeyHistoryZones`), each conditioned on every attribute it rewrites still
+holding what was read; a row it moves, in its move's Put (`movedRowOf`,
+`moveHistoryRow`). Each row counts once in `zonesRewritten`, and a dry run counts what it
+would rewrite. A row holding none sends no request (`ZoneValuesRekey.test.ts`, on rows
+published 1.40.0 wrote on 4.1.3 and on 4.1.2: `zone-values-1.40.0-effect-4.1.{3,2}.json`).
+An aggregate's rows under their current keys and an event stream's events are not
+rewritten: an aggregate's rows `rekey` moves are rebuilt as any aggregate write builds
+them, and the rest keep their form until they're next written.
+
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
 can. `holdsCustomDeclaration` finds a declaration with no `representation` id (and
