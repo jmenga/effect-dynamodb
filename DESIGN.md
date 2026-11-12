@@ -1215,7 +1215,11 @@ fresh read:
   its `__edd_e__`, the stored attributes of every unique field and `__edd_d__`, as read or
   absent). A row moved, deleted or changed since fails it, and the pass, reading the row again
   and finding it gone or changed (`sameOwnerValues`), stops: the write that moved or changed it
-  carried its sentinels.
+  carried its sentinels. An update giving the row another value is one such write, from the
+  application or another run: it releases the sentinel under the current key text, which isn't
+  there yet, so the one under the old key text stays where it is, rather than being brought to
+  the current key naming a row that no longer holds its value, where it would refuse the value to
+  every new item.
 - **A run repairs what an earlier one left.** A sentinel whose named row is absent while a row of
   its entity under another text of that key holds its value (`danglingHolder`: the values read
   back from the named key's text compose the keys of the other forms, one read each) is
@@ -1226,17 +1230,26 @@ fresh read:
   (`ownerCheck`), so a row arriving there in between fails it. A sentinel the sentinel's own visit
   brings to its row is claimed (`broughtForRow`), so the row's pass doesn't count it as its work.
 
-These checks go only on transactions that move or re-point something: a table with nothing to move
-sends what 1.40.0 sent. On tables with rows to move, a run nobody else writes beside sends fewer
-requests than 1.40.0 and some more `ConditionCheck` items: over 120 random tables, single default
-runs, 6,354 requests against 8,259, 1,536 transactions against 1,475 and 393 `ConditionCheck`
-items against 308.
+These checks go only on transactions that move or re-point something. A table with nothing to
+move gets exactly 1.40.0's requests (4,636 runs over 1,200 random tables, four option sets,
+compared request for request). On a table with rows to move, a row that doesn't move is sent
+nothing 1.40.0 didn't send it: over 300 random tables and three option sets, the requests naming
+only such rows were 1.40.0's, less 42 consistent reads of an unmoved aggregate's root that a run no
+longer sends. The rows that move cost fewer requests and some more `ConditionCheck` items: over
+120 random tables, single default runs, 6,354 requests against 8,259, 1,536 transactions against
+1,475 and 393 `ConditionCheck` items against 308. A moving stream's flip, and its check on the
+stream's head, also name the stream (`streamId`, below).
 
-`RekeyConcurrentRuns.test.ts` runs two and three default runs at once over 40 random tables, then a
-`releaseOrphanedReservations` run, then a put of a value already taken (refused), and runs one
-default run over the 1.40.0 fixture: it re-points the dangling sentinel and leaves the rows one run
-over the original table leaves. 0 of 240 random tables are left with a dangling sentinel, the
-one 1.40.0 left included.
+`RekeyConcurrentRuns.test.ts` runs two and three default runs at once over 40 random tables and
+checks, before any later run could repair one, that no sentinel names a key its row left; then one
+run alone, a `releaseOrphanedReservations` run, and a put of each value a row holds (refused). It
+runs the same way the eight tables where runs at once left a sentinel behind without these checks
+(found over 120 random tables in each direction, two and three runs, every request yielding first
+or a random number of times: 8 of 960 cases without either check, 0 with them); all eight fail
+without `sentinelAsRead` alone. It races an update giving a row another value against a sentinel brought to that row
+(the old value can be taken again afterwards, the new one can't), which fails without the row's
+`ConditionCheck`. And it runs one default run over the 1.40.0 fixture: it re-points the dangling
+sentinel and leaves the rows one run over the original table leaves.
 
 **Resume token.** `rk1.` + base64url JSON `{ t: tableName, s: positions }`, one
 position per segment: `0` not started, `1` done, or the segment's
