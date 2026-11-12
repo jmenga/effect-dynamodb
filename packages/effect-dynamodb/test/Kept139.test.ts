@@ -6,7 +6,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -38,6 +38,7 @@ import {
   renamedSparseMapUpsertsSuite,
   renamedSparseMapVerdictsSuite,
 } from "./helpers/RenamedSparseMapWrites.js"
+import { renamedSparseMapZOrderSuite } from "./helpers/RenamedSparseMapZOrder.js"
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
@@ -154,6 +155,10 @@ describe("a path below a struct that renames its keys, in a collection", () => {
 
 describe("a sparse map entry in a query's, a scan's and a collection's filter and select", () => {
   entryInQueriesSuite(openRecordingTable)
+})
+
+describe("a renamed sparse map on an entity with a Z-order index", () => {
+  renamedSparseMapZOrderSuite(openRecordingTable)
 })
 
 describe("an aggregate list filter below a struct that renames its keys as they're stored", () => {
