@@ -6,7 +6,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts` (against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts`, `helpers/AppendSparseMaps.ts` (both against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -15,6 +15,7 @@ import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateListFiltersSuite } from "./helpers/AggregateListFilters.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
+import { appendSparseMapsSuite } from "./helpers/AppendSparseMaps.js"
 import {
   clearEveryOpSuite,
   clearWritesSuite,
@@ -165,6 +166,10 @@ describe("a sparse map entry in a query's, a scan's and a collection's filter an
 
 describe("a sparse map entry on every terminal that takes a path callback", () => {
   entryOnEveryTerminalSuite(openRecordingTable)
+})
+
+describe("a time-series append whose appendInput holds a sparse map", () => {
+  appendSparseMapsSuite(openRecordingTable)
 })
 
 describe("a renamed sparse map on an entity with a Z-order index", () => {

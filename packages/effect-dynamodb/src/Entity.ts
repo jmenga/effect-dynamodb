@@ -13463,6 +13463,29 @@ const makeImpl = <
         }
       }
 
+      // A sparse map without a `field:` rename has no whole form: a read rebuilds it from its
+      // entries (`<prefix>#<key>`), and the append's SET writes the field whole, under its own
+      // name, which no read takes. Through 1.40.0 the entries were lost to every read, and the
+      // stored ones read in their place, so a map with entries is refused, as `.remove()` of
+      // it is. An empty one writes nothing a read sees, as it did; a renamed map's whole
+      // attribute is the form a read takes first, so it's written as it was (#238).
+      if (hasSparseFields) {
+        for (const field of Object.keys(sparseFields)) {
+          const value = encoded[field]
+          if (resolveDbName(field) !== field || value === null || typeof value !== "object")
+            continue
+          if (Object.keys(value).length === 0) continue
+          return yield* new ValidationError({
+            entityType,
+            operation: "append",
+            cause:
+              `"${field}" is a sparse map, stored as one attribute per entry, which an append ` +
+              `doesn't write. Write its entries with .update(key).set({ ${field}: ... }). ` +
+              `Nothing was sent.`,
+          })
+        }
+      }
+
       // A value with no stored form is an absent attribute, on the current item as on
       // the event item, so it's a `.remove()` of that field. A field left unset (an
       // optional `undefined`) isn't: it leaves the current item's attribute alone.
