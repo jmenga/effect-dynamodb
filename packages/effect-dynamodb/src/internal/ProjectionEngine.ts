@@ -2418,9 +2418,10 @@ export const makeEngine = (config: EngineConfig) => {
         // The bookkeeping of the other projections that have written the row (`carriedOf`), each
         // value as the entity stores it on a row. Over a tombstone it replaces what `initial` gave
         // it. Over a live row a change to it is refused (`[EDD-9144]`), and it fills what the write
-        // left out only when the write stores every data attribute the row holds (`keepsData`):
-        // one that drops one drops the others' checkpoints with it, as 1.40.0 did, so they fold
-        // their streams again and put their data back. A rebuild over a live row carries none: it
+        // left out only when the write, with it, stores every attribute the row holds under the
+        // name the row holds it by (`keepsData`): one that drops one drops the others'
+        // checkpoints with it, as 1.40.0 did, so they fold their streams again and put their data
+        // back. A rebuild over a live row carries none: it
         // drops the other projections' contributions to the state, so they lose their checkpoints
         // too and apply again.
         let item: Record<string, unknown> = mapped
@@ -2595,85 +2596,29 @@ export const makeEngine = (config: EngineConfig) => {
   }
 
   /**
-   * The fields no projection keeps as bookkeeping: the row's data. Read at write time: the read
-   * model's other projections may be defined after this one.
-   */
-  const dataFields = (): ReadonlyArray<string> | undefined => {
-    if (fields === undefined) return undefined
-    const bookkeeping = new Set<string>()
-    for (const layout of projectionLayoutsOf(readModel) ?? []) {
-      for (const [field] of layout.roles) bookkeeping.add(dbName(field))
-    }
-    return [...fields].filter((field) => !bookkeeping.has(dbName(field)))
-  }
-
-  /** The prefix of a sparse map stored as `name` (its entries are `<prefix>#<key>`), if it is one. */
-  const sparsePrefixes = new Map<string, string | undefined>()
-  const sparsePrefixOf = (name: string): string | undefined => {
-    if (sparsePrefixes.has(name)) return sparsePrefixes.get(name)
-    const probe: Record<string, unknown> = { [name]: { k: 1 } }
-    let prefix: string | undefined
-    try {
-      readModel._serializeSparseFields(probe)
-      const entry = Object.keys(probe).find((attribute) => attribute.endsWith("#k"))
-      prefix = Object.hasOwn(probe, name) || entry === undefined ? undefined : entry.slice(0, -2)
-    } catch {
-      prefix = undefined
-    }
-    sparsePrefixes.set(name, prefix)
-    return prefix
-  }
-
-  /**
-   * The stored attributes of `item` (as stored: renamed, packed, a sparse map as its entries) that
-   * hold the row's data (`data`): a field's stored name, or each entry of a sparse map, as the
-   * entity's reader takes them (`<prefix>#` and a key).
-   */
-  const dataAttributesOf = (
-    item: Record<string, unknown>,
-    data: ReadonlyArray<string>,
-  ): ReadonlyArray<string> => {
-    const out: Array<string> = []
-    for (const field of data) {
-      const name = dbName(field)
-      const prefix = sparsePrefixOf(name)
-      if (prefix === undefined) {
-        if (Object.hasOwn(item, name) && item[name] !== undefined) out.push(name)
-        continue
-      }
-      for (const attribute of Object.keys(item)) {
-        if (attribute.length > prefix.length + 1 && attribute.startsWith(`${prefix}#`)) {
-          out.push(attribute)
-        }
-      }
-    }
-    return out
-  }
-
-  /**
-   * Whether a write over the live `row` storing `item` stores every data attribute the row holds
-   * (#237), judged on exactly the attribute map the request carries: the row's attributes as read
-   * against the item's marshalled attributes (encoded, renamed, as sparse entries, packed, then
-   * marshalled: `validateAndBuildPutItem`, the transaction's own), each sparse entry on its own.
-   * Their values, and their types, may change. The data is every model field no projection keeps
-   * as bookkeeping. A value that stores nothing drops its attributes, whatever drops it: an
-   * `Option.none()`, an emptied sparse map, an empty set (the marshaller stores none), or anything
-   * else the marshaller leaves out. The row records who wrote it, not which data each wrote, so
-   * any dropped attribute counts. An item the entity or the marshaller refuses keeps nothing: the
-   * write then fails as it would have.
+   * Whether a write over the live `row` storing `item` keeps every attribute the row holds (#237),
+   * judged on two stored things alone: the row's attribute map as read, and the attribute map the
+   * write's request carries (`validateAndBuildPutItem`, the transaction's own: encoded, renamed, as
+   * sparse entries, packed, then marshalled). Every attribute of the row but its row token must be
+   * there under the same name; its value, and its type, may change. No definition says which
+   * attributes are data: a field another program renames, stores in a sparse map under another
+   * prefix, or doesn't define, is an attribute the write drops. `item` carries the other
+   * projections' bookkeeping (`carriedOf`), so theirs counts as kept only where it lands under the
+   * name the row holds it by. A value that stores nothing drops its attributes, whatever drops it:
+   * an `Option.none()`, an emptied sparse map, an empty set (the marshaller stores none). An item
+   * the entity or the marshaller refuses keeps nothing: the write then fails as it would have. A
+   * projection's row write is always a whole `Put`: nothing is left in place or removed by name.
    */
   const keepsData = (row: Row, item: Record<string, unknown>): Effect.Effect<boolean, never, any> =>
     Effect.gen(function* () {
-      const data = dataFields()
-      if (data === undefined) return false
-      const held = dataAttributesOf(row.item, data)
-      if (held.length === 0) return true
       const built = yield* Effect.option(
         validateAndBuildPutItem(readModel as any, item, `${config.label}.write`),
       )
       if (Option.isNone(built)) return false
       const written = built.value.marshalled
-      return held.every((name) => Object.hasOwn(written, name))
+      return Object.keys(row.item).every(
+        (name) => Object.hasOwn(written, name) || (name === ROW_TOKEN && row.token !== undefined),
+      )
     })
 
   /** The fields the library owns, re-applied after `toItem`. */
