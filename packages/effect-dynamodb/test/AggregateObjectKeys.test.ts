@@ -484,3 +484,58 @@ describe("a value with key text of its own is untouched", () => {
     }),
   )
 })
+
+describe("a key the write doesn't compose refuses nothing, as 1.40.0 stored it", () => {
+  // The list keys are sparse: `missing` absent, neither is composed, whatever `f` holds. 1.40.0
+  // stored the aggregate without list keys; so do `create` and `update`.
+  const schema = DynamoSchema.make({ name: "ao", version: 1, escapeKeys: false })
+  const Dummy = Entity.make({
+    model: Schema.Struct({ id: Schema.String }),
+    entityType: "Dummy",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const Base = Table.make({ schema, entities: { Dummy } })
+  const Roots = Aggregate.make(
+    Schema.Struct({
+      id: Schema.String,
+      f: Schema.Unknown,
+      missing: Schema.optional(Schema.String),
+      note: Schema.String,
+    }),
+    {
+      table: Base,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "roots" },
+      list: {
+        index: "gsi1",
+        name: "rl",
+        pk: { field: "gsi1pk", composite: ["missing"] },
+        sk: { field: "gsi1sk", composite: ["f"] },
+      },
+      root: { entityType: "Root" },
+      edges: {},
+    } as never,
+  )
+  const defined = { Base, Roots, Main: { ...Base, aggregates: { Roots } } }
+
+  it.effect("create and update store the object, with no list keys", () =>
+    Effect.gen(function* () {
+      const table = tableOf()
+      yield* run(defined, table, (db) =>
+        Effect.gen(function* () {
+          yield* db.aggregates.Roots.create({ id: "a", f: { a: 1 }, note: "one" })
+          yield* db.aggregates.Roots.update({ id: "a" }, ({ state }: any) => ({
+            ...state,
+            f: { a: 2 },
+          }))
+        }),
+      )
+      const [row] = rowsOf(table)
+      expect(rowsOf(table)).toHaveLength(1)
+      expect(row?.f).toEqual({ M: { a: { N: "2" } } })
+      expect(row).not.toHaveProperty("gsi1pk")
+      expect(row).not.toHaveProperty("gsi1sk")
+    }),
+  )
+})

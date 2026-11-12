@@ -50,12 +50,10 @@ import {
 } from "@effect-dynamodb/schema/Errors.js"
 import {
   compositeKeyFormKind,
-  defaultObjectText,
   keyFormValueKind,
   kindReadingOf,
   makeCompositeKeyForm,
   makeCompositeStoredForm,
-  objectKeyRefusal,
   otherNumericKind,
   type ReadBackText,
   readsBackOtherwise,
@@ -455,13 +453,14 @@ const composeUniqueSentinel = (
       ? (defaulted as ReadonlySet<unknown>)
       : new Set(Array.isArray(defaulted) ? defaulted : [])
   if (fields.some((f) => defaultedFields.has(f))) return undefined
+  // Sparse: a constraint missing a value has no sentinel, and composes none of its values.
+  if (fields.some((f) => source[f] === undefined || source[f] === null)) return undefined
   const serialized: Array<string> = []
   const fieldsRecord: globalThis.Record<string, string> = {}
   for (const f of fields) {
     const given = source[f]
-    if (given === undefined || given === null) return undefined
     const raw = stored(f, given) ?? given
-    const s = KeyComposer.compositeText(schema, raw)
+    const s = KeyComposer.siteCompositeText(schema, raw, f, constraintDef, undefined)
     serialized.push(s)
     fieldsRecord[f] = s
   }
@@ -921,6 +920,19 @@ export interface Entity<
     encoded: unknown,
     operation: string,
   ) => Effect.Effect<void, ValidationError>
+  /**
+   * @internal The schema a put written whole composes its keys under (#242, `EDD-9162`): an object
+   * composing `[object Object]` into a key it composes is refused where it's composed.
+   */
+  readonly _ownSchema: () => DynamoSchema.DynamoSchema
+  /**
+   * @internal Composes each unique sentinel `record` holds every value of under `under`, to refuse
+   * an object there before anything is sent (`EDD-9162`); throws what `composeKeysOrFail` takes.
+   */
+  readonly _composeUniqueSentinels: (
+    under: DynamoSchema.DynamoSchema,
+    record: globalThis.Record<string, unknown>,
+  ) => void
 
   /** @internal Unique fields a put's input leaves to an index-stored default. */
   readonly _unsentineledDefaults: (input: unknown) => ReadonlyArray<string>
@@ -3487,40 +3499,72 @@ const makeImpl = <
   }
 
   /**
-   * Refuses a write composing a key from an object that composes `[object Object]`, which every such
-   * object composes alike (`EDD-9162`). Only a write of the item's own values: a get, a delete, a
-   * query and an update's own key record compose that text as they always did, to reach a row an
-   * earlier release wrote under it.
+   * What composes a write's own composite where the composer refused it (#242, `EDD-9162`), named by
+   * the definition the composer was handed: an index's key, a vector index's partition, a unique
+   * constraint's sentinel, a time-series event's sort key.
    */
-  const refuseObjectKeyText = (
-    encoded: unknown,
-    operation: string,
-  ): Effect.Effect<void, ValidationError> => {
-    for (const field of objectKeyFields()) {
-      const value = (encoded as globalThis.Record<string, unknown>)[field]
-      if (typeof value !== "object" || value === null) continue
-      let form: unknown
-      try {
-        form = compositeKeyForm(field, value)
-      } catch {
-        continue
-      }
-      const text = compositeTextOf(form)
-      const refused = text === undefined ? undefined : defaultObjectText(form, text)
-      if (refused === undefined) continue
-      return Effect.fail(
-        new ValidationError({
-          entityType,
-          operation,
-          cause: objectKeyRefusal(
-            `Field "${field}" is composed into ${composedInto(field)}`,
-            refused,
-          ),
-        }),
-      )
+  const objectKeySiteName = (site: DynamoSchema.ObjectKeySite): string => {
+    const timeSeries = config.timeSeries as TimeSeriesConfig<any> | undefined
+    const field = site.attr ?? timeSeries?.orderBy
+    const named = (into: string) => `Field "${field}" is composed into ${into}`
+    if (site.key === KeyComposer.EVENT_SORT_KEY) {
+      return named("an event's sort key (timeSeries.orderBy)")
     }
-    return Effect.void
+    for (const [name, def] of Object.entries(allIndexes)) {
+      if (def === site.key) return named(name === "primary" ? "the primary key" : `index "${name}"`)
+    }
+    for (const [name, def] of vectorIndexEntries) {
+      if (def === site.key) return named(`vector index "${name}"'s partition`)
+    }
+    for (const [name, def] of Object.entries(
+      (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+    )) {
+      if (def === site.key) return named(`unique constraint "${name}"`)
+    }
+    return named(field === undefined ? "a key" : (composedInto(field) ?? "a key"))
   }
+
+  /**
+   * The schema a write composes its own keys under (#242, `EDD-9162`): where the composer composes a
+   * key from an object composing `[object Object]`, which every such object composes alike, it
+   * refuses the write. The decision is the composer's (`KeyComposer.siteCompositeText`), so a key the
+   * write doesn't compose refuses nothing: a sparse index or unique constraint missing a value, a
+   * half an update leaves. `own` says which composites are the write's own: every one for an item
+   * written whole; an update's payload ({@link ownPayload}), whose key record composes the key the
+   * row is stored under, as a get or a delete composes it, to reach a row an earlier release wrote
+   * under that text. A model none of whose key composites can hold an object composes under the
+   * schema itself, at no cost.
+   */
+  let ownSchemaFor:
+    | {
+        readonly schema: DynamoSchema.DynamoSchema
+        readonly indexes: typeof allIndexes
+        readonly own: DynamoSchema.DynamoSchema
+      }
+    | undefined
+  const ownSchema = (
+    own?: (site: DynamoSchema.ObjectKeySite) => boolean,
+  ): DynamoSchema.DynamoSchema => {
+    if (objectKeyFields().length === 0) return schema
+    if (own !== undefined) {
+      return {
+        ...schema,
+        objectKeys: (site) => (own(site) ? objectKeySiteName(site) : undefined),
+      }
+    }
+    if (ownSchemaFor?.schema !== schema || ownSchemaFor.indexes !== allIndexes) {
+      ownSchemaFor = {
+        schema,
+        indexes: allIndexes,
+        own: { ...schema, objectKeys: objectKeySiteName },
+      }
+    }
+    return ownSchemaFor.own
+  }
+
+  /** {@link ownSchema} for an update: the composites its `payload` gives are its own. */
+  const ownPayload = (payload: globalThis.Record<string, unknown>): DynamoSchema.DynamoSchema =>
+    ownSchema((site) => site.attr !== undefined && site.attr in payload)
 
   /**
    * A write's payload, encoded (see `encodeOrDecodeEncode`) and refused if it wouldn't read back.
@@ -3531,11 +3575,7 @@ const makeImpl = <
     input: unknown,
     operation: string,
   ): Effect.Effect<unknown, ValidationError> => {
-    const encoding = encodeOrDecodeEncode(schema, input, entityType, operation)
-    const encoded =
-      objectKeyFields().length === 0
-        ? encoding
-        : encoding.pipe(Effect.tap((value) => refuseObjectKeyText(value, operation)))
+    const encoded = encodeOrDecodeEncode(schema, input, entityType, operation)
     const readBack =
       readBacks.size === 0
         ? encoded
@@ -4718,10 +4758,15 @@ const makeImpl = <
    * on the guarded path after the item is marshalled, and the marshaller
    * would refuse a `NaN` as a defect.
    */
-  const composeAllKeys = (record: globalThis.Record<string, unknown>, operation: string) =>
+  const composeAllKeys = (
+    record: globalThis.Record<string, unknown>,
+    operation: string,
+    /** {@link ownSchema} for a write of the item's own values; a restore composes what's stored. */
+    under: DynamoSchema.DynamoSchema = schema,
+  ) =>
     composeKeysOrFail(entityType, operation, () => {
       const keys = KeyComposer.composeAllKeys(
-        schema,
+        under,
         entityType,
         entityVersion,
         allIndexes,
@@ -4735,8 +4780,40 @@ const makeImpl = <
           if (value !== undefined && value !== null) KeyComposer.compositeText(schema, value)
         }
       }
+      if (under !== schema) {
+        // The sentinels and vector partitions are composed once more where they're written, after
+        // a read or an embedding: composed here, a refusal sends nothing.
+        composeUniqueSentinels(under, record)
+        for (const [, definition] of vectorIndexEntries) {
+          KeyComposer.tryComposeVectorPartition(under, entityType, definition, keyForm(record))
+        }
+      }
       return keys
     })
+
+  /**
+   * Composes each unique constraint's sentinel `record` holds every value of, under `under`, and
+   * drops them: under a write's own schema (`ownSchema`) an object composing `[object Object]` into
+   * one refuses the write here, before anything is sent, where the sentinel itself is composed only
+   * after the item is read or marshalled.
+   */
+  const composeUniqueSentinels = (
+    under: DynamoSchema.DynamoSchema,
+    record: globalThis.Record<string, unknown>,
+  ): void => {
+    for (const [constraintName, constraintDef] of Object.entries(
+      (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+    )) {
+      composeUniqueSentinel(
+        under,
+        entityType,
+        constraintName,
+        constraintDef,
+        record,
+        storedSentinelValue,
+      )
+    }
+  }
 
   /**
    * Fill the auto-generated id field on the raw `put` input when configured and
@@ -4921,10 +4998,21 @@ const makeImpl = <
     composeKeysOrFail(entityType, "upsert", () => {
       const keys = { ...composed }
       const recordKeyForm = keyForm(record)
+      const written = (composites: ReadonlyArray<string>) =>
+        composites.some((attr) => !keptByUpsert(attr) && !isPrimaryComposite(attr))
+      // A half composed and not written refuses nothing (`ownSchema`).
+      const under = ownSchema((site) => {
+        const index = site.key as IndexDefinition
+        return written(
+          site.half === "pk"
+            ? [...index.pk.composite, ...(index.shards?.by ?? [])]
+            : index.sk.composite,
+        )
+      })
       for (const [indexName, index] of Object.entries(allIndexes)) {
         if (indexName === "primary" || index.pk.field in composed) continue
         const known = KeyComposer.composeKnownHalves(
-          schema,
+          under,
           entityType,
           entityVersion,
           index,
@@ -4932,12 +5020,7 @@ const makeImpl = <
         )
         for (const [field, composites] of halvesOf(index)) {
           const value = known[field]
-          if (
-            value !== undefined &&
-            composites.some((attr) => !keptByUpsert(attr) && !isPrimaryComposite(attr))
-          ) {
-            keys[field] = value
-          }
+          if (value !== undefined && written(composites)) keys[field] = value
         }
       }
       return keys
@@ -5602,17 +5685,16 @@ const makeImpl = <
     record: globalThis.Record<string, unknown>,
     withVectors: globalThis.Record<string, ReadonlyArray<number>> | undefined,
     embedFor: ReadonlySet<string> | "all",
-  ): Effect.Effect<VectorWriteResult, EmbeddingError, never> =>
+    /** {@link ownSchema} where an update composes its payload's partitions. */
+    under: DynamoSchema.DynamoSchema = schema,
+  ): Effect.Effect<VectorWriteResult, EmbeddingError | ValidationError, never> =>
     Effect.gen(function* () {
       const sets: globalThis.Record<string, unknown> = {}
       const removes: Array<string> = []
       for (const [logicalName, definition] of vectorIndexEntries) {
         const shouldEmbed = embedFor === "all" || embedFor.has(logicalName)
-        const partition = KeyComposer.tryComposeVectorPartition(
-          schema,
-          entityType,
-          definition,
-          keyForm(record),
+        const partition = yield* composeKeysOrFail(entityType, "update", () =>
+          KeyComposer.tryComposeVectorPartition(under, entityType, definition, keyForm(record)),
         )
         if (partition === undefined) {
           // No partition value ⇒ the item cannot be in the index at all. Drop
@@ -5772,11 +5854,13 @@ const makeImpl = <
         // Partition value: idempotent and cheap, so recompose whenever the
         // merged record can supply it (same reasoning as the PK-composites-only
         // GSI shape in §7).
-        const partition = KeyComposer.tryComposeVectorPartition(
-          schema,
-          entityType,
-          definition,
-          keyForm(merged),
+        const partition = yield* composeKeysOrFail(entityType, "update", () =>
+          KeyComposer.tryComposeVectorPartition(
+            ownPayload(updatePayload),
+            entityType,
+            definition,
+            keyForm(merged),
+          ),
         )
         if (partition === undefined) {
           // Only drop the partition when THIS writer invalidated it. Otherwise
@@ -7687,7 +7771,7 @@ const makeImpl = <
 
           // Compose all keys from the encoded input (ID fields still present
           // and key composites are wire-format strings/numbers).
-          const keys = yield* composeAllKeys(keyValues, operation)
+          const keys = yield* composeAllKeys(keyValues, operation, ownSchema())
 
           // A put that sends something before its write refuses a value DynamoDB can't
           // store first. Any other put finds out when it marshals, at no extra cost.
@@ -7815,7 +7899,8 @@ const makeImpl = <
               create: opts.putKind === "create",
               operation,
               key: encoded as globalThis.Record<string, unknown>,
-              composeKeys: (carried) => composeAllKeys({ ...keyValues, ...carried }, operation),
+              composeKeys: (carried) =>
+                composeAllKeys({ ...keyValues, ...carried }, operation, ownSchema()),
             })
             return yield* decodeAs(plan.item, plan.marshalled, mode)
           }
@@ -8332,9 +8417,10 @@ const makeImpl = <
       // marshalled: a composite with no key text (`NaN`, `[EDD-9096]`) or
       // Z-order level (`[EDD-9092]`) fails the update with a
       // `ValidationError`. Each branch below composes the keys it writes itself.
+      // A payload value a key composed here holds is the write's own (`ownSchema`, `EDD-9162`).
       yield* composeKeysOrFail(entityType, "update", () =>
         KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
+          ownPayload(hydratedUpdates),
           entityType,
           entityVersion,
           allIndexes,
@@ -8758,9 +8844,11 @@ const makeImpl = <
         // Z-order value the composer can't place (EDD-9092, #171) fails the
         // update with a `ValidationError`.
         const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
+        // The payload's values are the write's own; the rest of `newItem` is the row as stored.
+        const ownUpdate = ownPayload(hydratedUpdates as globalThis.Record<string, unknown>)
         const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
           KeyComposer.composeGsiKeysForUpdatePolicyAware(
-            schema,
+            ownUpdate,
             entityType,
             entityVersion,
             allIndexes,
@@ -8802,16 +8890,18 @@ const makeImpl = <
               currentRawDomain,
               readSentinelValue,
             )
-            const newSentinel = composeUniqueSentinel(
-              schema,
-              entityType,
-              constraintName,
-              constraintDef,
-              newItem,
-              (field, value) =>
-                Object.is(value, currentDomainItem[field])
-                  ? readSentinelValue(field, value)
-                  : storedSentinelValue(field, value),
+            const newSentinel = yield* composeKeysOrFail(entityType, "update", () =>
+              composeUniqueSentinel(
+                ownUpdate,
+                entityType,
+                constraintName,
+                constraintDef,
+                newItem,
+                (field, value) =>
+                  Object.is(value, currentDomainItem[field])
+                    ? readSentinelValue(field, value)
+                    : storedSentinelValue(field, value),
+              ),
             )
 
             if (!oldSentinel && !newSentinel) continue
@@ -8856,6 +8946,7 @@ const makeImpl = <
             yield* unpackedDomainCopy(newItem, "update.vector"),
             uState.withVectors,
             embedFor,
+            ownUpdate,
           )
           Object.assign(newItem, vectorWrite.sets)
           for (const field of vectorWrite.removes) delete newItem[field]
@@ -9681,7 +9772,7 @@ const makeImpl = <
       // composer can't place (EDD-9092, #171) fails with a `ValidationError`.
       const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
         KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
+          ownPayload(hydratedUpdates as globalThis.Record<string, unknown>),
           entityType,
           entityVersion,
           allIndexes,
@@ -11477,7 +11568,11 @@ const makeImpl = <
             ...writeStamps(upsertedUpdatedAt, undefined),
             ...(systemFields.createdAt ? { [systemFields.createdAt]: upsertedCreatedAt } : {}),
           }
-          const allKeys = yield* upsertKeys(stamped, yield* composeAllKeys(stamped, "upsert"))
+          // One request sends every key the input composes: each is the upsert's own.
+          const allKeys = yield* upsertKeys(
+            stamped,
+            yield* composeAllKeys(stamped, "upsert", ownSchema()),
+          )
           yield* refuseUncomposed(encodedInput, "upsert")
           const keyPlan = upsertKeyPlan(allKeys, item, suppliedCreatedAt !== undefined)
           const primaryKey = composePrimaryKey(item)
@@ -12066,19 +12161,21 @@ const makeImpl = <
       // off, the encoded text 1.36 wrote, which sorts "10" before "9".
       const primary = config.indexes.primary
       const appendKeyForm = keyForm(encoded)
+      // Every appendInput value is the append's own: the first append creates the row.
+      const ownAppend = ownSchema()
       const { pkValue, currentSk, eventSk } = yield* composeKeysOrFail(entityType, "append", () => {
         const currentSk = KeyComposer.composeSk(
-          schema,
+          ownAppend,
           entityType,
           entityVersion,
           primary,
           appendKeyForm,
         )
         return {
-          pkValue: KeyComposer.composePk(schema, entityType, primary, appendKeyForm),
+          pkValue: KeyComposer.composePk(ownAppend, entityType, primary, appendKeyForm),
           currentSk,
           eventSk: KeyComposer.composeEventSk(
-            schema,
+            ownAppend,
             currentSk,
             KeyComposer.eventOrderByValue(
               schema,
@@ -12162,7 +12259,7 @@ const makeImpl = <
       const composeAppendKeys = (createdAt: unknown) =>
         composeKeysOrFail(entityType, "append", () =>
           KeyComposer.composeGsiKeysForUpdatePolicyAware(
-            schema,
+            ownAppend,
             entityType,
             entityVersion,
             allIndexes,
@@ -17711,18 +17808,18 @@ const makeImpl = <
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
-    _refuseNotReadBack: (encoded: unknown, operation: string) => {
-      const readBack =
-        kindReads().model.size === 0
-          ? refuseNotReadBack(encoded, operation)
-          : Effect.andThen(
-              refuseNotReadBack(encoded, operation),
-              refuseOtherKindRead(encoded, operation),
-            )
-      return objectKeyFields().length === 0
-        ? readBack
-        : Effect.andThen(refuseObjectKeyText(encoded, operation), readBack)
-    },
+    _refuseNotReadBack: (encoded: unknown, operation: string) =>
+      kindReads().model.size === 0
+        ? refuseNotReadBack(encoded, operation)
+        : Effect.andThen(
+            refuseNotReadBack(encoded, operation),
+            refuseOtherKindRead(encoded, operation),
+          ),
+    _ownSchema: () => ownSchema(),
+    _composeUniqueSentinels: (
+      under: DynamoSchema.DynamoSchema,
+      record: globalThis.Record<string, unknown>,
+    ) => composeUniqueSentinels(under, record),
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),

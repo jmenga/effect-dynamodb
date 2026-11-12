@@ -18,6 +18,7 @@ import {
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
 import { encodeBigInt, encodeNumber, isStoredNaN } from "./internal/NumericKey.js"
+import { judgeObjectKeyText } from "./internal/ObjectKeyText.js"
 import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
 import { zonesAsStored } from "./internal/StoredForm.js"
 import {
@@ -688,19 +689,47 @@ export const keyValueText = (
   casing: DynamoSchema.Casing,
 ): string => keyText(schema, compositeText(schema, value), casing)
 
-/** {@link extractComposites} under the schema's setting, each value's {@link keyValueText}. */
+/**
+ * {@link compositeText} of `attr`'s `value` where a key is composed: `key` is the definition whose
+ * key it is and `half` its half. Under a write's own schema (`objectKeys`) an object composing
+ * `[object Object]` is refused here (#242, `EDD-9162`), so only a key actually composed refuses: an
+ * index a write leaves out (sparse, a half skipped) never composes its composites.
+ */
+export const siteCompositeText = (
+  schema: DynamoSchema.DynamoSchema,
+  value: unknown,
+  attr: string | undefined,
+  key: unknown,
+  half: "pk" | "sk" | undefined,
+): string => {
+  const text = compositeText(schema, value)
+  if (schema.objectKeys !== undefined) {
+    judgeObjectKeyText(schema, value, text, () => ({ attr, value, key, half }))
+  }
+  return text
+}
+
+/**
+ * {@link extractComposites} under the schema's setting, each value's {@link keyValueText}. `half`
+ * says which half of `index` they're composed into, for {@link siteCompositeText}.
+ */
 export const extractKeyComposites = (
   schema: DynamoSchema.DynamoSchema,
   index: { readonly casing?: DynamoSchema.Casing | undefined },
   composite: ReadonlyArray<string>,
   record: Record<string, unknown>,
+  half?: "pk" | "sk",
 ): ReadonlyArray<string> =>
   composite.map((attr) => {
     const value = record[attr]
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${attr}" in record`)
     }
-    return keyValueText(schema, value, index.casing ?? schema.casing)
+    return keyText(
+      schema,
+      siteCompositeText(schema, value, attr, index, half),
+      index.casing ?? schema.casing,
+    )
   })
 
 /**
@@ -715,7 +744,7 @@ export const composePk = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
-  const composites = extractKeyComposites(schema, index, index.pk.composite, record)
+  const composites = extractKeyComposites(schema, index, index.pk.composite, record, "pk")
   return composePkText(
     schema,
     entityType,
@@ -1000,7 +1029,7 @@ export const composeSk = (
   record: Record<string, unknown>,
 ): string => {
   assertStringHalf(index, "composeSk")
-  const composites = extractKeyComposites(schema, index, index.sk.composite, record)
+  const composites = extractKeyComposites(schema, index, index.sk.composite, record, "sk")
   const names = [...index.sk.composite]
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
@@ -1073,7 +1102,10 @@ export const composeZOrderSk = (
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${part.field}" in record`)
     }
-    return prefixSegment(keyValueText(schema, value, casing), part.hash)
+    return prefixSegment(
+      keyText(schema, siteCompositeText(schema, value, part.field, index, "sk"), casing),
+      part.hash,
+    )
   })
   const levels = layout.dimensions.map((dim) => {
     const value = record[dim.field]
@@ -1245,7 +1277,7 @@ const composePkPrefixUpTo = (
     schema,
     entityType,
     index,
-    extractKeyComposites(schema, index, slice, record),
+    extractKeyComposites(schema, index, slice, record, "pk"),
     slice,
     composedShardMarker(entityType, index, record),
   )
@@ -1274,7 +1306,7 @@ export const composeSkPrefixUpTo = (
 ): string => {
   assertStringHalf(index, "composeSkPrefixUpTo")
   const slice = index.sk.composite.slice(0, stopBefore)
-  const composites = extractKeyComposites(schema, index, slice, record)
+  const composites = extractKeyComposites(schema, index, slice, record, "sk")
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
 
@@ -2038,7 +2070,7 @@ export const composeVectorPartition = (
   },
   record: Record<string, unknown>,
 ): string => {
-  const composites = extractKeyComposites(schema, index, index.partition, record)
+  const composites = extractKeyComposites(schema, index, index.partition, record, "pk")
   return composeKey(schema, entityType, composites, {
     casing: index.casing,
     names: [...index.partition],
@@ -2504,8 +2536,19 @@ export const composeEventSk: {
     return `${first}#${applyCasing(EVENT_SK_INFIX, casing)}#${escapeKeyText(serializeValue(rest[0]), casing)}`
   }
   const casing = (rest[2] ?? first.casing) as DynamoSchema.Casing
-  return `${rest[0] as string}#${applyCasing(EVENT_SK_INFIX, casing)}#${keyValueText(first, rest[1], casing)}`
+  const text = keyText(
+    first,
+    siteCompositeText(first, rest[1], undefined, EVENT_SORT_KEY, "sk"),
+    casing,
+  )
+  return `${rest[0] as string}#${applyCasing(EVENT_SK_INFIX, casing)}#${text}`
 }
+
+/**
+ * The `key` of the site {@link composeEventSk} composes a time-series event's `orderBy` value at
+ * (`DynamoSchema.ObjectKeySite`), which names no attribute.
+ */
+export const EVENT_SORT_KEY = "timeSeries.orderBy"
 
 /**
  * The value of the `orderBy` attribute an event's sort key holds: its key form with numeric key

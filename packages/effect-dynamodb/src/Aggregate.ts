@@ -36,13 +36,11 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
-  defaultObjectText,
   fieldAtPath,
   type KindTargets,
   kindReadingOf,
   kindTargets,
   makeCompositeKeyForm,
-  objectKeyRefusal,
   readBackAs,
   readBackUnsure,
   readsBackOtherwise,
@@ -1864,14 +1862,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
     marshalOrFail(aggregateName, `aggregate.${operation}`, compose)
 
   /** The partition key `record` composes. Throws what {@link composeOrFail} turns into its failure. */
-  const collectionPkOf = (record: Record<string, unknown>): string =>
+  const collectionPkOf = (
+    record: Record<string, unknown>,
+    /** `create`'s own schema: its partition key is the write's own (`EDD-9162`). */
+    under: DynamoSchemaModule.DynamoSchema = config.schema,
+  ): string =>
     composeCollectionKey(
       config.schema,
       config.collection.name,
       keyCompositesOrThrow(
         aggregateName,
-        "its partition key",
-        config.schema,
+        AGGREGATE_KEY.partition,
+        under,
         config.pk.composite,
         keyRecord(record),
       ),
@@ -2476,124 +2478,55 @@ const makeAggregate = <TSchema extends Schema.Top>(
   /** The static discriminator values each node's sort key composes (`EDD-9162` judges them). */
   const keyEntriesOf = new Map(nodeSlots.map(({ node, keyEntries }) => [node, keyEntries]))
 
-  /** `[object Object]` when `form`, a composite's key-form value, composes it (`defaultObjectText`). */
-  const objectTextOf = (form: unknown): string | undefined => {
-    if (typeof form !== "object" || form === null) return undefined
-    try {
-      return defaultObjectText(form, KeyComposer.compositeText(config.schema, form))
-    } catch {
-      return undefined
-    }
-  }
-
   /**
-   * Refuses a write composing a key from an object that composes `[object Object]`, which every such
-   * object composes alike (`EDD-9162`), as an entity's write is refused: aggregates written with
-   * different values would share one partition, or one list or collection key, or a row would be
-   * keyed by a text no read finds again. The keys a write composes from the value: the root's
-   * partition key (`create`'s alone; `update` writes under the key it's given, composed as a read
-   * composes it), its collection sort key and list keys (sparse, as `buildDynamoItems` composes
-   * them), and every row's static discriminators. A `many` element's sort key already refuses every
-   * object (`manyEdgeSkComposites`).
+   * The keys a write composes its own values into (#242, `EDD-9162`), as an entity's write does: where
+   * the partition key (`create`'s), `buildDynamoItems` or a row's sort key composes a key from an
+   * object composing `[object Object]`, which every such object composes alike, the write is refused
+   * there. Aggregates written with different values would share one partition, or one list or
+   * collection key, or a row would be keyed by a text no read finds again. A key the write doesn't
+   * compose refuses nothing: a list key missing a value. A `many` element's sort key already refuses
+   * every object (`manyEdgeSkComposites`).
    *
-   * `read`, on an `update`, is the aggregate as read and its decomposition: a root composite equal to
-   * the one the root read holds is the key that row is stored under, composed again, as an entity
-   * update's own key record is, so an aggregate an earlier release wrote can still be updated. A
-   * `get`, `list` or `delete` composes the text as it always did.
+   * `read`, on an `update`, is the aggregate as read: a root composite equal to the one the root read
+   * holds is the key that row is stored under, composed again, as an entity update's own key record
+   * is, so an aggregate an earlier release wrote can still be updated. A `get`, `list` or `delete`
+   * composes the text as it always did.
    */
-  const refuseObjectKeys = (
-    groups: ReadonlyArray<TransactionGroup>,
-    rootValue: Record<string, unknown>,
-    operation: string,
-    read?: {
-      readonly groups: ReadonlyArray<TransactionGroup>
-      readonly rootValue: Record<string, unknown>
-    },
-  ): Effect.Effect<void, ValidationError> => {
-    const refusal = (what: string, text: string) =>
-      Effect.fail(
-        new ValidationError({
-          entityType: aggregateName,
-          operation,
-          cause: objectKeyRefusal(what, text),
-        }),
-      )
-    // A record whose key form fails is the key composition's to report (`composeOrFail`), and one
-    // read back that fails has no key to keep.
-    const formOf = (record: Record<string, unknown>) => {
+  const ownKeys = (read?: {
+    readonly rootValue: Record<string, unknown>
+    readonly rootKey: Record<string, unknown> | undefined
+  }): OwnKeys => {
+    // A record whose key form fails has no key to keep.
+    const formOf = (record: Record<string, unknown> | undefined) => {
+      if (record === undefined) return undefined
       try {
         return keyRecord(record)
       } catch {
-        return {}
+        return undefined
       }
     }
-    const rootRead = read?.groups
-      .flatMap((group) => group.items)
-      .find((item) => item.node === rootNode)
-    for (const group of groups) {
-      for (const item of group.items) {
-        if (item.node === rootNode) {
-          const fromValue = formOf(rootValue)
-          const fromKey = formOf(item.keyAttributes ?? item.attributes)
-          const readValue = read === undefined ? undefined : formOf(read.rootValue)
-          const readKey =
-            rootRead === undefined
-              ? undefined
-              : formOf(rootRead.keyAttributes ?? rootRead.attributes)
-          const listComposed =
-            config.list !== undefined &&
-            [...config.list.pk.composite, ...config.list.sk.composite].every((attr) =>
-              hasKeyValue(fromKey[attr]),
-            )
-          const keys: ReadonlyArray<
-            readonly [
-              string,
-              ReadonlyArray<string>,
-              Record<string, unknown>,
-              Record<string, unknown> | undefined,
-            ]
-          > = [
-            ...(read === undefined
-              ? [["its partition key", config.pk.composite, fromValue, undefined] as const]
-              : []),
-            ...(config.collection.index !== undefined && config.collection.sk !== undefined
-              ? [
-                  [
-                    "its collection sort key",
-                    config.collection.sk.composite,
-                    fromValue,
-                    readValue,
-                  ] as const,
-                ]
-              : []),
-            ...(listComposed && config.list !== undefined
-              ? [
-                  ["its list partition key", config.list.pk.composite, fromKey, readKey] as const,
-                  ["its list sort key", config.list.sk.composite, fromKey, readKey] as const,
-                ]
-              : []),
-          ]
-          for (const [into, composite, record, asRead] of keys) {
-            for (const attr of composite) {
-              const text = objectTextOf(record[attr])
-              if (text === undefined) continue
-              if (asRead !== undefined && deepEqual(asRead[attr], record[attr])) continue
-              return refusal(`Field "${attr}" of "${item.member}" is composed into ${into}`, text)
-            }
+    return {
+      schema: {
+        ...config.schema,
+        objectKeys: (site) => {
+          if (site.key instanceof DiscriminatorKey) {
+            return `Discriminator "${site.attr}" of "${site.key.member}" is composed into its sort key`
           }
-        }
-        // No read holds a row keyed by such a discriminator: one is never matched to its node.
-        for (const [attr, value] of keyEntriesOf.get(item.node) ?? []) {
-          const text = objectTextOf(value)
-          if (text === undefined) continue
-          return refusal(
-            `Discriminator "${attr}" of "${item.member}" is composed into its sort key`,
-            text,
-          )
-        }
-      }
+          if (read !== undefined && site.attr !== undefined) {
+            const asRead = formOf(
+              site.key === AGGREGATE_KEY.listPartition || site.key === AGGREGATE_KEY.listSort
+                ? read.rootKey
+                : read.rootValue,
+            )
+            if (asRead !== undefined && deepEqual(asRead[site.attr], site.value)) return undefined
+          }
+          return `Field "${site.attr}" of "${rootNode.entityType}" is composed into ${
+            (site.key as AggregateKey).into
+          }`
+        },
+      },
+      discriminators: (node) => keyEntriesOf.get(node) ?? [],
     }
-    return Effect.void
   }
 
   /** The nodes `item` is handed to by its entity type and static discriminator. */
@@ -2962,10 +2895,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
         config.schema,
         { present: true, value: written, update: true },
       )
-      yield* refuseObjectKeys(newGroups, assembledNew, "aggregate.update", {
-        groups: oldGroups,
-        rootValue: assembledOld,
-      })
 
       // 5. Diff at the ITEM (primary-key) level, not just the group level.
       //    A `many`-edge element — and a cleared `one` edge — lives in its PARENT's
@@ -3016,6 +2945,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       // Packed AFTER the group diff above compared the decomposed values, so
       // an unchanged packed value is never rewritten (#147).
       const newPacked = yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update")
+      const rootRead = oldGroups
+        .flatMap((group) => group.items)
+        .find((item) => item.node === rootNode)
       const newDynamo = yield* composeOrFail("update", () =>
         buildDynamoItems(
           newPacked,
@@ -3024,6 +2956,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
           assembledNew,
           keyRecord,
           stampFor(now, existingCreated, undefined, updatedBefore),
+          ownKeys({
+            rootValue: assembledOld,
+            rootKey:
+              rootRead === undefined ? undefined : (rootRead.keyAttributes ?? rootRead.attributes),
+          }),
         ),
       )
       yield* refuseOtherKindKeys(newGroups, "aggregate.update")
@@ -4162,7 +4099,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const assembled = { ...(decoded as object) } as Record<string, unknown>
 
           // 3. Compose PK
-          const pkValue = yield* composeOrFail("create", () => collectionPkOf(assembled))
+          const own = ownKeys()
+          const pkValue = yield* composeOrFail("create", () =>
+            collectionPkOf(assembled, own.schema),
+          )
 
           // 4. Decompose into items grouped by sub-aggregate transaction boundaries
           const groups = yield* decomposeAggregate(
@@ -4174,7 +4114,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
             config.schema,
             { present: true, value: written, update: false },
           )
-          yield* refuseObjectKeys(groups, assembled, "aggregate.create")
 
           // 5. Build DynamoDB items with composed keys (create only ever PUTs).
           //    Every row is new, so `created` has nothing to carry forward.
@@ -4192,6 +4131,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               assembled,
               keyRecord,
               stampFor(now, EMPTY_CREATED),
+              own,
             ),
           )
           yield* refuseOtherKindKeys(groups, "aggregate.create")
@@ -4314,7 +4254,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const listPkComposites = yield* composeOrFail("list", () =>
             keyCompositesOrThrow(
               aggregateName,
-              "its list partition key",
+              AGGREGATE_KEY.listPartition,
               config.schema,
               listConfig.pk.composite,
               keyRecord(filter ?? {}),
@@ -6983,7 +6923,7 @@ const fillStamps = (
  */
 const keyCompositesOrThrow = (
   aggregateName: string,
-  key: string,
+  key: AggregateKey,
   schema: DynamoSchemaModule.DynamoSchema,
   composite: ReadonlyArray<string>,
   record: Record<string, unknown>,
@@ -6995,12 +6935,48 @@ const keyCompositesOrThrow = (
       value: undefined,
       reason: `no value for ${names}`,
       message:
-        `[EDD-9123] Aggregate "${aggregateName}": ${key} is composed from ${names}, which has no ` +
-        `value here. An aggregate can't be read without this key, so nothing was sent. Supply it, ` +
-        `or compose the key from a field that always has one.`,
+        `[EDD-9123] Aggregate "${aggregateName}": ${key.into} is composed from ${names}, which has ` +
+        `no value here. An aggregate can't be read without this key, so nothing was sent. Supply ` +
+        `it, or compose the key from a field that always has one.`,
     })
   }
-  return KeyComposer.extractKeyComposites(schema, {}, composite, record)
+  return KeyComposer.extractKeyComposites(schema, key, composite, record)
+}
+
+/**
+ * A key an aggregate composes from its root's values, by what the refusals call it. Its composites
+ * take the schema's casing.
+ */
+interface AggregateKey {
+  readonly into: string
+  readonly casing?: undefined
+}
+
+/**
+ * The keys an aggregate composes from its root's values, each the definition its composites are
+ * composed for (`DynamoSchema.ObjectKeySite.key`), so a write's own schema names it (#242).
+ */
+const AGGREGATE_KEY: {
+  readonly [K in "partition" | "collectionSort" | "listPartition" | "listSort"]: AggregateKey
+} = {
+  partition: { into: "its partition key" },
+  collectionSort: { into: "its collection sort key" },
+  listPartition: { into: "its list partition key" },
+  listSort: { into: "its list sort key" },
+}
+
+/** The sort key a row's static discriminator is composed into: the row's, by its member. */
+class DiscriminatorKey {
+  constructor(readonly member: string) {}
+}
+
+/**
+ * What a write composes its own keys under (#242, `EDD-9162`): its own schema, and each row's
+ * static discriminators, which its sort key composes.
+ */
+interface OwnKeys {
+  readonly schema: DynamoSchemaModule.DynamoSchema
+  readonly discriminators: (node: ResolvedNode) => ReadonlyArray<readonly [string, unknown]>
 }
 
 /** A single write's stamp: when, and what `created` to preserve. */
@@ -7046,11 +7022,29 @@ const buildDynamoItems = (
    */
   keyRecord: (record: Record<string, unknown>) => Record<string, unknown>,
   stamp?: Stamp | undefined,
+  /**
+   * A write's own keys (`create`, `update`): each key composed here from an object composing
+   * `[object Object]` refuses the write where it's composed (`EDD-9162`), and so does a row's
+   * static discriminator. Absent, the keys are composed as they always were.
+   */
+  own?: OwnKeys | undefined,
 ): ReadonlyArray<{ group: string; items: ReadonlyArray<Record<string, AttributeValue>> }> =>
   groups.map((group) => ({
     group: group.name,
     items: group.items.map((item) => {
       const attrs: Record<string, unknown> = { ...item.attributes }
+      const schema = own?.schema ?? config.schema
+      if (own !== undefined) {
+        for (const [attr, value] of own.discriminators(item.node)) {
+          KeyComposer.siteCompositeText(
+            schema,
+            value,
+            attr,
+            new DiscriminatorKey(item.member),
+            "sk",
+          )
+        }
+      }
 
       // Add entity type discriminator
       attrs.__edd_e__ = item.entityType
@@ -7105,8 +7099,8 @@ const buildDynamoItems = (
               config.collection.name,
               keyCompositesOrThrow(
                 config.root.entityType,
-                "its collection sort key",
-                config.schema,
+                AGGREGATE_KEY.collectionSort,
+                schema,
                 collectionSk.composite,
                 keyRecord({ ...rootValue, ...stamped }),
               ),
@@ -7126,8 +7120,8 @@ const buildDynamoItems = (
         const listComposites = [...config.list.pk.composite, ...config.list.sk.composite]
         if (listComposites.every((attr) => hasKeyValue(listKeyValues[attr]))) {
           const listPkComposites = KeyComposer.extractKeyComposites(
-            config.schema,
-            {},
+            schema,
+            AGGREGATE_KEY.listPartition,
             config.list.pk.composite,
             listKeyValues,
           )
@@ -7145,8 +7139,8 @@ const buildDynamoItems = (
             )
           }
           const listSkComposites = KeyComposer.extractKeyComposites(
-            config.schema,
-            {},
+            schema,
+            AGGREGATE_KEY.listSort,
             config.list.sk.composite,
             listKeyValues,
           )

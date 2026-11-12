@@ -817,10 +817,13 @@ export const validateAndBuildPutItem = (
     for (const field of [sf.createdAt, sf.updatedAt, sf.version]) {
       if (field) composed[field] = Object.hasOwn(stamps, field) ? stamps[field] : item[field]
     }
+    // The item is written whole: every key composed from it is its own, and an object composing
+    // `[object Object]` into one is refused where it's composed (`EDD-9162`).
+    const own = entity._ownSchema()
     const composeKeys = (carried: Record<string, unknown>) =>
       composeKeysOrFail(entity.entityType, operation, () =>
         KeyComposer.composeAllKeys(
-          entity._schema,
+          own,
           entity.entityType,
           1,
           entity.indexes,
@@ -831,7 +834,8 @@ export const validateAndBuildPutItem = (
     // A unique field's sentinel key is composed from its value later, on the
     // guarded path, after this item is marshalled. One with no key text
     // (`NaN`, `[EDD-9096]`) is refused here, as `Entity.put` refuses it, not
-    // by the marshaller as a defect.
+    // by the marshaller as a defect; so is an object composing `[object Object]`
+    // into a sentinel composed.
     yield* composeKeysOrFail(entity.entityType, operation, () => {
       for (const def of Object.values(entity.unique ?? {})) {
         for (const field of resolveUniqueFields(def as UniqueConstraintDef)) {
@@ -841,6 +845,7 @@ export const validateAndBuildPutItem = (
           }
         }
       }
+      if (own !== entity._schema) entity._composeUniqueSentinels(own, composed)
     })
 
     Object.assign(item, stamps)

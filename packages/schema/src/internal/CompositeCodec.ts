@@ -76,28 +76,7 @@ export interface CompositeKeyFormOptions {
   readonly reads?: ((attr: string) => boolean) | undefined
 }
 
-/**
- * The key text a composite's key-form value composes when it's an object nothing gives other text
- * to, `[object Object]` (or another `[object …]` tag), which every such value composes alike, so rows
- * written with different values would share one key (#242, `EDD-9162`). `undefined` for any other
- * value: text, a number, a date, a look-alike the key form makes an instance of, a class with a
- * `toString` of its own. `text` is the text the value composed.
- */
-export const defaultObjectText = (value: unknown, text: string): string | undefined =>
-  typeof value === "object" && value !== null && text === Object.prototype.toString.call(value)
-    ? text
-    : undefined
-
-/**
- * The refusal of an object composed into a key for a write (`EDD-9162`): `what` names the field and
- * what composes it, and `text` is the text it composed.
- */
-export const objectKeyRefusal = (what: string, text: string): string =>
-  `${what}, and the value given composes the key text "${text}", which every such object ` +
-  "composes alike: items written with different values would share one key. Nothing was written. " +
-  "Compose the key from a field holding text, a number or a date, or give the value a toString of " +
-  "its own. A get, a delete or a query given such a value still composes that text, to reach a row " +
-  "an earlier release wrote. [EDD-9162]"
+export { defaultObjectText, objectKeyRefusal } from "./ObjectKeyText.js"
 
 /**
  * The refusal of a composite's number its declared kind can't hold exactly (the

@@ -157,6 +157,117 @@ describe("[EDD-9162] a write composing a key from an object is refused", () => {
   }
 })
 
+describe("a key the write doesn't compose refuses nothing, as 1.40.0 stored it", () => {
+  // `missing` absent: neither the index nor the constraints compose, whatever `u` holds. 1.40.0
+  // stored the item without index keys or sentinels; so does every write here.
+  const model = Schema.Struct({
+    id: Schema.String,
+    u: Schema.Unknown,
+    missing: Schema.optional(Schema.String),
+    n: Schema.optional(Schema.String),
+  })
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const byU = {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["missing", "u"] },
+    sk: { field: "gsi1sk", composite: [] },
+  } as const
+  const Indexed = Entity.make({ model, entityType: "I", primaryKey, indexes: { byU } })
+  const Unique = Entity.make({
+    model,
+    entityType: "U",
+    primaryKey,
+    unique: { leading: ["missing", "u"], trailing: ["u", "missing"] },
+  })
+  const Retained = Entity.make({
+    model,
+    entityType: "R",
+    primaryKey,
+    indexes: { byU },
+    versioned: { retain: true },
+  })
+  const SparseMain = Table.make({ schema, entities: { Indexed, Unique, Retained } })
+  const sparse = <A>(body: (db: any) => Effect.Effect<A, unknown, any>) => {
+    const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Indexed, Unique, Retained },
+        tables: { Main: SparseMain },
+      })
+      yield* body(db)
+      return [...table.items.values()]
+    }).pipe(
+      Effect.provide(SparseMain.layer({ name: "ok" })),
+      Effect.provide(table.layer),
+    ) as unknown as Effect.Effect<ReadonlyArray<unknown>, unknown>
+  }
+  const run = (op: any) => (typeof op.asEffect === "function" ? op.asEffect() : op)
+  const u = { a: 1 }
+  const WRITES: ReadonlyArray<
+    readonly [string, string, (db: any) => Effect.Effect<unknown, unknown>]
+  > = [
+    ["put", "I", (db) => run(db.entities.Indexed.put({ id: "a", u }))],
+    ["create", "I", (db) => run(db.entities.Indexed.create({ id: "a", u }))],
+    ["upsert", "I", (db) => run(db.entities.Indexed.upsert({ id: "a", u }))],
+    [
+      "a transaction's put",
+      "I",
+      (db) => Transaction.transactWrite([db.entities.Indexed.put({ id: "a", u })]),
+    ],
+    ["a batch's put", "I", (db) => Batch.write([db.entities.Indexed.put({ id: "a", u })])],
+    [
+      "update .set",
+      "I",
+      (db) =>
+        Effect.andThen(run(db.entities.Indexed.put({ id: "a", u: "text" })), () =>
+          run(db.entities.Indexed.update({ id: "a" }).set({ u })),
+        ),
+    ],
+    ["a retained put", "R", (db) => run(db.entities.Retained.put({ id: "a", u }))],
+    [
+      "a retained update",
+      "R",
+      (db) =>
+        Effect.andThen(run(db.entities.Retained.put({ id: "a", u: "text" })), () =>
+          run(db.entities.Retained.update({ id: "a" }).set({ u })),
+        ),
+    ],
+    ["a unique put", "U", (db) => run(db.entities.Unique.put({ id: "a", u }))],
+    ["a unique create", "U", (db) => run(db.entities.Unique.create({ id: "a", u }))],
+    [
+      "a unique transaction's put",
+      "U",
+      (db) => Transaction.transactWrite([db.entities.Unique.put({ id: "a", u })]),
+    ],
+    [
+      "a unique update",
+      "U",
+      (db) =>
+        Effect.andThen(run(db.entities.Unique.put({ id: "a", u: "text" })), () =>
+          run(db.entities.Unique.update({ id: "a" }).set({ u })),
+        ),
+    ],
+  ]
+  for (const [name, type, write] of WRITES) {
+    it.effect(name, () =>
+      Effect.gen(function* () {
+        const rows = (yield* sparse(write)) as ReadonlyArray<any>
+        expect(rows.filter((row) => row.__edd_e__?.S === type).map((row) => row.u)).toContainEqual({
+          M: { a: { N: "1" } },
+        })
+        // No index key, and no sentinel: nothing composed the object.
+        for (const row of rows) {
+          expect(row).not.toHaveProperty("gsi1pk")
+          expect(JSON.stringify(row)).not.toContain("[object object]")
+        }
+      }),
+    )
+  }
+})
+
 describe("a key-taking read or delete composes the text as it always did", () => {
   /** A row as 1.40.0 wrote it for `{ id: "a", k: { a: 1 }, n: "kept" }`. */
   const seed = (table: ReturnType<typeof makeRecordingTable>) =>
