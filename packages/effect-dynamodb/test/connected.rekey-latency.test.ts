@@ -14,13 +14,17 @@
  */
 
 import { it } from "@effect/vitest"
-import { Config, Duration, Effect, Layer } from "effect"
-import { describe } from "vitest"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import { Config, Deferred, Duration, Effect, Layer, Schema } from "effect"
+import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-import { type Around, gatedClient } from "./helpers/GatedClient.js"
+import { type Around, gatedClient, moveAnswerHeld } from "./helpers/GatedClient.js"
 import { seeded } from "./helpers/RandomTables.js"
 import * as RekeyChains from "./helpers/RekeyChains.js"
+import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -148,5 +152,100 @@ describeConnected("#240 rekey with its requests answered at random speeds, on Dy
         )
       }
     })
+  }
+})
+
+const accounts = (escapeKeys: boolean) => {
+  const schema = DynamoSchema.make({ name: "inflight", version: 1, escapeKeys })
+  const Accounts = Entity.make({
+    model: Schema.Struct({ id: Schema.String, email: Schema.String }),
+    entityType: "Account",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    unique: { email: ["email"] },
+  })
+  const MainTable = Table.make({ schema, entities: { Accounts } })
+  return {
+    schema,
+    MainTable,
+    client: DynamoClient.make({ entities: { Accounts }, tables: { MainTable } }),
+  }
+}
+
+const sentinelPk = (world: ReturnType<typeof accounts>, email: string) =>
+  DynamoSchema.composeUniqueKey(world.schema, "Account", "email", [
+    KeyComposer.keyText(world.schema, email, "lowercase"),
+  ]).pk
+
+/**
+ * One order random speeds reach only now and then, forced on DynamoDB Local (`moveAnswerHeld`).
+ * Off: `foo%20bar`'s sentinel goes where `foo bar`'s is, so `foo%20bar`'s pass moves `foo bar`'s
+ * sentinel out of its way, to `foo bar`'s current key. `foo bar`'s own pass reads that key before
+ * the move lands and its old key after, with the move's answer not back. Finding the sentinel under
+ * neither, the pass reads its current key again and takes the move as its work; without that read
+ * it counted its item `unchanged`, which a run meeting the rows in another order doesn't. Each
+ * step that never comes is given up after five seconds, so a broken order fails, not hangs.
+ */
+describeConnected("#240 a sentinel moved to its current key by another pass, on DynamoDB", () => {
+  for (const concurrency of [2, 4]) {
+    it.live(
+      `that move's answer not back: the item's pass takes the move as its work (${concurrency} at once)`,
+      () =>
+        Effect.gen(function* () {
+          const was = accounts(true)
+          const now = accounts(false)
+          const tableName = `inflight-${Date.now()}-${tables++}`
+          const held = yield* moveAnswerHeld(
+            { current: sentinelPk(now, "foo bar"), old: sentinelPk(now, "foo%20bar") },
+            (deferred) => Deferred.await(deferred).pipe(Effect.timeoutOption(Duration.seconds(5))),
+          )
+          const gated = Layer.effect(
+            DynamoClient,
+            Effect.gen(function* () {
+              return gatedClient(yield* DynamoClient, held.around)
+            }),
+          ).pipe(Layer.provide(ClientLayer))
+          const run = (options: Table.RekeyOptions) =>
+            Effect.gen(function* () {
+              const db = yield* now.client
+              return yield* db.tables.MainTable.rekey(options)
+            })
+          const body = Effect.gen(function* () {
+            const writer = yield* was.client.pipe(
+              Effect.provide(was.MainTable.layer({ name: tableName })),
+            )
+            yield* writer.entities.Accounts.put({ id: "a", email: "foo%20bar" }).asEffect()
+            yield* writer.entities.Accounts.put({ id: "b", email: "foo bar" }).asEffect()
+            const dry = yield* run({ concurrency, dryRun: true }).pipe(
+              Effect.provide(now.MainTable.layer({ name: tableName })),
+            )
+            const real = yield* run({ concurrency }).pipe(
+              Effect.provide(Layer.merge(gated, now.MainTable.layer({ name: tableName }))),
+            )
+            return { dry, real }
+          })
+          const { dry, real } = yield* Effect.acquireUseRelease(
+            Effect.gen(function* () {
+              const client = yield* DynamoClient
+              yield* client.createTable({
+                TableName: tableName,
+                BillingMode: "PAY_PER_REQUEST",
+                ...Table.definition(now.MainTable),
+              })
+            }),
+            () => body,
+            () =>
+              Effect.gen(function* () {
+                const client = yield* DynamoClient
+                yield* client.deleteTable({ TableName: tableName })
+              }).pipe(Effect.ignore),
+          ).pipe(Effect.provide(ClientLayer))
+          expect(held.order()).toEqual({ readBefore: true, readAfter: true })
+          expect(real.conflicts).toEqual([])
+          expect(real.sentinelsMoved).toBe(2)
+          expect(real.unchanged).toBe(0)
+          expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
+        }),
+      60_000,
+    )
   }
 })

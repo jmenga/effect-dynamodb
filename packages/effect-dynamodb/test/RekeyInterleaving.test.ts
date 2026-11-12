@@ -3,7 +3,8 @@
  * the same report, the same rows stored, and a dry run that says the same. Each test forces one
  * interleaving with a gated client ({@link gatedClient}): a row's two visits (the scan's, and a move's
  * that needs it out of the way) racing for one write, a segment scanned only after the run moved a row
- * it holds, aggregates sharing a partition met in every order. DynamoDB Local meets these only under
+ * it holds, a pass reading a key another pass's move has written before that move's answer is back,
+ * aggregates sharing a partition met in every order. DynamoDB Local meets these only under
  * load (`connected.rekey-chains.test.ts`, `connected.sharding.test.ts`); here each runs every time.
  */
 
@@ -16,7 +17,7 @@ import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
-import { deletesAt, gatedLayer } from "./helpers/GatedClient.js"
+import { deletesAt, gatedLayer, moveAnswerHeld } from "./helpers/GatedClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 import { storedRows } from "./helpers/StoredRows.js"
@@ -236,6 +237,43 @@ describe("a row's two visits judge it once", () => {
           expect(decided(dry)).toEqual(decided(real))
           expect(again).toMatchObject({ conflicts: [], unchanged: 2, scanned: 2 })
         }),
+    )
+  }
+})
+
+describe("a sentinel moved to its current key by another pass, that move's answer not back", () => {
+  for (const concurrency of [2, 4]) {
+    it.effect(`the item's pass takes the move as its work (${concurrency} at once)`, () =>
+      Effect.gen(function* () {
+        // Off: `foo%20bar`'s sentinel goes where `foo bar`'s is, so `foo%20bar`'s pass moves
+        // `foo bar`'s sentinel out of its way, to `foo bar`'s current key. `foo bar`'s own pass
+        // reads that key before the move lands and its old key after, with the move's answer not
+        // back: the run has put the sentinel there, though it doesn't know yet. Finding it under
+        // neither key it read, the pass reads its current key again, as it does once the answer
+        // is back, and takes the move as its work.
+        const now = accounts(false)
+        const held = yield* moveAnswerHeld(
+          { current: sentinelPk(now, "foo bar"), old: sentinelPk(now, "foo%20bar") },
+          (deferred) =>
+            Effect.raceFirst(
+              Deferred.await(deferred),
+              Effect.forEach(Array.from({ length: 2000 }), () => Effect.yieldNow, {
+                discard: true,
+              }),
+            ),
+        )
+        const { dry, real } = yield* sentinelRuns(
+          false,
+          { a: "foo%20bar", b: "foo bar" },
+          (_now, run) => (run === "real" ? held.around : open()),
+          { concurrency },
+        )
+        expect(held.order()).toEqual({ readBefore: true, readAfter: true })
+        expect(real.conflicts).toEqual([])
+        expect(real.sentinelsMoved).toBe(2)
+        expect(real.unchanged).toBe(0)
+        expect(decided(dry)).toEqual(decided(real))
+      }),
     )
   }
 })
