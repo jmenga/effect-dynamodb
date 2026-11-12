@@ -61,6 +61,7 @@ import {
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import { readingInstances } from "@effect-dynamodb/schema/internal/InstanceReads.js"
+import { keyReadings } from "@effect-dynamodb/schema/internal/KeyReadings.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
 import { KeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
@@ -3694,8 +3695,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
     const record = keyRecord(key)
     // Its zones under the names they were given, as 1.38.0 to 1.40.0 keyed them on Effect 4.1.3: a
     // rekey-only reading (`givenZoneReading`).
-    const given = givenZoneReading(record, fromAttributeMap(row) as Record<string, unknown>)
-    const readings = given === undefined ? [record] : [record, given]
+    const readings = keyReadings(record, [
+      givenZoneReading(record, fromAttributeMap(row) as Record<string, unknown>),
+    ])
     return [
       config.schema,
       KeyText136.schema136(config.schema),

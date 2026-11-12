@@ -1,0 +1,92 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0 + effect@4.1.3",
+ "note": "Captured once from the published effect-dynamodb 1.39.0 and @effect-dynamodb/schema 1.39.0 build running on effect 4.1.3 (not 4.1.2), on DynamoDB Local (Node 24, ICU 78.3). Never regenerate it.",
+ "describes": "One table on DynamoSchema { name: mx, version: 1 }: Mixed (id: String, d: Duration, at: DateTimeZoned, note?: String; pk [id], sk [d, at], softDelete: true). Item a (d 1500 millis, at epoch 0 zoned in Etc/UTC, note a) put, deleted and restored; item b (the same key values, note b) put. rows is the table scanned afterwards, sorted by pk|sk; results each step's outcome (1.39.0 itself no longer found a after its restore).",
+ "results": {
+  "putA": "ok",
+  "deleteA": "ok",
+  "restoreA": "ok",
+  "getA": {
+   "tag": "ItemNotFound",
+   "says": ""
+  },
+  "putB": "ok",
+  "getB": "ok"
+ },
+ "rows": [
+  {
+   "note": {
+    "S": "a"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "d": {
+    "M": {
+     "~effect/Duration": {
+      "S": "~effect/Duration"
+     },
+     "value": {
+      "M": {
+       "millis": {
+        "N": "1500"
+       },
+       "_tag": {
+        "S": "Millis"
+       }
+      }
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Mixed"
+   },
+   "sk": {
+    "S": "$mx#v1#mixed#d_[object object]#at_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "id": {
+    "S": "a"
+   },
+   "pk": {
+    "S": "$mx#v1#mixed#id_a"
+   }
+  },
+  {
+   "note": {
+    "S": "b"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "d": {
+    "M": {
+     "~effect/Duration": {
+      "S": "~effect/Duration"
+     },
+     "value": {
+      "M": {
+       "millis": {
+        "N": "1500"
+       },
+       "_tag": {
+        "S": "Millis"
+       }
+      }
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Mixed"
+   },
+   "sk": {
+    "S": "$mx#v1#mixed#d_1500 millis#at_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "id": {
+    "S": "b"
+   },
+   "pk": {
+    "S": "$mx#v1#mixed#id_b"
+   }
+  }
+ ]
+}

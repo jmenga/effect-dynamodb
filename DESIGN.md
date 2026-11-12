@@ -1850,7 +1850,10 @@ the row for `rekey` alone (`restoredObjectReading`,
 `internal/RestoredKeyText.ts`) gives each composite stored as a map the key form
 makes an instance of its map's text, the text that `restore` composed, so the
 key is an earlier position of the row, moved from under the usual guards, in a
-dry run counted only. Nothing else composes that text for a write (`EDD-9162`).
+dry run counted only; it is combined with the other earlier readings composite by
+composite (`keyReadings`, "Readings combined composite by composite"), so a key that
+also holds a zone under its given name is found. Nothing else composes that text for a
+write (`EDD-9162`).
 The sentinel that `restore` wrote under `[object object]` names the key the item
 left: `rekey` leaves it and counts it as `unrecognizedKey`. The value stays
 reserved by the sentinel `put` wrote, which that `restore`'s soft delete didn't
@@ -5289,6 +5292,26 @@ hold its stream id, which is text, so they hold no zone. Pinned by
 sentinels, snapshots, tombstones, events, an index, an aggregate) and 1.39.0 wrote on
 4.1.3 (`named-zone-keys-1.39.0-effect-4.1.3.json`: a zone itself), with a case-only
 zone and a zone of one name that don't move.
+
+**Readings combined composite by composite (`rekey`, 1.41.0).** One key can hold composites
+earlier releases each composed their own way: 1.39.0 on Effect 4.1.3 restored an item keyed
+by a `Duration` and a date zoned in `Etc/UTC` under `…#d_[object object]#at_…[etc/utc]`, the
+`Duration` as `restoredObjectReading` reads it and the zone as `givenZoneReading` does, a key
+no one reading composes. So `rowKeyForms` (and an aggregate's `holdsPartition`) hands the
+key form's record and each earlier reading (`keyForm139`, `givenZoneReading`,
+`restoredObjectReading`) to `keyReadings` (`internal/KeyReadings.ts`), which reads each
+composite as the key form does or as any earlier reading does, in every combination: the key
+form's reading first, then each earlier reading by itself, then the other combinations, fewest
+composites changed first, no reading twice. Each reading is composed under every form of key
+text (1.36's, 1.37's, the escaped one, the inverted index's), as every reading was, so the
+product covers both. The readings are capped at `READINGS_BOUND`, 64 per row: every
+combination of six composites read two ways, or three read four ways. Past it, the
+combinations changing the most composites aren't tried; a row stored under one of them isn't
+recognised, stays where it is and is counted `skipped.unrecognizedKey`, and the dry run
+counts it the same way. Each earlier reading by itself is always among the 64. A row no
+earlier reading reads differently has the key form's reading alone, so its run costs nothing
+more. Pinned by `MixedReadingsRekey.test.ts` on the rows published 1.39.0 wrote on 4.1.3
+(`mixed-restore-keys-1.39.0-effect-4.1.3.json`), under either `escapeKeys` setting.
 
 **Zones those releases stored as values (`rekey`, 1.41.0).** On Effect 4.1.3, 1.38.0 to
 1.40.0 stored every named zone's map with its `resolvedId` (any zone, not only an alias),

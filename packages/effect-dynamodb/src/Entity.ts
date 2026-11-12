@@ -66,6 +66,7 @@ import {
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacked.js"
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
+import { keyReadings } from "@effect-dynamodb/schema/internal/KeyReadings.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
 import { unpackStoredSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
@@ -13849,34 +13850,22 @@ const makeImpl = <
   const bytesText = (bytes: Uint8Array): string => String.fromCharCode(...bytes)
 
   /**
-   * A row's values in the key form, then in 1.39.0's where that differs (`keyForm139`), then with
-   * each zone under the name it was given where a value names one so (`givenZoneReading`: the text
-   * 1.38.0 to 1.40.0 composed on Effect 4.1.3), then with each composite stored as a map the key
-   * form makes an instance of under the map's text (`restoredObjectReading`: what 1.39.0's and
-   * 1.40.0's `restore` composed, `[object object]`): the records each key text a row may be stored
-   * under is composed from.
+   * The records each key text a row may be stored under is composed from (`keyReadings`): its
+   * values in the key form, and each composite as an earlier release read it, in every combination
+   * — in 1.39.0's form (`keyForm139`), with each zone under the name it was given where a value
+   * names one so (`givenZoneReading`: the text 1.38.0 to 1.40.0 composed on Effect 4.1.3), and with
+   * each composite stored as a map the key form makes an instance of under the map's text
+   * (`restoredObjectReading`: what 1.39.0's and 1.40.0's `restore` composed, `[object object]`).
    */
   const rowKeyForms = (
     values: globalThis.Record<string, unknown>,
   ): ReadonlyArray<globalThis.Record<string, unknown>> => {
     const rowKeyForm = keyForm(values)
-    const rowKeyForm139 = keyForm139(values)
-    const readings = Object.keys(rowKeyForm139).some(
-      (attr) =>
-        !Object.is(
-          rowKeyForm139[attr],
-          Object.hasOwn(rowKeyForm, attr) ? rowKeyForm[attr] : undefined,
-        ),
-    )
-      ? [rowKeyForm, rowKeyForm139]
-      : [rowKeyForm]
-    const given = givenZoneReading(rowKeyForm, values, readsKey)
-    const restored = restoredObjectReading(rowKeyForm, values, readsKey)
-    return [
-      ...readings,
-      ...(given === undefined ? [] : [given]),
-      ...(restored === undefined ? [] : [restored]),
-    ]
+    return keyReadings(rowKeyForm, [
+      keyForm139(values),
+      givenZoneReading(rowKeyForm, values, readsKey),
+      restoredObjectReading(rowKeyForm, values, readsKey),
+    ])
   }
 
   type RowTargets = {

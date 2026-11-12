@@ -119,6 +119,8 @@ A key composite holding one of Effect's look-alikes (a `Duration`, `BigDecimal`,
 
 `rekey` reads such an item's stored map as the text that `restore` composed, recognises `[object object]` as an earlier place of the row, and moves it to the key `put` wrote, its index keys with it, with the usual guards, dry run, report and resume. Afterwards `get` finds it, and a second run moves nothing.
 
+A key can hold composites earlier releases each composed their own way: 1.39.0 on `effect` 4.1.3 restored an item keyed by a `Duration` and a date zoned in `Etc/UTC` under `…#d_[object object]#at_…[etc/utc]`, the `Duration` as its map and the zone [as given](#rows-keyed-by-a-zones-given-name-effect-413). `rekey` reads each composite every way an earlier release read it (in 1.39.0's form, a zone as given, a map as `restore` read it), in every combination, fewest composites read another way first, up to 64 readings of one row. Past that, a row stored under a combination it didn't try is left where it is and counted in `skipped.unrecognizedKey`; each earlier release's reading by itself is always tried. 64 covers every combination of six composites read two ways, or three read four ways.
+
 The unique-constraint sentinel that `restore` wrote under `[object object]` names the key the item left, so `rekey` leaves it and counts it as `skipped.unrecognizedKey`, on every run. The value stays reserved: 1.39.0's soft delete didn't release the sentinel `put` wrote, which names the item's key as `put` wrote it. With `escapeKeys` off that's where the item moves, and with it turned on, that sentinel moves with the item. No write composes `[object object]` since 1.41.0 (`EDD-9162`), so the leftover sentinel holds nothing back.
 
 ## Turning `escapeKeys` on over existing data
