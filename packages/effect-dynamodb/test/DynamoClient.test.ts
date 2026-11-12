@@ -1167,17 +1167,17 @@ describe("DynamoClient", () => {
             // Type-level only — never invoked. The calls below would throw
             // EDD-9053 / EDD-9045 at runtime; what is under test is that they
             // do not COMPILE, which `tsconfig.test.json` checks (#106).
-            const _neverRun = () => {
+            const _neverRun = () => [
               // Every SK composite pinned by the accessor.
               // @ts-expect-error `.where()` is gone once SkRemaining is never
               db.entities.Balls.primary({ matchId: "m-1", ballKey: "1-009" }).where(() => ({
                 gte: "1-0",
-              }))
+              })),
 
               // Index whose sort key has no composites at all.
               // @ts-expect-error `.where()` is gone once SkRemaining is never
-              db.entities.Lookups.byEmail({ email: "a@b.c" }).where(() => ({ gte: "x" }))
-            }
+              db.entities.Lookups.byEmail({ email: "a@b.c" }).where(() => ({ gte: "x" })),
+            ]
             void _neverRun
 
             // Still offered while a composite remains open.
