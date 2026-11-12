@@ -3,7 +3,8 @@
  * `Date` in a `Schema.Unknown` field as an empty map and read it back as `{}`, with no error. Every
  * write path refuses one and writes nothing, natively and packed alike, by one function
  * (`LostValues`); a row already holding `{}` reads as `{}`; and a model with no untyped position has
- * no check at all.
+ * no check at all. What isn't refused (a list holding `undefined`, a function or a hole, and a
+ * bigint) is pinned as 1.40.0 stores it, natively and packed, on Effect 4.1.2 and 4.1.3 alike.
  */
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -197,6 +198,60 @@ describe("natively and packed, one decision", () => {
       expect(row.loose).toEqual({})
     }).pipe(Effect.provide(Main.layer({ name: "lost" })), Effect.provide(table.layer))
   })
+})
+
+describe("left as 1.40.0 stores them, on Effect 4.1.2 and 4.1.3 alike", () => {
+  /** A list with nothing at index 1. */
+  const holed = () => {
+    const list: Array<unknown> = [1]
+    list[2] = 2
+    return list
+  }
+  const closedUp = { stored: { L: [{ N: "1" }, { N: "2" }] }, read: [1, 2] }
+  const notJson = (at: string, what: string) =>
+    `Packed attribute "packed": the value at ${at} is ${what}, which JSON cannot represent.`
+  /**
+   * Each value this release doesn't refuse in an untyped field (`EDD-9161` lists what it does):
+   * natively, the attribute stored and what a read hands back; packed, the refusal 1.40.0 gave too.
+   */
+  const KEPT: ReadonlyArray<
+    readonly [string, () => unknown, { readonly stored: unknown; readonly read: unknown }, string]
+  > = [
+    ["undefined in a list", () => [1, undefined, 2], closedUp, notJson("packed[1]", "undefined")],
+    ["a function in a list", () => [1, () => 0, 2], closedUp, notJson("packed[1]", "a function")],
+    ["a hole in a list", holed, closedUp, notJson("packed[1]", "undefined")],
+    ["a bigint", () => 5n, { stored: { N: "5" }, read: 5 }, notJson("packed", "a bigint")],
+    [
+      "a bigint past 2^53",
+      () => 2n ** 60n + 1n,
+      { stored: { N: "1152921504606846977" }, read: 2n ** 60n + 1n },
+      notJson("packed", "a bigint"),
+    ],
+    [
+      "a bigint in a map",
+      () => ({ n: 5n }),
+      { stored: { M: { n: { N: "5" } } }, read: { n: 5 } },
+      notJson("packed.n", "a bigint"),
+    ],
+  ]
+  for (const [name, make, native, packed] of KEPT) {
+    it.effect(name, () => {
+      const table = makeRecordingTable()
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Values }, tables: { Main } })
+        yield* db.entities.Values.put({ id: "loose", loose: make() }).asEffect()
+        const row = [...table.items.values()].find((item) => item.id?.S === "loose")
+        const got = yield* db.entities.Values.get({ id: "loose" })
+        expect({ stored: row?.loose, read: got.loose }).toEqual(native)
+        const exit = yield* Effect.exit(
+          db.entities.Values.put({ id: "packed", packed: make() }).asEffect(),
+        )
+        expect(String(failureOf(exit)?.cause)).toContain(packed)
+        expect(failureOf(exit)).toBeInstanceOf(ValidationError)
+        expect(table.items.size).toBe(1)
+      }).pipe(Effect.provide(Main.layer({ name: "lost" })), Effect.provide(table.layer))
+    })
+  }
 })
 
 describe("what a model with no untyped position pays", () => {
