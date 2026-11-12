@@ -20,6 +20,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, Result, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -362,13 +363,13 @@ describe("a zone at any depth is keyed, reserved and stored under its resolved n
           }
         }
         expect(equalPairs).toBeGreaterThan(0)
-        // Each the text of the resolved name, the same on either Effect.
+        // Each the text of the resolved name, the same on either Effect (escaped under
+        // `escapeKeys`, as the `test:escape-on` runs set it).
+        const text = AppSchema.escapeKeys
+          ? KeyComposer.escapeKeyText(container.text, "lowercase")
+          : container.text
         for (const { how, name, key } of texts.filter((t) => resolved(t.name) === "UTC")) {
-          expect({ how, name, key }).toEqual({
-            how,
-            name,
-            key: `$zd#v1#${keyed}#f_${container.text}`,
-          })
+          expect({ how, name, key }).toEqual({ how, name, key: `$zd#v1#${keyed}#f_${text}` })
         }
       }).pipe(
         Effect.provide(Main.layer({ name: "zd" })),
