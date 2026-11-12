@@ -179,13 +179,27 @@ export const cases: ReadonlyArray<Case> = [
   { expression: "contains(#l, :two_s)", holds: true },
   { expression: "contains(#l, :one)", holds: true },
   { expression: "contains(#missing, :x)", holds: false },
-  // size: a string's characters (on DynamoDB Local, UTF-16 code units; the evaluator can't tell
-  // for a string beyond ASCII), a set's members, a list's elements, a map's keys, a binary's bytes.
+  // size: a string's length (on DynamoDB Local, UTF-16 code units: "é" is 1, "😀" is 2), a set's
+  // members, a list's elements, a map's keys, a binary's bytes. Beyond ASCII the evaluator answers
+  // only where UTF-16 code units, code points and UTF-8 bytes all give the same answer ("é": 1, 1, 2;
+  // "😀": 2, 1, 4; "～": 1, 1, 3), since DynamoDB doesn't document which it counts.
   { expression: "size(#s) = :three", holds: true },
   { expression: "size(#accent) = :one", holds: true, unsure: true },
   { expression: "size(#accent) = :two", holds: false, unsure: true },
   { expression: "size(#emoji) = :one", holds: false, unsure: true },
   { expression: "size(#emoji) = :two", holds: true, unsure: true },
+  { expression: "size(#emoji) = :four", holds: false, unsure: true },
+  { expression: "size(#wide) = :three", holds: false, unsure: true },
+  { expression: "size(#accent) = :zero", holds: false },
+  { expression: "size(#accent) <> :zero", holds: true },
+  { expression: "size(#accent) > :zero", holds: true },
+  { expression: "size(#accent) BETWEEN :one AND :two", holds: true },
+  { expression: "size(#accent) >= :three", holds: false },
+  { expression: "size(#emoji) < :five", holds: true },
+  { expression: "size(#emoji) > :four", holds: false },
+  { expression: "size(#wide) BETWEEN :one AND :three", holds: true },
+  { expression: "size(#wide) IN (:zero, :four)", holds: false },
+  { expression: "NOT size(#accent) = :zero", holds: true },
   { expression: "size(#ss) = :two", holds: true },
   { expression: "size(#l) = :two", holds: true },
   { expression: "size(#m) = :two", holds: true },

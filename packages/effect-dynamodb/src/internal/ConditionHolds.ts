@@ -14,7 +14,13 @@
  * naming nothing makes a comparison false, except `<>`, which it makes true; values of different
  * types are never equal and never ordered; numbers compare by value, strings by their UTF-8 bytes,
  * sets as sets. `undefined` where it can't say: text it doesn't read, a request DynamoDB would
- * refuse, or the `size()` of a string beyond ASCII.
+ * refuse, or a `size()` of a string beyond ASCII whose answer depends on how its length is counted.
+ *
+ * DynamoDB documents a string's `size()` as "the length of the string" without saying in what.
+ * DynamoDB Local counts UTF-16 code units (`connected.condition-holds.test.ts` pins it: `"é"` is 1,
+ * `"😀"` is 2). The evaluator answers by every count a length could be taken in — UTF-16 code
+ * units, code points and UTF-8 bytes — and only where they all give the same answer: `size(s) = 0`
+ * on `"é"` is false whichever DynamoDB uses, `size(s) = 1` can't be told.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -255,16 +261,20 @@ const equal = (a: AttributeValue, b: AttributeValue): boolean | undefined => {
   }
 }
 
+/** The ways a string's length could be counted: UTF-16 code units, code points, UTF-8 bytes. */
+type Count = (text: string) => number
+const COUNTS: ReadonlyArray<Count> = [
+  (text) => text.length,
+  (text) => [...text].length,
+  (text) => utf8.encode(text).length,
+]
+
 /**
  * `size()` of a value: `undefined` for one without a size (a number, boolean or null, which a
- * comparison reads as absent), `"unknown"` for a string beyond ASCII (DynamoDB Local counts its
- * UTF-16 code units; the evaluator doesn't claim how DynamoDB counts them). A string is ASCII
- * exactly when its UTF-8 bytes are as many as its code units.
+ * comparison reads as absent); a string's length as `count` takes it.
  */
-const sizeOf = (value: AttributeValue): number | undefined | "unknown" => {
-  if (value.S !== undefined) {
-    return utf8.encode(value.S).length === value.S.length ? value.S.length : "unknown"
-  }
+const sizeOf = (value: AttributeValue, count: Count): number | undefined | "unknown" => {
+  if (value.S !== undefined) return count(value.S)
   if (value.B !== undefined) return bytesOf(value.B)?.length ?? "unknown"
   if (value.SS !== undefined) return value.SS.length
   if (value.NS !== undefined) return value.NS.length
@@ -282,6 +292,16 @@ export const conditionHolds = (
 ): boolean | undefined => {
   const tokens = tokenize(expression, names)
   if (tokens === undefined) return undefined
+  const verdicts = COUNTS.map((count) => evaluate(tokens, item, values, count))
+  return verdicts.every((verdict) => verdict === verdicts[0]) ? verdicts[0] : undefined
+}
+
+const evaluate = (
+  tokens: ReadonlyArray<Token>,
+  item: Item,
+  values: Readonly<Record<string, AttributeValue>>,
+  count: Count,
+): Verdict => {
   let next = 0
   const peek = () => tokens[next]
   const take = () => {
@@ -314,7 +334,7 @@ export const conditionHolds = (
       expect(")")
       const held = at(item, path)
       if (held === undefined) return undefined
-      const size = sizeOf(held)
+      const size = sizeOf(held, count)
       return typeof size === "number" ? { N: String(size) } : size
     }
     return at(item, pathOf(token))
