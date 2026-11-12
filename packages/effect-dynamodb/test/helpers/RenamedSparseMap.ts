@@ -20,8 +20,15 @@
  * `put`, `Batch.write`, a transaction's put and a retained or unique `upsert` are sent as 1.40.0 sent
  * them, and so is every write naming no entry. A plain `upsert` carries the same guard as an unread
  * update (`RenamedSparseMapWrites.ts`). `fixtures/renamed-sparse-map-1.40.0.json` holds what the published
- * 1.40.0 did in each case (identical under `escapeKeys`); every case where 1.40.0 left the map as
- * the operation meant to leave it leaves the same rows here.
+ * 1.40.0 did in each case, every request whole (identical under `escapeKeys`); every case where
+ * 1.40.0 left the map as the operation meant to leave it leaves the same rows here. Where the head
+ * sends what 1.40.0 didn't, it differs only in the fields `REQUEST_FIELDS` names: a request's
+ * expressions and the names and values they map (and a retained snapshot's map, which 1.40.0
+ * emptied), or a request as a whole; never a key, a table or what a write returns.
+ *
+ * A read (`get`, a scan's filter or select) takes the map from whichever form the row holds:
+ * 1.40.0's filter or select of `t.counts.a` named `counts.a` (no row holds it) and its `.entry()`
+ * threw.
  */
 
 import { readFileSync } from "node:fs"
@@ -36,6 +43,8 @@ import { createPathBuilder } from "../../src/internal/PathBuilder.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
+import { wholeOf } from "./RenamedSparseMapWrites.js"
+import { differingPaths } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: any
@@ -197,41 +206,6 @@ export const normal = (value: unknown): any =>
         : held,
   )
 
-const PARTS = [
-  "KeyConditionExpression",
-  "UpdateExpression",
-  "ConditionExpression",
-  "FilterExpression",
-  "ProjectionExpression",
-  "ExpressionAttributeNames",
-  "ExpressionAttributeValues",
-  "Item",
-] as const
-const partsOf = (input: Record<string, any>) =>
-  Object.fromEntries(PARTS.filter((part) => input[part] !== undefined).map((p) => [p, input[p]]))
-
-/** A request as the capture recorded it: its command and expression parts, a transaction's per item. */
-export const sentOf = (request: unknown): unknown => {
-  const [command, input] = Object.entries(request as Record<string, Record<string, any>>)[0]!
-  return normal(
-    input.TransactItems !== undefined
-      ? {
-          [command]: (input.TransactItems as ReadonlyArray<Record<string, any>>).map((item) =>
-            Object.fromEntries(Object.entries(item).map(([kind, body]) => [kind, partsOf(body)])),
-          ),
-        }
-      : input.RequestItems !== undefined
-        ? {
-            [command]: Object.values(input.RequestItems as Record<string, any>).flatMap((reqs) =>
-              (reqs as ReadonlyArray<Record<string, any>>).map((r) =>
-                Object.fromEntries(Object.entries(r).map(([k, b]) => [k, partsOf(b)])),
-              ),
-            ),
-          }
-        : { [command]: partsOf(input) },
-  )
-}
-
 /** An outcome as the capture recorded it: a result, or a failure's tag and its message's first line. */
 export const outcomeOf = (exit: Exit.Exit<unknown, unknown>, length = 200): any => {
   if (Exit.isSuccess(exit)) return { ok: normal(exit.value) }
@@ -299,7 +273,7 @@ const runCase = (
         const before = rowsOf(yield* table.rows)
         log.length = 0
         const exit = yield* Effect.exit(Effect.suspend(() => body(db)))
-        const sent = log.map(sentOf)
+        const sent = log.map((request) => wholeOf(request, table.name))
         const read = yield* Effect.exit(db.entities[entity].get({ id: "a" }))
         return {
           before,
@@ -314,6 +288,23 @@ const runCase = (
       }),
     )
   })
+
+/**
+ * The fields of a request the head may send other than 1.40.0 did, each as a pattern of the path
+ * `differingPaths` names: the expressions, the names and values they map, the row a refusal
+ * returns, a retained snapshot's map (`snapshotsKept`), and a request as a whole (one the head
+ * sends that 1.40.0 didn't, or the reverse).
+ */
+const REQUEST_FIELDS =
+  /^\[\d+\](\.\w+)?$|^\[\d+\]\.\w+(\.TransactItems\[\d+\]\.\w+)?\.(UpdateExpression|ConditionExpression|FilterExpression|ProjectionExpression|ReturnValuesOnConditionCheckFailure|ExpressionAttributeNames\.#\w+|ExpressionAttributeValues\.:\w+|Item\.sr(\..*)?)$/
+
+/** Every field in which `got`'s requests differ from `was`'s is one {@link REQUEST_FIELDS} names. */
+export const expectRequestFieldsOnly = (
+  was: ReadonlyArray<unknown>,
+  got: ReadonlyArray<unknown>,
+) => {
+  for (const path of differingPaths(was, got)) expect(path).toMatch(REQUEST_FIELDS)
+}
 
 /** The commands a case sent, in order. */
 export const commands = (sent: ReadonlyArray<unknown>) =>
@@ -341,6 +332,7 @@ export const guardedUpsert = (
             ? "attribute_not_exists(#fm0)"
             : `${update.ConditionExpression} AND attribute_not_exists(#fm0)`,
         ExpressionAttributeNames: { ...update.ExpressionAttributeNames, "#fm0": "sr" },
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
       },
     },
   ]
@@ -386,6 +378,7 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
                   return inTransaction ? Transaction.transactWrite([update]) : update.asEffect()
                 })
                 const { captured } = got
+                expectRequestFieldsOnly(was.sent, captured.sent)
                 if (leaves === "refused") {
                   // Refused before sending, as 1.40.0 refused it.
                   expect(captured.outcome).toEqual(was.outcome)
@@ -477,9 +470,103 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
               return
             }
             expect(captured).toEqual(guardedUpsert(fixture.cases[name]!, before, says, holdsWhole))
+            expectRequestFieldsOnly(fixture.cases[name]!.sent, captured.sent)
           }),
+        )
+      }
+      if (entity !== "Plain") continue
+      for (const [label, body, outcome] of reads) {
+        const name = `${on}: ${label}`
+        const was = fixture.cases[name]!
+        const same = JSON.stringify(was.outcome) === JSON.stringify(outcome)
+        it.effect(
+          same
+            ? `${name}: as 1.40.0`
+            : `${name}: reads the row's map, where 1.40.0 ${was.outcome.die !== undefined ? "threw" : `returned ${JSON.stringify(was.outcome.ok)}`}`,
+          () =>
+            Effect.gen(function* () {
+              const { captured, before } = yield* runCase(open, entity, form, body)
+              expect(captured.outcome).toEqual(outcome)
+              expect(captured.rows).toEqual(before)
+              expect(captured.read).toEqual(was.read)
+              expect(captured.rows).toEqual(was.rows)
+              if (label === "get") expect(captured).toEqual(was)
+              expectRequestFieldsOnly(was.sent, captured.sent)
+            }),
         )
       }
     }
   }
 }
+
+/** Reads of the map on `Plain`, each with what it returns from a row holding `{ a: 1 }`. */
+const reads: ReadonlyArray<
+  readonly [
+    label: string,
+    body: (db: any) => Effect.Effect<unknown, unknown, any>,
+    outcome: unknown,
+  ]
+> = [
+  ["get", (db) => db.entities.Plain.get({ id: "a" }), { ok: { id: "a", counts: { a: 1 } } }],
+  [
+    "scan filter eq(t.counts.a, 1)",
+    (db) =>
+      db.entities.Plain.scan()
+        .filter((t: any, { eq }: any) => eq(t.counts.a, 1))
+        .collect(),
+    { ok: [{ id: "a", counts: { a: 1 } }] },
+  ],
+  [
+    "scan filter eq(t.counts.entry('a'), 1)",
+    (db) =>
+      db.entities.Plain.scan()
+        .filter((t: any, { eq }: any) => eq(t.counts.entry("a"), 1))
+        .collect(),
+    { ok: [{ id: "a", counts: { a: 1 } }] },
+  ],
+  [
+    "scan filter eq(t.counts.a, 9)",
+    (db) =>
+      db.entities.Plain.scan()
+        .filter((t: any, { eq }: any) => eq(t.counts.a, 9))
+        .collect(),
+    { ok: [] },
+  ],
+  [
+    "scan filter notExists(t.counts.entry('b'))",
+    (db) =>
+      db.entities.Plain.scan()
+        .filter((t: any, { notExists }: any) => notExists(t.counts.entry("b")))
+        .collect(),
+    { ok: [{ id: "a", counts: { a: 1 } }] },
+  ],
+  [
+    "scan select((t) => [t.counts.entry('a'), t.note])",
+    (db) =>
+      db.entities.Plain.scan()
+        .select((t: any) => [t.counts.entry("a"), t.note])
+        .collect(),
+    { ok: [{ counts: { a: 1 } }] },
+  ],
+  [
+    "scan select(['counts'])",
+    (db) => db.entities.Plain.scan().select(["counts"]).collect(),
+    { ok: [{ counts: { a: 1 } }] },
+  ],
+  [
+    "scan select((t) => [t.counts.a])",
+    (db) =>
+      db.entities.Plain.scan()
+        .select((t: any) => [t.counts.a])
+        .collect(),
+    { ok: [{ counts: { a: 1 } }] },
+  ],
+  [
+    "scan select((t) => [t.counts.entry('a')])",
+    (db) =>
+      db.entities.Plain.scan()
+        .select((t: any) => [t.counts.entry("a")])
+        .collect(),
+    { ok: [{ counts: { a: 1 } }] },
+  ],
+]
