@@ -4,8 +4,11 @@
  * write path refuses one and writes nothing, natively and packed alike, by one function
  * (`LostValues`); a row already holding `{}` reads as `{}`; and a model with no untyped position has
  * no check at all. What isn't refused (a list holding `undefined`, a function or a hole, and a
- * bigint) is pinned as 1.40.0 stores it, natively and packed, on Effect 4.1.2 and 4.1.3 alike.
+ * bigint) is pinned as 1.40.0 stores it, natively and packed, on Effect 4.1.2 and 4.1.3 alike; so are
+ * sparse, frozen and exotic lists, alone and next to an empty set, against what published 1.40.0
+ * stored (`fixtures/untyped-lists-1.40.0.json`).
  */
+import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -251,6 +254,82 @@ describe("left as 1.40.0 stores them, on Effect 4.1.2 and 4.1.3 alike", () => {
         expect(table.items.size).toBe(1)
       }).pipe(Effect.provide(Main.layer({ name: "lost" })), Effect.provide(table.layer))
     })
+  }
+})
+
+describe("lists marshalling closes up, byte-identical to 1.40.0 (fixtures/untyped-lists-1.40.0.json)", () => {
+  const fixture = JSON.parse(
+    readFileSync(new URL("./fixtures/untyped-lists-1.40.0.json", import.meta.url), "utf8"),
+  ) as {
+    readonly generatedFrom: string
+    readonly cases: Record<
+      string,
+      Record<string, { readonly stored?: unknown; readonly failure?: string }>
+    >
+  }
+  class Listed extends Array {}
+  /** A list of `length` holding `at` and holes everywhere else (`[, 1]` is `sparse(2, { 1: 1 })`). */
+  const sparse = (length: number, at: Record<number, unknown>): Array<unknown> => {
+    const list = new Array<unknown>(length)
+    for (const [index, value] of Object.entries(at)) list[Number(index)] = value
+    return list
+  }
+  /** The generator's cases, by its names. */
+  const CASES: Record<string, () => unknown> = {
+    "a hole first": () => sparse(2, { 1: 1 }),
+    "a hole between": () => sparse(3, { 0: 1, 2: 2 }),
+    "a hole last": () => sparse(3, { 0: 1, 1: 2 }),
+    "only holes": () => new Array(3),
+    "undefined between": () => [1, undefined, 2],
+    "a function between": () => [1, () => 0, 2],
+    frozen: () => Object.freeze([1, 2]),
+    "frozen with a hole": () => Object.freeze(sparse(2, { 1: 1 })),
+    "a proxy over a list": () => new Proxy([1, 2], {}),
+    "a proxy over a list with a hole": () => new Proxy(sparse(2, { 1: 1 }), {}),
+    "a subclass of Array": () => Listed.of(1, 2),
+    "a list with a named property": () => Object.assign([1, 2], { x: 3 }),
+    "nested holes": () => [sparse(2, { 1: 1 }), sparse(2, { 0: 2 })],
+    "a hole in a map's list": () => ({ list: sparse(2, { 1: 1 }) }),
+    "a hole before a Chunk": () => sparse(2, { 1: Chunk.make(1) }),
+  }
+  /** Its own `untyped` field, alone (`loose`) or next to an empty set, as the generator wrote it. */
+  const FORMS: Record<string, (value: unknown) => unknown> = {
+    alone: (value) => value,
+    "next to an empty set": (value) => ({ list: value, empty: new Set() }),
+  }
+
+  it("the fixture is published 1.40.0's, and every case is here", () => {
+    expect(fixture.generatedFrom).toBe("effect-dynamodb@1.40.0")
+    expect(Object.keys(fixture.cases)).toEqual(Object.keys(CASES))
+  })
+
+  for (const [name, make] of Object.entries(CASES)) {
+    for (const [form, put] of Object.entries(FORMS)) {
+      const was = fixture.cases[name]![form]!
+      it.effect(
+        `${name}, ${form}: ${was.failure === undefined ? "stored as 1.40.0 stored it" : "refused, where 1.40.0 failed"}`,
+        () => {
+          const table = makeRecordingTable()
+          return Effect.gen(function* () {
+            const db = yield* DynamoClient.make({ entities: { Values }, tables: { Main } })
+            const exit = yield* Effect.exit(
+              db.entities.Values.put({ id: "loose", loose: put(make()) }).asEffect(),
+            )
+            if (was.failure === undefined) {
+              expect(Exit.isSuccess(exit)).toBe(true)
+              const row = [...table.items.values()].find((item) => item.id?.S === "loose")
+              expect(row?.loose).toEqual(was.stored)
+            } else {
+              // 1.40.0 ran the stack out; the Chunk holds itself (`EDD-9124`), nothing written.
+              expect(was.failure).toBe("defect RangeError")
+              expect(failureOf(exit)).toBeInstanceOf(ValidationError)
+              expect(String(failureOf(exit)?.cause)).toContain("[EDD-9124]")
+              expect(table.items.size).toBe(0)
+            }
+          }).pipe(Effect.provide(Main.layer({ name: "lost" })), Effect.provide(table.layer))
+        },
+      )
+    }
   }
 })
 

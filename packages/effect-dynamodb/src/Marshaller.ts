@@ -199,6 +199,13 @@ const withoutCachedNormals = (value: unknown, open = new Set<object>()): unknown
   }
 }
 
+/**
+ * A list's elements with their indices, as marshalling walks them: a hole isn't there to walk (it
+ * stores the list closed up), so it has no entry, in a sparse, frozen or exotic list alike.
+ */
+const listEntries = (list: ReadonlyArray<unknown>): ReadonlyArray<readonly [number, unknown]> =>
+  list.flatMap((element, index) => [[index, element] as const])
+
 /** {@link dataValuesOf}, with each value's name. */
 const dataEntriesOf = (value: object): ReadonlyArray<readonly [string, unknown]> => {
   const entries: Array<readonly [string, unknown]> = []
@@ -231,7 +238,7 @@ const cycleIn = (
   open.add(value)
   try {
     const parts: ReadonlyArray<readonly [string | number, unknown]> = Array.isArray(value)
-      ? value.map((element, index) => [index, element] as const)
+      ? listEntries(value)
       : value instanceof Map
         ? [...value].map(([key, entry]) => [String(key), entry] as const)
         : dataEntriesOf(value)
@@ -388,7 +395,7 @@ const isRefused = (value: unknown): boolean => {
 }
 
 const partsOf = (value: unknown): ReadonlyArray<readonly [string | number, unknown]> => {
-  if (Array.isArray(value)) return value.map((element, index) => [index, element] as const)
+  if (Array.isArray(value)) return listEntries(value)
   if (value instanceof Map) return [...value]
   if (typeof value !== "object" || value === null) return []
   return propertiesOf(value)
