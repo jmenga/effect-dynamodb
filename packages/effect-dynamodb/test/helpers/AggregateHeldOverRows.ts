@@ -33,9 +33,9 @@ import {
   givenOverRow,
   MIRRORED,
   PARTITION,
+  type ReadBack,
   SORT,
   TYPE,
-  withCopiesRead,
 } from "./AggregateUpgradeSweep.js"
 
 type Row = Record<string, AttributeValue>
@@ -137,25 +137,23 @@ const ctx =
     ...extra,
   })
 
-/** `create` giving `name`, on `member`'s row, `given` where the library writes `library`. */
-const over = (member: string, name: string, given: string, what: string, library: string) => ({
+/** `create` giving `name`, on `member`'s row, `given` where a read of `member` returns `read`. */
+const over = (member: string, name: string, given: string, what: string, read: ReadBack) => ({
   member,
-  message: givenOverRow(member, name, given, what, library),
+  message: givenOverRow(member, name, given, what, read),
 })
-const PK = "$held#v1#held#a"
-
 export const shapes: Record<string, () => Shape> = {
   "an Unknown one edge holding pk": unknownOne(
     { text: "n", pk: "mine" },
-    { refused: over("note", "pk", "mine", PARTITION, PK) },
+    { refused: over("note", "pk", "mine", PARTITION, undefined) },
   ),
   "an Unknown one edge holding sk": unknownOne(
     { text: "n", sk: "mine" },
-    { refused: over("note", "sk", "mine", SORT, "$held#v1#note") },
+    { refused: over("note", "sk", "mine", SORT, undefined) },
   ),
   "an Unknown one edge holding __edd_e__": unknownOne(
     { text: "n", __edd_e__: "mine" },
-    { refused: over("note", "__edd_e__", "mine", TYPE, "Note") },
+    { refused: over("note", "__edd_e__", "mine", TYPE, undefined) },
   ),
   // A name the library doesn't write on the row: written, and taken off every read, as on 1.40.0.
   "an Unknown one edge holding gsi1pk": unknownOne({ text: "n", gsi1pk: "mine" }),
@@ -222,8 +220,8 @@ export const shapes: Record<string, () => Shape> = {
     edges: { note: one() },
     input: { id: "a", note: { kind: "text", text: "hello" } },
   }),
-  // A union isn't judged: which member holds the name can't be told from the schema alone. Written
-  // as on 1.40.0, which reads back the library's copy.
+  // A union is judged by what a read of the whole value returns: 1.40.0 read back the library's
+  // copy, not the value given.
   "a one edge union, a member declaring csk, given that member": () => ({
     collection: MIRROR,
     model: Schema.Struct({
@@ -235,6 +233,8 @@ export const shapes: Record<string, () => Shape> = {
     }),
     edges: { note: one() },
     input: { id: "a", note: { kind: "key", csk: "mine" } },
+    refused: over("note", "csk", "mine", MIRRORED, "$held#v1#note"),
+    read140: { id: "a", note: { kind: "key", csk: "$held#v1#note" } },
   }),
   "a one edge declaring csk (required)": () => ({
     collection: MIRROR,
@@ -522,20 +522,12 @@ export const suite = (
                   const get = outcome(yield* Effect.exit(A.get({ id: "a" })))
                   yield* harness.requests(tableName)
                   expect({ step, ...judged(get) }).toEqual({ step, ...judged(was.get) })
-                  // 1.40.0's result, each context copy as the get after it reads it.
-                  const context = shape.context ?? []
+                  // What a `get` right after reads (#241); where 1.40.0's update failed, as it
+                  // failed.
                   expect({ step, ...judged(update) }).toEqual({
                     step,
-                    ...(was.update.ok === undefined
-                      ? judged(was.update)
-                      : { ok: withCopiesRead(was.update.ok, was.get.ok, shape.edges, context) }),
+                    ...(was.update.ok === undefined ? judged(was.update) : judged(get)),
                   })
-                  if (update.ok !== undefined && get.ok !== undefined) {
-                    expect({
-                      step,
-                      copies: withCopiesRead(update.ok, get.ok, shape.edges, context),
-                    }).toEqual({ step, copies: update.ok })
-                  }
                 }
               }),
             shape.pk,

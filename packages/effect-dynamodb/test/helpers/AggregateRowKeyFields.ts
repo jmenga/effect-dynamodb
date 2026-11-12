@@ -138,7 +138,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     model: Schema.Struct({ id: S, pk: opt(S) }),
     edges: {},
     input: { id: "a", pk: "mine" },
-    write: givenOverRow("Root", "pk", "mine", PARTITION, KEY),
+    write: givenOverRow("Root", "pk", "mine", PARTITION, undefined),
     member: "Root",
     read140: { ok: { id: "a" } },
   }),
@@ -160,7 +160,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     model: Schema.Struct({ id: S, sk: opt(S) }),
     edges: {},
     input: { id: "a", sk: "mine" },
-    write: givenOverRow("Root", "sk", "mine", SORT, "$keyf#v1#root"),
+    write: givenOverRow("Root", "sk", "mine", SORT, undefined),
     member: "Root",
     read140: { ok: { id: "a" } },
   }),
@@ -168,7 +168,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     model: Schema.Struct({ id: S, __edd_e__: opt(S) }),
     edges: {},
     input: { id: "a", __edd_e__: "mine" },
-    write: givenOverRow("Root", "__edd_e__", "mine", TYPE, "Root"),
+    write: givenOverRow("Root", "__edd_e__", "mine", TYPE, undefined),
     member: "Root",
     read140: { ok: { id: "a" } },
   }),
@@ -230,7 +230,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     model: Schema.Struct({ id: S, note: Schema.Struct({ text: S, sk: opt(S) }) }),
     edges: { note: one(A) },
     input: { id: "a", note: { text: "n", sk: "mine" } },
-    write: givenOverRow("note", "sk", "mine", SORT, "$keyf#v1#note"),
+    write: givenOverRow("note", "sk", "mine", SORT, undefined),
     member: "note",
     read140: { ok: { id: "a", note: { text: "n" } } },
   }),
@@ -246,7 +246,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     }),
     edges: { lines: many(A, ["sk"]) },
     input: { id: "a", lines: [{ sk: "x", qty: 1 }] },
-    write: givenOverRow("lines", "sk", "x", SORT, "$keyf#v1#line#x"),
+    write: givenOverRow("lines", "sk", "x", SORT, { fails: 'Missing key at ["sk"]' }),
     member: "lines",
     read140: { failed: "ValidationError", operation: "aggregate.assemble" },
   }),
@@ -257,7 +257,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     }),
     edges: { lines: many(A) },
     input: { id: "a", lines: [{ qty: 1, __edd_e__: "mine" }] },
-    write: givenOverRow("lines", "__edd_e__", "mine", TYPE, "Line"),
+    write: givenOverRow("lines", "__edd_e__", "mine", TYPE, undefined),
     member: "lines",
     read140: { ok: { id: "a", lines: [{ qty: 1 }] } },
   }),
@@ -267,7 +267,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
       model: Schema.Struct({ id: S, part: Part }),
       edges: { part: sub(A, Part, {}) },
       input: { id: "a", part: { name: "p", pk: "mine" } },
-      write: givenOverRow("part", "pk", "mine", PARTITION, KEY),
+      write: givenOverRow("part", "pk", "mine", PARTITION, undefined),
       member: "part",
       read140: { ok: { id: "a", part: { name: "p" } } },
     }
@@ -679,9 +679,7 @@ export const suite = (
                 reason?: string
               }
               expect(error._tag).toBe("AggregateDecompositionError")
-              expect(error.reason).toBe(
-                givenOverRow("part", "pkey", "mine", PARTITION, "$strip#v1#strip#a"),
-              )
+              expect(error.reason).toBe(givenOverRow("part", "pkey", "mine", PARTITION, undefined))
               expect(yield* harness.commands(tableName)).toEqual([])
             }),
           ),
@@ -690,10 +688,11 @@ export const suite = (
 
     // `update` isn't judged (`EDD-9159` is `create`'s): its state is what the read gave, and what the
     // read filled in can't be told from what the caller set. A value given where the library writes
-    // another is replaced by the library's, as on 1.40.0, and the update returns 1.40.0's result, the
-    // state as mutated, which a get after it doesn't read: the read hands back the library's value
-    // (a discriminator, a list key's text) or takes the attribute off (DESIGN.md §11 "What `update` returns" lists these).
-    // The upgrade sweep compares each with what published 1.40.0 sent, stored and returned.
+    // another is replaced by the library's, as on 1.40.0. 1.40.0 returned the state as mutated
+    // (`update`), which a get after it doesn't read: the read hands back the library's value (a
+    // discriminator, a list key's text) or takes the attribute off. The update now returns what that
+    // get reads (`read`, DESIGN.md §11 "What `update` returns"). The upgrade sweep compares each with
+    // what published 1.40.0 sent and stored.
     const updates: ReadonlyArray<{
       readonly label: string
       readonly from: string
@@ -752,7 +751,7 @@ export const suite = (
       },
     ]
     for (const { label, from, change, commands, update, read } of updates) {
-      it(`${label}: written as on 1.40.0, the library's value over it; returns the state as mutated`, () =>
+      it(`${label}: written as on 1.40.0, the library's value over it; returns what a get after it reads`, () =>
         Effect.runPromise(
           harness.onTable((tableName) =>
             Effect.gen(function* () {
@@ -764,7 +763,8 @@ export const suite = (
                 yield* Effect.exit(A.update({ id: "a" }, ({ state }: any) => change(state))),
               )
               expect(yield* harness.commands(tableName)).toEqual(commands)
-              expect(result).toEqual({ ok: update })
+              expect(update).not.toEqual(read)
+              expect(result).toEqual({ ok: read })
               expect(outcome(yield* Effect.exit(A.get({ id: "a" })))).toEqual({ ok: read })
             }),
           ),

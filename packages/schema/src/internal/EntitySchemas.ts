@@ -1883,6 +1883,9 @@ const refusesUndefinedPositions = (
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
+  // A ref held as less than its class (`refHeldTarget`) is another schema than the field it
+  // re-points, whatever its leaves.
+  if (heldStructs.has(schema)) return true
   if (opts?.undefinedPositionsOnly) return holdsUndefinedPosition(schema)
   if (opts?.absentReads === "only") return holdsAbsentRead(schema)
   if (opts?.absentReads && holdsUnwalkedAbsent(schema)) return true
@@ -2815,29 +2818,53 @@ export interface DerivedSchemas {
 export const hiddenFieldNamesOf = (fields: SchemaFields): ReadonlySet<string> =>
   new Set(Object.keys(fields).filter((name) => isHidden(fields[name] as Schema.Top)))
 
+/** The targets {@link refHeldTarget} decided, each once. */
+const refHeldTargets = new WeakMap<Schema.Top, Schema.Top>()
+/** The schemas {@link refHeldTarget} built: a target's fields without its hidden ones. */
+const heldStructs = new WeakSet<Schema.Top>()
+
 /**
- * @internal What a ref to an entity of model `target` holds (#241): what a read of that entity
- * returns, which put-time hydration and a cascade store, both through `refDataOf` (the entity's
- * own read schema encoding the item it read). A read leaves out the target's `DynamoModel.Hidden`
- * fields ({@link hiddenFieldNamesOf}). Where one of them is required, the ref is the target's other
- * fields, a plain object as the entity's own read decodes it: up to 1.40.0 it was the whole target,
- * so the referencing row, stored without that field, failed every read (`Missing key`), its own
- * `put` included, after writing it. Any other target is held as declared, a class read back as its
- * instance, as up to 1.40.0.
+ * @internal What a ref to an entity of model `target` holds (#241), the one decision every ref
+ * position takes (an entity's `refs`, an aggregate's edges and the refs nested in their entities):
+ * what a read of that entity returns, which put-time hydration and a cascade store, both through
+ * `refDataOf` (the entity's own read schema encoding the item it read). A read leaves out the
+ * target's `DynamoModel.Hidden` fields ({@link hiddenFieldNamesOf}), so the stored ref holds none
+ * of them. Where a hidden field read absent fails, as a read decodes it (`Missing key`), the ref is
+ * the target's other fields, a plain object as the entity's own read decodes it: up to 1.40.0 it
+ * was the whole target, so the referencing row failed every read, after its write. Every other
+ * target is held as declared, a class read back as its instance, as up to 1.40.0: one whose hidden
+ * fields are optional, or read absent as a value (`Schema.Unknown`, `Schema.Any`,
+ * `Schema.UndefinedOr`, a decoding default).
  */
-export const refHeldSchema = (target: Schema.Top, options: DeepSubstitutionOptions): Schema.Top => {
+export const refHeldTarget = (target: Schema.Top): Schema.Top => {
+  const decided = refHeldTargets.get(target)
+  if (decided !== undefined) return decided
   const fields = getSchemaFields(target)
-  if (fields === undefined) return substituteSchemaDeep(target, options)
-  const hidden = hiddenFieldNamesOf(fields)
-  const hiddenRequired = [...hidden].some(
-    (name) => optionalField(fields[name] as Schema.Top) === undefined,
-  )
-  if (!hiddenRequired) return substituteSchemaDeep(target, options)
-  return substituteSchemaDeep(
-    Schema.Struct(Object.fromEntries(Object.entries(fields).filter(([name]) => !hidden.has(name)))),
-    options,
-  )
+  const hidden = fields === undefined ? new Set<string>() : hiddenFieldNamesOf(fields)
+  // A hidden field read absent, as a read of the referencing row decodes it.
+  const failsAbsent = (name: string) =>
+    Option.isNone(
+      Schema.decodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [name]: fields![name] as Schema.Top }), {
+          legacyReads: true,
+          absentReads: true,
+        }) as unknown as Schema.Codec<unknown>,
+      )({}),
+    )
+  const held =
+    fields !== undefined && [...hidden].some(failsAbsent)
+      ? (Schema.Struct(
+          Object.fromEntries(Object.entries(fields).filter(([name]) => !hidden.has(name))),
+        ) as unknown as Schema.Top)
+      : target
+  if (held !== target) heldStructs.add(held)
+  refHeldTargets.set(target, held)
+  return held
 }
+
+/** @internal {@link refHeldTarget}, substituted as a read or a write takes it (`options`). */
+export const refHeldSchema = (target: Schema.Top, options: DeepSubstitutionOptions): Schema.Top =>
+  substituteSchemaDeep(refHeldTarget(target), options)
 
 export const buildDerivedSchemas = (
   modelFields: SchemaFields,

@@ -1753,10 +1753,12 @@ describe("deciding which rows are the aggregate's reads and decomposes nothing m
       }).toEqual(plain)
       // The update reads the partition, assembles the old state, decomposes it and the new state,
       // and reads the value written once more for its stamps (as 1.39.0 did), then writes its
-      // group and its cleanup; `rekey` reads what it reads without one (the scan, the old and new
-      // partitions, the roots it checks), and assembles and decomposes the aggregate once.
+      // group and its cleanup, and assembles the rows read and written as a `get` right after
+      // reads them, its result (#241, no request); `rekey` reads what it reads without one (the
+      // scan, the old and new partitions, the roots it checks), and assembles and decomposes the
+      // aggregate once.
       expect(owned).toEqual({
-        update: { assemble: 1, decompose: 3, reads: 1, requests: 3 },
+        update: { assemble: 2, decompose: 3, reads: 1, requests: 3 },
         rekey: { assemble: 1, decompose: 1, reads: 5 },
       })
       // Without `ownsRows`, the same but the cleanup.

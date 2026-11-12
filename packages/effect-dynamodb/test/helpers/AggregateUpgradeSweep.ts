@@ -99,63 +99,77 @@ export const CONTEXT = "a context attribute the aggregate copies onto its rows"
 export const LIST_PK = "the attribute holding its list partition key"
 export const LIST_SK = "the attribute holding its list sort key"
 
-/** `EDD-9159`'s refusal of a `create` giving `name` another value than the library's. */
+/**
+ * What a read of a member returns at a name, as `EDD-9159` shows it: a string value, `undefined`
+ * where the read returns nothing there, or the read's failure. `{ shown }` is a value already
+ * rendered as the refusal renders it (a set, a date, a number).
+ */
+export type ReadBack = string | undefined | { readonly fails: string } | { readonly shown: string }
+
+/** A value as `EDD-9159` renders it: a string quoted, a `{ shown }` as rendered. */
+const shownAs = (value: string | { readonly shown: string }) =>
+  typeof value === "string" ? JSON.stringify(value) : value.shown
+
+/**
+ * `EDD-9159`'s refusal of a `create` giving `name` a value a read of `member` doesn't return:
+ * `given` (a string value, or `{ shown }`), and what the read returns there (`read`).
+ */
 export const givenOverRow = (
   member: string,
   name: string,
-  given: string,
+  given: string | { readonly shown: string },
   what: string,
-  library: string,
-) =>
-  `[EDD-9159] "${member}" gives "${name}" the value ${JSON.stringify(given)} at the top of its ` +
-  `value, which is also ${what}. The library writes ${JSON.stringify(library)} there over the ` +
-  "value's own, so the value would not read back as given. Give it " +
-  `${JSON.stringify(library)}, leave it out of the value, or name it something else.`
+  read: ReadBack,
+) => {
+  const returned =
+    read === undefined || (typeof read === "object" && "fails" in read) ? undefined : shownAs(read)
+  const reads =
+    typeof read === "object" && read !== null && "fails" in read
+      ? `fails there (${read.fails})`
+      : returned === undefined
+        ? "returns nothing for it"
+        : `returns ${returned} for it`
+  return (
+    `[EDD-9159] "${member}" gives "${name}" the value ${shownAs(given)} at the top of its value, ` +
+    `which is also ${what}. The library writes its own value there, and a read of "${member}" ` +
+    `${reads}, so the value would not read back as given. ` +
+    (typeof read === "object" && read !== null && "fails" in read
+      ? `Name it something else, or declare "${name}" so a read of "${member}" takes the library's value.`
+      : returned === undefined
+        ? "Leave it out of the value, or name it something else."
+        : `Give it ${returned}, leave it out of the value, or name it something else.`)
+  )
+}
 
 /**
- * `update`'s result as 1.40.0 returned it (`was`), with each member value's copy of a context
- * attribute as the read after it gives it (`read`): what this release returns. Member values are
- * those the edges hold (`edges`, through sub-aggregates), not a value nested in one; a `many` edge
- * with a custom `decompose` or `assemble` keeps 1.40.0's.
+ * `EDD-9159`'s refusal of a `create` giving `name` no value where the library writes its own and a
+ * read of `member` fails there (`fails`).
  */
-export const withCopiesRead = (
-  was: unknown,
-  read: unknown,
-  edges: Record<string, any>,
-  context: ReadonlyArray<string>,
-): unknown => {
-  const isObject = (x: unknown): x is Record<string, unknown> =>
-    typeof x === "object" && x !== null && !Array.isArray(x)
-  const member = (value: unknown, after: unknown): unknown => {
-    if (!isObject(value) || !isObject(after)) return value
-    const next = { ...value }
-    for (const name of context) {
-      if (Object.hasOwn(after, name)) next[name] = after[name]
-      else delete next[name]
-    }
-    return next
-  }
-  const walk = (value: unknown, after: unknown, at: Record<string, any>): unknown => {
-    if (!isObject(value) || !isObject(after)) return value
-    const next = { ...value }
-    for (const [field, edge] of Object.entries(at)) {
-      const held = value[field]
-      const got = after[field]
-      if (edge._tag === "ManyEdge") {
-        if (edge.decompose !== undefined || edge.assemble !== undefined) continue
-        if (Array.isArray(held) && Array.isArray(got)) {
-          next[field] = held.map((element, i) => member(element, got[i]))
-        }
-      } else if (edge._tag === "OneEdge") {
-        next[field] = member(held, got)
-      } else if (edge._tag === "BoundSubAggregate") {
-        next[field] = walk(member(held, got), got, edge.aggregate.edges)
-      }
-    }
-    return next
-  }
-  return walk(was, read, edges)
-}
+export const unreadOverRow = (member: string, name: string, what: string, fails: string) =>
+  `[EDD-9159] "${member}" gives "${name}" no value, and "${name}" is also ${what}. The library ` +
+  `writes its own value there, and a read of "${member}" fails there (${fails}), so the row would ` +
+  `not read back. Declare "${name}" in "${member}"'s value so it reads the library's value, or ` +
+  "name it something else."
+
+/**
+ * `EDD-9159`'s refusal of a `create` whose `many` edge with a custom `decompose` gives `name` on its
+ * rows `own`: a read of `member` returns `read` there, not `asReturned`, what it would return had
+ * the rows kept their own value.
+ */
+export const customOverRow = (
+  member: string,
+  name: string,
+  own: string | { readonly shown: string },
+  what: string,
+  asReturned: string | { readonly shown: string },
+  read: string | { readonly shown: string } | { readonly fails: string },
+) =>
+  `[EDD-9159] "${member}"'s rows give "${name}" the value ${shownAs(own)}, which is also ${what}. ` +
+  `The library writes its own value there, and a read of "${member}" ` +
+  (typeof read === "object" && "fails" in read
+    ? `fails (${read.fails})`
+    : `returns ${shownAs(read)}, not ${shownAs(asReturned)}`) +
+  ", so the value would not read back as given. Leave it out of the rows, or name it something else."
 
 /** The builders a shape is defined with, over one release's modules. */
 const kit = (lib: SweepLib) => {

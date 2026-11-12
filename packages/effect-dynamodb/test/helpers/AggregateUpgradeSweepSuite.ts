@@ -24,6 +24,7 @@ import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
 import {
   CONTEXT,
+  customOverRow,
   givenOverRow,
   inputOf,
   LIST_PK,
@@ -44,7 +45,6 @@ import {
   stepsOf,
   sweepShapes,
   TYPE,
-  withCopiesRead,
 } from "./AggregateUpgradeSweep.js"
 
 const published: {
@@ -266,141 +266,233 @@ const NAMED: Readonly<Record<string, Named>> = {
 }
 
 /**
- * The shapes whose `create` gives, at the top of a row's value, a name the library writes on that
- * row a value other than the library's (#241, `EDD-9159`): 1.40.0 wrote it and every read handed back
- * the library's, never what was given. This release refuses the `create`, nothing sent: the
- * member, the name, the value given, what the attribute is, and the library's value.
+ * The shapes whose failing step (its second transaction refused) leaves rows holding a context
+ * attribute's old value behind the root, by the context attributes (#241). From the retry on, this
+ * release writes their groups too, the rows a group already holding the root's value stays
+ * unwritten, and every read hands back the root's value on every row. 1.40.0 wrote only what the
+ * diff found changed, so those rows kept the old value, and each read handed it back, until their
+ * group next changed. Compared with 1.40.0 with every row's copy set to the root's on both sides,
+ * and the transactions putting only those rows taken out of this release's requests.
  */
-const REFUSED_AT_CREATE: Readonly<
-  Record<
-    string,
-    readonly [member: string, name: string, given: string, what: string, library: string]
-  >
-> = {
-  "held: an Unknown one edge holding pk": ["note", "pk", "mine", PARTITION, "$sweep#v1#sweep#a"],
-  "held: an Unknown one edge holding sk": ["note", "sk", "mine", SORT, "$sweep#v1#note"],
-  "held: an Unknown one edge holding __edd_e__": ["note", "__edd_e__", "mine", TYPE, "Note"],
-  "held: a one edge declaring csk (required)": ["note", "csk", "mine", MIRRORED, "$sweep#v1#note"],
-  "context: an Unknown one edge holding another tenantId": [
-    "note",
-    "tenantId",
-    "other",
-    CONTEXT,
-    "t1",
+const STALE_AFTER_FAILING: Readonly<Record<string, ReadonlyArray<string>>> = {
+  "held: context: a sub-aggregate with an edge, both declaring tenantId": ["tenantId"],
+  "repro: context over a Schema.optional date beside an Unknown value under a sub-aggregate": [
+    "since",
   ],
-  "context: an Unknown element holding another tenantId": [
-    "lines",
-    "tenantId",
-    "other",
-    CONTEXT,
-    "t1",
-  ],
-  "context: a struct one edge declaring tenantId, given another": [
-    "note",
-    "tenantId",
-    "other",
-    CONTEXT,
-    "t1",
-  ],
-  "context: a sub-aggregate declaring tenantId, given another": [
-    "part",
-    "tenantId",
-    "other",
-    CONTEXT,
-    "t1",
-  ],
-  "context: an Unknown one edge holding csk, the collection sort key's copy": [
+  "repro: context changed while a later group's transaction fails": ["tenantId"],
+}
+
+/** `rows` with each row's copy of a context attribute (`names`) the root row's. */
+const copiesAsRoot = (rows: ReadonlyArray<Row>, names: ReadonlyArray<string>) => {
+  const root = rows.find((row) => typeOf(row) === "Root")
+  return rows.map((row) => {
+    if (root === undefined || row === root) return row
+    const next: Row = { ...row }
+    for (const name of names) if (Object.hasOwn(next, name)) next[name] = root[name]!
+    return next
+  })
+}
+
+/** A value read with each nested copy of a context attribute (`names`) the root's. */
+const valueCopiesAsRoot = (value: unknown, names: ReadonlyArray<string>): unknown => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value
+  const root = value as Record<string, unknown>
+  const walk = (inner: unknown): unknown => {
+    if (Array.isArray(inner)) return inner.map(walk)
+    if (inner === null || typeof inner !== "object") return inner
+    const out: Record<string, unknown> = {}
+    for (const [key, v] of Object.entries(inner)) {
+      out[key] = names.includes(key) && Object.hasOwn(root, key) ? root[key] : walk(v)
+    }
+    return out
+  }
+  const out: Record<string, unknown> = {}
+  for (const [key, v] of Object.entries(root)) out[key] = names.includes(key) ? v : walk(v)
+  return out
+}
+
+/** The sort keys of the rows holding a copy of a context attribute other than the root row's. */
+const staleKeysIn = (rows: ReadonlyArray<Row>, names: ReadonlyArray<string>) => {
+  const root = rows.find((row) => typeOf(row) === "Root")!
+  return new Set(
+    rows
+      .filter(
+        (row) =>
+          row !== root &&
+          names.some(
+            (name) =>
+              Object.hasOwn(row, name) && JSON.stringify(row[name]) !== JSON.stringify(root[name]),
+          ),
+      )
+      .map((row) => row.sk!.S!),
+  )
+}
+
+/** Whether a request is a transaction putting only rows at `keys`. */
+const putsOnly = (request: Request, keys: ReadonlySet<string>) => {
+  if (request.command !== "TransactWriteItems") return false
+  const items = putsOf([request])
+  const all = (request.input as { TransactItems?: ReadonlyArray<unknown> }).TransactItems ?? []
+  return (
+    items.length > 0 &&
+    items.length === all.length &&
+    items.every((item) => keys.has((item.sk as { S?: string } | undefined)?.S ?? ""))
+  )
+}
+
+/** A `create` refused by `EDD-9159`: `givenOverRow`'s arguments, the member first. */
+const over = (...args: Parameters<typeof givenOverRow>) => [args[0], givenOverRow(...args)] as const
+
+/**
+ * The shapes whose `create` gives, at the top of a row's value, a name the library writes on that
+ * row a value a read of the member doesn't return (#241, `EDD-9159`): 1.40.0 wrote it and every
+ * read handed back something else (the library's value, or nothing where a read takes the name
+ * off). This release refuses the `create`, nothing sent: the member, the name, the value given,
+ * what the attribute is, and what the read returns there.
+ */
+const REFUSED_AT_CREATE: Readonly<Record<string, readonly [member: string, reason: string]>> = {
+  "held: an Unknown one edge holding pk": over("note", "pk", "mine", PARTITION, undefined),
+  "held: an Unknown one edge holding sk": over("note", "sk", "mine", SORT, undefined),
+  "held: an Unknown one edge holding __edd_e__": over("note", "__edd_e__", "mine", TYPE, undefined),
+  "held: a one edge declaring csk (required)": over(
     "note",
     "csk",
     "mine",
     MIRRORED,
     "$sweep#v1#note",
-  ],
-  "keys: root declares pk (optional), given mine": [
-    "Root",
-    "pk",
+  ),
+  "held: a one edge union, a member declaring csk, given that member": over(
+    "note",
+    "csk",
     "mine",
-    PARTITION,
-    "$sweep#v1#sweep#a",
+    MIRRORED,
+    "$sweep#v1#note",
+  ),
+  "context: an Unknown one edge holding another tenantId": over(
+    "note",
+    "tenantId",
+    "other",
+    CONTEXT,
+    "t1",
+  ),
+  "context: an Unknown element holding another tenantId": over(
+    "lines",
+    "tenantId",
+    "other",
+    CONTEXT,
+    "t1",
+  ),
+  "context: an Unknown element with a custom assemble holding another tenantId": [
+    "lines",
+    customOverRow(
+      "lines",
+      "tenantId",
+      "other",
+      CONTEXT,
+      { shown: '[{ "qty": 1, "text": "n", "tenantId": "other" }]' },
+      { shown: '[{ "qty": 1, "text": "n", "tenantId": "t1" }]' },
+    ),
   ],
-  "keys: root's composite id is the pk attribute": [
+  "context: a struct one edge declaring tenantId, given another": over(
+    "note",
+    "tenantId",
+    "other",
+    CONTEXT,
+    "t1",
+  ),
+  "context: a sub-aggregate declaring tenantId, given another": over(
+    "part",
+    "tenantId",
+    "other",
+    CONTEXT,
+    "t1",
+  ),
+  "context: an Unknown one edge holding csk, the collection sort key's copy": over(
+    "note",
+    "csk",
+    "mine",
+    MIRRORED,
+    "$sweep#v1#note",
+  ),
+  "keys: root declares pk (optional), given mine": over("Root", "pk", "mine", PARTITION, undefined),
+  "keys: root's composite id is the pk attribute": over(
     "Root",
     "id",
     "a",
     PARTITION,
     "$sweep#v1#sweep#a",
-  ],
-  "keys: root declares sk (optional), given mine": ["Root", "sk", "mine", SORT, "$sweep#v1#root"],
-  "keys: root declares __edd_e__ (optional), given mine": [
+  ),
+  "keys: root declares sk (optional), given mine": over("Root", "sk", "mine", SORT, undefined),
+  "keys: root declares __edd_e__ (optional), given mine": over(
     "Root",
     "__edd_e__",
     "mine",
     TYPE,
-    "Root",
-  ],
-  "keys: root declares the list pk attribute status": [
+    undefined,
+  ),
+  "keys: root declares the list pk attribute status": over(
     "Root",
     "status",
     "open",
     LIST_PK,
     "$sweep#v1#bystatus#open",
-  ],
-  "keys: root declares the list sk attribute rank": [
+  ),
+  "keys: root declares the list sk attribute rank": over(
     "Root",
     "rank",
     "r1",
     LIST_SK,
     "$sweep#v1#byrank#r1",
-  ],
-  "keys: root declares the list sk attribute lsk, given mine, its list composite prio given": [
+  ),
+  "keys: root declares the list sk attribute lsk, given mine, its list composite prio given": over(
     "Root",
     "lsk",
     "mine",
     LIST_SK,
     "$sweep#v1#byprio#p1",
-  ],
-  "keys: one edge value declares sk (optional), given mine": [
+  ),
+  "keys: one edge value declares sk (optional), given mine": over(
     "note",
     "sk",
     "mine",
     SORT,
-    "$sweep#v1#note",
-  ],
-  "keys: many element declares __edd_e__ (optional), given mine": [
+    undefined,
+  ),
+  "keys: many element declares __edd_e__ (optional), given mine": over(
     "lines",
     "__edd_e__",
     "mine",
     TYPE,
-    "Line",
-  ],
-  "keys: sub-aggregate declares pk (optional), given mine": [
+    undefined,
+  ),
+  "keys: sub-aggregate declares pk (optional), given mine": over(
     "part",
     "pk",
     "mine",
     PARTITION,
-    "$sweep#v1#sweep#a",
-  ],
-  "keys: one edge value declares csk, the collection sk mirror, given mine": [
+    undefined,
+  ),
+  "keys: one edge value declares csk, the collection sk mirror, given mine": over(
     "note",
     "csk",
     "mine",
     MIRRORED,
     "$sweep#v1#note",
-  ],
-  "strip: sub-aggregate with an edge declaring pkey (optional), keyed under pkey, given mine": [
+  ),
+  "strip: sub-aggregate with an edge declaring pkey (optional), keyed under pkey, given mine": over(
+    "part",
+    "pkey",
+    "mine",
+    PARTITION,
+    undefined,
+  ),
+  "strip: childless sub-aggregate declaring pkey (optional), keyed under pkey, given mine": over(
     "part",
     "pkey",
     "mine",
     PARTITION,
     "$sweep#v1#sweep#a",
-  ],
-  "strip: childless sub-aggregate declaring pkey (optional), keyed under pkey, given mine": [
-    "part",
-    "pkey",
-    "mine",
-    PARTITION,
-    "$sweep#v1#sweep#a",
-  ],
+  ),
 }
 
 /** `requests` with each item put held as `row` makes it. */
@@ -475,12 +567,8 @@ export const sweepSuite = (
             // 1.40.0 created it, and its read handed back the library's value, not the one given.
             expect(judged(then.create)).toEqual({ ok: plain(inputOf(shape)) })
             expect(judged(then.get)).not.toEqual({ ok: plain(inputOf(shape)) })
-            const [member] = refused
-            expect(now.create).toEqual({
-              failed: "AggregateDecompositionError",
-              member,
-              reason: givenOverRow(...refused),
-            })
+            const [member, reason] = refused
+            expect(now.create).toEqual({ failed: "AggregateDecompositionError", member, reason })
             expect(now.requests).toEqual([])
             expect(now.rows).toEqual([])
             return
@@ -492,25 +580,67 @@ export const sweepSuite = (
           }
           named?.head(now, from === "seeded" ? then.rows : now.rows!)
           expect(outcome(now.get)).toEqual(outcome(then.get))
-          const context = shape.context ?? []
-          const edges = {
-            ...shape.edges,
-            aside: { _tag: "BoundSubAggregate", aggregate: { edges: {} } },
-          }
+          const stale = STALE_AFTER_FAILING[label]
+          const failingAt = now.steps.findIndex((step) => step.step.startsWith("failing"))
+          const staleKeys =
+            stale === undefined ? new Set<string>() : staleKeysIn(now.steps[failingAt]!.rows, stale)
+          if (stale !== undefined) expect(staleKeys.size).toBeGreaterThan(0)
           for (const [i, step] of now.steps.entries()) {
             const was = then.steps[i]!
             expect(step.step).toBe(was.step)
             const id = { step: step.step }
-            expect({ ...id, get: outcome(step.get) }).toEqual({ ...id, get: outcome(was.get) })
+            const repaired = stale !== undefined && i > failingAt
+            const copies = (value: Outcome) =>
+              repaired && value.ok !== undefined
+                ? { ...value, ok: valueCopiesAsRoot(asValue(value.ok), stale) }
+                : value
+            const rowsOf = (all: ReadonlyArray<Row>) =>
+              repaired ? stamped(copiesAsRoot(all.map(asRow), stale)) : rows(all)
+            expect({ ...id, get: outcome(copies(step.get)) }).toEqual({
+              ...id,
+              get: outcome(copies(was.get)),
+            })
+            // What a `get` right after reads (#241); where 1.40.0's update failed, as it failed.
             expect({ ...id, update: outcome(step.update) }).toEqual({
               ...id,
-              update: outcome(
-                was.update.failed !== undefined
-                  ? was.update
-                  : { ok: withCopiesRead(was.update.ok, was.get.ok, edges, context) },
-              ),
+              update: outcome(was.update.failed !== undefined ? was.update : step.get),
             })
-            expect({ ...id, requests: requests(step.requests) }).toEqual({
+            // The transactions writing the rows left behind that 1.40.0 didn't send: only at the
+            // retry, and every such row's group.
+            const sent140 = (was.requests as ReadonlyArray<Request>).map((r) =>
+              JSON.stringify(requests([r])),
+            )
+            const repairs = repaired
+              ? step.requests.filter((r) => {
+                  if (!putsOnly(r, staleKeys)) return false
+                  const at = sent140.indexOf(JSON.stringify(requests([r])))
+                  if (at === -1) return true
+                  sent140.splice(at, 1)
+                  return false
+                })
+              : []
+            if (repaired) {
+              const put = new Set(putsOf(repairs).map((row) => row.sk!.S!))
+              expect({ ...id, repairs: put.size > 0 }).toEqual({
+                ...id,
+                repairs: step.step === "retry",
+              })
+              if (step.step === "retry") {
+                const written = new Set(putsOf(step.requests).map((row) => row.sk!.S!))
+                expect([...staleKeys].filter((k) => !written.has(k))).toEqual([])
+              }
+              // Every row's copy is the root's once the retry is written.
+              const root = step.rows.find((row) => typeOf(row) === "Root")!
+              for (const row of step.rows) {
+                for (const name of stale!) {
+                  if (Object.hasOwn(row, name)) expect(row[name]).toEqual(root[name])
+                }
+              }
+            }
+            expect({
+              ...id,
+              requests: requests(step.requests.filter((r) => !repairs.includes(r))),
+            }).toEqual({
               ...id,
               requests: requests(was.requests),
             })
@@ -518,7 +648,7 @@ export const sweepSuite = (
               ...id,
               refused: requests(was.refused),
             })
-            expect({ ...id, rows: rows(step.rows) }).toEqual({ ...id, rows: rows(was.rows) })
+            expect({ ...id, rows: rowsOf(step.rows) }).toEqual({ ...id, rows: rowsOf(was.rows) })
           }
         })
       it(`${label}: on 1.40.0's rows, never refused; sends, stores, reads and returns what 1.40.0 did`, () =>

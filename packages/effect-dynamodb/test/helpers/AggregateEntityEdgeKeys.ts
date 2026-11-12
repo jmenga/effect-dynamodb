@@ -1025,6 +1025,8 @@ export const suite = (
           expect(title.outcome.fail).toBe("AggregateTransactionOverflow")
           expect(title.outcome.error.itemCount).toBe(101)
           expect(title.outcome.error.previousKeyText).toBe(50)
+          // The root's group is the write's first transaction: no earlier one committed.
+          expect(title.outcome.error.committed).toEqual([])
           expect(title.outcome.error.message).toBe(
             `Aggregate "Bulk": the transaction of sub-aggregate "root" holds 101 items, over ` +
               `DynamoDB's limit of 100 for one transaction, and DynamoDB rejected it. Nothing was ` +
@@ -1040,6 +1042,7 @@ export const suite = (
           expect(adding.outcome.fail).toBe("AggregateTransactionOverflow")
           expect(adding.outcome.error.itemCount).toBe(151)
           expect(adding.outcome.error.previousKeyText).toBeUndefined()
+          expect(adding.outcome.error.committed).toEqual([])
           expect(adding.outcome.error.message).not.toContain("rekey")
           expect(adding.rows).toEqual(sorted(seeded))
           // `rekey` reports the 50 rows, moves them, and the update then fits.
@@ -1099,11 +1102,79 @@ export const suite = (
               expect(title.outcome.fail).toBe("AggregateTransactionOverflow")
               expect(title.outcome.error.itemCount).toBe(items)
               expect(title.outcome.error.previousKeyText).toBe(45)
+              expect(title.outcome.error.committed).toEqual([])
               expect(title.outcome.error.message).toContain(
                 "so 45 of these 101 items are those deletes",
               )
               expect(title.rows).toEqual(sorted(created.rows))
             }
+          }
+        }),
+    )
+
+    it.effect.skipIf(!harness.enforcesLimits)(
+      "a later group over the limit leaves the earlier groups written, and the overflow's committed names exactly them",
+      () =>
+        Effect.gen(function* () {
+          const id = "x2"
+          const pk = `$edges#v1#split#${id}`
+          const cased = (count: number) =>
+            Array.from({ length: count }, (_, i) => line(1, { lineId: `c${i}`, hex: `h${i}` }))
+          for (const [count, items] of [
+            [99, 100],
+            [100, 101],
+          ] as const) {
+            const [created, update] = yield* session(harness, OFF, [], ({ db, step }) =>
+              Effect.gen(function* () {
+                return [
+                  yield* step(
+                    "create",
+                    () =>
+                      db.aggregates.Splits.create({
+                        id,
+                        title: "t",
+                        part: { partName: "p", cased: cased(1) },
+                      }),
+                    pk,
+                  ),
+                  yield* step(
+                    "update title and part",
+                    () =>
+                      later(
+                        db.aggregates.Splits.update({ id }, ({ state }: any) => ({
+                          ...state,
+                          title: "t2",
+                          part: { ...state.part, cased: cased(count) },
+                        })),
+                      ),
+                    pk,
+                  ),
+                ] as const
+              }),
+            )
+            expect(created.outcome).toHaveProperty("ok")
+            const writes = update.requests.filter(
+              (request) => request.command === "TransactWriteItems",
+            )
+            // The root's group, then the part's: its row and one per element.
+            expect(writes.map((request) => request.input.TransactItems.length)).toEqual([1, items])
+            const root = (rows: ReadonlyArray<Row>) =>
+              rows.find((row) => row.sk?.S === "$edges#v1#split")!
+            const part = (rows: ReadonlyArray<Row>) =>
+              rows.filter((row) => row.sk?.S !== "$edges#v1#split")
+            expect(root(update.rows).title).toEqual({ S: "t2" })
+            if (items <= 100) {
+              expect(update.outcome.ok.title).toBe("t2")
+              expect(part(update.rows)).toHaveLength(1 + count)
+              continue
+            }
+            expect(update.outcome.fail).toBe("AggregateTransactionOverflow")
+            expect(update.outcome.error.subgraph).toBe("part")
+            expect(update.outcome.error.itemCount).toBe(items)
+            expect(update.outcome.error.committed).toEqual(["root"])
+            expect(update.outcome.error.previousKeyText).toBeUndefined()
+            // The root's group committed; the part's rows are as the create left them.
+            expect(part(update.rows)).toEqual(part(created.rows))
           }
         }),
     )

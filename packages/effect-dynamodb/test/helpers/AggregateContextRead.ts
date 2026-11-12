@@ -26,7 +26,7 @@ import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
-import { CONTEXT, givenOverRow, MIRRORED, withCopiesRead } from "./AggregateUpgradeSweep.js"
+import { CONTEXT, customOverRow, givenOverRow, MIRRORED } from "./AggregateUpgradeSweep.js"
 
 type Row = Record<string, AttributeValue>
 type Outcome = { readonly ok?: unknown; readonly failed?: string; readonly operation?: string }
@@ -120,7 +120,8 @@ export const shapes: Record<string, () => Shape> = {
     { qty: 1, text: "n", tenantId: "other" },
     { refused: givenOverRow("lines", "tenantId", "other", CONTEXT, "t1"), member: "lines" },
   ),
-  // A custom `assemble` is handed the rows with the context attributes: written and read as before.
+  // A custom `assemble` is handed the rows with the context attributes, the library's copy over the
+  // row's own: 1.40.0 read back "t1", not the value given, judged by what a read of the edge returns.
   "an Unknown element with a custom assemble holding another tenantId": () => ({
     model: root({ lines: Schema.Array(Schema.Unknown) }),
     edges: {
@@ -130,6 +131,15 @@ export const shapes: Record<string, () => Shape> = {
       }),
     },
     input: { id: "a", tenantId: "t1", lines: [{ qty: 1, text: "n", tenantId: "other" }] },
+    refused: customOverRow(
+      "lines",
+      "tenantId",
+      "other",
+      CONTEXT,
+      { shown: '[{ "qty": 1, "text": "n", "tenantId": "other" }]' },
+      { shown: '[{ "qty": 1, "text": "n", "tenantId": "t1" }]' },
+    ),
+    member: "lines",
   }),
   // A value declaring the context field reads the root's value back, the copy `context` makes:
   // given another, 1.40.0 read back the root's.
@@ -252,7 +262,7 @@ export const suite = (
           ))
         continue
       }
-      it(`${label}: stores and reads back what 1.40.0 did; a no-op update returns 1.40.0's result, context copies as stored`, () =>
+      it(`${label}: stores and reads back what 1.40.0 did; a no-op update returns what a get after it reads`, () =>
         Effect.runPromise(
           harness.onTable((tableName) =>
             Effect.gen(function* () {
@@ -275,15 +285,8 @@ export const suite = (
               ] as const) {
                 expect({ step, ...judged(now) }).toEqual({ step, ...judged(then[step]) })
               }
-              // 1.40.0's result, each context copy as the get after it reads it.
-              expect(judged(noop)).toEqual({
-                ok: withCopiesRead(
-                  then.noop.ok,
-                  then.getAfterUpdate.ok,
-                  shape.edges,
-                  shape.context ?? ["tenantId"],
-                ),
-              })
+              // What a `get` right after reads (#241).
+              expect(judged(noop)).toEqual(judged(getAfterUpdate))
             }),
           ),
         ))

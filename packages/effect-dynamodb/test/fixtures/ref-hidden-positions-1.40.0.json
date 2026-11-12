@@ -1,0 +1,1568 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0"
+ ],
+ "note": "Captured once from the published effect-dynamodb 1.40.0 on DynamoDB Local (#241): a ref to an entity whose DynamoModel.Hidden field is required, optional, Schema.Unknown, Schema.Any, Schema.UndefinedOr(String) or has a decoding default, at every position a ref takes: an entity's refs, an aggregate's root one edge, a many element wrapping the ref, a many element that is the entity, a sub-aggregate's one edge (declared by the root as a struct of its own) and a sub-aggregate's many element. Steps: the target put (secret \"s\"), the referencing put or create, its get. `instances` is whether each ref read back as the target's class; `rows` are every stored row but the target's. Never regenerate: it is what 1.40.0 did.",
+ "cases": {
+  "entity required": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "decode",
+    "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "ValidationError",
+    "operation": "decode",
+    "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#player"
+     },
+     "id": {
+      "S": "p"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#player#id_p"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     }
+    }
+   ]
+  },
+  "one required": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyWrapper required": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyEntity required": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"teams\"][0][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "subOne required": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "get": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Expected Team\n  at [\"squad\"][\"team\"]"
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#squadteam#squadno#0000000000000001"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadTeam"
+     }
+    }
+   ]
+  },
+  "subManyWrapper required": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"squad\"][\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "entity optional": {
+   "create": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#player"
+     },
+     "id": {
+      "S": "p"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#player#id_p"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     }
+    }
+   ]
+  },
+  "one optional": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#teamedge"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "TeamEdge"
+     }
+    }
+   ]
+  },
+  "manyWrapper optional": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "id": "l",
+       "team": {
+        "id": "t",
+        "name": "team"
+       }
+      }
+     ]
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "id": "l",
+       "team": {
+        "id": "t",
+        "name": "team"
+       }
+      }
+     ]
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ]
+  },
+  "manyEntity optional": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "teams": [
+      {
+       "id": "t",
+       "name": "team"
+      }
+     ]
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "teams": [
+      {
+       "id": "t",
+       "name": "team"
+      }
+     ]
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#teamrow#t"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "TeamRow"
+     }
+    }
+   ]
+  },
+  "subOne optional": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#squadteam#squadno#0000000000000001"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadTeam"
+     }
+    }
+   ]
+  },
+  "subManyWrapper optional": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "lines": [
+       {
+        "id": "l",
+        "team": {
+         "id": "t",
+         "name": "team"
+        }
+       }
+      ]
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "lines": [
+       {
+        "id": "l",
+        "team": {
+         "id": "t",
+         "name": "team"
+        }
+       }
+      ]
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hp#v1#squadline#squadno#0000000000000001#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadLine"
+     }
+    }
+   ]
+  },
+  "entity unknown": {
+   "create": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#player"
+     },
+     "id": {
+      "S": "p"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#player#id_p"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     }
+    }
+   ]
+  },
+  "one unknown": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyWrapper unknown": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyEntity unknown": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"teams\"][0][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "subOne unknown": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#squadteam#squadno#0000000000000001"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadTeam"
+     }
+    }
+   ]
+  },
+  "subManyWrapper unknown": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"squad\"][\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "entity any": {
+   "create": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#player"
+     },
+     "id": {
+      "S": "p"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#player#id_p"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     }
+    }
+   ]
+  },
+  "one any": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyWrapper any": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyEntity any": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"teams\"][0][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "subOne any": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#squadteam#squadno#0000000000000001"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadTeam"
+     }
+    }
+   ]
+  },
+  "subManyWrapper any": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"squad\"][\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "entity undefinedOr": {
+   "create": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#player"
+     },
+     "id": {
+      "S": "p"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#player#id_p"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     }
+    }
+   ]
+  },
+  "one undefinedOr": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyWrapper undefinedOr": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "manyEntity undefinedOr": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"teams\"][0][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "subOne undefinedOr": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team"
+      }
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#squadteam#squadno#0000000000000001"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadTeam"
+     }
+    }
+   ]
+  },
+  "subManyWrapper undefinedOr": {
+   "create": {
+    "failed": "ValidationError",
+    "operation": "aggregate.create",
+    "cause": "Missing key\n  at [\"squad\"][\"lines\"][0][\"team\"][\"secret\"]"
+   },
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "rows": []
+  },
+  "entity default": {
+   "create": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team",
+      "secret": "d"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "p",
+     "team": {
+      "id": "t",
+      "name": "team",
+      "secret": "d"
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#player"
+     },
+     "id": {
+      "S": "p"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#player#id_p"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     }
+    }
+   ]
+  },
+  "one default": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "team": {
+      "id": "t",
+      "name": "team"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "team": {
+      "id": "t",
+      "name": "team",
+      "secret": "d"
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#teamedge"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "TeamEdge"
+     }
+    }
+   ]
+  },
+  "manyWrapper default": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "id": "l",
+       "team": {
+        "id": "t",
+        "name": "team"
+       }
+      }
+     ]
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "id": "l",
+       "team": {
+        "id": "t",
+        "name": "team",
+        "secret": "d"
+       }
+      }
+     ]
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ]
+  },
+  "manyEntity default": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "teams": [
+      {
+       "id": "t",
+       "name": "team"
+      }
+     ]
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "teams": [
+      {
+       "id": "t",
+       "name": "team",
+       "secret": "d"
+      }
+     ]
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#teamrow#t"
+     },
+     "id": {
+      "S": "t"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "TeamRow"
+     }
+    }
+   ]
+  },
+  "subOne default": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team",
+       "secret": "d"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "team": {
+       "id": "t",
+       "name": "team",
+       "secret": "d"
+      }
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadTeam"
+     },
+     "name": {
+      "S": "team"
+     },
+     "sk": {
+      "S": "$hp#v1#squadteam#squadno#0000000000000001"
+     },
+     "id": {
+      "S": "t"
+     },
+     "secret": {
+      "S": "d"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     }
+    }
+   ]
+  },
+  "subManyWrapper default": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "lines": [
+       {
+        "id": "l",
+        "team": {
+         "id": "t",
+         "name": "team"
+        }
+       }
+      ]
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "squad": {
+      "name": "s",
+      "lines": [
+       {
+        "id": "l",
+        "team": {
+         "id": "t",
+         "name": "team",
+         "secret": "d"
+        }
+       }
+      ]
+     }
+    }
+   },
+   "instances": [
+    true
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hp#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "name": {
+      "S": "s"
+     },
+     "sk": {
+      "S": "$hp#v1#squad#squadno#0000000000000001"
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Squad"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hp#v1#squadline#squadno#0000000000000001#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "team"
+       },
+       "id": {
+        "S": "t"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hp#v1#agg#a"
+     },
+     "squadNo": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SquadLine"
+     }
+    }
+   ]
+  }
+ }
+}

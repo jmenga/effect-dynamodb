@@ -611,9 +611,12 @@ describe("a transformed field under a custom decompose", () => {
       ).toBe(5)
       // The rows read (1); the new state, read as the domain value it is (3); the old rows' stored
       // form (1); the new value, as 1.39.0 read it (1); the new rows' stored form (1). The rows
-      // read are decomposed once, as read.
+      // read are decomposed once, as read. The write sends the edge's rows either way (its
+      // `decompose` is the caller's), and returns them as a `get` right after reads them, assembled
+      // from the rows read and written (1, #241).
+      const counts: Array<number> = []
       for (const note of ["unchanged", "changed"]) {
-        expect(
+        counts.push(
           yield* run((db) =>
             db.aggregates.Orders.update({ id: "a" }, ({ state }: any) =>
               note === "unchanged"
@@ -621,8 +624,9 @@ describe("a transformed field under a custom decompose", () => {
                 : { ...state, lines: state.lines.map((line: any) => ({ ...line, f: 6 })) },
             ),
           ),
-        ).toBe(7)
+        )
       }
+      expect(counts).toEqual([8, 8])
       // The rows read (1) and their stored form (1).
       expect(yield* run((db) => db.tables.Main.rekey())).toBe(2)
     }),
