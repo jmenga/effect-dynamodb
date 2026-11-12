@@ -41,6 +41,29 @@ export interface ClientOptions {
 }
 
 /**
+ * Static credentials for a layer. `sessionToken` is the third part of temporary
+ * credentials (an assumed role, STS), which the SDK sends as
+ * `x-amz-security-token`. Nothing in the library reads them: the SDK client gets
+ * them, and AWS's reply to a refused signature, which can quote the token, is
+ * redacted (`internal/CredentialRefusal.ts`).
+ */
+export type Credentials = {
+  readonly accessKeyId: string
+  readonly secretAccessKey: string
+  readonly sessionToken?: string | undefined
+}
+
+/**
+ * {@link Credentials} as the SDK client takes them: a token left `undefined` is
+ * left out, since the SDK's type has none for `undefined`. Anything else is
+ * passed as given.
+ */
+export const sdkCredentials = (credentials: Credentials) => {
+  const { sessionToken, ...rest } = credentials
+  return sessionToken === undefined ? rest : { ...rest, sessionToken }
+}
+
+/**
  * The handler's options an operator tunes per environment, each read through
  * `Config`. One that is missing stays unset; one that doesn't parse fails the
  * layer with its `ConfigError`.
