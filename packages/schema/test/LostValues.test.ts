@@ -65,6 +65,26 @@ const LOST: ReadonlyArray<readonly [string, () => unknown, readonly [string, str
     ["an ArrayBuffer", () => new Uint8Array([1]).buffer, ["binary data (ArrayBuffer)", "f"]],
     ["a DataView", () => new DataView(new Uint8Array([1]).buffer), ["binary data (DataView)", "f"]],
     ["a Float64Array", () => new Float64Array([1.5]), ["binary data (Float64Array)", "f"]],
+    // Every other typed array, which the AWS SDK fails to send (a TypeError while serialising),
+    // and a SharedArrayBuffer, which it stores as an empty map.
+    ...[
+      Int8Array,
+      Uint8ClampedArray,
+      Int16Array,
+      Uint16Array,
+      Int32Array,
+      Uint32Array,
+      Float32Array,
+      BigInt64Array,
+      BigUint64Array,
+    ].map(
+      (Kind) => [`a ${Kind.name}`, () => new Kind(1), [`binary data (${Kind.name})`, "f"]] as const,
+    ),
+    [
+      "a SharedArrayBuffer",
+      () => new SharedArrayBuffer(1),
+      ["binary data (SharedArrayBuffer)", "f"],
+    ],
     [
       "an Exit dying of an Error",
       () => Exit.die(new Error("x")),

@@ -14,8 +14,9 @@
  * `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`, whose content isn't in its properties;
  * an `Error` holding a `message` or a `cause` that isn't one of its enumerable properties; Effect's
  * `Redacted`, whose value is held outside it; a `Map` with a key that isn't a string, whose keys are
- * stored as text; and binary data other than a `Uint8Array`, of which a read hands back other bytes
- * or none. A cookie's expiry is the exception to a `Date`: the marshaller writes it as ISO text.
+ * stored as text; and binary data other than a `Uint8Array`: an `ArrayBuffer` or a `DataView` is
+ * stored as empty bytes, a `SharedArrayBuffer` as an empty map, and the AWS SDK fails to send any
+ * other typed array (a `TypeError`). A cookie's expiry is the exception to a `Date`: the marshaller writes it as ISO text.
  * `undefined`, a function or a hole in a list isn't one: the list closes up, as it always has, and a
  * caller can rely on that (a documented limit). Everything is read from descriptors, so no getter is
  * called.
