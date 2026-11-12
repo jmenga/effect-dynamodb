@@ -374,12 +374,15 @@ describeConnected("the key written is the key composed from the row read back (c
                 Effect.gen(function* () {
                   if (values.length === 1) {
                     // An `Option` is stored as a map, and DynamoDB refuses append's ordering guard
-                    // (`<`) on a map, as it did on 1.39.0: DynamoDB holds no such event. The bounds
-                    // are checked below on the rows the fixture puts directly.
-                    const failed = yield* Effect.flip(
+                    // (`<`) on a map, as it did on 1.39.0: DynamoDB holds no such event. The
+                    // refusal is diagnosed as `EDD-9163` (#242). The bounds are checked below on
+                    // the rows the fixture puts directly.
+                    const failed: any = yield* Effect.flip(
                       db.entities.E.append({ id: "x", n: values[0] }).asEffect(),
                     )
-                    expect((failed as any)._tag).toBe("DynamoValidationError")
+                    expect(failed._tag).toBe("ValidationError")
+                    expect(String(failed.cause?.message)).toContain("[EDD-9163]")
+                    expect(failed.cause?.cause?._tag).toBe("DynamoValidationError")
                     expect(yield* table.rows).toEqual([])
                     return
                   }

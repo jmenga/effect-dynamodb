@@ -210,11 +210,14 @@ import {
 import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
 import {
   batchEntries,
+  type Diagnosis,
   diagnosedValidationError,
   diagnoseFailure,
   keyAttributesOf,
+  storedTypeName,
   targetsFor,
   transactItemTarget,
+  withCause,
 } from "./internal/WriteDiagnosis.js"
 import {
   decodeSparseFields,
@@ -12501,6 +12504,34 @@ const makeImpl = <
 
       const marshalledEventItem = toAttributeMap(eventItem)
 
+      /**
+       * DynamoDB's refusal of the guard on the stored `orderBy` (`#_tsob < :_tsNewOb`), as
+       * `EDD-9163` (#242): an `orderBy` stored as a map (an `Option`, a `Result`, a `Duration`,
+       * a `BigDecimal`, a zone), a list, a boolean or null is a value `<` doesn't take, so DynamoDB
+       * refuses the condition whatever the item holds (a field always stored so can never
+       * append; a null only fails the appends holding it). Not
+       * checked: the append is sent, and the refusal, confirmed against the condition sent
+       * (`OperandType`), is this. Any other diagnosis is the one every write gives.
+       */
+      const orderByRefusal = (diagnosis: Diagnosis, original: unknown) =>
+        diagnosis._tag === "OperandType" && diagnosis.attribute === orderByName
+          ? new ValidationError({
+              entityType,
+              operation: "append",
+              cause: withCause(
+                `[EDD-9163] Entity "${entityType}": this append's timeSeries.orderBy field ` +
+                  `"${orderByField}" is stored as ${storedTypeName(diagnosis.operandType)}. An ` +
+                  "append writes only when the stored orderBy is below the new one, and " +
+                  `DynamoDB evaluates ${diagnosis.operator} only on numbers, strings and ` +
+                  "binary, so it refused the append. A field stored as a map, a list or a " +
+                  "boolean (an Option, a Result, a Duration, a BigDecimal, a zone) can never " +
+                  "order appends: order them by a field stored as a number or a string (a " +
+                  "date, a number, a Schema.DurationFromMillis). Nothing was written.",
+                original,
+              ),
+            })
+          : diagnosedValidationError(diagnosis, original, { operation: "append", entityType })
+
       // ---------- Execute TransactWriteItems ----------
       /** One attempt: the UpdateItem guarded by `cas` (and the user's condition), then the event Put. */
       const send = (cas: AppendCas, expression = updateExpression) => {
@@ -12551,8 +12582,8 @@ const makeImpl = <
                 ),
             }),
             keys: entityKeys,
-            rewrite: (diagnosis, original) =>
-              diagnosedValidationError(diagnosis, original, { operation: "append", entityType }),
+            optIn: ["OperandType"],
+            rewrite: orderByRefusal,
           }),
           Effect.matchEffect({
             onSuccess: () => Effect.succeed({ stale: false as const }),

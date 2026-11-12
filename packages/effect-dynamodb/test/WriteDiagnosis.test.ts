@@ -56,6 +56,7 @@ import {
   ddbEmptyTableKey,
   ddbExpressionTooLong,
   ddbMemberOutOfRange,
+  ddbOperandType,
   ddbPayloadTooLarge,
   ddbTooManyInOperands,
   ddbTooManyOperators,
@@ -1496,6 +1497,114 @@ describe("WriteDiagnosis (#144)", () => {
         input: { FilterExpression: "#e0 = :v", ExpressionAttributeNames: { "#e0": "status" } },
       }
       expect(diagnoseRejection(rejected(ddbEmptyIn("Filter")), read)).toBeUndefined()
+    })
+  })
+
+  describe("a condition comparing a value of a type its operator doesn't take (#242)", () => {
+    const map = { M: { value: { N: "1" } } }
+    const compared = (expression: string, values: Record<string, object>): TransactWriteItem => ({
+      Update: {
+        TableName: "t",
+        Key: { pk: { S: "p#a" }, sk: { S: "s" } },
+        UpdateExpression: "SET #e2 = :n",
+        ConditionExpression: expression,
+        ExpressionAttributeNames: { "#e0": "seq", "#e1": "meta", "#e2": "other" },
+        ExpressionAttributeValues: { ":n": { N: "1" }, ...values } as never,
+      },
+    })
+
+    it("< with a map: the attribute it's compared with, as stored", () => {
+      const d = expectTag(
+        diagnose(
+          rejected(ddbOperandType("<", "M")),
+          transaction([
+            compared("attribute_not_exists(#pk) OR #e1.#e0 < :v", { ":v": map }),
+            put("z"),
+          ]),
+        ),
+        "OperandType",
+      )
+      expect(d.attribute).toBe("meta.seq")
+      expect(d.operator).toBe("<")
+      expect(d.operandType).toBe("M")
+      expect(d.target.source).toBe("operation 0 (Doc)")
+      const text = explainDiagnosis(d, "append")
+      expect(text).toContain('compares "meta.seq" with < to a value stored as a map (M)')
+      expect(text).toContain("Nothing was written.")
+    })
+
+    it("the value on the left, and BETWEEN", () => {
+      expect(
+        expectTag(
+          diagnose(
+            rejected(ddbOperandType(">=", "L")),
+            single(compared(":v >= #e0", { ":v": { L: [] } })),
+          ),
+          "OperandType",
+        ).attribute,
+      ).toBe("seq")
+      expect(
+        expectTag(
+          diagnose(
+            rejected(ddbOperandType("BETWEEN", "BOOL")),
+            single(
+              compared("#e0 BETWEEN :lo AND :hi", { ":lo": { N: "1" }, ":hi": { BOOL: true } }),
+            ),
+          ),
+          "OperandType",
+        ).attribute,
+      ).toBe("seq")
+    })
+
+    it("in a cancellation reason: the entry at that position", () => {
+      const d = expectTag(
+        diagnose(
+          cancelled([undefined, { Code: "ValidationError", Message: ddbOperandType("<", "M") }]),
+          transaction([put("z"), compared("#e0 < :v", { ":v": map })]),
+        ),
+        "OperandType",
+      )
+      expect(d.target.source).toBe("operation 1 (Doc)")
+    })
+
+    it("no such comparison in the request, or the other expression kind: passed through", () => {
+      // DynamoDB names a list; the condition compares a map.
+      expect(
+        diagnose(rejected(ddbOperandType("<", "L")), single(compared("#e0 < :v", { ":v": map }))),
+      ).toBeUndefined()
+      // DynamoDB names `>`; the condition compares with `<`.
+      expect(
+        diagnose(rejected(ddbOperandType(">", "M")), single(compared("#e0 < :v", { ":v": map }))),
+      ).toBeUndefined()
+      expect(
+        diagnose(
+          rejected(ddbOperandType("<", "M", "Update")),
+          single(compared("#e0 < :v", { ":v": map })),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("opt-in: a site that doesn't name it passes DynamoDB's refusal through", async () => {
+      const error = rejected(ddbOperandType("<", "M"))
+      const sent = () => single(compared("#e0 < :v", { ":v": map }))
+      const run = (optIn?: ReadonlyArray<"OperandType">) =>
+        Effect.runPromise(
+          Effect.fail(error).pipe(
+            diagnoseFailure({
+              sent,
+              keys: () => KEYS,
+              ...(optIn !== undefined && { optIn }),
+              rewrite: (diagnosis, original) =>
+                diagnosedValidationError(diagnosis, original, {
+                  operation: "put",
+                  entityType: "Doc",
+                }),
+            }),
+            Effect.flip,
+          ),
+        )
+      expect(await run()).toBe(error)
+      expect((await run(["OperandType"]))._tag).toBe("ValidationError")
     })
   })
 
