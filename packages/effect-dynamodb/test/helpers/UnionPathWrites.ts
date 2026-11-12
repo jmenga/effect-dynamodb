@@ -7,13 +7,14 @@
  * on `Union([{ kind: "a", x }, { kind: "b", y }])` was refused with `Expected "a"`, whatever the row
  * held, as was `vary.v = "tt"` on `Union([{ v: number }, { v: string }])`. A value one of the other
  * members takes is now written as that member stores it, and the update's clauses in the field are
- * judged together: refused where no member of each union on the way reads what they leave there,
- * as 1.40.0 refused it where a clause the schema can't judge (an increment) is beside it. The
- * request each sends is the one 1.40.0 sent for the same paths with the first member's value
- * (`twin`), but for that value. A path write reads nothing of the row, so a tag written alone leaves
- * whatever else the row holds: on a row holding the other member, the update is applied and the
- * read-back reports the row no longer matches the model, as 1.40.0 reported `tag.kind = "a"` on a
- * row holding member `b`.
+ * judged together. A path write reads nothing of the row, so such a value is written only where the
+ * update writes every property of the member it writes into (`tag.kind = "b"` beside
+ * `tag.y = 2`): what it leaves there then reads whatever the row held. Anywhere else it stays
+ * refused as 1.40.0 refused it: a tag written alone (on a row holding the other member it would
+ * leave that member's properties under the new tag, a row no read takes; 1.40.0's refusal kept it
+ * readable), or beside a clause the schema can't judge (an increment). The request each sends is
+ * the one 1.40.0 sent for the same paths with the first member's value (`twin`), but for that
+ * value.
  *
  * `tag.kind = "a"` beside `pathRemove(["tag", "x"])` leaves a value no member reads (`a` requires
  * `x`), on any row: refused, nothing sent. 1.40.0 applied it, and the read-back failed (in a
@@ -172,12 +173,12 @@ const inTransaction = new Set([
 /**
  * A write 1.40.0 refused that is now sent: the case 1.40.0 sent for the same paths (`twin`), the
  * values the request holds in place of the twin's, and what the row reads back as (`reads`, the
- * field written; `undefined`: the row no longer matches the model).
+ * field written), on a row of either member.
  */
 type Sent = {
   readonly twin: string
   readonly values: Record<string, unknown>
-  readonly reads: readonly [field: string, value: unknown] | undefined
+  readonly reads: readonly [field: string, value: unknown]
 }
 const b = { S: "b" }
 const sent: Record<string, Sent> = {}
@@ -199,7 +200,6 @@ const sends = (
   }
 }
 const tx = ["", " / in a transaction"]
-sends("tag.kind = b", "tag.kind = a", { ":ps2": b }, { a: undefined, b: ["tag", ROWS.b.tag] }, tx)
 const tagB2 = ["tag", { kind: "b", y: 2 }] as const
 sends(
   "tag.kind = b, tag.y = 2",
@@ -210,22 +210,10 @@ sends(
 )
 sends("tag.y = 2, tag.kind = b", "tag.y = 2, tag.kind = a", { ":ps5": b }, { a: tagB2, b: tagB2 })
 sends(
-  "tag.kind = b, tag.x = tt",
-  "tag.kind = a, tag.x = tt",
-  { ":ps2": b },
-  { a: undefined, b: ["tag", ROWS.b.tag] },
-)
-sends(
   "vary.v = tt",
   "vary.v = 5",
   { ":ps2": { S: "tt" } },
   { a: ["vary", { v: "tt" }], b: ["vary", { v: "tt" }] },
-)
-sends(
-  "deep.inner.kind = b",
-  "deep.inner.kind = a",
-  { ":ps3": b },
-  { a: undefined, b: ["deep", ROWS.b.deep] },
 )
 const deepB3 = ["deep", { inner: { kind: "b", y: 3 } }] as const
 sends(
@@ -234,24 +222,12 @@ sends(
   { ":ps3": b },
   { a: deepB3, b: deepB3 },
 )
-sends(
-  "maybe.kind = b",
-  "maybe.kind = a",
-  { ":ps2": b },
-  { a: undefined, b: ["maybe", ROWS.b.maybe] },
-)
 const maybeB3 = ["maybe", { kind: "b", y: 3 }] as const
 sends(
   "maybe.kind = b, maybe.y = 3",
   "maybe.kind = a, maybe.y = 3",
   { ":ps2": b },
   { a: maybeB3, b: maybeB3 },
-)
-sends(
-  "nested.g.kind = b",
-  "nested.g.kind = a",
-  { ":ps3": b },
-  { a: undefined, b: ["nested", ROWS.b.nested] },
 )
 const nestedB2 = ["nested", { g: { kind: "b", y: 2 } }] as const
 sends(
@@ -366,15 +342,6 @@ export const unionPathWritesSuite = (open: OpenTable) => {
               // The twin's requests, but for the value 1.40.0 refused.
               const twin = fixture.cases[now!.twin]!
               expect(head.sent).toEqual(withValues(twin.sent, now!.values))
-              if (now!.reads === undefined) {
-                // A path write reads nothing of the row: the other member's properties are left.
-                expect(head.read.fail).toBe("ValidationError")
-                if (how === "alone") {
-                  expect(head.outcome.fail).toBe("ValidationError")
-                  expect(head.outcome.says).toMatch(/^The update WAS applied/)
-                } else expect(head.outcome).toEqual({ ok: null })
-                return
-              }
               const [field, value] = now!.reads
               expect(head.outcome).toEqual(
                 how === "alone" ? { ok: { ...was.read.ok, [field]: value } } : { ok: null },

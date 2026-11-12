@@ -3559,9 +3559,14 @@ export const makePathValueEncoder = (
   /**
    * Whether the values a union on the way reads can take what an update's clauses inside one field
    * leave there ({@link UnionClause}), together (#238). `uncertain` answers a clause the schema
-   * can't judge.
+   * can't judge. `whole`: only where they write every property of the member they write into, so
+   * that it reads what they leave whatever the row held.
    */
-  readonly readTogether: (clauses: ReadonlyArray<UnionClause>, uncertain: boolean) => boolean
+  readonly readTogether: (
+    clauses: ReadonlyArray<UnionClause>,
+    uncertain: boolean,
+    whole: boolean,
+  ) => boolean
   /** Whether a path passes a union of several members. */
   readonly passesUnion: (segments: ReadonlyArray<string | number>) => boolean
 } => {
@@ -4014,9 +4019,42 @@ export const makePathValueEncoder = (
         return "unknown"
     }
   }
-  const readTogether = (clauses: ReadonlyArray<UnionClause>, uncertain: boolean): boolean => {
+  /**
+   * Whether the clauses write every property of the member each union takes, wherever they write a
+   * property of that member directly (#238): what they leave there is then read whatever the row
+   * held, as nothing the row holds is read in its place. A member that isn't a plain struct
+   * isn't known to be. A union the path only passes through is the row's: DynamoDB writes below it
+   * only where the row holds the map the path names.
+   */
+  const determined = (
+    clauses: ReadonlyArray<UnionClause>,
+    held: ReadonlyMap<string, Schema.Top>,
+  ): boolean => {
+    for (const [at, member] of held) {
+      const base = JSON.parse(at) as ReadonlyArray<string | number>
+      const direct = clauses.filter(
+        (clause) =>
+          clause._tag !== "Other" &&
+          clause.segments.length === base.length + 1 &&
+          base.every((segment, i) => clause.segments[i] === segment),
+      )
+      if (direct.length === 0) continue
+      if (parentOf(member) !== "struct") return false
+      const written = new Set(direct.map((clause) => clause.segments[base.length]))
+      const properties = (member.ast as SchemaAST.Objects).propertySignatures
+      if (!properties.every((property) => written.has(property.name as string))) return false
+    }
+    return true
+  }
+  const readTogether = (
+    clauses: ReadonlyArray<UnionClause>,
+    uncertain: boolean,
+    whole: boolean,
+  ): boolean => {
     const options = clauses.map((clause) =>
       waysTo(clause.segments).filter((way) => {
+        // A member that reads past the path reads what the row held beside it, unknown here.
+        if (whole && way.end._tag === "Unread") return false
         const verdict = admits(way, clause)
         return verdict === "unknown" ? uncertain : verdict
       }),
@@ -4026,7 +4064,7 @@ export const makePathValueEncoder = (
       choices: ReadonlyMap<string, Schema.Top>,
     ): boolean => [...choices].every(([at, member]) => (held.get(at) ?? member) === member)
     const search = (index: number, held: ReadonlyMap<string, Schema.Top>): boolean => {
-      if (index === options.length) return true
+      if (index === options.length) return !whole || determined(clauses, held)
       // A clause with no way the walk follows is one the schema can't judge.
       if (options[index]!.length === 0 && waysTo(clauses[index]!.segments).length === 0) {
         return uncertain && search(index + 1, held)

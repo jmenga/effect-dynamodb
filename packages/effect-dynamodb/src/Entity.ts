@@ -4447,8 +4447,12 @@ const makeImpl = <
    * (#238): refused where no member of each union on the way reads what they leave there together
    * (`readTogether`), every clause judged where the schema says what a member reads after it.
    * Where a value is taken only by another member than the schema at its path (`refusedBefore`,
-   * which 1.40.0 refused), a clause the schema can't judge leaves it refused as 1.40.0 refused it;
-   * otherwise such a clause is taken as read, and the update is sent as 1.40.0 sent it.
+   * which 1.40.0 refused), it's written only where the clauses write every property of the member
+   * they write into, so that it reads what they leave whatever the row held: a path write reads
+   * nothing of the row, and on a row holding another member 1.40.0's refusal kept it readable.
+   * Anywhere else, beside a clause the schema can't judge included, it stays refused as 1.40.0
+   * refused it. Beside values the first member takes, a clause the schema can't judge is taken as
+   * read, and the update is sent as 1.40.0 sent it.
    */
   const unionRefusal = (
     uState: UpdateState,
@@ -4491,9 +4495,10 @@ const makeImpl = <
       // the schema can't judge.
       const rest = clauses.filter((clause) => clause.at === `field:${field}`).length
       for (let i = judged.length; i < rest; i++) judged.push({ _tag: "Other", segments: [field] })
-      if (pathValues.readTogether(judged, !otherWay)) continue
+      if (pathValues.readTogether(judged, !otherWay, otherWay)) continue
       // A value only another member takes, beside what the schema can't judge or what no member
-      // reads with it: refused as 1.40.0 refused the update.
+      // reads with it, or leaving what the row held to be read with it: refused as 1.40.0 refused
+      // the update.
       if (otherWay) return refusedBefore
       refusal ??= {
         operation: "update.pathSet",
