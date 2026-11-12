@@ -2661,16 +2661,16 @@ Compiles to **one `SET` per bucket**. The above produces `SET #m_2026_01 = :map`
 ```ts
 // Counter — bucket attribute IS the scalar; works on a fresh item with no parent ceremony.
 db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.totals.entry('2026-01'), 1)
+  .pathAdd({ segments: ['totals#2026-01'], value: 1 })
   // → ADD totals#2026-01 :1
 
 // Inner-field update on a struct bucket — uses native DynamoDB nested-Map syntax.
 db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.metrics.entry('2026-01').views, 1)
+  .pathAdd({ segments: ['metrics#2026-01', 'views'], value: 1 })
   // → ADD metrics#2026-01.views :1
 ```
 
-`PathBuilder<Model>` exposes `.entry(key)` on sparse Record fields, returning a path typed by the inner value schema. The path compiles to `<prefix>#<key>` for the bucket itself, and `<prefix>#<key>.<field>` for nested-Map field access using DynamoDB's native nested-map syntax. `ExpressionAttributeNames` aliasing handles the `#` literal.
+A path operation names an entry by its attribute's segment (`<prefix>#<key>`). In a condition, a filter or a select, `PathBuilder<Model>` exposes `.entry(key)` on sparse Record fields, returning a path typed by the inner value schema. The path compiles to `<prefix>#<key>` for the bucket itself, and `<prefix>#<key>.<field>` for nested-Map field access using DynamoDB's native nested-map syntax. `ExpressionAttributeNames` aliasing handles the `#` literal.
 
 **Caveat.** Nested-Map operations on inner fields (`metrics#2026-01.views`) require the bucket attribute to exist. Use record-style for new buckets, path-style for buckets known to exist. This mirrors DynamoDB's native semantics — the library does not paper over it.
 
@@ -2813,7 +2813,7 @@ yield* db.entities.Pages.put({ pageId: 'p1', views: {} })
 
 // First view — atomic counter on a fresh item, no parent-map dance.
 yield* db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.views.entry('2026-04'), 1)
+  .pathAdd({ segments: ['views#2026-04'], value: 1 })
 // On disk: views#2026-04 = N(1)
 
 // Concurrent writers to different months never race.
@@ -2852,7 +2852,7 @@ yield* db.entities.Pages.update({ pageId: 'p1' })
 
 // Atomic per-leaf update within a known bucket.
 yield* db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.metrics.entry('2026-04').views, 1)
+  .pathAdd({ segments: ['metrics#2026-04', 'views'], value: 1 })
 // On disk: metrics#2026-04.views = 101
 
 // Reset — two-op helper, atomic via the version CAS.
@@ -3968,9 +3968,25 @@ removes it. So a field spelled like an entry wins for a bare segment, and the
 entry stays reachable through `.entry()` (a key without `#`) and
 `removeEntries` (any key): `test/SparseEntries.test.ts` pins both with a field
 `data#x` stored as `counter` beside the entry `x`, and a field `data#x#y`
-beside the entry `x#y`. A query's, a scan's and a collection's `filter` and
-`select` take `.entry()` too, since #238: every query path builder knows its entity's sparse
-maps (through 1.40.0 none did, so `.entry()` threw in every query callback). A
+beside the entry `x#y`. `.entry()` resolves the same way on every terminal that takes a path
+callback, since #238: each builds its path builder with `pathBuilderOf(models)`
+(`internal/PathBuilder.ts`), the one place that knows which fields are sparse maps (an
+entity's query accessors, `scan()`, `.history()`, `versions()`, `deleted.list()`, a
+collection's accessors over its members' models, a write's `.condition()`, the entity's own
+`condition` / `filter` / `select`, an aggregate `list` filter). Through 1.40.0 only a write's
+condition and the entity's own builder knew the maps, so `.entry()` threw in every query
+callback. The entity's own `filter` and `select` (on an unbound `Query`) go through the naming a
+bound query uses (`entityNaming`), as its `condition` goes through the write's: through 1.40.0
+they named an entry of a map a `field:` rename stores whole, and a key an entry's struct renames
+as stored, as written (`helpers/EntryOnEveryTerminal.ts`,
+`test/fixtures/entry-terminals-1.40.0.json`). `.entry()` names a map only at the top level
+(`t.inner.zones.entry()` is refused: through 1.40.0 it tested `inner.z#east`), and only a field
+the model declares (`Object.hasOwn`): the tables a definition looks fields up in by name
+(`getSparseFields`, `getPackedFields`, `fieldRenames`) have no prototype, so a field named
+`constructor` or `valueOf` is not taken for a sparse map whose prefix is `undefined` (through
+1.40.0 an update of it beside a sparse map wrote `undefined#…` attributes and returned the old
+value). Path operations take segments, not a callback; segments a builder's `.entry()` built
+carry the mark that they name an entry (`entryOfPath`). A
 filter on `t.g.entry("b")` names the attribute a condition names, and asks the
 row where it holds a map a `field:` rename stores whole (`entryForms`). In a
 collection each member names the entry by its own prefix, a member that holds

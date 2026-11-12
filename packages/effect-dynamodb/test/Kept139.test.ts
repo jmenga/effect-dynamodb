@@ -6,7 +6,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts` (against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -22,6 +22,7 @@ import {
 } from "./helpers/ClearWrites.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { entryInQueriesSuite } from "./helpers/EntryInQueries.js"
+import { entryOnEveryTerminalSuite } from "./helpers/EntryOnEveryTerminal.js"
 import { entrySelectsSuite } from "./helpers/EntrySelects.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import { openRecordingTable } from "./helpers/Kept139.js"
@@ -160,6 +161,10 @@ describe("a path below a struct that renames its keys, in a collection", () => {
 
 describe("a sparse map entry in a query's, a scan's and a collection's filter and select", () => {
   entryInQueriesSuite(openRecordingTable)
+})
+
+describe("a sparse map entry on every terminal that takes a path callback", () => {
+  entryOnEveryTerminalSuite(openRecordingTable)
 })
 
 describe("a renamed sparse map on an entity with a Z-order index", () => {

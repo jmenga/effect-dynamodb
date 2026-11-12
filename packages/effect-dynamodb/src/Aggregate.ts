@@ -128,7 +128,7 @@ import {
 } from "./internal/ExpressionLimits.js"
 import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
-import { createPathBuilder, type PathBuilder, type StoredBelow } from "./internal/PathBuilder.js"
+import { type PathBuilder, pathBuilderOf, type StoredBelow } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
 import { asRead, notReadBack, notStoredForm, readBackRefusal } from "./internal/RoundTrip.js"
 import {
@@ -5497,6 +5497,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             aggregateName,
             rootStoredFormAt,
             storedBelowFields(schemaFields),
+            schema,
           )
 
           // Attribute names that make up a resume key on the list index: the index
@@ -5890,8 +5891,8 @@ const edgePackedFields = (
   const configured = DynamoModel.getPackedFields(entity.model)
   const packed: Record<string, DynamoModel.PackedConfig> = {}
   for (const [field, storedAs] of Object.entries(configured)) {
-    if (itemFields !== undefined && !(field in itemFields)) continue
-    if (discriminator !== undefined && field in discriminator) {
+    if (itemFields !== undefined && !Object.hasOwn(itemFields, field)) continue
+    if (discriminator !== undefined && Object.hasOwn(discriminator, field)) {
       throw new Error(
         `[EDD-9072] Aggregate edge "${edgeName}": discriminator "${field}" is a packed field of ` +
           `entity "${entity.entityType}". A discriminator is matched as a scalar stored value.`,
@@ -5923,7 +5924,7 @@ const edgeDispatchFields = (
   const sparse = DynamoModel.getSparseFields(entity.model)
   const dispatch = new Set<string>(Object.keys(packed ?? {}))
   for (const [field, schema] of Object.entries(itemFields ?? {})) {
-    if (field in sparse) continue
+    if (Object.hasOwn(sparse, field)) continue
     if (isDispatchEligible(schema)) dispatch.add(field)
   }
   return dispatch.size > 0 ? [...dispatch] : undefined
@@ -9473,14 +9474,13 @@ const compileListFilter = <Model>(
   aggregateName: string,
   storedAt: StoredFormAt,
   below: StoredBelow,
+  /** The aggregate's model: a callback's `.entry()` resolves on its sparse maps (`pathBuilderOf`). */
+  model: unknown,
 ): Effect.Effect<CompileResult | undefined, ValidationError> => {
   if (filter === undefined) return Effect.succeed(undefined)
   const expr =
     typeof filter === "function"
-      ? filter(
-          createPathBuilder<Model>() as PathBuilder<Model, Model, never>,
-          createConditionOps<Model>(),
-        )
+      ? filter(pathBuilderOf<Model>([model]), createConditionOps<Model>())
       : parseSimpleShorthand(filter)
   const problem = emptyPartProblem(expr)
   if (problem !== undefined) {

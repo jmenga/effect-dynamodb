@@ -109,7 +109,6 @@ import {
   type Compressor,
   make as makeCompressionRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
-import { getSparseFields } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
@@ -207,7 +206,7 @@ import {
   type PackedAttributeGuard,
   unregisteredCodecError,
 } from "./internal/Packed.js"
-import { createPathBuilder, type PathModel, type StoredBelow } from "./internal/PathBuilder.js"
+import { type PathModel, pathBuilderOf, type StoredBelow } from "./internal/PathBuilder.js"
 import {
   type OutboxCandidate,
   physicalTableName,
@@ -2483,23 +2482,12 @@ interface EntityLike {
 }
 
 /**
- * A query's path builder over the members' models: `.entry(key)` on each sparse map field (#238),
- * baked with the first member's prefix where members declare one field with different ones (a
- * collection names each member's entry by its own prefix: `collectionNaming`).
+ * A query's path builder over the members' models (`pathBuilderOf`): `.entry(key)` on each sparse
+ * map field, baked with the first member's prefix where members declare one field with different
+ * ones (a collection names each member's entry by its own prefix: `collectionNaming`).
  */
-const queryPathBuilder = (entities: ReadonlyArray<EntityLike>) => {
-  const sparse: Record<string, { readonly prefix: string }> = {}
-  for (const entityLike of entities) {
-    for (const [field, config] of Object.entries(getSparseFields(entityLike.model))) {
-      if (!Object.hasOwn(sparse, field)) sparse[field] = config
-    }
-  }
-  return createPathBuilder(
-    undefined,
-    undefined,
-    Object.keys(sparse).length > 0 ? sparse : undefined,
-  )
-}
+const queryPathBuilder = (entities: ReadonlyArray<EntityLike>) =>
+  pathBuilderOf(entities.map((entityLike) => entityLike.model))
 
 /** An entity's domain field names (its record's), when its schema exposes them. */
 const domainFieldsOf = (entityLike: EntityLike): ReadonlySet<string> | undefined => {

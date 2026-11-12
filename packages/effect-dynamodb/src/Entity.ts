@@ -20,7 +20,6 @@ import {
   type ExtractIdentifier,
   type ExtractPackedFields,
   type ExtractUnremovableFields,
-  getSparseFields,
   isConfiguredModel,
   isRefField,
 } from "@effect-dynamodb/schema/DynamoModel.js"
@@ -183,11 +182,11 @@ import {
 } from "./internal/Packed.js"
 import {
   compilePath,
-  createPathBuilder,
   entryOfPath,
   type PathModel,
-  storedPath,
+  pathBuilderOf,
   type StoredBelow,
+  storedPath,
   withEntry,
 } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
@@ -19369,10 +19368,13 @@ const makeImpl = <
   // Expression combinators: condition, filter, select
   // ---------------------------------------------------------------------------
 
-  // Sparse-field map used by createPathBuilder to wire `.entry(key)` accessors.
-  const sparseFieldsForPath = hasSparseFields ? sparseFields : undefined
-  const entityPathBuilder = createPathBuilder<any>([], resolveDbName, sparseFieldsForPath)
+  // The path builder of the entity's own conditions, filters and selects (`pathBuilderOf`), and
+  // the naming its filters and selects get, as a bound query's do (`entityNaming`): a write names
+  // a condition's stored attributes itself.
+  const entityPathBuilder = pathBuilderOf<any>([config.model])
   const entityConditionOps = createConditionOps<any>()
+  const ownNaming = () =>
+    entityNaming(resolveDbName, storedFormAt, wholeRowsOf(entity), storedBelow)
 
   /**
    * Build a condition expression combinator from callback or shorthand.
@@ -19402,9 +19404,12 @@ const makeImpl = <
         : parseSimpleShorthand(cbOrShorthand)
     refusePackedExpr(expr, "filter")
     // Each operand that is one of Effect's instances or a `Date` in the form this entity's
-    // attribute holds it (#242), whichever query it's added to.
-    const stored = operandsAsStored(expr, storedFormAt)
-    return <A>(q: Query.Query<A>): Query.Query<A> => filterExprStored(q, stored)
+    // attribute holds it (#242), whichever query it's added to, and its paths named as the entity
+    // stores them (#238).
+    return <A>(q: Query.Query<A>): Query.Query<A> => {
+      const { renameExpr } = ownNaming()
+      return filterExprStored(q, renameExpr === undefined ? expr : renameExpr(expr))
+    }
   }
 
   /**
@@ -19423,12 +19428,22 @@ const makeImpl = <
       const paths = cbOrAttrs(entityPathBuilder)
       const segments = paths.map((p: { segments: ReadonlyArray<string | number> }) => p.segments)
       refuse(segments)
-      return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
-        selectPaths(q, segments)
+      return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> => {
+        const { selectAs } = ownNaming()
+        return selectAs === undefined ? selectPaths(q, segments) : selectAs(q, segments, "paths")
+      }
     }
     refuse(cbOrAttrs.map((attribute) => [attribute]))
-    return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
-      Query.select(q, cbOrAttrs)
+    return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> => {
+      const { selectAs } = ownNaming()
+      return selectAs === undefined
+        ? Query.select(q, cbOrAttrs)
+        : selectAs(
+            q,
+            cbOrAttrs.map((attribute) => [attribute]),
+            "attributes",
+          )
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -19732,17 +19747,14 @@ export const bind = <
       TGeneratedId
     >
 
-    // Sparse-field map (if any) — extracted from the Entity's configured model
-    // so the PathBuilder used by `.condition((t, ops) => ...)` exposes
-    // `.entry(key)` accessors on sparse-map fields.
-    const boundSparseFields = getSparseFields(entity.model as Schema.Top)
-    const boundSparseFieldsForPath =
-      Object.keys(boundSparseFields).length > 0 ? boundSparseFields : undefined
+    // The path builder every callback of the binding gets (`pathBuilderOf`), so `.entry(key)`
+    // resolves on the entity's sparse maps in a condition as in a query.
+    const boundPathBuilder = () => pathBuilderOf([entity.model])
 
     // Shared config for the bound-CRUD builders — pre-resolved services plus
     // a typed PathBuilder/ConditionOps so `.condition((t, ops) => ...)` works.
     const boundCrudConfig: import("./internal/BoundCrud.js").BoundCrudConfig<unknown> = {
-      pathBuilder: createPathBuilder(undefined, undefined, boundSparseFieldsForPath),
+      pathBuilder: boundPathBuilder(),
       conditionOps: createConditionOps(),
       provide,
     }
@@ -19760,7 +19772,7 @@ export const bind = <
     // .filter() ergonomics they get from index accessors and `.scan()`.
     const wrapAsBoundQuery = <A>(q: Query.Query<A>, operation: string) => {
       const bqConfig: BoundQueryConfig<unknown> = {
-        pathBuilder: createPathBuilder(undefined, undefined, boundSparseFieldsForPath),
+        pathBuilder: boundPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
         ...entityNaming(
@@ -20016,7 +20028,7 @@ export const bind = <
       },
       history: (key: Key) => {
         const q = (entity.history as any as (k: Key) => Query.Query<any>)(key)
-        const pathBuilder = createPathBuilder(undefined, undefined, boundSparseFieldsForPath)
+        const pathBuilder = boundPathBuilder()
         const conditionOps = createConditionOps()
         const ts = (entity as unknown as { readonly timeSeries?: TimeSeriesConfig<any> }).timeSeries
         const orderBy = ts?.orderBy

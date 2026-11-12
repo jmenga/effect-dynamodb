@@ -7,7 +7,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0).
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts` (against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0).
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -35,6 +35,7 @@ import {
 } from "./helpers/ClearWrites.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { entryInQueriesSuite } from "./helpers/EntryInQueries.js"
+import { entryOnEveryTerminalSuite } from "./helpers/EntryOnEveryTerminal.js"
 import { entrySelectsSuite } from "./helpers/EntrySelects.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
@@ -241,6 +242,10 @@ describeConnected(
     entryInQueriesSuite(openTable)
   },
 )
+
+describeConnected("a sparse map entry on every terminal that takes a path callback", () => {
+  entryOnEveryTerminalSuite(openTable)
+})
 
 describeConnected("a renamed sparse map on an entity with a Z-order index", () => {
   renamedSparseMapZOrderSuite(openTable)

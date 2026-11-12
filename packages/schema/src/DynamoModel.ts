@@ -729,8 +729,9 @@ export const isPackedConfig = (value: unknown): value is PackedConfig =>
 export const getPackedFields = (
   model: Schema.Top | ConfiguredModel<any, any>,
 ): globalThis.Record<string, PackedConfig> => {
-  if (!isConfiguredModel(model)) return {}
-  const out: globalThis.Record<string, PackedConfig> = {}
+  // Null-prototype: a field is looked up by name, and a model field may be named `constructor`.
+  const out: globalThis.Record<string, PackedConfig> = Object.create(null)
+  if (!isConfiguredModel(model)) return out
   for (const [name, attr] of Object.entries(model.attributes)) {
     if (attr.packed) out[name] = attr.packed
   }
@@ -826,8 +827,11 @@ export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Sche
 export const getSparseFields = (
   model: Schema.Top | ConfiguredModel<any, any>,
 ): globalThis.Record<string, SparseConfig> => {
-  if (!isConfiguredModel(model)) return {}
-  const out: globalThis.Record<string, SparseConfig> = {}
+  // Null-prototype: a field is looked up by name (`field in sparseFields`), and a model field may
+  // be named like an `Object.prototype` member (`valueOf`, `constructor`), which a plain object
+  // reports as a sparse map whose prefix is `undefined` (#238).
+  const out: globalThis.Record<string, SparseConfig> = Object.create(null)
+  if (!isConfiguredModel(model)) return out
   for (const [name, attr] of Object.entries(model.attributes)) {
     if (attr.sparse) out[name] = attr.sparse
   }

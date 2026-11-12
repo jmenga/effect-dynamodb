@@ -9,6 +9,8 @@
 // Path interface — a resolved attribute path with phantom types
 // ---------------------------------------------------------------------------
 
+import { getSparseFields } from "@effect-dynamodb/schema/DynamoModel.js"
+
 export const PathTag: unique symbol = Symbol.for("effect-dynamodb/Path")
 export type PathTag = typeof PathTag
 
@@ -268,15 +270,21 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
           createPathBuilder(withEntry([...segments, index], entry), resolveDbName, sparseFields)
       }
       if (prop === "entry") {
-        // The previous segment must be a top-level field name marked sparse.
-        // We look up its prefix and bake the segment as `<prefix>#<key>`.
+        // The path must be a top-level field marked sparse: a sparse map is a top-level field, so a
+        // nested field of the same name (`t.inner.zones`) is not it. We look up its prefix and bake
+        // the segment as `<prefix>#<key>`.
         const last = segments[segments.length - 1]
-        if (typeof last !== "string" || !sparseFields || !(last in sparseFields)) {
+        if (
+          segments.length !== 1 ||
+          typeof last !== "string" ||
+          !sparseFields ||
+          !Object.hasOwn(sparseFields, last)
+        ) {
           // No-op for non-sparse fields — return a function that throws so
           // misuse is loud and clear.
           return (_key: string) => {
             throw new Error(
-              `PathBuilder.entry: field "${String(last)}" is not configured as a sparse map`,
+              `PathBuilder.entry: field "${segments.join(".")}" is not configured as a sparse map`,
             )
           }
         }
@@ -315,6 +323,40 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
   }
   return new Proxy({} as any, handler) as PathBuilder<Model, Model, Keys>
 }
+
+/**
+ * The sparse maps whose `.entry(key)` a path builder over `models` resolves (#238): each field a
+ * model's configuration stores as a sparse map, with its prefix, by the first model declaring it
+ * (a collection names each member's entry by its own prefix: `collectionNaming`). `undefined`
+ * when none does. A model that isn't configured declares none.
+ */
+export const sparseFieldsOf = (
+  models: ReadonlyArray<unknown>,
+): globalThis.Record<string, { readonly prefix: string }> | undefined => {
+  const sparse: globalThis.Record<string, { readonly prefix: string }> = Object.create(null)
+  let any = false
+  for (const model of models) {
+    for (const [field, config] of Object.entries(getSparseFields(model as never))) {
+      if (Object.hasOwn(sparse, field)) continue
+      sparse[field] = config
+      any = true
+    }
+  }
+  return any ? sparse : undefined
+}
+
+/**
+ * The path builder a callback over `models` gets (#238), on every terminal that takes one: an
+ * entity's conditions, filters, selects and path operations, its query accessors, `scan()`,
+ * `.history()`, `versions()` and `deleted.list()`, a collection's accessors, an aggregate's `list`
+ * filter, `Transaction.check`. The one place `.entry(key)` is resolved: a sparse map of any of
+ * the models ({@link sparseFieldsOf}).
+ */
+export const pathBuilderOf = <Model>(
+  models: ReadonlyArray<unknown>,
+  resolveDbName?: (name: string) => string,
+): PathBuilder<Model, Model, never> =>
+  createPathBuilder<Model, never>(undefined, resolveDbName, sparseFieldsOf(models))
 
 // ---------------------------------------------------------------------------
 // compilePath — shared path→DynamoDB expression name compilation
