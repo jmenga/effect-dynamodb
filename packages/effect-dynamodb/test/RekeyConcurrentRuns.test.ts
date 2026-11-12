@@ -12,7 +12,8 @@
 
 import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
+import type { Around } from "./helpers/GatedClient.js"
 import {
   jittered,
   type Row,
@@ -24,6 +25,7 @@ import {
   tableOf,
   takenValues,
   takeValue,
+  takeValueOn,
   writeRandom,
   yieldingFirst,
 } from "./helpers/RandomTables.js"
@@ -71,6 +73,8 @@ describe.each([
             yield* rekeyOnce(escapeKeys, alone, RUNS[0])
             const table = tableOf(rows)
             yield* rekeyRuns(escapeKeys, table, RUNS.slice(0, together), yieldingFirst)
+            // Before any later run could repair one, no sentinel names a key its row left.
+            expect(strayed([...table.items.values()]), `${at}, right after`).toEqual([])
             // What a conflict left, one run alone takes.
             yield* rekeyOnce(escapeKeys, table, RUNS[0])
             expect(strayed([...table.items.values()]), at).toEqual([])
@@ -87,6 +91,96 @@ describe.each([
       120_000,
     )
   }
+})
+
+/**
+ * Runs at once that, before a move held the sentinel keys it read and a re-point the row it names,
+ * left a sentinel naming the key its row left, found over 120 random tables in each direction with
+ * two and three runs, each request yielding first or a random number of times: each must leave
+ * every sentinel naming its row before any later run, then a run releasing orphans must release
+ * none, and every value a row holds must still be refused to a new item.
+ */
+const LEFT_A_SENTINEL_BEHIND = [
+  { escapeKeys: true, seed: 12, together: 2, jitter: true },
+  { escapeKeys: true, seed: 62, together: 2, jitter: true },
+  { escapeKeys: true, seed: 76, together: 2, jitter: true },
+  { escapeKeys: true, seed: 110, together: 3, jitter: false },
+  { escapeKeys: false, seed: 4, together: 2, jitter: true },
+  { escapeKeys: false, seed: 18, together: 2, jitter: false },
+  { escapeKeys: false, seed: 36, together: 2, jitter: true },
+  { escapeKeys: false, seed: 59, together: 2, jitter: true },
+] as const
+
+describe("runs at once that once left a sentinel behind", () => {
+  for (const { escapeKeys, seed, together, jitter } of LEFT_A_SENTINEL_BEHIND) {
+    it.effect(
+      `to ${escapeKeys ? "on" : "off"}, seed ${seed}, ${together} runs, ${jitter ? "yielding at random" : "yielding first"}`,
+      () =>
+        Effect.gen(function* () {
+          const rows = yield* writeRandom(!escapeKeys, seed)
+          const table = tableOf(rows)
+          yield* rekeyRuns(
+            escapeKeys,
+            table,
+            RUNS.slice(0, together),
+            jitter ? jittered(seed * 7 + together) : yieldingFirst,
+          )
+          expect(strayed([...table.items.values()])).toEqual([])
+          const after = yield* valuesStillReserved(escapeKeys, table)
+          expect(after.reservations).toMatchObject({ orphaned: 0, released: 0, undecided: 0 })
+          expect(after.accepted).toEqual([])
+        }),
+    )
+  }
+})
+
+/**
+ * A sentinel brought by itself to the row it names, a row that stays where it is, holds the row as
+ * read. An update giving the row another value between the pass's read and its write fails the
+ * write, and the sentinel is left under its old key text, where the update didn't see it: brought
+ * to the current key naming a row that no longer holds its value, it would refuse that value to
+ * every new item.
+ */
+describe("a sentinel brought to a row that stays, the row given another value meanwhile", () => {
+  it.effect("is left where it was, and its value can be taken again", () =>
+    Effect.gen(function* () {
+      const table = makeRecordingTable()
+      const off = randomWorld(false)
+      const on = randomWorld(true)
+      // The id's key text is the same both ways, so the row stays; its email's isn't.
+      yield* Effect.gen(function* () {
+        const db = yield* off.client
+        yield* db.entities.Members.put({ id: "plain", email: "a b", nick: "n" }).asEffect()
+      }).pipe(Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))))
+      const update = Effect.gen(function* () {
+        const db = yield* on.client
+        yield* db.entities.Members.update({ id: "plain" }).set({ email: "c d" }).asEffect()
+      }).pipe(Effect.provide(Layer.merge(table.layer, on.MainTable.layer({ name: "t" }))))
+      let raced = false
+      const around: Around = (command, input, send) => {
+        const brings =
+          command === "transactWriteItems" &&
+          ((input as any).TransactItems ?? []).some(
+            (item: any) => item.Put?.Item?.pk?.S === "$fz#v1#member.email#a%20b",
+          )
+        if (raced || !brings) return send
+        raced = true
+        return Effect.andThen(update, send)
+      }
+      const report = yield* rekeyOnce(true, table, {}, around)
+      expect(raced).toBe(true)
+      expect(report.conflicts).toEqual([])
+      const sentinels = [...table.items.values()]
+        .filter((row) => row.__edd_e__?.S === "Member._unique.email")
+        .map((row) => row.pk?.S)
+        .sort()
+      expect(sentinels).toEqual(["$fz#v1#member.email#a b", "$fz#v1#member.email#c%20d"])
+      const take = (value: string, n: number) =>
+        takeValueOn(true, table.layer, "t", { member: "Members", value: `email:${value}` }, n)
+      expect(yield* take("a b", 1)).toBe("accepted")
+      expect(yield* take("c d", 2)).toBe("refused")
+    }),
+  )
 })
 
 /**
