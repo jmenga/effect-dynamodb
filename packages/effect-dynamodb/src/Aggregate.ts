@@ -142,6 +142,8 @@ import {
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
   outboxMarkInUse,
+  ROW_TOKEN,
+  rowTokened,
 } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
@@ -7937,6 +7939,15 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
           [tombstone],
           table,
           (field) => `its projection tombstones' "${field}"`,
+        )
+      }
+      // The row token (#237), on the rows and tombstones of a read model several projections write.
+      if (rowTokened(e)) {
+        anyText(
+          [ROW_TOKEN],
+          tombstone === undefined ? [own] : [own, tombstone],
+          table,
+          (field) => `its projection rows' "${field}"`,
         )
       }
       for (const constraint of Object.keys(e.unique ?? {})) {
