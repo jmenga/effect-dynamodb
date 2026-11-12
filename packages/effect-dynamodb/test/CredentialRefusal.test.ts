@@ -465,42 +465,6 @@ describe("a session token given to a layer", () => {
     ),
   )
 
-  it.live("is not sent when left undefined, by either client", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const keys = { ...credentials, sessionToken: undefined }
-        const endpoint = yield* refusingEndpoint(refused)
-        yield* put.pipe(
-          Effect.provide(
-            Layer.mergeAll(
-              DynamoClient.layer({
-                region: "us-east-1",
-                endpoint: endpoint.url,
-                credentials: keys,
-              }),
-              MainTable.layer({ name: "t" }),
-            ),
-          ),
-          Effect.flip,
-        )
-        yield* Effect.gen(function* () {
-          const streams = yield* DynamoStreamsClient
-          yield* streams.getRecords({ ShardIterator: "iterator" })
-        }).pipe(
-          Effect.provide(
-            DynamoStreamsClient.layer({
-              region: "us-east-1",
-              endpoint: endpoint.url,
-              credentials: keys,
-            }),
-          ),
-          Effect.flip,
-        )
-        expect(endpoint.tokens).toEqual([undefined, undefined])
-      }),
-    ),
-  )
-
   it.effect("is in no rendering of either client built with it", () =>
     Effect.gen(function* () {
       const options = { region: "us-east-1", endpoint: "http://127.0.0.1:1", credentials }

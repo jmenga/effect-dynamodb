@@ -1751,7 +1751,10 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
    * @param config.credentials - Optional Config for static credentials, with a
-   *   `sessionToken` when they are temporary (an assumed role)
+   *   `sessionToken` when they are temporary (an assumed role). When any part
+   *   is missing from the provider, `credentials` is unset as a whole and the
+   *   SDK's default credential chain applies; to make the token alone optional,
+   *   read it with `Config.withDefault(undefined)`.
    * @param config.requestHandler - Optional Config for each of the handler's
    *   timeouts (`connectionTimeout`, `socketTimeout`, `requestTimeout`,
    *   `throwOnRequestTimeout`), which an operator tunes per environment, or an

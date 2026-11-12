@@ -98,6 +98,10 @@ describe("ClientOptions types", () => {
       credentials: { accessKeyId: "a", secretAccessKey: "s", sessionToken: "t" },
     })
     DynamoClient.layer({ region, credentials: { ...keys, sessionToken: token } })
+    // A token decoded from a source that holds null for none.
+    const nullable = { ...keys, sessionToken: null as string | null }
+    DynamoClient.layer({ region, credentials: nullable })
+    DynamoClient.layer({ region, credentials: { ...keys, sessionToken: null } })
     DynamoClient.layer({
       region,
       // @ts-expect-error an unknown key must not compile
@@ -134,6 +138,10 @@ describe("ClientOptions types", () => {
     DynamoClient.layerConfig({
       region: Config.String("REGION"),
       credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(undefined)) }),
+    })
+    DynamoClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(null)) }),
     })
     DynamoClient.layerConfig({
       region: Config.String("REGION"),

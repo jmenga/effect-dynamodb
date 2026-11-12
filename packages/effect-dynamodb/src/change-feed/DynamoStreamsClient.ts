@@ -188,7 +188,11 @@ export class DynamoStreamsClient extends Context.Service<
     client: DynamoDBStreamsClient,
   ): Layer.Layer<DynamoStreamsClient> => Layer.succeed(DynamoStreamsClient, fromSdkClient(client))
 
-  /** A live layer reading its configuration from Effect `Config` providers. */
+  /**
+   * A live layer reading its configuration from Effect `Config` providers. As
+   * on `DynamoClient.layerConfig`, `credentials` missing any part is unset as a
+   * whole, and the SDK's default credential chain applies.
+   */
   static readonly layerConfig = (
     config: DynamoStreamsClientConfigFromConfig,
   ): Layer.Layer<DynamoStreamsClient, Config.ConfigError> =>
