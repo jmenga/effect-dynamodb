@@ -13601,6 +13601,11 @@ const makeImpl = <
    * to `to` after a row there that moves there too, whichever the scan reaches first, so a read
    * model's removal tombstone, not the row it removed, ends up at `to`, and the report is the
    * same in every order. In a dry run nothing moves: that row is judged as if at `to`.
+   *
+   * A row under other key text that has to move out first and, as far as the run's journal knows,
+   * hasn't is looked at again before the row is refused (`reread`): another run's move can have
+   * taken it meanwhile, as a sentinel's move out of the way is looked at again
+   * ({@link sentinelRekeys}' `stillThere`). Only on the way to refusing.
    */
   const clearTarget = (
     ctx: Rekey.RekeyRowContext,
@@ -13609,6 +13614,7 @@ const makeImpl = <
     to: StoredKey,
     copy?: (held: StoredRow) => boolean,
     elsewhere: ReadonlyArray<StoredKey> = [],
+    reread = true,
   ): Effect.Effect<
     | { readonly cleared: true; readonly tally: Rekey.RekeyTally }
     | { readonly cleared: false; readonly tally: Rekey.RekeyTally }
@@ -13669,9 +13675,11 @@ const makeImpl = <
       }
       // Another value's row under other key text moves out first, judged as its own unit.
       const judged = yield* judgeStoredRow(held, ctx)
-      return ctx.vacated(toAttributeMap(to))
-        ? { cleared: true, tally: {} }
-        : { cleared: false, tally: cantMoveHolder(kind, from, to, judged) }
+      if (ctx.vacated(toAttributeMap(to))) return { cleared: true, tally: {} }
+      if (reread && judged !== "loop") {
+        return yield* clearTarget(ctx, kind, from, to, copy, elsewhere, false)
+      }
+      return { cleared: false, tally: cantMoveHolder(kind, from, to, judged) }
     })
 
   /**

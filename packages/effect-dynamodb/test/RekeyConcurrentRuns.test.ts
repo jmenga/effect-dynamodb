@@ -602,3 +602,96 @@ describe("a sentinel moved out of the way by another run between a pass's reads"
     )
   }
 })
+
+/**
+ * Two runs at once, to off: row `a%20b` goes where row `a b` is stored. Run X's pass for `a%20b`
+ * reads that key, holding `a b`'s row, and run Y moves that row out of the way before X's move of
+ * it (held) gets to it. X judges the row as its own unit, finds it gone and writes nothing; X reads
+ * the key again before refusing, finds it empty and moves. Without that read X reported the key
+ * `taken` (`A row that can't move holds its current key`), which no run alone does: over 960 random
+ * cases of two and three runs at once, 459 such reports.
+ */
+describe("a row moved out of the way by another run between a pass's reads", () => {
+  for (const concurrency of [2, 4]) {
+    it.effect(`the pass reads the key again and moves (${concurrency} at once)`, () =>
+      Effect.gen(function* () {
+        const table = makeRecordingTable()
+        const on = randomWorld(true)
+        yield* Effect.gen(function* () {
+          const db = yield* on.client
+          yield* db.entities.Rows.put({ id: "a%20b", note: "a" }).asEffect()
+          yield* db.entities.Rows.put({ id: "a b", note: "b" }).asEffect()
+        }).pipe(Effect.provide(Layer.merge(table.layer, on.MainTable.layer({ name: "t" }))))
+        const pk = "$fz#v1#row"
+        const moving = "$fz#v1#row#id_a%2520b"
+        const to = "$fz#v1#row#id_a%20b"
+        const out = "$fz#v1#row#id_a b"
+        const xRead = yield* Deferred.make<void>()
+        const yOut = yield* Deferred.make<void>()
+        const xIn = yield* Deferred.make<void>()
+        let xWaited = false
+        const orFallBack = (deferred: Deferred.Deferred<void>) =>
+          Effect.raceFirst(
+            Deferred.await(deferred),
+            Effect.forEach(Array.from({ length: 4000 }), () => Effect.yieldNow, { discard: true }),
+          )
+        // X: the moving row's pass (the fiber that read it) reads its current key, holding the
+        // other row; X's own move of that row waits for Y's.
+        let movingPass: number | undefined
+        const x: Around = (command, input, send) =>
+          Effect.flatMap(Effect.fiberId, (fiber) => {
+            const sk = input?.Key?.sk?.S
+            if (command === "getItem" && sk === moving) movingPass ??= fiber
+            if (command === "getItem" && sk === to && fiber === movingPass) {
+              return Effect.tap(send, (answer: any) =>
+                answer?.Item === undefined ? Effect.void : Deferred.succeed(xRead, undefined),
+              )
+            }
+            if (command === "transactWriteItems" && putsAt(input, pk, out)) {
+              return orFallBack(yOut).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    xWaited ||= Deferred.isDoneUnsafe(yOut)
+                  }),
+                ),
+                Effect.andThen(send),
+              )
+            }
+            return command === "transactWriteItems" && putsAt(input, pk, to)
+              ? Effect.tap(send, () => Deferred.succeed(xIn, undefined))
+              : send
+          })
+        // Y: starts after that read; its move into the key waits for X's.
+        const y: Around = (command, input, send) =>
+          orFallBack(xRead).pipe(
+            Effect.andThen(
+              command === "transactWriteItems" && putsAt(input, pk, to)
+                ? orFallBack(xIn)
+                : Effect.void,
+            ),
+            Effect.andThen(send),
+            Effect.tap(() =>
+              command === "transactWriteItems" && putsAt(input, pk, out)
+                ? Deferred.succeed(yOut, undefined)
+                : Effect.void,
+            ),
+          )
+        const [byX, byY] = yield* Effect.all(
+          [
+            rekeyOnce(false, table, { concurrency }, x),
+            rekeyOnce(false, table, { concurrency }, y),
+          ],
+          { concurrency: 2 },
+        )
+        expect(Deferred.isDoneUnsafe(xRead)).toBe(true)
+        expect(xWaited).toBe(true)
+        expect(byX.conflicts).toEqual([])
+        expect(byY.conflicts).toEqual([])
+        expect(byX.moved.item + byY.moved.item).toBe(2)
+        expect([...table.items.keys()].sort()).toEqual([`${pk}|${out}`, `${pk}|${to}`])
+        const again = yield* rekeyOnce(false, table, {})
+        expect(again).toMatchObject({ moved: { item: 0 }, conflicts: [] })
+      }),
+    )
+  }
+})

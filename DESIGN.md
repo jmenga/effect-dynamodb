@@ -1096,9 +1096,15 @@ be reported twice, two ways, or counted as `unchanged` after the run moved it.
   whose sentinel's current key holds another item's sentinel naming a row that
   is gone reads the key again before refusing (`stillThere`): a move of the run
   may just have taken that row with its sentinel. Having moved such a sentinel
-  out of its way, it reads the key again unless the journal shows it empty:
-  another run may have moved that sentinel first (two runs at once reported the
-  key `taken` without this read; `RekeyConcurrentRuns.test.ts` forces the order).
+  out of its way, it reads the key again unless the journal shows it empty, and
+  so does a row whose current key holds another value's row under other key text
+  that, judged, didn't leave as far as the journal knows (`clearTarget`'s
+  `reread`): another run may have moved it first. Over 960 random cases of two
+  and three runs at once, the runs reported 558 conflicts that one run alone over
+  the same table doesn't (459 rows and 97 sentinel keys `taken`), and with these
+  reads 9 (3 sentinel keys `taken`, 4 `bothKeys`, 2 `contended`); the rows end as
+  one run alone leaves them either way. `RekeyConcurrentRuns.test.ts` forces both
+  orders.
   And a pass moving a sentinel out of another's way, whose sentinel its own row's
   move took meanwhile, has nothing left to do (`movedMeanwhile`). Each costs a
   read, only on the way to refusing. Before them, about one random table in four
