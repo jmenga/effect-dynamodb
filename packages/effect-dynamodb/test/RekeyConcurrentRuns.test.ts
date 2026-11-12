@@ -12,8 +12,13 @@
 
 import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Layer } from "effect"
-import type { Around } from "./helpers/GatedClient.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { Effect, Layer, Schema } from "effect"
+import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
+import * as Table from "../src/Table.js"
+import { type Around, gatedLayer } from "./helpers/GatedClient.js"
 import {
   jittered,
   type Row,
@@ -397,4 +402,115 @@ describe.each([
       }
     }),
   )
+})
+
+const badgeKey = {
+  pk: { field: "pk", composite: ["team"] },
+  sk: { field: "sk", composite: ["id"] },
+} as const
+
+/** Badges, keyed by team and id: a row with a space in both has three key texts. */
+const badges = (escapeKeys: boolean) => {
+  const schema = DynamoSchema.make({ name: "ad", version: 1, escapeKeys })
+  const Badges = Entity.make({
+    model: Schema.Struct({ team: Schema.String, id: Schema.String, email: Schema.String }),
+    entityType: "Badge",
+    primaryKey: badgeKey,
+    unique: { email: ["email"] },
+  })
+  const MainTable = Table.make({ schema, entities: { Badges } })
+  return {
+    schema,
+    MainTable,
+    client: DynamoClient.make({ entities: { Badges }, tables: { MainTable } }),
+  }
+}
+
+/**
+ * A badge written by 1.36 (`team_t u`, `id_a b`) and moved to its 1.37 text (`id_a%20b`) by a run
+ * that left its sentinel naming the 1.36 key, as runs of 1.37 to 1.40 at once could.
+ */
+const leftAt137 = Effect.gen(function* () {
+  const table = makeRecordingTable()
+  const off = badges(false)
+  yield* Effect.gen(function* () {
+    const db = yield* off.client
+    yield* db.entities.Badges.put({ team: "t u", id: "a b", email: "x y" }).asEffect()
+  }).pipe(Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))))
+  const rows = [...table.items.values()]
+  const row = rows.find((one) => one.__edd_e__?.S === "Badge")!
+  const at137 = KeyText136.composeAt(KeyText136.forms(off.schema)[1]!, "Badge", 1, badgeKey, {
+    team: "t u",
+    id: "a b",
+  })
+  return [
+    ...rows.filter((one) => one !== row),
+    { ...row, pk: { S: at137.pk! }, sk: { S: at137.sk! } },
+  ]
+})
+
+const rekeyBadges = (
+  escapeKeys: boolean,
+  table: ReturnType<typeof makeRecordingTable>,
+  options: Table.RekeyOptions,
+  order: number,
+) => {
+  const now = badges(escapeKeys)
+  return Effect.gen(function* () {
+    const db = yield* now.client
+    return yield* db.tables.MainTable.rekey(options)
+  }).pipe(
+    Effect.provide(
+      Layer.merge(
+        gatedLayer(table.client as DynamoClientService, scanShuffled(order)),
+        now.MainTable.layer({ name: "t" }),
+      ),
+    ),
+  )
+}
+
+/**
+ * The row moves, and its pass takes the sentinel along though it names another of the row's keys:
+ * one where no row is, found under any key text (`Adopt` `all`). To on, the sentinel moves to its
+ * current key naming the row's; to off, the row moves to the key the sentinel names, which stays.
+ */
+describe.each([
+  [
+    "to on",
+    true,
+    "$ad#v1#badge.email#x%20y",
+    "$ad#v1#badge#team_t%20u",
+    "$ad#v1#badge#id_a%20b",
+    1,
+  ],
+  ["to off", false, "$ad#v1#badge.email#x y", "$ad#v1#badge#team_t u", "$ad#v1#badge#id_a b", 0],
+] as const)("a row at its 1.37 text whose sentinel names its 1.36 key, %s", (_, escapeKeys, sentinelPk, rowPk, rowSk, sentinelsMoved) => {
+  const first = new Map<string, unknown>()
+  for (const segments of [1, 2, 4]) {
+    for (const order of [0, 1, 2]) {
+      it.effect(`moves with its sentinel: ${segments} segment(s), order ${order}`, () =>
+        Effect.gen(function* () {
+          const table = tableOf(yield* leftAt137)
+          const options = { segments, concurrency: 4, pageSize: 1 }
+          const dry = yield* rekeyBadges(escapeKeys, table, { ...options, dryRun: true }, order)
+          const real = yield* rekeyBadges(escapeKeys, table, options, order)
+          expect(decided(dry)).toEqual(decided(real))
+          expect(real.conflicts).toEqual([])
+          expect(real.moved.item).toBe(1)
+          expect(real.sentinelsMoved).toBe(sentinelsMoved)
+          const rows = [...table.items.values()]
+          expect(strayed(rows)).toEqual([])
+          const sentinel = rows.find((row) => row._entity_pk !== undefined)
+          expect(sentinel?.pk?.S).toBe(sentinelPk)
+          expect([sentinel?._entity_pk?.S, sentinel?._entity_sk?.S]).toEqual([rowPk, rowSk])
+          const again = yield* rekeyBadges(escapeKeys, table, options, 0)
+          expect(again).toMatchObject({ sentinelsMoved: 0, moved: { item: 0 }, conflicts: [] })
+          const outcome = { report: decided(real), rows: storedRows(table.items.values()) }
+          const seen = first.get("outcome")
+          if (seen === undefined) first.set("outcome", outcome)
+          else expect(outcome).toEqual(seen)
+        }),
+      )
+    }
+  }
 })
