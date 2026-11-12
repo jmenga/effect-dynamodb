@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
 import {
+  jittered,
   type Row,
   randomWorld,
   rekeyOnce,
@@ -84,6 +85,51 @@ describe.each([
           }
         }),
       120_000,
+    )
+  }
+})
+
+/**
+ * Runs started together with their requests answered at random speeds (`jittered`), over the tables
+ * where that once left rows a later run couldn't move. An aggregate whose root another run had just
+ * moved read its old partition, where a third aggregate's move had brought that one's rows (the old
+ * partition being where its values compose a key now), and took them for its own: moved into its
+ * partition, or refused as two elements at one sort key. A stream another run had moved away was
+ * flipped on its old partition, where another stream's move had brought its first event: that
+ * event carried the moved mark ever after, under both keys, and its stream was reported `bothKeys`
+ * or its partition `taken` on every run. Rows under an aggregate's old partition are its own only
+ * while its root is there, and a flip marks only the stream's own first event.
+ */
+describe.each([
+  ["to on", true],
+  ["to off", false],
+] as const)("rekey runs started together, answered at random speeds, %s", (_direction, escapeKeys) => {
+  for (const seed of [2, 10, 16, 36, 46, 48]) {
+    it.effect(
+      `seed ${seed}: end where one run ends, however their requests interleave`,
+      () =>
+        Effect.gen(function* () {
+          const rows = yield* writeRandom(!escapeKeys, seed)
+          const options = { segments: 2, concurrency: 4, pageSize: 3 }
+          const alone = tableOf(rows)
+          yield* rekeyOnce(escapeKeys, alone, options)
+          for (let jitter = 1; jitter <= 8; jitter++) {
+            const at = `jitter ${jitter}`
+            const table = tableOf(rows)
+            const runs = [options, { ...RUNS[1], concurrency: 4 }, { ...RUNS[2], concurrency: 4 }]
+            yield* rekeyRuns(
+              escapeKeys,
+              table,
+              runs.slice(0, 2 + (jitter % 2)),
+              jittered(seed * 1000 + jitter),
+            )
+            const after = yield* rekeyOnce(escapeKeys, table, options)
+            expect(after.conflicts, at).toEqual([])
+            expect(strayed([...table.items.values()]), at).toEqual([])
+            expect(storedRows(table.items.values()), at).toEqual(storedRows(alone.items.values()))
+          }
+        }),
+      60_000,
     )
   }
 })

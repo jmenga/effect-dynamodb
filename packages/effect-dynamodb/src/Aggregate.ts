@@ -3033,11 +3033,30 @@ const makeAggregate = <TSchema extends Schema.Top>(
         conflicts,
       })
       for (let attempt = 0; attempt < REKEY_ATTEMPTS; attempt++) {
-        const stored: Array<Record<string, AttributeValue>> = []
-        const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "rekey", {
-          stored,
-          from,
-        })
+        const read: Array<Record<string, AttributeValue>> = []
+        const fetched = yield* fetchPartition(key, "rekey", { stored: read, from })
+        const { client, tableConfig, pkValue } = fetched
+        // The rows under the old partition are the aggregate's only while its root is there. Once
+        // the root has left — moved by a run started at the same time — another aggregate's move
+        // can bring its rows there (the old partition is where its values compose a key now): they
+        // are that aggregate's, not this one's, and this one is read from its current partition
+        // alone (#240).
+        const rootAtFrom =
+          from !== undefined &&
+          read.some(
+            (item) =>
+              item[config.pk.field]?.S === from &&
+              item.sk?.S === rekeyRootSk &&
+              item.__edd_e__?.S === config.root.entityType &&
+              partitionUnder(config.schema, rootKeyAsRead(fromAttributeMap(item))) ===
+                partitionUnder(config.schema, key),
+          )
+        const at = rootAtFrom ? from : undefined
+        const allItems =
+          at === from
+            ? fetched.allItems
+            : fetched.allItems.filter((item) => item[config.pk.field] !== from)
+        const stored = at === from ? read : read.filter((item) => item[config.pk.field]?.S !== from)
         const done = (rows: number): Rekey.RekeyTally => {
           const unchanged = Math.max(0, rows - movedRows - rewrittenRows)
           return {
@@ -3053,12 +3072,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // A write moving the aggregate between the reads of its two partitions shows its
         // rows under both, and they can't be assembled or placed: with rows in both, read
         // again, and while a row read under the old partition has gone from it, retry.
-        const atFrom = allItems.filter((item) => item[config.pk.field] === from)
-        if (from !== undefined && atFrom.length > 0 && atFrom.length < allItems.length) {
-          const again = yield* fetchPartition(key, "rekey", { from })
+        const atFrom = allItems.filter((item) => item[config.pk.field] === at)
+        if (at !== undefined && atFrom.length > 0 && atFrom.length < allItems.length) {
+          const again = yield* fetchPartition(key, "rekey", { from: at })
           const held = new Set(
             again.allItems
-              .filter((item) => item[config.pk.field] === from)
+              .filter((item) => item[config.pk.field] === at)
               .map((item) => String(item.sk)),
           )
           if (atFrom.some((item) => !held.has(String(item.sk)))) continue
@@ -3087,7 +3106,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           buildDynamoItems(groups, config, pkValue, undefined, keyRecord),
           allItems,
           pkValue,
-          from,
+          at,
         )
         const doubled = rows.filter(
           (row) => row.placement === "both" || row.placement === "ambiguous",

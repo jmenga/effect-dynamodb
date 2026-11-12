@@ -5736,7 +5736,10 @@ export const makeStream = <
           }
           if (!copiedAll) continue
           // FLIP — conditioned on the stream being as copied: no event past
-          // the head, the head (and its seal) and the snapshot unchanged.
+          // the head, the head (and its seal) and the snapshot unchanged. The
+          // first event and the head are this stream's: once a run started at
+          // the same time has moved this stream away, another stream's move can
+          // bring its rows here (#240), and the flip must not mark those.
           const head = rows.reduce((top, row) => Math.max(top, versionOf(row)), 1)
           const headRow = rows.find((row) => versionOf(row) === head)
           const snapshot = rows.find((row) => skOf(row) === snapshotSk)
@@ -5752,14 +5755,15 @@ export const makeStream = <
                 UpdateExpression: "SET #moved = :to",
                 ConditionExpression:
                   head === 1
-                    ? `attribute_exists(#pk) AND attribute_not_exists(#moved) AND ${sealClause}`
-                    : "attribute_exists(#pk) AND attribute_not_exists(#moved)",
+                    ? `attribute_exists(#pk) AND #sid = :sid AND attribute_not_exists(#moved) AND ${sealClause}`
+                    : "attribute_exists(#pk) AND #sid = :sid AND attribute_not_exists(#moved)",
                 ExpressionAttributeNames: {
                   "#pk": "pk",
+                  "#sid": "streamId",
                   "#moved": MOVED_ATTRIBUTE,
                   ...(head === 1 && { "#sealed": SEALED_ATTRIBUTE }),
                 },
-                ExpressionAttributeValues: toAttributeMap({ ":to": to }),
+                ExpressionAttributeValues: toAttributeMap({ ":to": to, ":sid": streamIdText }),
               },
             },
             {
@@ -5776,8 +5780,13 @@ export const makeStream = <
                     ConditionCheck: {
                       TableName: ctx.tableName,
                       Key: toAttributeMap({ pk: from, sk: composeEventSk(head) }),
-                      ConditionExpression: `attribute_exists(#pk) AND ${sealClause}`,
-                      ExpressionAttributeNames: { "#pk": "pk", "#sealed": SEALED_ATTRIBUTE },
+                      ConditionExpression: `attribute_exists(#pk) AND #sid = :sid AND ${sealClause}`,
+                      ExpressionAttributeNames: {
+                        "#pk": "pk",
+                        "#sid": "streamId",
+                        "#sealed": SEALED_ATTRIBUTE,
+                      },
+                      ExpressionAttributeValues: toAttributeMap({ ":sid": streamIdText }),
                     },
                   },
                 ]
