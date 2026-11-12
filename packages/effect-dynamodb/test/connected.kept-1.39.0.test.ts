@@ -7,7 +7,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapRaces.ts`.
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0).
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -41,6 +41,7 @@ import { pathClearSuite } from "./helpers/PathClears.js"
 import { renamedSparseMapSuite } from "./helpers/RenamedSparseMap.js"
 import { renamedSparseMapPathsSuite } from "./helpers/RenamedSparseMapPaths.js"
 import { renamedSparseMapRacesSuite } from "./helpers/RenamedSparseMapRaces.js"
+import { renamedSparseMapVerdictTableSuite } from "./helpers/RenamedSparseMapVerdictTable.js"
 import {
   renamedSparseMapCopiesSuite,
   renamedSparseMapUpsertsSuite,
@@ -179,6 +180,13 @@ describeConnected(
   "a sparse map a field: rename stores whole, moved between a transaction's plan and its write",
   () => {
     renamedSparseMapRacesSuite(openTable)
+  },
+)
+
+describeConnected(
+  "a refused write of a sparse map a field: rename stores whole, cell by cell of its decision table",
+  () => {
+    renamedSparseMapVerdictTableSuite(openTable)
   },
 )
 

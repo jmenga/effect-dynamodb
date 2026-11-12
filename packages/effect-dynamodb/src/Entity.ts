@@ -135,7 +135,6 @@ import {
   wholeRowsOf,
 } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
-import { conditionHolds } from "./internal/ConditionHolds.js"
 import {
   isNumeric,
   memberKind,
@@ -165,6 +164,7 @@ import {
   type UnprovableRow,
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
+import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
@@ -2308,6 +2308,19 @@ const GUARDED_PUT_ATTEMPTS = 3
  * nothing asserted about it: read again, never reported (#133).
  */
 class DeletedConcurrently extends Data.TaggedError("DeletedConcurrently")<{}> {}
+
+/**
+ * @internal A write made from a read of the row was refused by its form guard alone: the row's
+ * renamed sparse map `field` changed form since the read (#238, `internal/FormGuard.ts`). Read
+ * again and written again; never reported — once attempts run out, the race is reported naming
+ * `field` ({@link formKeptMoving}).
+ */
+class FormMoved extends Data.TaggedError("FormMoved")<{
+  readonly field: string
+  /** The key, through `encodeKey`, as the error reporting the race names it. */
+  readonly key: globalThis.Record<string, unknown>
+  readonly stored: globalThis.Record<string, AttributeValue>
+}> {}
 
 /**
  * The `ConcurrentModification`s that report a sentinel release whose
@@ -6828,6 +6841,31 @@ const makeImpl = <
     return new ConditionalCheckFailed({ entityType, key })
   }
 
+  /**
+   * A write made from a read whose renamed sparse map changed form before every attempt landed
+   * (#238): the race, reported as a lost race is, naming the map — `OptimisticLockError` (its
+   * version didn't move) or `ConcurrentModification` (its `current` filled by the caller).
+   */
+  const formKeptMoving = (moved: FormMoved): OptimisticLockError | ConcurrentModification => {
+    const key = moved.key
+    if (systemFields.version) {
+      const version = storedVersionOf(moved.stored) ?? 0
+      return new OptimisticLockError({
+        entityType,
+        key,
+        expectedVersion: version,
+        actualVersion: version,
+        attributes: [moved.field],
+      })
+    }
+    return new ConcurrentModification({
+      entityType,
+      key,
+      attributes: [moved.field],
+      current: Option.none(),
+    })
+  }
+
   /** The domain field a stored attribute holds (`storedAs` renames reversed). */
   const domainNameOf = (attr: string): string =>
     Object.keys(data.modelFields as object).find((field) => resolveDbName(field) === attr) ?? attr
@@ -11062,10 +11100,8 @@ const makeImpl = <
       // they were written (#238): a write made without reading the row is refused, and one made
       // from a read is refused if the row changed form since.
       for (const [i, [field, form]] of [...formGuards].entries()) {
-        names[`#fm${i}`] = renamedMapAttribute(field)!
-        formConditions.push(
-          form === "whole" ? `attribute_exists(#fm${i})` : `attribute_not_exists(#fm${i})`,
-        )
+        names[formGuardName(i)] = renamedMapAttribute(field)!
+        formConditions.push(formGuard(i, form))
       }
 
       // A legacy retain item gets its incarnation token with this write.
@@ -11151,16 +11187,33 @@ const makeImpl = <
       // DynamoDB's to reject, and is diagnosed naming the caller's part (#144).
       const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
       /**
-       * The renamed sparse map whose entries this update wrote as their own attributes, without
-       * reading the row, to a stored row that holds it whole — what its guard refused (#238).
+       * A refusal of `expression` by its form guard (`internal/FormGuard.ts`), judged on the row it
+       * returned (#238). Written without reading the row, the map is stored whole there: `EDD-9150`
+       * where the rest of the condition is known to hold, else the rest's verdict, as before (a
+       * caller's condition the evaluator can't tell is answered as the caller's). Written from a
+       * read, the row changed form since: read again and written again ({@link FormMoved}), which
+       * lets DynamoDB judge a condition the evaluator can't. `undefined`: the rest of the condition
+       * refused it, answered as before.
        */
-      const storedWholeMap = (stored: globalThis.Record<string, unknown> | undefined) =>
-        stored === undefined
-          ? undefined
-          : [...formGuards].find(
-              ([field, form]) =>
-                form === "entries" && Object.hasOwn(stored, renamedMapAttribute(field)!),
-            )?.[0]
+      const formRefusal = (
+        expression: string | undefined,
+        stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+      ): ValidationError | FormMoved | undefined => {
+        const rejection = rejectedBy({ expression, names, values }, stored)
+        if (rejection._tag === "Rest" || (held === undefined && !rejection.known)) return undefined
+        const field = sparseRenames.get(rejection.attribute)!
+        return held === undefined
+          ? new ValidationError({
+              entityType,
+              operation: "update",
+              cause: renamedMapRefusal(field, "update"),
+            })
+          : new FormMoved({
+              field,
+              key: encodedKey as globalThis.Record<string, unknown>,
+              stored: stored as globalThis.Record<string, AttributeValue>,
+            })
+      }
 
       // The top-level attributes this update writes — what `updatedOld` /
       // `updatedNew` return.
@@ -11216,12 +11269,14 @@ const makeImpl = <
               | DynamoClientError
               | OptimisticLockError
               | ConditionalCheckFailed
-              | ValidationError => {
+              | ValidationError
+              | FormMoved => {
               // The update is guarded by the snapshot version AND any user
               // condition; the stored item (ALL_OLD) says which rejected it.
               const rejection = (
                 stored: Readonly<globalThis.Record<string, unknown>> | undefined,
               ) =>
+                formRefusal(guardParts.join(" AND "), stored) ??
                 conditionRejection(
                   encodedKey as globalThis.Record<string, unknown>,
                   stored,
@@ -11304,7 +11359,8 @@ const makeImpl = <
             | ConditionalCheckFailed
             | ItemNotFound
             | MissingForCreate
-            | ValidationError => {
+            | ValidationError
+            | FormMoved => {
             // The stored item (ALL_OLD) says what rejected the update: no
             // item (it must exist), a restated immutable value, the
             // version CAS, or the user's condition.
@@ -11335,24 +11391,11 @@ const makeImpl = <
                   )
                 : undefined
               if (fallback !== undefined) return fallback
-              // The form guard is answered only where the rest of the condition holds on the row
-              // returned: the caller's condition and the version keep their own verdicts (#238).
-              const wholeMap = held === undefined ? storedWholeMap(stored) : undefined
-              if (
-                wholeMap !== undefined &&
-                conditionHolds(
-                  condParts.filter((part) => !formConditions.includes(part)).join(" AND "),
-                  stored as globalThis.Record<string, AttributeValue>,
-                  names,
-                  values,
-                ) !== false
-              ) {
-                return new ValidationError({
-                  entityType,
-                  operation: "update",
-                  cause: renamedMapRefusal(wholeMap, "update"),
-                })
-              }
+              // The form guard is answered only where the rest of the condition is known to hold
+              // on the row returned: the caller's condition and the version keep their own
+              // verdicts (#238).
+              const form = formRefusal(conditionExpression, stored)
+              if (form !== undefined) return form
               return conditionRejection(
                 encodedKey as globalThis.Record<string, unknown>,
                 stored,
@@ -11414,10 +11457,25 @@ const makeImpl = <
     /** The row as the caller read it, consistently (a transaction's plan): see {@link runPreparedUpdate}. */
     held?: globalThis.Record<string, AttributeValue>,
   ) => {
-    const run = () =>
+    const once = () =>
       prepared === undefined
         ? runUpdate(key, mode, requested, held)
         : runPreparedUpdate(key, prepared, mode, held)
+    // A form race (#238): the row's renamed sparse map changed form between the update's read and
+    // its write. Read again and written again, as a guarded put is; once every attempt raced, the
+    // race is reported naming the map. A row handed in (a transaction's plan) is never re-read here:
+    // its writes are recorded, not sent, so they're never refused.
+    const run = () =>
+      once().pipe(
+        Effect.retry({
+          times: held === undefined ? GUARDED_PUT_ATTEMPTS - 1 : 0,
+          while: (e) => e instanceof FormMoved,
+        }),
+        Effect.catchIf(
+          (e): e is FormMoved => e instanceof FormMoved,
+          (moved) => withCurrentItem(Effect.fail(formKeptMoving(moved)), () => moved.stored),
+        ),
+      )
     return run().pipe(
       Effect.catchIf(
         (e): e is MissingForCreate => e instanceof MissingForCreate,
@@ -11648,13 +11706,16 @@ const makeImpl = <
       // Otherwise: every attribute the main item's condition names — the
       // op's own guard inputs are all among them, so if none changed the
       // guard held, and only the caller's condition can have rejected it.
+      // A renamed sparse map's form guard is judged first, by the function
+      // every write carrying it asks (`internal/FormGuard.ts`, #238); its
+      // attribute is no input of the rest.
       const mainItem = items[roles.findIndex((role) => role._tag === "main")]
       const guarded = mainItem?.Update ?? mainItem?.Put ?? mainItem?.Delete
       const conditionAttrs = [
         ...new Set(
           (guarded?.ConditionExpression?.match(/#[A-Za-z0-9_]+/g) ?? []).flatMap((token) => {
             const attr = guarded?.ExpressionAttributeNames?.[token]
-            return attr === undefined ? [] : [attr]
+            return attr === undefined || /^#fm\d+$/.test(token) ? [] : [attr]
           }),
         ),
       ]
@@ -11728,6 +11789,30 @@ const makeImpl = <
           }
           if (main === undefined) return sideFailed ? lostRace(undefined) : undefined
           if (main === "absent") return lostRace(undefined)
+          // Refused by the form guard: the row's map changed form since the plan's read. Planned
+          // again — which lets DynamoDB judge a caller's condition the evaluator can't — and
+          // reported naming the map once every attempt raced.
+          const form = rejectedBy(
+            {
+              expression: guarded?.ConditionExpression,
+              names: guarded?.ExpressionAttributeNames,
+              values: guarded?.ExpressionAttributeValues,
+            },
+            main,
+          )
+          if (form._tag === "Form") {
+            return {
+              _tag: "Retry",
+              stored: main,
+              error: formKeptMoving(
+                new FormMoved({
+                  field: sparseRenames.get(form.attribute)!,
+                  key: encodedKey,
+                  stored: main,
+                }),
+              ),
+            }
+          }
           if (raced(main) || !request.callerCondition) return lostRace(main)
           return { _tag: "Condition" }
         },
@@ -12887,8 +12972,8 @@ const makeImpl = <
           // read takes the map in its place: such a row refuses the upsert (#238). The guard costs
           // no request, and an entity without such a map sends what it always sent.
           const formGuards = [...entriesWritten].map((field, i) => {
-            names[`#fm${i}`] = renamedMapAttribute(field)!
-            return `attribute_not_exists(#fm${i})`
+            names[formGuardName(i)] = renamedMapAttribute(field)!
+            return formGuard(i, "entries")
           })
           condParts.push(...formGuards)
 
@@ -12914,28 +12999,18 @@ const makeImpl = <
             if (isAwsConditionalCheckFailed(err.cause)) {
               const corrupt = versionCorruption(err.cause.Item, "upsert")
               if (corrupt !== undefined) return corrupt
-              const stored = err.cause.Item
-              // The form guard is answered only where the rest of the condition holds on the row
-              // returned: the caller's condition and the key guards keep their own verdicts.
-              const wholeMap =
-                stored === undefined
-                  ? undefined
-                  : [...entriesWritten].find((field) =>
-                      Object.hasOwn(stored, renamedMapAttribute(field)!),
-                    )
-              if (
-                wholeMap !== undefined &&
-                conditionHolds(
-                  condParts.filter((part) => !formGuards.includes(part)).join(" AND "),
-                  stored as globalThis.Record<string, AttributeValue>,
-                  names,
-                  values,
-                ) !== false
-              ) {
+              // The form guard is answered only where the rest of the condition is known to hold
+              // on the row returned: the caller's condition and the key guards keep their own
+              // verdicts (#238, `internal/FormGuard.ts`).
+              const rejection = rejectedBy(
+                { expression: upsertInput.ConditionExpression, names, values },
+                err.cause.Item,
+              )
+              if (rejection._tag === "Form" && rejection.known) {
                 return new ValidationError({
                   entityType,
                   operation: "upsert",
-                  cause: renamedMapRefusal(wholeMap, "upsert"),
+                  cause: renamedMapRefusal(sparseRenames.get(rejection.attribute)!, "upsert"),
                 })
               }
               if (keyGuards.length > 0 && err.cause.Item !== undefined) {

@@ -6,7 +6,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapRaces.ts`. Connected twin:
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -28,6 +28,7 @@ import { pathClearSuite } from "./helpers/PathClears.js"
 import { renamedSparseMapSuite } from "./helpers/RenamedSparseMap.js"
 import { renamedSparseMapPathsSuite } from "./helpers/RenamedSparseMapPaths.js"
 import { renamedSparseMapRacesSuite } from "./helpers/RenamedSparseMapRaces.js"
+import { renamedSparseMapVerdictTableSuite } from "./helpers/RenamedSparseMapVerdictTable.js"
 import {
   renamedSparseMapCopiesSuite,
   renamedSparseMapUpsertsSuite,
@@ -109,6 +110,10 @@ describe("a sparse map a field: rename stores whole, through the paths beyond an
 
 describe("a sparse map a field: rename stores whole, moved between a transaction's plan and its write", () => {
   renamedSparseMapRacesSuite(openRecordingTable)
+})
+
+describe("a refused write of a sparse map a field: rename stores whole, cell by cell of its decision table", () => {
+  renamedSparseMapVerdictTableSuite(openRecordingTable)
 })
 
 describe("a copy from an entry of a sparse map a field: rename stores whole", () => {
