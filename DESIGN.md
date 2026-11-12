@@ -4950,34 +4950,61 @@ collection index, the collection sort key's copy (`rowKeyAttributes`); the root'
 row its list keys when every list composite has a value (`listKeyAttributes`,
 sparse); and every row beneath the root the attributes `context` copies from the
 root (`mergeContextValues`). Up to 1.40.0 a value given for one of those names
-was replaced by the library's, and every read handed back the library's value,
-or nothing, or failed (`pk: { field: "id", composite: ["id"] }` read `id` back
-as the key text; a `many` element's sort key composite named `sk` failed every
-read). `create`, and only `create`, now refuses such a value when it differs from
-the library's (`givenOverRow`, over every row `buildDynamoItems` built,
-`refuseGivenOverRows`; `AggregateDecompositionError`, nothing sent), naming the
-member, the field, the value given and the library's value:
+was replaced by the library's, and a read handed back something else: the
+library's value, its stored text where the member declares the name in another
+form, nothing, or a failure (`pk: { field: "id", composite: ["id"] }` read `id`
+back as the key text; a `many` element's sort key composite named `sk` failed
+every read). `create`, and only `create`, now refuses a value exactly when a
+`get` right after would not return it (`refuseGivenOverRows`,
+`AggregateDecompositionError`, nothing sent):
 
-- **Judged:** each name the library writes on that kind of row (`rowKeysOn`, the
-  write-side twin of `readTakesOff`, and, on a row beneath the root, each context
-  name) that the caller's input gives a value at the top of the row's value
-  (`DecomposedItem.input`: the input as given, before decoding filled anything
-  in, read with `given`, so a function is no value), where the row's schema
-  places the name (`placedFields`). The value, in its stored form
-  (`DecomposedItem.own`), is compared with what the built row holds there.
-  Equal: written byte for byte as on 1.40.0. Different: refused. Absent (not
-  given, a decoding default, an optional field left out): not judged.
-- **Not judged, written and read as on 1.40.0:** a discriminator, the library's
-  to fill whatever the value holds (a `Schema.BigInt` `1n` for a discriminator
-  `1`, an element copied between sub-aggregates of one model); a name the library
-  doesn't write on that row (an index key name no list key composes there, such
-  as `gsi1pk` on an edge or on a root whose list composite has no value, and a
-  timestamp the library stamps), which a read takes off as 1.40.0 did; a value
-  nested below the top level, which is no attribute of the row; a value whose
-  fields the schema can't place exactly (a union, a record, a declaration: which
-  member holds the name can't be told from the schema); and a `many` edge with a
-  custom `decompose` or `assemble`, which maps its value to rows and back
-  itself. `Aggregate.make` refuses nothing, pure or operational: whether a write
+- **The judgement, one function at every place.** Each row as the write builds
+  it is read as a `get` reads it: unmarshalled, its packed attributes unpacked
+  (`unpackAggregateItems`), taken as its member's value (`rowValueAsRead`:
+  renamed, sparse fields as a read restores them) and decoded by the member's
+  own schema, the decode assembly runs (`readAt`: the field's schema where the
+  member's places the name, `placedFields`; the value as it is where the member
+  keeps what it's given; otherwise the whole value's schema, so a union, record,
+  declaration, `Schema.suspend` or `StructWithRest` is read whole). What it
+  reads is compared with the value given, decoded (`DecomposedItem.value`), in
+  domain terms (`sameValue`): sets by their members, `Date` / `DateTime` by
+  instant (and zone where the type carries one), `bigint` and numbers by value
+  (`NaN` equal to `NaN`), `Option`, classes and `Data` structurally
+  (`Equal.equals` where the value implements it), a `Uint8Array` by its bytes.
+  Equal: written byte for byte as on 1.40.0. Different, or a read that fails
+  there: refused. Given no value, a name the member's schema places is read too,
+  unless the member declares it with the root's own schema: the library's value
+  is then the member's (a context copy), and only a read that fails there is
+  refused (`unreadOverRowReason`; a root `Schema.NumberFromString` copied onto a
+  member declaring `Schema.Number`, which 1.40.0 stored and every read failed
+  on). The places: a `one` edge's value, a `many` element, a
+  sub-aggregate's root, and the root's own row; a `many` edge with a custom
+  `decompose` or `assemble` is read whole, through them (`customOverRowReason`):
+  refused where its read with the library's values differs from its read with
+  the values its rows were given, or, its rows given none, where its read with
+  the root's `context` values fails (`customUnreadReason`).
+- **The value given is looked up by the one name the input holds it under**
+  (`inputNameIn`): a `many` edge's `inputField` where the input holds that name,
+  else the field's. Hydration's ids, the rename before decoding
+  (`renameInputFields`, now applied whether or not an id is fetched: 1.40.0 left
+  a value under its `inputField` unrenamed when no id was fetched and refused the
+  `create` with a `ValidationError`, though the input type names it so) and the
+  judged value (`inputFor`) all go through it. A `${field}Id` is not judged: the
+  caller gives the id, not the value hydration stores.
+- **The message** names the member and the field, and shows the value given and
+  what a read returns, each rendered so the two can be told apart (`rendered`: a
+  string quoted, a number bare, `6n`, `Set { "a", "b" }`, `DateTime.Utc(…)`,
+  `Uint8Array [1, 2, 3]`), or the read's failure.
+- **Not judged, written and read as on 1.40.0:** a name given no value (not
+  given, a decoding default, an optional field left out) whose read succeeds; a
+  discriminator, the
+  library's to fill whatever the value holds (a `Schema.BigInt` `1n` for a
+  discriminator `1`, an element copied between sub-aggregates of one model); a
+  name the library doesn't write on that row (an index key name no list key
+  composes there, such as `gsi1pk` on an edge or on a root whose list composite
+  has no value, and a timestamp the library stamps), which a read takes off as
+  1.40.0 did; and a value nested below the top level, which is no attribute of
+  the row. `Aggregate.make` refuses nothing, pure or operational: whether a write
   gives a field another value is known only at the write, and a required field
   whose every value is the library's (`csk: Schema.Literal("$app#v1#note")`)
   round-trips.
@@ -4985,9 +5012,22 @@ member, the field, the value given and the library's value:
   the library's, as on 1.40.0. The state an update mutates is what its read gave,
   and what the read filled in (a context copy, a list key's or the collection
   sort key's text, a discriminator) can't be told from what the caller set, so a
-  judgement would refuse updates 1.40.0 made: a no-op, or a change to another
-  field, over rows a partial earlier write left holding the old context value; a
-  copy between sub-aggregates.
+  judgement would refuse updates 1.40.0 made. What it returns is what a read
+  after it returns ("What `update` returns", below).
+
+The pairings (`AggregateContextPairings.test.ts`,
+`helpers/AggregateContextPairings.ts`, against
+`fixtures/aggregate-context-pairings-1.40.0.json`) run every scalar, date,
+`bigint`, set, byte and opaque declaration of a root `context` field against
+every declaration a member gives it (the same form, another form, optional,
+renamed with `field:`, stored packed), at a `one` edge, a `many` element, a
+sub-aggregate's root and under a custom `decompose`, given the root's value,
+another, or none: where 1.40.0's `get` returned the value as given, `create`
+sends, stores and reads what 1.40.0 did; where it returned another or failed, it
+is refused. A `many` value given under its `inputField`
+(`AggregateInputField.test.ts`, `fixtures/aggregate-input-field-1.40.0.json`) is
+judged at the root and beneath a sub-aggregate, with a ref hydrated and without,
+under each `escapeKeys` setting.
 
 Rows already stored read as before (`AggregateHeldOverRows.test.ts`,
 `connected.aggregate-held-over-rows.test.ts` against
@@ -5024,35 +5064,55 @@ doesn't declare is taken off exactly as on 1.40.0, another writer's index key
 included. A sub-aggregate with no edge of its own is read as a `one` edge is
 (`subAggregateRowKind`), so its row follows the edge's rule.
 
-**What `update` returns (#241).** 1.40.0's result: the mutated state as decoded,
-or, where a node declares a stamp, the rows written assembled. One change: a
-member value's copy of a context attribute is the value its row holds once the
-write is done (`contextCopiesAsStored`), as a `get` right after reads it: the
-root's on a row the write sent, the value read on a row it left (a group the
-diff left alone; a group a retry after a partial failure finds unchanged, whose
-rows still hold the old value). `DecomposedItem.path` pairs each member value
-with its row. The copy is placed where the member's schema places the name
-(`placedFields`), decoded by its schema as a read decodes it, and left out where
-a read leaves it out (taken off, or the row holding none). A discriminator, a
-place the schema can't place exactly, a `many` edge with a custom `decompose` or
-`assemble`, and a value whose row isn't found keep what the state held. No
-request is added. A `get` right after can still read otherwise than the update
-returned, as on 1.40.0 (listed, not changed):
+**What `update` returns (#241).** What a `get` right after it reads: the
+partition as the write leaves it, assembled as a read assembles it, from the rows
+the update read with its writes applied (`inReadOrder`: by the collection index's
+sort key, else `sk`, in DynamoDB's byte order). With nothing written, the state
+it read (`current`). 1.40.0 returned the mutated state as decoded, and a `get`
+right after read otherwise wherever: a discriminator the value held another
+value in; a name a read takes off (`pk`, `sk`, `__edd_e__`, a name like an index
+key the value doesn't declare); a root list key's or the collection sort key's
+copy a read handed back, after a write composing another; a context copy (and,
+in a new `Schema.Unknown` value, the discriminator or partition key copies a
+read hands back beside it); `many` elements the mutation held out of key order;
+a row the update left in place that the new value doesn't hold (a row of a type
+another aggregate shares). Each now returns what the read returns. No request is
+added: the update has read the partition, and the assembly runs in memory once,
+when a write is sent. Two cases still differ from a later `get`: an assembly of
+the rows written that fails (a value 1.40.0 also stored and couldn't read back),
+which returns the mutated state as decoded, as 1.40.0 did; and another writer's
+write between the update and the `get`.
 
-- a discriminator the value held another value in: the library's is stored, and
-  read;
-- a name a read takes off (`pk`, `sk`, `__edd_e__`, a name like an index key the
-  value doesn't declare): the update returns it, a read leaves it out;
-- a root list key's or the collection sort key's copy a read handed back, after
-  a write composing another: the update returns the text it read;
-- a context copy in a value whose schema can't place it exactly (a union member,
-  a record, a declaration) or in a `many` edge with a custom `decompose` or
-  `assemble`;
-- `many` elements the mutation holds out of key order: the update returns them
-  in the mutation's order, a read in key order;
-- a row the update leaves in place that the new value doesn't hold (a row of a
-  type another aggregate shares, at a key the new value doesn't write): a read
-  returns it.
+**A context copy the root's value has moved past (#241).** A group whose rows
+hold a context attribute's copy that isn't the root's value, compared in domain
+terms (`staleContextGroups`, the copy decoded as a read decodes the root's own),
+counts as changed and is written: rows an earlier update left behind when a
+later group's transaction failed after the root's committed. 1.40.0 left them
+holding the old value until something else in their group changed. A group
+whose copies already equal the root's stays unwritten, so diff narrowing and
+every request of an ordinary update are 1.40.0's (the upgrade sweep, every
+shape and step).
+
+**Rows under the other `escapeKeys` setting's text (#241, `EDD-9160`).** A
+sort key built from a `many` element's composites or a discriminator value can
+compose different text under the two settings: a `$`, `#` or other escaped
+character, a number other than a non-negative integer below 1e16. Rows written
+before the setting was turned over stay under the old text until `rekey` moves
+them. Up to 1.40.0 an update writing such a group put its rows under the new
+text beside the old, so every element read twice, a sub-aggregate whose root was
+doubled failed to read, and where one value's text under one setting is
+another's under the other (`a b` escapes to `a%20b`), one element's row
+overwrote another's. An update about to write a group one of whose rows is
+stored under the other setting's text (`refuseOtherSettingRows`) is now refused
+with a `ValidationError` naming the member, the row's sort key and `rekey`,
+after its `Query` and before anything is written. Not refused, and sent as on
+1.40.0: keys whose text is the same under both settings; a row at a key another
+element of the value read composes now (the aliasing above, read as that
+element's own); a row the update moves itself (an `entity:` edge's under 1.40.0's
+composition); and a group the update doesn't write
+(`AggregateEscapeFlip.test.ts`, `fixtures/aggregate-escape-flip-1.40.0.json`:
+rows 1.40.0 wrote under one setting, each update step under the other or the
+same, against what 1.40.0 sent, stored and read).
 
 **What `create` hydrates, and by what key.** An edge with an `entity` is given
 ids where its input takes them: a `one` or `ref` edge's `${field}Id`, the
@@ -6176,10 +6236,9 @@ configuration that could add one (#98).
    declared dates before it validates (`fillStamps`), so the value it returns holds
    them. `update` keeps `createdAt` whatever the mutation did, as an entity's update
    has no `createdAt` to name. A mutation that changes `updatedAt` wins; otherwise a
-   rewritten row is stamped, and a row the diff left keeps its value. When a node
-   declares a stamp, the result is assembled from the rows written, with no I/O. When
-   none does, it's the decoded value, each member value's copy of a context
-   attribute as its row holds it ("What `update` returns", above), and nothing extra runs.
+   rewritten row is stamped, and a row the diff left keeps its value. `update`'s
+   result is the partition as its write leaves it, assembled with no I/O ("What
+   `update` returns", above), so it holds the stamps stored.
 7. **A `many` edge with a custom `decompose`.** `fillStamps` works on the value as the model has it, before it's decoded (`fillRows`). With `decompose` and `assemble` it takes the value apart, fills each row and puts it back, so a `Schema.Record` of rows is stamped like an array, and its rows' fields are read from the record's value schema (`manyElementFields`, `extractKeyedValue`), so a date in one is stored in its own form. A value they can't take apart or put back is left for the schema to report. Two can't be filled: a value with `decompose` and no `assemble` that isn't an array (there's no way to put its rows back, nor does it read back), and an opaque field (`Schema.Unknown`) with no `entity`, where nothing says what its rows hold, so they're stamped and it's stripped on read, as a row that doesn't declare the date. A `Schema.ReadonlyMap`, `Schema.HashMap` or `Schema.Chunk` field works here, as it doesn't anywhere else (`EDD-9125`), because its collection is rows and is never stored itself.
 8. **The input matches what `create` takes, at every row.** A `one` or `ref` edge whose `entity` one id names takes an id (`venueId`), of the type of the entity's key composite (`refIdInput`, `_EdgeIdValue`: a number, a bigint, a `Date`, a brand), which `create` fetches and denormalises. One with no `entity`, or whose `entity` is keyed by more than one attribute (or none), has nothing to fetch by, so it takes the value under its field name, with its stamps optional: the derived `inputSchema` (`deriveWithStamps`, `rowInput`) and the type (`AggregateInputType`, `_IsValueEdge`) agree. A `many` edge's elements follow the same rule: ids of that type for an element that is the entity, `${field}Id` for the field of an element that holds it (`deriveElementInputSchema`, `_TransformManyEdge`), an element declared a union as 1.39.0 took it (the union as declared; its type 1.39.0's, `_UnionElementInput`), and the elements as given for an edge with nothing to fetch. A `Schema.Record` `many` edge's values have optional stamps too (`keyedInput`, `_TransformManyEdge`), and its `sk.composite` names are checked against them (`ManyEdgeSkPaths`). Any other object field takes any name there: its rows are whatever its `decompose` makes, and a scalar field has no rows and takes none.
 9. **A stamp takes the form its row stores the field's values in.** On `create` and `update`, on the root and on edges, a stamp in a field a row declares is stored as the row stores any value of that field (`storedDateEncodings`, read by both `buildAttrEncoders` and `rowStampsOf`): the field's own date encoding, `Schema.optional` included, as an entity's write stores it (#241; up to 1.40.0 the union hid the annotation and such a field's values and stamps were stored as ISO text, `test/fixtures/aggregate-stamp-forms-1.39.0.json`). A row that doesn't declare the field holds the root's form: the root's declaration's, else the stamp's own encoding. So one attribute never holds a value in one form and a stamp in another on a row. Key text keeps the form it had (`storedDateEncodings(field, keyText)`, `buildKeyAttrEncoders`, and `RowStamps.createdKey` / `updatedKey` for a key over a stamp), so no key moves. A row stored as ISO text reads as it is and switches a group at a time: both sides of an update's diff are decomposed with the same encoders, so a no-op update writes nothing, and a changed group's rows are all written in the declared form, a kept `created` converted to it (`inStampForm`, the same instant; `test/fixtures/aggregate-optional-dates-1.40.0.json`). 1.39.0 stamped an edge in the root's form whatever the edge declared; an edge declaring a date in another encoding now stores its stamp in that encoding, and reads either.
@@ -8016,8 +8075,8 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9134` | `internal/ProjectionEngine.ts` (`sharedOutboxKeySpace`, `refuseSharedOutboxKeySpace`), through `DynamoClient.make`, a table's `rekey` and `EventStore.processBatch` | Two read models whose projections' outboxes are on one table, in the same key space (the partition and sort key text their primary keys compose: schema name and version, primary collection, entity type, the composites' labels, and what each composite's type can compose: a number's or bigint's key text, a literal union's members, `true` and `false`, or any text). `DynamoClient.make` (among the entities it binds and its tables' members) and `processBatch` (among the read models of the projections it's handed) refuse two whose keys can be the same with values that hold no `#`: their items would overwrite each other. A defect, before anything runs. Two whose keys meet only through a value holding `#`, or part where one's value can't spell the other's text (a number beside a label), bind and run. `rekey` of the outbox's table refuses two whose items it could read as each other's, a value holding `#` included and a literal composite read as any text, as its reader reads one, with the outboxes of projections defined since the client was made; and a member of that table claiming the outbox items of a read model's entity type that could read them as its own, unless it composes its keys exactly as the read model does. A `ValidationError`, before it sends anything; `rekey` of other tables runs. Tables are compared by the physical name the context gives them, so two handles on one table are one table. Read models that never meet at one of these can't be checked: key spaces must be distinct per outbox table. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
 | `EDD-9158` | Retired, never released | Allocated during 1.41's development for refusing an entity-level ref's `${field}Id` for an entity keyed by more than one composite, and retired before release: a key whose other composites have an encoding default composes from the identifier alone, and 1.40.0 fetches and stores it. Such an id is fetched under the identifier, as on 1.40.0, and fails as it did where the key can't be composed. Don't reuse the number |
-| `EDD-9159` | `Aggregate.ts` (`givenOverRow`, through `refuseGivenOverRows`), at `create` only (`AggregateDecompositionError`, nothing sent) | A `create` whose input gives, at the top of a row's value (the root's, a sub-aggregate's, a `one` edge's value, a `many` element), a name the library writes on that row (`rowKeysOn`: `__edd_e__`, the partition key attribute, `sk`, the collection sort key's copy, the root's list keys on a write composing them; on a row beneath the root, a context attribute) a value which, in its stored form, differs from what the library writes there (#241). Up to 1.40.0 the library's value replaced it and every read handed that back, or nothing, or failed. Judged on the caller's input as given (`given`), where the row's schema places the name (`placedFields`); a value equal to the library's, or none, is written as on 1.40.0. Not judged: a discriminator, a name the library doesn't write on that row, a nested value, a union, record or declaration, a custom `decompose` or `assemble`, and `update` (its state is the read's: a value given there is replaced by the library's, as on 1.40.0). `Aggregate.make` refuses nothing. The message names the member, the field, the value given and the library's value |
-| `EDD-9160` | Not allocated | Reserved for #241's branch and never used: free for the next allocation |
+| `EDD-9159` | `Aggregate.ts` (`givenOverRowReason`, `customOverRowReason`, through `refuseGivenOverRows`), at `create` only (`AggregateDecompositionError`, nothing sent) | A `create` whose input gives, at the top of a row's value (the root's, a sub-aggregate's root, a `one` edge's value, a `many` element, or a `many` edge's value through its custom `decompose` / `assemble`), a value for a name the library writes on that row (`__edd_e__`, the partition key attribute, `sk`, the collection sort key's copy, the root's list keys on a write composing them; on a row beneath the root, a context attribute) that a `get` right after would not return (#241): the row as built, read as a `get` reads it (unpacked, renamed, sparse fields restored, decoded by the member's own schema), compared with the value given in domain terms (`sameValue`). Up to 1.40.0 the library's value replaced it and the read handed back something else, or failed. Equal: written as on 1.40.0. Given no value, a name the member places with another schema than the root's is refused only where that read fails (`unreadOverRowReason`, `customUnreadReason`). The value given is looked up under the name the input holds it by (`inputNameIn`: a `many` edge's `inputField`). Not judged: a discriminator, a name the library doesn't write on that row, a nested value, and `update`. `Aggregate.make` refuses nothing. The message names the member and the field and shows the value given and what the read returns (or its failure), each rendered unambiguously |
+| `EDD-9160` | `Aggregate.ts` (`refuseOtherSettingRows`), at `update` (`ValidationError`, nothing written) | An aggregate `update` about to write a group one of whose rows is stored under the sort key text the other `escapeKeys` setting composes (a `$`, `#` or other escaped character, or a number other than a non-negative integer below 1e16, in a `many` element's sort key or a discriminator value), written before the setting was turned over (#241). Up to 1.40.0 the update wrote the group's rows under the new text beside the old, so every element read twice (or a doubled sub-aggregate root failed to read, or, with texts aliasing across the settings, one element's row overwrote another's). Not refused: a key whose text is the same under both settings, a row at a key another element read composes now, a row the update moves itself (an `entity:` edge's under 1.40.0's composition), a group the update doesn't write. The message names the member, the row's sort key and `rekey` |
 | `EDD-9161` | `internal/LostValues.ts` (schema, `lostAs`, `lostIn`, `readJudged`), through `internal/RoundTrip.ts` (`readBackOf`, `notReadBack`) on `Entity.ts` (`encodeForWrite`, `unstorableOperand`, `_refuseNotReadBack`), `Marshaller.ts` (`marshallStorable`: a part behind a getter, judged as it's called), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox), `Aggregate.ts` (`refuseLost`), and `internal/PackedCodec.ts` (`written`) | A write's value, at a position no schema types (`Schema.Unknown`, `Schema.Any`, at any depth, `holdsUntyped`), holding a part DynamoDB doesn't store: a `Date` (valid or not) or a `RegExp`, written as an empty map that reads back as `{}`; a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`; an `Error` holding a `message` or a `cause` that isn't an enumerable property; a `Redacted`, of which only the marker is stored; a `Map` with a key that isn't a string, whose keys read back as text; and the binary data 1.40.0 stored as less than it is or failed to send, kind by kind: an `ArrayBuffer`, a `DataView` or a `Blob` (a `File` is one), stored as empty bytes; a `SharedArrayBuffer`, stored as an empty map; an instance of a subclass of any of them, stored as the map of its enumerable properties; and the typed arrays `Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`, `BigInt64Array` and `BigUint64Array` themselves, which the AWS SDK fails to serialise (up to 1.40.0 a `DynamoError` holding its `TypeError`). Any other binary kind (a `Float16Array`, a subclass of a typed array, a kind a later runtime adds) is stored as 1.40.0 stored it. A cookie's expiry is stored as ISO text, so it isn't one, and a list holding `undefined`, a function or a hole closes up as it always has. A `ValidationError` naming the path, with nothing written, on every write path: `put` / `create` / `upsert`, an update's `.set` and path operations, `transactWrite`, `Batch.write`, a time-series `append`, an aggregate's `create` and `update`, an event stream's `append` (event and metadata) and snapshot, and a projection's outbox. A packed field refuses the same values with the same words, through the same function, where it refused them before as JSON can't hold them (a map and binary data still as not JSON). A part behind a getter is judged as the marshaller calls the getter, which is called as often as 1.40.0 called it. Only a schema holding an untyped position pays for the walk. Rows already stored as `{}` read as `{}`. |
 | `EDD-9162` | `internal/ObjectKeyText.ts` (schema, `defaultObjectText`, `objectKeyRefusal`, `judgeObjectKeyText`), decided where a key is composed (`KeyComposer.siteCompositeText`) under a write's own schema (`Entity.ts` `ownSchema`, `DynamoSchema.objectKeys`) | A write composing a key from an object whose key text is its default `[object …]` tag (a struct, a `Data` class, a class of one's own without a `toString`), which every such object composes alike: in the primary key, an index, a unique constraint, a vector partition or a time-series `orderBy`, on `put`, `create`, `upsert`, an update recomposing an index key, `append`, and a transaction's and a batch's put. A `ValidationError` naming the field and what composes it, with nothing written. A key-taking read or delete (`get`, `delete`, a query accessor, an update's own key record, `restore`) still composes the text, to reach a row an earlier release wrote under it. A value with a key form isn't refused. A key the write doesn't compose (sparse, a half an update leaves) refuses nothing. An aggregate's `create` and `update` too, through `Aggregate.ts` (`ownKeys`, `buildDynamoItems`): the partition key (`create`), the collection sort key, the list keys and a row's static discriminators; an `update` keeps a root composite equal to the one read. |
 | `EDD-9163` | `internal/WriteDiagnosis.ts` (`OperandType`, a site's opt-in diagnosis), rewritten by `Entity.ts` (the time-series `append`, `orderByRefusal`) | A time-series `append` whose `orderBy` value is stored as a type DynamoDB's `<` doesn't take: a map (an `Option`, a `Result`, a `Duration`, a `BigDecimal`, a zone), a list, a boolean or null. The append guards on the stored `orderBy` being below the new one (`#_tsob < :_tsNewOb`), and DynamoDB refuses that condition whatever the item holds, so such an entity can never `append` (a nullable one, each append holding null). It isn't checked: the append is sent, and DynamoDB's refusal (`Incorrect operand type for operator or function; operator or function: <, operand type: M`), confirmed on the request sent (the guard `#_tsob < :_tsNewOb` is in its condition and `:_tsNewOb` is of the type DynamoDB named), is rewritten into a `ValidationError` naming `timeSeries.orderBy`, its field and the type, with DynamoDB's error as the cause and nothing written. A refusal of the caller's own condition is DynamoDB's error, unchanged. A struct's `orderBy` is refused before that, as its key text (`EDD-9162`). |
