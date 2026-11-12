@@ -245,7 +245,36 @@ describe("rows published 1.40.0 keyed by a zone's given name on Effect 4.1.3", (
     expect(keys).not.toContain("asia/calcutta")
   })
 
-  it.effect("before rekey, an alias zone's rows are unreachable; a delete by key leaves them", () =>
+  it.effect("before rekey, a put writes a second row, which rekey reports and leaves", () =>
+    Effect.gen(function* () {
+      const table = seeded(written140.rows)
+      yield* onCodecs(table, (db) =>
+        Effect.gen(function* () {
+          const t0 = at("Asia/Kolkata", 0)
+          const zones = { at: t0, tz: zone("Asia/Kolkata"), tzf: zone("Asia/Kolkata") }
+          yield* db.entities.Retained.put({ id: "r1", ...zones }).asEffect()
+          const report = yield* db.tables.Main.rekey({ repairIndexKeys: true })
+          expect(
+            report.conflicts
+              .filter((conflict: { member: string }) => conflict.member === "Retained")
+              .map(({ kind, reason }: { kind: string; reason: string }) => [kind, reason]),
+          ).toEqual([
+            ["item", "bothKeys"],
+            ["snapshot", "bothKeys"],
+          ])
+          const keys = keysOf(rowsOf(table)).join("\n")
+          expect(keys).toContain(
+            "$zones#v1#retained#at_1970-01-01t05:30:00.000+05:30[asia/kolkata]",
+          )
+          expect(keys).toContain(
+            "$zones#v1#retained#at_1970-01-01t05:30:00.000+05:30[asia/calcutta]",
+          )
+        }),
+      )
+    }),
+  )
+
+  it.effect("before rekey, an alias zone's rows are unreachable by get, update and delete", () =>
     Effect.gen(function* () {
       const table = seeded(written140.rows)
       yield* onCodecs(table, (db) =>
@@ -268,10 +297,48 @@ describe("rows published 1.40.0 keyed by a zone's given name on Effect 4.1.3", (
               expect([name, reached]).toEqual([name, REACHED])
             }
           }
-          // A delete by key reports success and leaves the row; one that reads the item first (a
-          // soft delete, a unique constraint's release) reports it missing.
+          // A get or an update by key reports the item missing, and the update writes nothing; an
+          // aggregate's get, update and delete report that they found no rows.
           const before = keysOf(rowsOf(table))
           const t0 = at("Asia/Kolkata", 0)
+          for (const exit of [
+            yield* Effect.exit(db.entities.Retained.get({ id: "r1", at: t0 })),
+            yield* Effect.exit(db.entities.Instant.get({ id: "z1", zd: t0 })),
+            yield* Effect.exit(
+              db.entities.Retained.update({ id: "r1", at: t0 }).set({ note: "y" }).asEffect(),
+            ),
+            yield* Effect.exit(
+              db.entities.Series.update({ id: "s1", tz: zone("Asia/Kolkata") })
+                .set({ note: "y" })
+                .asEffect(),
+            ),
+            yield* Effect.exit(
+              db.entities.Soft.update({ id: "b1", tz: zone("Asia/Kolkata"), at: t0 })
+                .set({ note: "y" })
+                .asEffect(),
+            ),
+            yield* Effect.exit(
+              db.entities.Instant.update({ id: "z1", zd: t0 }).set({ note: "y" }).asEffect(),
+            ),
+          ]) {
+            expect(JSON.stringify(exit)).toContain("ItemNotFound")
+          }
+          const rootUpdate = yield* Effect.exit(
+            db.aggregates.Roots.update(
+              { id: "g1", tz: zone("Asia/Kolkata") },
+              ({ state }: any) => ({ ...state, note: "y" }),
+            ),
+          )
+          expect(JSON.stringify(rootUpdate)).toContain("AggregateAssemblyError")
+          for (const exit of [
+            yield* Effect.exit(db.aggregates.Roots.get({ id: "g1", tz: zone("Asia/Kolkata") })),
+            yield* Effect.exit(db.aggregates.Roots.delete({ id: "g1", tz: zone("Asia/Kolkata") })),
+          ]) {
+            expect(JSON.stringify(exit)).toContain("AggregateAssemblyError")
+          }
+          expect(keysOf(rowsOf(table))).toEqual(before)
+          // A delete by key reports success and leaves the row; one that reads the item first (a
+          // soft delete, a unique constraint's release) reports it missing.
           yield* db.entities.Retained.delete({ id: "r1", at: t0 }).asEffect()
           yield* db.entities.Series.delete({ id: "s1", tz: zone("Asia/Kolkata") }).asEffect()
           for (const exit of [

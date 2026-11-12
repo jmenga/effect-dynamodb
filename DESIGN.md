@@ -5229,7 +5229,12 @@ text per version.
 zone's key text from its `id`, so on Effect 4.1.3 they keyed an alias or a renamed zone
 by the name it was given (`…[asia/kolkata]`, `timezone.named(etc/utc)`), where every
 key now composes the resolved name, the text 1.40.0 composed on 4.1.2. Normal operation
-never looks there (no fallback read). `rekey` alone does: `givenZoneReading`
+never looks there (no fallback read), so until `rekey` runs such a row is absent, as at
+any key holding nothing: `get` and `update` report `ItemNotFound` (an aggregate's `get`,
+`update` and `delete`, `AggregateAssemblyError`), a `delete` reports success and leaves it
+(`ItemNotFound` where it reads the item first: a unique constraint, soft delete), a `put`
+writes a second row, which `rekey` reports as `bothKeys` and leaves, and its unique value
+isn't enforced. The upgrade note says to run `rekey` first. `rekey` alone looks: `givenZoneReading`
 (`internal/ZoneKeyText.ts`) takes a row's key-form record and its stored values, finds
 each value naming a zone by another name (a zone's text a codec stored, the zone in a
 zoned date's ISO text, a zone's map holding `resolvedId` beside the `id` it was given),
