@@ -20,10 +20,14 @@
  */
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
-import { Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Schema } from "effect"
 import { expect } from "vitest"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
+import {
+  EXPRESSION_MAX_SUBSTITUTION_BYTES,
+  substitutionBytes,
+} from "../../src/internal/ExpressionLimits.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import type { Harness, RepairTable } from "./RekeyRepair.js"
@@ -548,5 +552,103 @@ export const copyScenarios: ReadonlyArray<VectorRaceScenario> = [
           expect(vectorTerms(requests)).toEqual([])
         }),
     ),
+  ),
+]
+
+// ---------------------------------------------------------------------------
+// The vector terms fit beside the caller's condition, or aren't sent
+// ---------------------------------------------------------------------------
+
+/** The substitution bytes of the conditioned action of each request `write` sent. */
+const conditionSubstitutions = (requests: ReadonlyArray<{ readonly input: Row }>) =>
+  requests.flatMap(({ input }) =>
+    [input, ...(input.TransactItems ?? []).map((item: Row) => Object.values(item)[0])]
+      .filter((action: Row) => action.ConditionExpression !== undefined)
+      .map((action: Row) => {
+        const tokens = new Set<string>(action.ConditionExpression.match(/[#:][A-Za-z0-9_]+/g) ?? [])
+        const used = (entries: Row = {}) =>
+          Object.fromEntries(Object.entries(entries).filter(([token]) => tokens.has(token)))
+        return {
+          bytes: substitutionBytes(
+            used(action.ExpressionAttributeNames),
+            used(action.ExpressionAttributeValues),
+          ),
+          vector: substitutionBytes(
+            Object.fromEntries(
+              Object.entries(
+                (action.ExpressionAttributeNames ?? {}) as Record<string, string>,
+              ).filter(([, name]) => /^__edd_vp?_/.test(name)),
+            ),
+            Object.fromEntries(
+              Object.entries((action.ExpressionAttributeValues ?? {}) as Row).filter(([token]) =>
+                /^:dv\d+$/.test(token),
+              ),
+            ),
+          ),
+        }
+      }),
+  )
+
+/**
+ * A write copying the vector from its read, under a caller's condition holding `pad` in a value:
+ * once with a short pad, to measure the condition with the vector terms, then with a pad that
+ * leaves the condition one byte under DynamoDB's substitution limit without them. The vector terms
+ * don't fit beside it, so the write holds the version alone, as 1.40.0 sent it, and stays within
+ * the limit.
+ */
+const besideCondition = (
+  name: string,
+  entity: "Softs" | "Counts",
+  write: (db: any, pad: string) => Effect.Effect<unknown, unknown, any>,
+): VectorRaceScenario =>
+  copyScenario(name, (table, db) =>
+    Effect.gen(function* () {
+      const sent = (pad: string, id: string) =>
+        Effect.gen(function* () {
+          yield* db.entities[entity]
+            .put({ id, text: "a", handle: "h", count: 1 })
+            .withVector("byText", STALE)
+          table.clear()
+          yield* write(db, pad).pipe(Effect.provideService(Id, id))
+          return table.requests()
+        })
+      const measured = conditionSubstitutions(yield* sent("", "x"))
+      expect(measured).toHaveLength(1)
+      expect(measured[0]!.vector).toBeGreaterThan(1)
+      const room = EXPRESSION_MAX_SUBSTITUTION_BYTES - (measured[0]!.bytes - measured[0]!.vector)
+      const requests = yield* sent("p".repeat(room - 1), "y")
+      expect(vectorTerms(requests)).toEqual([])
+      const [action] = conditionSubstitutions(requests)
+      expect(action!.bytes).toBe(EXPRESSION_MAX_SUBSTITUTION_BYTES - 1)
+    }),
+  )
+
+/** The item a {@link besideCondition} write names. */
+class Id extends Context.Service<Id, string>()("test/VectorWriteRaces/Id") {}
+
+export const budgetScenarios: ReadonlyArray<VectorRaceScenario> = [
+  besideCondition(
+    "a soft delete under a condition filling the substitutions: the version alone, as 1.40.0 sent it",
+    "Softs",
+    (db, pad) =>
+      Effect.gen(function* () {
+        const id = yield* Id
+        yield* db.entities.Softs.delete({ id })
+          .condition((t: any, { or, eq }: any) => or(eq(t.handle, "h"), eq(t.note, pad)))
+          .asEffect()
+      }),
+  ),
+  besideCondition(
+    "a wide update under a condition filling the substitutions: the version alone, as 1.40.0 sent it",
+    "Counts",
+    (db, pad) =>
+      Effect.gen(function* () {
+        const id = yield* Id
+        yield* db.entities.Counts.update({ id })
+          .set(wide)
+          .add({ count: 1 })
+          .condition((t: any, { or, eq }: any) => or(eq(t.handle, "h"), eq(t.note, pad)))
+          .asEffect()
+      }),
   ),
 ]

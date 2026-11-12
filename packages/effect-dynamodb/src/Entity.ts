@@ -5516,6 +5516,11 @@ const makeImpl = <
     dependsOn: "item" | ReadonlyArray<string>,
     /** The rest of the condition, ANDed with the guard (the user's, …). */
     others: string | undefined,
+    /** The substitutions `others` sends, which the vector terms must fit beside. */
+    othersSubstitutions?: {
+      readonly names: globalThis.Record<string, string>
+      readonly values: globalThis.Record<string, AttributeValue>
+    },
   ): {
     readonly expression: string
     readonly names: globalThis.Record<string, string>
@@ -5569,7 +5574,13 @@ const makeImpl = <
       const heldValues = { ...values }
       const { terms, held } = vectorsAsRead(read, heldNames, heldValues)
       const expression = [byVersion.expression, ...terms].join(" AND ")
-      if (!fits(expression) || !substitutionsFit(heldNames, heldValues)) return byVersion
+      const substitutions = {
+        names: { ...othersSubstitutions?.names, ...heldNames },
+        values: { ...othersSubstitutions?.values, ...heldValues },
+      }
+      if (!fits(expression) || !substitutionsFit(substitutions.names, substitutions.values)) {
+        return byVersion
+      }
       return { ...byVersion, expression, names: heldNames, values: heldValues, inputs: held }
     }
     names["#dpk"] = pkField
@@ -8529,16 +8540,23 @@ const makeImpl = <
             ? vectorsAsRead(currentItem, vectorNames, vectorValues, embedFor)
             : { terms: [], held: [] }
         const withVectors = [guardedCondition, ...vectorHold.terms].join(" AND ")
+        // Only the placeholders a condition uses (the Put has no update expression).
+        const usedBy = (condition: string) => {
+          const tokens = new Set(condition.match(/[#:][A-Za-z0-9_]+/g) ?? [])
+          return <V>(entries: globalThis.Record<string, V>) =>
+            Object.fromEntries(Object.entries(entries).filter(([token]) => tokens.has(token)))
+        }
+        const usedWithVectors = usedBy(withVectors)
         const vectorsHeld =
           vectorHold.terms.length > 0 &&
           expressionFits(withVectors) &&
-          substitutionsFit(vectorNames, vectorValues)
+          substitutionsFit(
+            usedWithVectors({ ...writeNames, ...vectorNames }),
+            usedWithVectors({ ...writeValues, ...vectorValues }),
+          )
         const putCondition = vectorsHeld ? withVectors : guardedCondition
         const heldVectors = vectorsHeld ? vectorHold.held : []
-        // Only the placeholders the condition uses (the Put has no update expression).
-        const putTokens = new Set(putCondition.match(/[#:][A-Za-z0-9_]+/g) ?? [])
-        const used = <V>(entries: globalThis.Record<string, V>) =>
-          Object.fromEntries(Object.entries(entries).filter(([token]) => putTokens.has(token)))
+        const used = usedBy(putCondition)
         const putValues = used({ ...writeValues, ...wideGuard?.values, ...vectorValues })
         const mainPut = {
           TableName: tableName,
@@ -10267,7 +10285,12 @@ const makeImpl = <
                 // conditioned on it being unchanged, so no concurrent update is lost
                 // into them (#133).
                 yield* checkVersion(result.Item, "delete")
-                const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
+                const softGuard = deleteGuard(
+                  result.Item,
+                  "item",
+                  userCondition?.expression,
+                  userCondition,
+                )
 
                 const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
                 // Clock-backed time source; `now` is the ISO timestamp used for the

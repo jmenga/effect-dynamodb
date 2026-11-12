@@ -25,3 +25,9 @@ describe("a reembed landing between a read-first write's read and its write", ()
     it.live(scenario.name, () => scenario.run(harness))
   }
 })
+
+describe("the vector terms are held only where they fit beside the caller's condition", () => {
+  for (const scenario of VectorWriteRaces.budgetScenarios) {
+    it.live(scenario.name, () => scenario.run(harness))
+  }
+})

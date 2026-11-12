@@ -6536,7 +6536,10 @@ and nothing changes for an entity without a vector index
 1.40.0 sent). The terms carry the vector in the request: for 1,536 dimensions,
 about 12.7 KB of DynamoDB's size accounting (17.5 KB for float32-derived
 values) added to a soft delete's transaction, far within its 4 MB, and the same
-to an update's substitutions, within their 2 MB.
+to an update's substitutions, within their 2 MB. "Where they fit" counts the
+whole condition, the caller's `.condition()` included: the terms are left out,
+and the version alone is sent as 1.40.0 sent it, when they would take the
+expression past its length or operator limits or its substitutions past 2 MB.
 
 ### Lifecycle integration
 
