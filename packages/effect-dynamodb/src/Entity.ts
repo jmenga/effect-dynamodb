@@ -14986,11 +14986,18 @@ const makeImpl = <
             { [primary.pk.field]: pk, [primary.sk.field]: sk },
             kindOf,
           )
-        const values = readAs((attr) => primaryKeyKinds.get(attr)) ?? readAsOtherNumericKind(readAs)
-        if (values === undefined) continue
+        const readKeyForm =
+          readAs((attr) => primaryKeyKinds.get(attr)) ?? readAsOtherNumericKind(readAs)
+        if (readKeyForm === undefined) continue
         for (const under of keyFormsOf()) {
           try {
-            const composed = KeyText136.composeAt(under, entityType, entityVersion, primary, values)
+            const composed = KeyText136.composeAt(
+              under,
+              entityType,
+              entityVersion,
+              primary,
+              readKeyForm,
+            )
             const key = keyAt(composed[primary.pk.field]!, composed[primary.sk.field]!)
             if (!sameStoredKey(key, named)) {
               candidates.set(Rekey.identity(key[rekeyPk]!, key[rekeySk]!), key)
