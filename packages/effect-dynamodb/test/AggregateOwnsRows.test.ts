@@ -603,6 +603,35 @@ describe("the bind check counts each attribute as its row holds it after the las
       primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
     } as any)
 
+  it.effect("a projection outbox's read-model mark under the partition key's attribute", () =>
+    Effect.gen(function* () {
+      // The table's partition attribute is `__edd_rm__`: an outbox item's read-model mark (#237)
+      // replaces it, as its `eventType` does above.
+      const schema = DynamoSchema.make({ name: "rm", version: 1 })
+      const Tallies = Entity.make({
+        model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
+        entityType: "Tally",
+        primaryKey: {
+          pk: { field: "__edd_rm__", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as any)
+      const Events = outboxOf(schema, Tallies, {})
+      const Main = Table.make({ schema, entities: { Tallies } })
+      const Orders = owner(Main, schema, {
+        pkField: "__edd_rm__",
+        collection: "shared",
+        edgeType: "Tally#outbox",
+      })
+      expect(
+        yield* binds(
+          { entities: { Tallies }, aggregates: { Orders }, tables: { Main } },
+          Layer.merge(Main.layer({ name: "rm" }), Events.layer({ name: "events" })),
+        ),
+      ).toEqual(refusal("Tallies", "Tally#outbox", `its projection outbox's "__edd_rm__"`))
+    }),
+  )
+
   it.effect("a projection outbox's index keys, which have no head, are any text", () =>
     Effect.gen(function* () {
       // The outbox index's partition is `Tally#outbox`, under `opk`: the aggregate's partition.

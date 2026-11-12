@@ -138,6 +138,7 @@ import {
   marshalOrFail,
   OUTBOX_CLAIM,
   OUTBOX_CLAIMED_UNTIL,
+  OUTBOX_READ_MODEL,
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
 } from "./internal/TransactableOps.js"
@@ -7978,6 +7979,7 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
           [
             ...(outbox.sk === undefined ? [] : [outbox.sk]),
             OUTBOX_ROW_SK,
+            OUTBOX_READ_MODEL,
             "effect",
             "source",
             "streamId",
