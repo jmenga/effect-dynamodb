@@ -44,6 +44,7 @@ import {
   isDecodingDefault,
   isSchemaLike,
   isSetDeclaration,
+  keyRenamesOf,
   lackDecision,
   numericTypeWithStringEncoding,
   ReadsAbsentAs,
@@ -3493,6 +3494,21 @@ const missingAt = (
 }
 
 /**
+ * A union's member as a path's judgement reads it (#238): a struct that renames its keys as it's
+ * stored ({@link keyRenamesOf}) is read as the struct it renames, by its properties' own names,
+ * which a path names (each written under its stored name, which the struct reads it from).
+ * Anything else as it is.
+ */
+const readAs = (member: Schema.Top): Schema.Top => {
+  const ast = member.ast
+  if (!SchemaAST.isObjects(ast) || ast.encoding === undefined || !keyRenamesOf(ast)) return member
+  const renamed = (member as { readonly to?: unknown }).to
+  return isSchemaLike(renamed) && SchemaAST.isObjects(renamed.ast) && plainNode(renamed.ast)
+    ? renamed
+    : member
+}
+
+/**
  * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
  * `pathPrepend`, `pathIfNotExists`) and record-based `append` (#133).
  *
@@ -3557,16 +3573,11 @@ export const makePathValueEncoder = (
    */
   readonly pathSet: (segments: ReadonlyArray<string | number>, value: unknown) => PathSetValue
   /**
-   * Whether the values a union on the way reads can take what an update's clauses inside one field
-   * leave there ({@link UnionClause}), together (#238). `uncertain` answers a clause the schema
-   * can't judge. `whole`: only where they write every property of the member they write into, so
-   * that it reads what they leave whatever the row held.
+   * Whether what an update's clauses inside one field leave there ({@link UnionClause}) is read
+   * (#238). `strict`: whatever the row holds, at every union the clauses pass — every member reads
+   * it, or the clauses write all of one member that does. Otherwise: by some member at each union.
    */
-  readonly readTogether: (
-    clauses: ReadonlyArray<UnionClause>,
-    uncertain: boolean,
-    whole: boolean,
-  ) => boolean
+  readonly reads: (clauses: ReadonlyArray<UnionClause>, strict: boolean) => boolean
   /** Whether a path passes a union of several members. */
   readonly passesUnion: (segments: ReadonlyArray<string | number>) => boolean
 } => {
@@ -4000,80 +4011,151 @@ export const makePathValueEncoder = (
     wayEncoders.set(stored, fn)
     return fn
   }
-  /** Whether the member a way takes reads what one clause leaves at its end. */
-  const admits = (way: UnionWay, clause: UnionClause): boolean | "unknown" => {
+  /**
+   * What one clause leaves at the node it ends at (`schema`, reached as `asDeclared` says, held by a
+   * `parent`): read, not read, or `"unknown"`, which the schema can't judge — a copy, an
+   * increment, an append, a whole field, a list position removed.
+   */
+  const endVerdict = (clause: UnionClause, at: UnionWayAt): boolean | "unknown" => {
     if (clause._tag === "Other") return "unknown"
-    const { end } = way
-    switch (end._tag) {
-      case "Unread":
-        return true
-      case "CannotHold":
-        return false
-      case "Unknown":
-        return "unknown"
-      case "At":
-        if (clause._tag === "Value") return wayValidator(end)(clause.encoded) === undefined
-        if (typeof clause.segments[clause.segments.length - 1] !== "string") return "unknown"
-        if (end.parent === "record") return true
-        if (end.parent === "struct") return rowCanLack(end.original)
-        return "unknown"
+    if (clause._tag === "Value") return wayValidator(at)(clause.encoded) === undefined
+    if (typeof clause.segments[clause.segments.length - 1] !== "string") return "unknown"
+    if (at.parent === "record") return true
+    if (at.parent === "struct") return rowCanLack(at.original)
+    return "unknown"
+  }
+  /** Clauses below a node, each with the path left from there. */
+  type Below = ReadonlyArray<{
+    readonly rest: ReadonlyArray<string | number>
+    readonly clause: UnionClause
+  }>
+  /** The clauses going further from a node, by the segment they take next, in order. */
+  const bySegment = (below: Below): ReadonlyArray<readonly [string | number, Below]> => {
+    const groups: Array<[string | number, Array<Below[number]>]> = []
+    for (const { rest, clause } of below) {
+      if (rest.length === 0) continue
+      const [segment, ...after] = rest
+      const group = groups.find(([held]) => held === segment)
+      const entry = { rest: after, clause }
+      if (group === undefined) groups.push([segment!, [entry]])
+      else group[1].push(entry)
     }
+    return groups
   }
   /**
-   * Whether the clauses write every property of the member each union takes, wherever they write a
-   * property of that member directly (#238): what they leave there is then read whatever the row
-   * held, as nothing the row holds is read in its place. A member that isn't a plain struct
-   * isn't known to be. A union the path only passes through is the row's: DynamoDB writes below it
-   * only where the row holds the map the path names.
+   * The judgement of an update's clauses inside one field (#238), at a node: `schema`, reached as
+   * `asDeclared` says ({@link writesFirstMemberOnly}), held by a `parent`.
+   *
+   * `strict` asks whether what they leave is read WHATEVER the row holds there, at every union the
+   * clauses pass, passed through or ended at, at any depth: at a union, either (a) every member
+   * reads what they leave below it, or (b) they write every property of one member that reads it
+   * ({@link fixes}), so that the update itself sets which member the row holds. A member without
+   * the next segment reads past it (a plain struct), or holds nothing there for DynamoDB to write
+   * into (a scalar, a list given a property, a struct given a position), which refuses the update
+   * and leaves the row as it was. Anything the schema can't judge isn't read, and two clauses on
+   * one path (which DynamoDB refuses) aren't either.
+   *
+   * Otherwise it asks whether SOME row reads what they leave: one member at each union reads every
+   * clause below it, the member taken alike for every clause under the same union. Anything the
+   * schema can't judge is taken as read, and a member holding nothing there as not reading it.
    */
-  const determined = (
-    clauses: ReadonlyArray<UnionClause>,
-    held: ReadonlyMap<string, Schema.Top>,
+  const judge = (
+    schema: Schema.Top,
+    below: Below,
+    asDeclared: boolean,
+    parent: UnionParent,
+    strict: boolean,
   ): boolean => {
-    for (const [at, member] of held) {
-      const base = JSON.parse(at) as ReadonlyArray<string | number>
-      const direct = clauses.filter(
-        (clause) =>
-          clause._tag !== "Other" &&
-          clause.segments.length === base.length + 1 &&
-          base.every((segment, i) => clause.segments[i] === segment),
-      )
-      if (direct.length === 0) continue
-      if (parentOf(member) !== "struct") return false
-      const written = new Set(direct.map((clause) => clause.segments[base.length]))
-      const properties = (member.ast as SchemaAST.Objects).propertySignatures
-      if (!properties.every((property) => written.has(property.name as string))) return false
+    const ending = below.filter(({ rest }) => rest.length === 0)
+    const further = bySegment(below)
+    const at: UnionWayAt = { _tag: "At", original: schema, asDeclared, parent }
+    if (strict && ending.length > 0 && (ending.length > 1 || further.length > 0)) return false
+    for (const { clause } of ending) {
+      const verdict = endVerdict(clause, at)
+      if (verdict === "unknown" ? !strict : verdict) continue
+      return false
     }
-    return true
-  }
-  const readTogether = (
-    clauses: ReadonlyArray<UnionClause>,
-    uncertain: boolean,
-    whole: boolean,
-  ): boolean => {
-    const options = clauses.map((clause) =>
-      waysTo(clause.segments).filter((way) => {
-        // A member that reads past the path reads what the row held beside it, unknown here.
-        if (whole && way.end._tag === "Unread") return false
-        const verdict = admits(way, clause)
-        return verdict === "unknown" ? uncertain : verdict
-      }),
+    if (further.length === 0) return true
+    const opt = optionalField(schema)
+    const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+    // Through a later member of an optional union, a path is written as declared, as `originalAt`
+    // writes it ({@link writesFirstMemberOnly}).
+    const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
+    const declaredFor = (member: Schema.Top) =>
+      asDeclared || (first !== undefined && !first.has(member))
+    const reads = (member: Schema.Top) => memberReads(member, further, declaredFor(member), strict)
+    if (members.length === 1) return reads(members[0]!)
+    if (!strict) return members.some(reads)
+    return (
+      members.every(reads) ||
+      members.some((member) => fixes(member, further, declaredFor(member)) && reads(member))
     )
-    const agree = (
-      held: ReadonlyMap<string, Schema.Top>,
-      choices: ReadonlyMap<string, Schema.Top>,
-    ): boolean => [...choices].every(([at, member]) => (held.get(at) ?? member) === member)
-    const search = (index: number, held: ReadonlyMap<string, Schema.Top>): boolean => {
-      if (index === options.length) return !whole || determined(clauses, held)
-      // A clause with no way the walk follows is one the schema can't judge.
-      if (options[index]!.length === 0 && waysTo(clauses[index]!.segments).length === 0) {
-        return uncertain && search(index + 1, held)
-      }
-      return options[index]!.some(
-        (way) => agree(held, way.choices) && search(index + 1, new Map([...held, ...way.choices])),
-      )
+  }
+  /** {@link judge} under one member, for the clauses going further, by segment. */
+  const memberReads = (
+    member: Schema.Top,
+    further: ReadonlyArray<readonly [string | number, Below]>,
+    asDeclared: boolean,
+    strict: boolean,
+  ): boolean =>
+    further.every(([segment, below]) => {
+      const read = readAs(member)
+      const child = childAtSegment(read, segment)
+      if (child !== undefined) return judge(child, below, asDeclared, parentOf(read), strict)
+      const end = missingAt(read, segment)
+      if (strict) return end._tag !== "Unknown"
+      // A clause the schema can't judge is taken as read, wherever the member leaves it.
+      if (below.every(({ clause }) => clause._tag === "Other")) return true
+      return end._tag === "Unread" || end._tag === "Unknown"
+    })
+  /**
+   * Whether the clauses going further from a union's member write every property of it (#238):
+   * each set or removed, or, for a property holding a plain struct, every property of THAT written
+   * in turn, or for one holding a union, every property of one of its members that reads what they
+   * leave. What the member holds after the update is then all theirs, whatever the row held. A
+   * member that isn't a plain struct isn't known to be.
+   */
+  const fixes = (
+    member: Schema.Top,
+    further: ReadonlyArray<readonly [string | number, Below]>,
+    asDeclared: boolean,
+  ): boolean => {
+    const read = readAs(member)
+    if (parentOf(read) !== "struct") return false
+    return (read.ast as SchemaAST.Objects).propertySignatures.every((property) => {
+      const group = further.find(([segment]) => segment === property.name)
+      if (group === undefined) return false
+      const child = childAtSegment(read, property.name as string)
+      return child !== undefined && fixedBy(child, group[1], asDeclared)
+    })
+  }
+  /** Whether the clauses below a node set all of it ({@link fixes}). */
+  const fixedBy = (schema: Schema.Top, below: Below, asDeclared: boolean): boolean => {
+    const ending = below.filter(({ rest }) => rest.length === 0)
+    if (ending.length > 0) {
+      return ending.length === 1 && below.length === 1 && ending[0]!.clause._tag !== "Other"
     }
-    return search(0, new Map())
+    const further = bySegment(below)
+    const opt = optionalField(schema)
+    const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+    const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
+    return members.some((member) => {
+      const declared = asDeclared || (first !== undefined && !first.has(member))
+      return (
+        fixes(member, further, declared) &&
+        (members.length === 1 || memberReads(member, further, declared, true))
+      )
+    })
+  }
+  const reads = (clauses: ReadonlyArray<UnionClause>, strict: boolean): boolean => {
+    const head = clauses[0]?.segments[0]
+    const start = typeof head === "string" ? (refTargets[head] ?? modelFields[head]) : undefined
+    // A field the walk can't follow is one the schema can't judge.
+    if (start === undefined || clauses.some((clause) => clause.segments[0] !== head)) {
+      return !strict
+    }
+    const below = clauses.map((clause) => ({ rest: clause.segments.slice(1), clause }))
+    return judge(start, below, false, "other", strict)
   }
   return {
     operand: (segments, value, kind) => {
@@ -4113,7 +4195,7 @@ export const makePathValueEncoder = (
       }
       return { encoded: written, issue, otherWay: false, check }
     },
-    readTogether,
+    reads,
     passesUnion: (segments) => waysTo(segments).some((way) => way.choices.size > 0),
     validate: (segments, encoded) => {
       const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)

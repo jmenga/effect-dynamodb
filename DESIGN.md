@@ -4218,37 +4218,74 @@ whatever the row held, as was `pathSet(["vary", "v"], "tt")` on
 written as the first other way through the unions on the path takes it
 (`pathSet` and `waysTo` in `makePathValueEncoder`: each member of each plain
 union), encoded and validated there; a value no way takes is refused as
-before, with the first member's issue. Every `pathSet` into a union's member is
-then judged with the update's other clauses in the same field (`unionRefusal`
-in `Entity.ts`, `readTogether`): one member of each union on the way must read
-what all of them leave there, a value valid where the member declares the path
-(a plain struct that doesn't declare it reads past it) and a removed property
-the member can lack (`rowCanLack`); a scalar or a list holds no path below it.
-A path write reads nothing of the row, so a value only another member takes
-(one 1.40.0 refused) is written only where the update's clauses write every
-property of the member they write into (`readTogether`'s `whole`, `determined`):
-what they leave there then reads whatever the row held. Written alone, it would
-leave the properties of the member the row held under it: `tag.kind = "b"` on a
-row holding `a` leaves `{ kind: "b", x }`, a row no read takes, which 1.40.0's
-refusal prevented. So such a value stays refused as 1.40.0 refused it where the
-update leaves a property of that member unwritten, where the schema can't say (a
-member that isn't a plain struct; a removed list position; an increment, an
-append, a copy or a write of the whole field beside it), and where only a member
-that reads past the path reads it. Beside values the first member takes, a
-clause the schema can't judge is taken as read, and the update is sent as
-1.40.0 sent it. So `tag.kind = "b"` beside `tag.y = 2` is sent, and reads as
-`b` on a row of either member; `tag.kind = "b"` alone, or beside
-`pathRemove(["tag", "y"])` (`b` requires `y`), `tag.x = "tt"`, `tag.y = "s"`
-or `pathAdd(["tag", "y"], 1)`, is refused as on 1.40.0; `vary.v = "tt"` is
-sent, its member being all of `v`; and `tag.kind = "a"` beside
-`pathRemove(["tag", "x"])` is refused with nothing sent (`ValidationError`
-`update.pathSet`), where 1.40.0 applied it and left a row no read takes.
-`tag.kind = "a"` alone, which the first member takes, is sent as 1.40.0 sent
-it, and on a row holding `b` its read-back reports a row that no longer matches
-the model, as 1.40.0's did (a transaction reads nothing back and succeeds).
-Each request is the one 1.40.0 sent for the same paths, but for the value (`test/fixtures/union-path-writes-1.40.0.json`,
-`helpers/UnionPathWrites.ts`, alone and in a transaction, on the recording
-table and DynamoDB Local).
+before, with the first member's issue. `pathAppend`, `pathPrepend` and
+`pathIfNotExists` values are checked by the first member alone, as 1.40.0
+checked them.
+
+Every update with a `pathSet` into a union's member is then judged by one
+function, `reads` in `makePathValueEncoder` (called by `unionRefusal` in
+`Entity.ts`), over every clause of the update in the same field: each
+`pathSet` and `pathRemove` where the schema says what each member reads after
+it, and every other path operation (`pathAdd`, `pathSubtract`, `pathAppend`,
+`pathPrepend`, `pathIfNotExists`, `pathDelete`, a copy) and record operation
+(`.set`, `.add`, …) on the field as a clause it can't judge. It asks one of two
+questions.
+
+- **A value only another member takes** (one 1.40.0 refused) is written only
+  where what the update leaves is read **whatever the row holds**, at EVERY
+  union the field's clauses pass, passed through or ended at, at any depth: at
+  that union either (a) every member reads what the clauses leave below it, or
+  (b) they write every property of one member that reads it, so that the
+  update itself sets which member the row holds. A property counts as written
+  when it's set, removed (an optional one), or holds a plain struct every
+  property of which is written in turn, or a union one member of which is
+  (`fixes`). A member without the next segment reads past it (a plain struct),
+  or holds nothing there for DynamoDB to write into (a scalar, a list given a
+  property, a struct given a position), which refuses the update and leaves
+  the row as it was. Anything the schema can't judge (an increment, an append,
+  a copy, a whole-field write, a removed list position, a member that isn't a
+  plain struct: a `Schema.Class`, a transformation) isn't read, nor are two
+  clauses on one path, which DynamoDB refuses. Anywhere else the update is
+  refused as 1.40.0 refused it, with the first member's issue. A path write
+  reads nothing of the row, and a value written into a member the row doesn't
+  hold leaves that member's other properties under it: `pass.inner.v = "str"`
+  on `Union([{ kind: "a", inner: { v: number } }, { kind: "b", inner: { v:
+  string } }])`, whose members both hold `inner`, leaves `kind: "a"` beside a
+  string on a row of the first, which no read takes. It's refused, as on
+  1.40.0; `pass.kind = "b"` beside it is sent, and reads as `b` on either row.
+- **Otherwise**, values the first member takes, as 1.40.0 checked them, are
+  sent as 1.40.0 sent them unless no row can read what the update leaves: one
+  member at each union, the same for every clause under it, must read every
+  clause, a clause the schema can't judge taken as read. Refused with nothing
+  sent where none can (`ValidationError`, `update.pathSet`):
+  `tag.kind = "a"` beside `pathRemove(["tag", "x"])`, which 1.40.0 applied,
+  leaving a row no read takes. A value the first member takes is not checked
+  against the others: `pass.inner.v = 7` is sent as 1.40.0 sent it, and on a
+  row holding the second member its read-back reports a row that no longer
+  matches the model, as 1.40.0's did. Refusing it would refuse what 1.40.0
+  wrote correctly on every row of the first member.
+
+A path through a union whose members rename their keys (`Schema.encodeKeys`)
+is written by the names they store (see "A path below a struct that renames
+its keys"), where 1.40.0 wrote the names given, beside what the row held, where
+no read took them. That write is one 1.40.0 never made, so it's judged by the
+first question too, each such member read as the struct it renames (`readAs`),
+and refused with nothing sent where it fails: `renamed.kind = "b"` alone, or
+`pathRemove(["renamed", "x"])` where a member requires `x`, would leave a row no
+read takes.
+
+So `tag.kind = "b"` beside `tag.y = 2` is sent, and reads as `b` on a row of
+either member; `tag.kind = "b"` alone, or beside `pathRemove(["tag", "y"])`
+(`b` requires `y`), `tag.x = "tt"`, `tag.y = "s"` or `pathAdd(["tag", "y"], 1)`,
+is refused as on 1.40.0; `vary.v = "tt"` is sent, its member being all of `v`;
+`outer.g.kind = "b"` beside `outer.g.y = 2` on
+`Union([{ mode: "a", g: A }, { mode: "b", g: B }])` is refused as on 1.40.0
+(`mode` isn't written), and sent beside `outer.mode = "b"`. Each request is the
+one 1.40.0 sent for the same paths, but for the value
+(`test/fixtures/union-path-writes-1.40.0.json` and
+`union-path-writes-passed-1.40.0.json`, `helpers/UnionPathWrites.ts`: plain
+and retained entities, alone and in a transaction, on the recording table and
+DynamoDB Local; every case of each fixture is asserted).
 
 **Path operations on key and unique fields (#133).** DynamoDB evaluates a path
 operation, so compiling one on an index composite or unique field would change

@@ -49,7 +49,7 @@ import {
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
-import { unionPathWritesSuite } from "./helpers/UnionPathWrites.js"
+import { unionPathWritesPassedSuite, unionPathWritesSuite } from "./helpers/UnionPathWrites.js"
 import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
 
 const ENDPOINT = Effect.runSync(
@@ -229,4 +229,8 @@ describeConnected(
 
 describeConnected("a path write into a union's member", () => {
   unionPathWritesSuite(openTable)
+})
+
+describeConnected("a path write through unions every member of which holds the path", () => {
+  unionPathWritesPassedSuite(openTable)
 })

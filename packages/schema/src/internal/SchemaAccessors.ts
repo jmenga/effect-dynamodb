@@ -1307,8 +1307,10 @@ export const rowCanLack = (field: Schema.Top): boolean =>
 /**
  * A struct that renames its keys as it's stored (`Schema.encodeKeys`): each property's stored
  * name, by its own, and the property each stored name holds.
+ *
+ * @internal
  */
-interface KeyRenames {
+export interface KeyRenames {
   readonly storedName: ReadonlyMap<string, string>
   readonly holding: ReadonlyMap<string, SchemaAST.PropertySignature>
 }
@@ -1331,8 +1333,10 @@ const keyRenamesFound = new WeakMap<SchemaAST.Objects, KeyRenames | null>()
  * exactly that shape is read as the rename it has the shape of: a stored property is then the
  * encoded form of its own, so a removal of a key the stored struct requires leaves a row no read
  * decodes, whatever the functions do.
+ *
+ * @internal
  */
-const keyRenamesOf = (ast: SchemaAST.Objects): KeyRenames | undefined => {
+export const keyRenamesOf = (ast: SchemaAST.Objects): KeyRenames | undefined => {
   const found = keyRenamesFound.get(ast)
   if (found !== undefined) return found ?? undefined
   const renames = declaredKeyRenames(ast)

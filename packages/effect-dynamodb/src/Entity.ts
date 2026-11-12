@@ -4443,16 +4443,23 @@ const makeImpl = <
   }
 
   /**
-   * A path write into a union's member, judged with the update's other clauses in the same field
-   * (#238): refused where no member of each union on the way reads what they leave there together
-   * (`readTogether`), every clause judged where the schema says what a member reads after it.
+   * A path write into a union's member, judged with every other clause of the update in the same
+   * field (#238), by one judgement (`reads`) for every path operation: a `pathSet` or a removal
+   * where the schema says what each member reads after it, and anything else — an increment, an
+   * append, a `pathIfNotExists`, a copy, a write of all of the field — as a clause the schema can't
+   * judge.
+   *
    * Where a value is taken only by another member than the schema at its path (`refusedBefore`,
-   * which 1.40.0 refused), it's written only where the clauses write every property of the member
-   * they write into, so that it reads what they leave whatever the row held: a path write reads
-   * nothing of the row, and on a row holding another member 1.40.0's refusal kept it readable.
-   * Anywhere else, beside a clause the schema can't judge included, it stays refused as 1.40.0
-   * refused it. Beside values the first member takes, a clause the schema can't judge is taken as
-   * read, and the update is sent as 1.40.0 sent it.
+   * which 1.40.0 refused), it's sent only where what the update leaves is read whatever the row
+   * held, at EVERY union the field's clauses pass, passed through or ended at, at any depth: every
+   * member reads it there, or the update writes every property of one member that does (a struct
+   * property set whole or every property of it written, in turn). A path write reads nothing of
+   * the row, and on a row holding another member 1.40.0's refusal kept it readable. Anywhere else
+   * it stays refused as 1.40.0 refused it.
+   *
+   * Beside values the first member takes, as 1.40.0 checked them, the update is sent as 1.40.0
+   * sent it unless no row can read what it leaves: one member at each union, the same for every
+   * clause under it, must read every clause, a clause the schema can't judge taken as read.
    */
   const unionRefusal = (
     uState: UpdateState,
@@ -4463,13 +4470,39 @@ const makeImpl = <
     const sets = uState.pathSets ?? []
     const judgedPath = (segments: ReadonlyArray<string | number>) =>
       segments.length > 1 && entryOfPath(segments) === undefined
-    const fields = new Set(
-      sets
-        .filter(
-          (op) => !isCopy(op) && judgedPath(op.segments) && pathValues.passesUnion(op.segments),
-        )
+    const passes = (segments: ReadonlyArray<string | number>) =>
+      judgedPath(segments) && pathValues.passesUnion(segments)
+    // A path through a union written by other names than its own: the names a member that renames
+    // its keys stores them under. 1.40.0 wrote the names given, beside what the row held, where no
+    // read took them; the write is one it never made, judged as a value only another member takes.
+    const renamed = (segments: ReadonlyArray<string | number>) =>
+      passes(segments) && storedBelow(segments).some((segment, i) => segment !== segments[i + 1])
+    const everyPath: ReadonlyArray<readonly [string, ReadonlyArray<string | number>]> = [
+      ...sets.map((op) => ["pathSet", op.segments] as const),
+      ...(uState.pathRemoves ?? []).map((segments) => ["pathRemove", segments] as const),
+      ...(
+        [
+          ["pathAdd", uState.pathAdds],
+          ["pathSubtract", uState.pathSubtracts],
+          ["pathAppend", uState.pathAppends],
+          ["pathPrepend", uState.pathPrepends],
+          ["pathIfNotExists", uState.pathIfNotExists],
+          ["pathDelete", uState.pathDeletes],
+        ] as const
+      ).flatMap(([name, ops]) => (ops ?? []).map((op) => [name, op.segments] as const)),
+    ]
+    // Each field so written, by the first operation that does.
+    const renamedFields = new Map<string, string>()
+    for (const [name, segments] of everyPath) {
+      const field = String(segments[0])
+      if (renamed(segments) && !renamedFields.has(field)) renamedFields.set(field, name)
+    }
+    const fields = new Set([
+      ...sets
+        .filter((op) => !isCopy(op) && passes(op.segments))
         .map((op) => String(op.segments[0])),
-    )
+      ...renamedFields.keys(),
+    ])
     if (fields.size === 0) return undefined
     const clauses = clausesOf(uState)
     let refusal: RefusedOperand | undefined
@@ -4491,20 +4524,38 @@ const makeImpl = <
       for (const segments of removals) {
         judged.push({ _tag: judgedPath(segments) ? "Removal" : "Other", segments })
       }
-      // Every other clause in the field (an increment, an append, a write of all of it, …) is one
-      // the schema can't judge.
+      // Every other path operation in the field, where it writes.
+      let pathOps = judged.length
+      for (const ops of [
+        uState.pathAdds,
+        uState.pathSubtracts,
+        uState.pathAppends,
+        uState.pathPrepends,
+        uState.pathIfNotExists,
+        uState.pathDeletes,
+      ]) {
+        for (const { segments } of ops ?? []) {
+          if (!inField(segments)) continue
+          pathOps++
+          judged.push({ _tag: "Other", segments: judgedPath(segments) ? segments : [field] })
+        }
+      }
+      // Every record operation in the field (a write of all of it, an increment, …).
       const rest = clauses.filter((clause) => clause.at === `field:${field}`).length
-      for (let i = judged.length; i < rest; i++) judged.push({ _tag: "Other", segments: [field] })
-      if (pathValues.readTogether(judged, !otherWay, otherWay)) continue
-      // A value only another member takes, beside what the schema can't judge or what no member
-      // reads with it, or leaving what the row held to be read with it: refused as 1.40.0 refused
-      // the update.
+      for (let i = pathOps; i < rest; i++) judged.push({ _tag: "Other", segments: [field] })
+      const strict = otherWay || renamedFields.has(field)
+      if (pathValues.reads(judged, strict)) continue
+      // A value only another member takes, where what the update leaves isn't read whatever the
+      // row held: refused as 1.40.0 refused the update.
       if (otherWay) return refusedBefore
       refusal ??= {
-        operation: "update.pathSet",
-        issue:
-          `the path operations on "${field}" leave a value no member of its union reads: what ` +
-          "one of them needs a member to hold, another removes or refuses. Nothing was sent.",
+        operation: `update.${renamedFields.get(field) ?? "pathSet"}`,
+        issue: strict
+          ? `the path operations on "${field}" write into its union's members by the names they ` +
+            "store their keys under, and leave a value not every member reads: write every " +
+            `property of one member, or all of "${field}". Nothing was sent.`
+          : `the path operations on "${field}" leave a value no member of its union reads: what ` +
+            "one of them needs a member to hold, another removes or refuses. Nothing was sent.",
       }
     }
     return refusal
