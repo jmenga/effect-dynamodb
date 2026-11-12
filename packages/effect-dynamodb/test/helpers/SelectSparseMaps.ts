@@ -19,6 +19,7 @@ import { Cause, Effect, Exit, Schema } from "effect"
 import { expect } from "vitest"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
+import { comparedCases } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: { readonly ok?: unknown }
@@ -28,6 +29,7 @@ interface Captured {
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/select-sparse-maps-1.39.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const fixtureCases = comparedCases("select-sparse-maps-1.39.0.json", fixture.cases)
 
 const byCat = {
   name: "gsi1",
@@ -225,7 +227,7 @@ const unordered = (items: unknown): unknown =>
  */
 export const selectSparseMapsSuite = (open: OpenTable, options: { readonly dynamodb: boolean }) => {
   for (const name of Object.keys(scenarios)) {
-    const was = fixture.cases[name]!
+    const was = fixtureCases.compared(name)
     const changed = Object.hasOwn(results, name)
     const entry = entryProjections[name]
     it.effect(
@@ -278,4 +280,5 @@ export const selectSparseMapsSuite = (open: OpenTable, options: { readonly dynam
         }),
     )
   }
+  fixtureCases.everyCaseCompared()
 }

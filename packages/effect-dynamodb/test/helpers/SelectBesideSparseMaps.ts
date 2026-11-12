@@ -25,7 +25,7 @@ import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
-import { differingPaths } from "./WholeDiff.js"
+import { comparedCases, differingPaths } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: { readonly ok?: ReadonlyArray<Record<string, unknown>> }
@@ -38,6 +38,7 @@ const fixture = JSON.parse(
     "utf8",
   ),
 ) as { readonly cases: Record<string, Captured> }
+const fixtureCases = comparedCases("select-beside-sparse-maps-1.40.0.json", fixture.cases)
 
 const key = (composite: string) =>
   ({
@@ -394,6 +395,7 @@ export const selectBesideSparseMapsSuite = (
   options: { readonly dynamodb: boolean },
 ) => {
   for (const [name, [select, run, table = MainTable]] of Object.entries(scenarios)) {
+    const was = fixtureCases.compared(name)
     const want = expected(name, select)
     it.effect(
       namesMap(select)
@@ -422,7 +424,6 @@ export const selectBesideSparseMapsSuite = (
           expect(got.sent).toEqual(want.sent)
           if (options.dynamodb || namesMap(select)) expect(got.outcome).toEqual(want.outcome)
           // The fields the head changes, named: the projection, and each item's map.
-          const was = fixture.cases[name]!
           const changed = differingPaths(was.sent, got.sent)
           expect(changed).toEqual(namesMap(select) ? projectionPaths(was.sent) : [])
           if (options.dynamodb || namesMap(select)) {
@@ -437,4 +438,5 @@ export const selectBesideSparseMapsSuite = (
         }),
     )
   }
+  fixtureCases.everyCaseCompared()
 }

@@ -45,7 +45,7 @@ import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
-import { expectDiffersOnly } from "./WholeDiff.js"
+import { comparedCases, expectDiffersOnly } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: any
@@ -57,6 +57,7 @@ interface Captured {
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/renamed-sparse-map-1.40.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const fixtureCases = comparedCases("renamed-sparse-map-1.40.0.json", fixture.cases)
 
 const model = (unique: boolean) =>
   DynamoModel.configure(
@@ -470,7 +471,7 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
         const [label, op, leaves, namesEntry] = write
         for (const inTransaction of [false, true]) {
           const name = `${on}: ${label}${inTransaction ? ", in a transaction" : ""}`
-          const was = fixture.cases[name]!
+          const was = fixtureCases.compared(name)
           // Without reading the row (a plain or unique update, standalone): refused on a row
           // holding the map whole, once its guard is. `clearMap` reads the row.
           const unread = !inTransaction && entity !== "Retained" && label !== ".clearMap('counts')"
@@ -580,16 +581,17 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
         const name = `${on}: ${label}`
         // A plain upsert is guarded on the row not holding the map whole (`RenamedSparseMapWrites.ts`).
         const guarded = entity === "Plain" && label.startsWith("upsert")
+        const was = fixtureCases.compared(name)
         it.effect(`${name}: ${guarded ? "guarded" : "sent as 1.40.0 sent it"}`, () =>
           Effect.gen(function* () {
             const { captured, before, says } = yield* runCase(open, entity, form, body)
             if (!guarded) {
-              expect(captured).toEqual(fixture.cases[name])
+              expect(captured).toEqual(was)
               return
             }
-            expect(captured).toEqual(guardedUpsert(fixture.cases[name]!, before, says, holdsWhole))
+            expect(captured).toEqual(guardedUpsert(was, before, says, holdsWhole))
             expectRequestsDifferAt(
-              fixture.cases[name]!.sent,
+              was.sent,
               captured.sent,
               fieldsOf(UNREAD, "ConditionExpression", ["#fm0"]).concat(
                 `${UNREAD}.ReturnValuesOnConditionCheckFailure`,
@@ -601,7 +603,7 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
       if (entity !== "Plain") continue
       for (const [label, body, outcome, differs] of reads) {
         const name = `${on}: ${label}`
-        const was = fixture.cases[name]!
+        const was = fixtureCases.compared(name)
         const same = JSON.stringify(was.outcome) === JSON.stringify(outcome)
         it.effect(
           same
@@ -621,6 +623,7 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
       }
     }
   }
+  fixtureCases.everyCaseCompared()
 }
 
 const SCAN = "[0].scan"

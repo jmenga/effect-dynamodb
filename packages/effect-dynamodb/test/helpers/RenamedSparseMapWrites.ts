@@ -36,7 +36,7 @@ import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
 import { normal, outcomeOf, rowsOf } from "./RenamedSparseMap.js"
-import { expectDiffersOnly } from "./WholeDiff.js"
+import { comparedCases, expectDiffersOnly } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: any
@@ -51,6 +51,7 @@ const upsertFixture = JSON.parse(
     "utf8",
   ),
 ) as { readonly cases: Record<string, Captured> }
+const upsertCases = comparedCases("renamed-sparse-map-upserts-1.40.0.json", upsertFixture.cases)
 
 const primaryKey = { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } }
 const fields = {
@@ -200,7 +201,7 @@ export const renamedSparseMapUpsertsSuite = (open: OpenTable) => {
         ? [...upserts, ...omitted]
         : upserts) {
         const name = `${on}: ${label}`
-        const was = upsertFixture.cases[name]!
+        const was = upsertCases.compared(name)
         const renamed = entity !== "Unrenamed"
         // Refused where the caller's condition holds: where it doesn't, the caller's verdict wins.
         const refused = renamed && entries && seed === "put" && was.outcome.ok !== undefined
@@ -239,6 +240,7 @@ export const renamedSparseMapUpsertsSuite = (open: OpenTable) => {
       }
     }
   }
+  upsertCases.everyCaseCompared()
 }
 
 /** A request whole, as the captures hold it: the table's name, UUIDs and timestamps set aside. */
@@ -265,6 +267,7 @@ const copyFixture = JSON.parse(
     "utf8",
   ),
 ) as { readonly cases: Record<string, Captured> }
+const copyCases = comparedCases("renamed-sparse-map-copies-1.40.0.json", copyFixture.cases)
 
 const copyDefinitions = () => {
   const model = DynamoModel.configure(
@@ -386,6 +389,43 @@ const runCopy = (open: OpenTable, entity: string, row: string, body: (db: any) =
     )
   })
 
+/**
+ * Where a copy that reads where a read takes the entry differs from 1.40.0's record of its own
+ * spelling (`was`): the update's expression and the two names its source maps; the copied value
+ * (`n`), in the row, the read and a retained update's result. Where 1.40.0's spelling failed
+ * (naming an attribute the row lacks), also the outcome whole, and on a retained entity the version
+ * it now writes, the snapshot of the row it replaces (where the row held entries: 1.40.0's seed
+ * snapshot held `sr`) and, standalone, the read back of the item it now writes.
+ */
+const copyDifference = (
+  entity: string,
+  row: string,
+  label: string,
+  inTransaction: boolean,
+  was: Captured,
+): ReadonlyArray<string> => {
+  const update = "sent[1].transactWriteItems.TransactItems[0].Update"
+  const source = label.startsWith("pathSet") ? "#ps" : "#psb"
+  const failed = was.outcome.fail !== undefined
+  const retained = entity === "Retained"
+  return [
+    `${update}.UpdateExpression`,
+    `${update}.ExpressionAttributeNames.${source}1`,
+    `${update}.ExpressionAttributeNames.${source}2`,
+    ...(failed
+      ? ["outcome.fail", "outcome.says", "outcome.ok"]
+      : retained && !inTransaction
+        ? ["outcome.ok.n"]
+        : []),
+    ...(failed && retained && !inTransaction ? ["sent[2]"] : []),
+    "rows[0].n.N",
+    ...(failed && retained ? ["rows[0].version.N"] : []),
+    ...(failed && retained && row === "entries" ? ["rows[1].sr", "rows[1].counts#a"] : []),
+    "read.ok.n",
+    ...(failed && retained ? ["read.ok.version"] : []),
+  ]
+}
+
 export const renamedSparseMapCopiesSuite = (open: OpenTable) => {
   for (const entity of ["Plain", "Retained"]) {
     for (const row of ["whole", "entries", "both"]) {
@@ -405,6 +445,8 @@ export const renamedSparseMapCopiesSuite = (open: OpenTable) => {
                     row === "entries" ? "counts.entry('a')" : "['counts', 'a']",
                   ),
                 )
+          const was = copyCases.compared(name)
+          const like = copyCases.compared(sibling)
           it.effect(
             sibling === name
               ? `${name}: as 1.40.0`
@@ -415,13 +457,22 @@ export const renamedSparseMapCopiesSuite = (open: OpenTable) => {
                   const update = op(db.entities[entity].update({ id: "a" }))
                   return inTransaction ? Transaction.transactWrite([update]) : update.asEffect()
                 })
-                expect(captured).toEqual(copyFixture.cases[sibling])
+                expect(captured).toEqual(like)
+                // Against its own spelling on 1.40.0: the source the copy reads, and what follows.
+                if (sibling !== name) {
+                  expectDiffersOnly(
+                    was,
+                    captured,
+                    copyDifference(entity, row, label, inTransaction, was),
+                  )
+                }
               }),
           )
         }
       }
     }
   }
+  copyCases.everyCaseCompared()
 }
 
 const verdictFixture = JSON.parse(
@@ -430,6 +481,7 @@ const verdictFixture = JSON.parse(
     "utf8",
   ),
 ) as { readonly cases: Record<string, Captured> }
+const verdictCases = comparedCases("renamed-sparse-map-verdicts-1.40.0.json", verdictFixture.cases)
 
 const verdictDefinitions = () => {
   const model = DynamoModel.configure(Schema.Struct(fields), {
@@ -537,7 +589,7 @@ export const renamedSparseMapVerdictsSuite = (open: OpenTable) => {
   for (const [label, entities, op, head, condition] of verdicts) {
     for (const entity of entities) {
       const name = `${entity}, a row put created: ${label}`
-      const was = verdictFixture.cases[name]!
+      const was = verdictCases.compared(name)
       it.effect(
         head === "refused"
           ? `${name}: refused (EDD-9150), where 1.40.0 ${was.outcome.ok !== undefined ? "reported success and lost the entry" : "judged the entry as counts#a and failed on the condition"}`
@@ -626,4 +678,5 @@ export const renamedSparseMapVerdictsSuite = (open: OpenTable) => {
       )
     }
   }
+  verdictCases.everyCaseCompared()
 }

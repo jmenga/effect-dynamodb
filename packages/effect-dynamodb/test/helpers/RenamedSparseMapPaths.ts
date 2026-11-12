@@ -32,7 +32,7 @@ import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
 import { outcomeOf, rowsOf } from "./RenamedSparseMap.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
-import { expectDiffersOnly } from "./WholeDiff.js"
+import { comparedCases, expectDiffersOnly } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: any
@@ -47,6 +47,7 @@ const fixture = JSON.parse(
     "utf8",
   ),
 ) as { readonly cases: Record<string, Captured> }
+const captures = comparedCases("renamed-sparse-map-paths-1.40.0.json", fixture.cases)
 
 /** A timestamp inside a longer string (a tombstone's sort key) as `<time>`, a write token as `<token>`. */
 const EMBEDDED_ISO = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g
@@ -519,7 +520,7 @@ const runCase = (open: OpenTable, one: Case) =>
 
 export const renamedSparseMapPathsSuite = (open: OpenTable) => {
   for (const one of cases) {
-    const was = comparable(fixture.cases[one.name]!)
+    const was = comparable(captures.compared(one.name))
     const added = ADDED[one.name]
     it.effect(
       added === undefined
@@ -548,4 +549,5 @@ export const renamedSparseMapPathsSuite = (open: OpenTable) => {
         }),
     )
   }
+  captures.everyCaseCompared()
 }

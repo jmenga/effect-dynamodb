@@ -22,11 +22,12 @@ import { expect } from "vitest"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
-import { expectDiffersOnly } from "./WholeDiff.js"
+import { comparedCases, expectDiffersOnly } from "./WholeDiff.js"
 
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/entry-beside-field-1.40.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const fixtureCases = comparedCases("entry-beside-field-1.40.0.json", fixture.cases)
 
 export interface Captured {
   readonly outcome: unknown
@@ -249,6 +250,7 @@ const rowOf = (rows: ReadonlyArray<Row>, entity: string): Row | null => {
 /** Each scenario on a table of its own: the outcome, every request it sent, the row and its read. */
 export const entryBesideFieldSuite = (open: OpenTable) => {
   for (const [name, [entity, run]] of Object.entries(scenarios)) {
+    const was = fixtureCases.compared(name)
     it.effect(name, () =>
       Effect.gen(function* () {
         const log: Array<unknown> = []
@@ -285,8 +287,9 @@ export const entryBesideFieldSuite = (open: OpenTable) => {
         expect(got.row).toEqual(want.row)
         expect(got.read).toEqual(want.read)
         expect(got.outcome).toEqual(want.outcome)
-        expectDiffersOnly(fixture.cases[name], got, want === fixture.cases[name] ? [] : CHANGED)
+        expectDiffersOnly(was, got, want === was ? [] : CHANGED)
       }),
     )
   }
+  fixtureCases.everyCaseCompared()
 }

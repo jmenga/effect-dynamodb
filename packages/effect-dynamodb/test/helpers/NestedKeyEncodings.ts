@@ -25,7 +25,7 @@ import { expect } from "vitest"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
-import { differingPaths } from "./WholeDiff.js"
+import { comparedCases, differingPaths } from "./WholeDiff.js"
 
 export interface Captured {
   readonly outcome: unknown
@@ -37,6 +37,7 @@ export interface Captured {
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/nested-key-encodings-1.40.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const fixtureCases = comparedCases("nested-key-encodings-1.40.0.json", fixture.cases)
 
 const Amount = Schema.Struct({
   amount: Schema.Number,
@@ -362,6 +363,7 @@ const rowOf = (rows: ReadonlyArray<Row>, entity: string): Row | null => {
 /** Each scenario on a table of its own: the outcome, what it sent, the row and its read. */
 export const nestedKeyEncodingsSuite = (open: OpenTable) => {
   for (const [name, [entity, , run]] of Object.entries(scenarios)) {
+    const was = fixtureCases.compared(name)
     it.effect(name, () =>
       Effect.gen(function* () {
         const log: Array<unknown> = []
@@ -404,7 +406,7 @@ export const nestedKeyEncodingsSuite = (open: OpenTable) => {
         // write a domain spelling had lost, or where a refusal sends nothing; never in its key,
         // expressions or values.
         if (says === undefined) {
-          for (const path of differingPaths(fixture.cases[name]!.sent, got.sent)) {
+          for (const path of differingPaths(was.sent, got.sent)) {
             expect(path).toMatch(/^\[\d+\](\..*\.ExpressionAttributeNames\.#\w+)?$/)
           }
         }
@@ -459,6 +461,7 @@ export const nestedKeyEncodingsSuite = (open: OpenTable) => {
       }),
     )
   }
+  fixtureCases.everyCaseCompared()
 }
 
 // ---------------------------------------------------------------------------

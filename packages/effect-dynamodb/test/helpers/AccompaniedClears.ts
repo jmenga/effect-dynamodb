@@ -27,7 +27,7 @@ import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
-import { differingPaths } from "./WholeDiff.js"
+import { comparedCases, differingPaths } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: unknown
@@ -39,6 +39,7 @@ interface Captured {
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/accompanied-clears-1.40.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const cases = comparedCases("accompanied-clears-1.40.0.json", fixture.cases)
 
 const T2 = Schema.Tuple([Schema.String, Schema.String])
 const XY = Schema.Struct({ x: Schema.Number, y: Schema.String })
@@ -240,7 +241,7 @@ export const accompaniedClearsSuite = (open: OpenTable) => {
   for (const [field, seed, label, op] of scenarios) {
     for (const mode of modes) {
       const name = `f: ${field}, holding ${JSON.stringify(seed)}: ${label}${modeName(mode)}`
-      const was = fixture.cases[name]!
+      const was = cases.compared(name)
       const refusal = refused[label]
       it.effect(
         refusal === "unreadable"
@@ -337,4 +338,5 @@ export const accompaniedClearsSuite = (open: OpenTable) => {
       )
     }
   }
+  cases.everyCaseCompared()
 }

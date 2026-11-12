@@ -36,6 +36,7 @@ import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
 import { overlappingUpdatePaths, unusedPlaceholders } from "./MockDynamoClient.js"
 import { outcomeOf, rowsOf } from "./RenamedSparseMap.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
+import { comparedCases } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: any
@@ -47,6 +48,7 @@ interface Captured {
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/clear-writes-1.40.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const fixtureCases = comparedCases("clear-writes-1.40.0.json", fixture.cases)
 
 const primaryKey = { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } }
 const definitions = () => {
@@ -202,7 +204,7 @@ export const clearWritesSuite = (open: OpenTable) => {
       for (const [label, op, leaves] of writes) {
         for (const inTransaction of [false, true]) {
           const name = `${entity}, ${row === "unrenamed" ? "a row put created" : `the map ${row}`}: ${label}${inTransaction ? ", in a transaction" : ""}`
-          const was = fixture.cases[name]!
+          const was = fixtureCases.compared(name)
           // A subtract from an entry the clear removes has nothing to work on, wherever the row
           // held it (inside `sr` too); a retained entity's starts from nothing, as it did.
           const refused = leaves === "subtract" && !retained
@@ -309,11 +311,13 @@ export const clearWritesSuite = (open: OpenTable) => {
       }
     }
   }
+  fixtureCases.everyCaseCompared()
 }
 
 const removalFixture = JSON.parse(
   readFileSync(new URL("../fixtures/retained-entry-removals-1.40.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const removalCases = comparedCases("retained-entry-removals-1.40.0.json", removalFixture.cases)
 
 /**
  * A retained entity's `.removeEntries()` (#238), which writes the item whole and the version it
@@ -335,7 +339,7 @@ export const retainedEntryRemovalsSuite = (open: OpenTable) => {
       ] as const) {
         for (const inTransaction of [false, true]) {
           const name = `${entity}, ${row === "unrenamed" ? "a row put created" : `the map ${row}`}: ${label}${inTransaction ? ", in a transaction" : ""}`
-          const was = removalFixture.cases[name]!
+          const was = removalCases.compared(name)
           // Where 1.40.0's snapshot lost the entry: the map whole, the entry removed alone.
           const lost = (row === "whole" || row === "both") && !label.includes(".set(")
           it.effect(
@@ -408,11 +412,13 @@ export const retainedEntryRemovalsSuite = (open: OpenTable) => {
       }
     }
   }
+  removalCases.everyCaseCompared()
 }
 
 const everyOpFixture = JSON.parse(
   readFileSync(new URL("../fixtures/clear-every-op-1.40.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const everyOpCases = comparedCases("clear-every-op-1.40.0.json", everyOpFixture.cases)
 
 const everyOpDefinitions = () => {
   const fields = {
@@ -628,7 +634,7 @@ export const clearEveryOpSuite = (open: OpenTable) => {
       for (const { label, field, op, leaves, retained: inMemory } of everyOp) {
         for (const inTransaction of [false, true]) {
           const name = `${entity}, ${row === "unrenamed" ? "a row put created" : `the map ${row}`}: ${label}${inTransaction ? ", in a transaction" : ""}`
-          const was = everyOpFixture.cases[name]!
+          const was = everyOpCases.compared(name)
           const expected = retained && inMemory !== undefined ? inMemory : leaves
           const refused = expected === "refused"
           it.effect(
@@ -746,4 +752,5 @@ export const clearEveryOpSuite = (open: OpenTable) => {
       }
     }
   }
+  everyOpCases.everyCaseCompared()
 }

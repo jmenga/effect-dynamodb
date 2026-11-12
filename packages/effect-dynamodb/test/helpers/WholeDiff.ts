@@ -3,7 +3,7 @@
  * so a test names each field the head changes and holds every other one equal (#238).
  */
 
-import { expect } from "vitest"
+import { expect, it } from "vitest"
 
 /**
  * The paths at which `was` and `got` differ, as `sent[0].updateItem.ConditionExpression`: a value
@@ -36,4 +36,25 @@ export const differingPaths = (was: unknown, got: unknown): ReadonlyArray<string
 /** `got` is `was` but for exactly the fields `named`. */
 export const expectDiffersOnly = (was: unknown, got: unknown, named: ReadonlyArray<string>) => {
   expect([...differingPaths(was, got)].sort()).toEqual([...named].sort())
+}
+
+/**
+ * A fixture's cases as a suite compares them. The suite takes each case by `compared(name)` as it
+ * registers the test comparing it, then calls `everyCaseCompared()`, which registers a test that it
+ * took every case the fixture holds and none it lacks: a case the suite has no test for fails it.
+ */
+export const comparedCases = <C>(file: string, cases: Record<string, C>) => {
+  const taken = new Set<string>()
+  return {
+    compared: (name: string): C => {
+      if (!Object.hasOwn(cases, name))
+        throw new Error(`${file} holds no case ${JSON.stringify(name)}`)
+      taken.add(name)
+      return cases[name]!
+    },
+    everyCaseCompared: () =>
+      it(`${file}: every case is compared`, () => {
+        expect([...taken].sort()).toEqual(Object.keys(cases).sort())
+      }),
+  }
 }

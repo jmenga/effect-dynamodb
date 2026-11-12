@@ -22,10 +22,12 @@ import { Cause, Effect, Exit, Schema } from "effect"
 import { expect } from "vitest"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
+import { comparedCases } from "./WholeDiff.js"
 
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/hash-field-names-1.39.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Captured> }
+const fixtureCases = comparedCases("hash-field-names-1.39.0.json", fixture.cases)
 
 export interface Captured {
   readonly outcome: unknown
@@ -219,6 +221,7 @@ const sortedRow = (row: Row | undefined): Row =>
  */
 export const hashFieldNamesSuite = (open: OpenTable, options: { readonly projects: boolean }) => {
   for (const name of Object.keys(scenarios)) {
+    fixtureCases.compared(name)
     it.effect(name, () =>
       Effect.gen(function* () {
         const log: Array<unknown> = []
@@ -254,4 +257,5 @@ export const hashFieldNamesSuite = (open: OpenTable, options: { readonly project
       }),
     )
   }
+  fixtureCases.everyCaseCompared()
 }

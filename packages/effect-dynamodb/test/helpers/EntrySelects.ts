@@ -29,12 +29,14 @@ import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
 import { outcomeOf } from "./RenamedSparseMap.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
+import { comparedCases } from "./WholeDiff.js"
 
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/entry-selects-1.40.0.json", import.meta.url), "utf8"),
 ) as {
   readonly cases: Record<string, { readonly outcome: any; readonly sent: ReadonlyArray<any> }>
 }
+const fixtureCases = comparedCases("entry-selects-1.40.0.json", fixture.cases)
 
 const byGroup = {
   name: "gsi1",
@@ -225,7 +227,7 @@ export const entrySelectsSuite = (open: OpenTable) => {
   for (const [label, select, docs, peer, projected] of selects) {
     for (const through of ["a query", "a collection"] as const) {
       const name = `${through}: select ${label}`
-      const was = fixture.cases[name]!
+      const was = fixtureCases.compared(name)
       const expected = through === "a query" ? docs : { Docs: docs, Peers: [peer] }
       const same = JSON.stringify(was.outcome) === JSON.stringify({ ok: expected })
       it.effect(
@@ -292,4 +294,5 @@ export const entrySelectsSuite = (open: OpenTable) => {
       )
     }
   }
+  fixtureCases.everyCaseCompared()
 }
