@@ -10,56 +10,16 @@
  * would.
  */
 
-import { createHash, createHmac } from "node:crypto"
 import { describe, expect, it } from "@effect/vitest"
 import { Config, Effect, type Layer } from "effect"
 import { DynamoStreamsClient } from "../src/change-feed/DynamoStreamsClient.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import type { Credentials } from "../src/internal/ClientOptions.js"
-import { localServer, type SeenRequest } from "./helpers/LocalServer.js"
+import { localServer } from "./helpers/LocalServer.js"
+import { signedWith, wire } from "./helpers/SigV4.js"
 
 type Via = "layer" | "layerConfig"
 const vias = ["layer", "layerConfig"] as const
-
-const AUTHORIZATION =
-  /^AWS4-HMAC-SHA256 Credential=([^/]+)\/(\d{8})\/([^/]+)\/([^/]+)\/aws4_request, SignedHeaders=([^,]+), Signature=([0-9a-f]{64})$/
-
-const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
-const hmac = (key: string | Buffer, text: string) => createHmac("sha256", key).update(text).digest()
-
-/** Whether `request` carries a valid SigV4 signature made with `secret`. */
-const signedWith = (request: SeenRequest, secret: string): boolean => {
-  const match = AUTHORIZATION.exec(String(request.headers.authorization))
-  if (match === null) return false
-  const [, , day, region, service, signedHeaders, signature] =
-    match as unknown as ReadonlyArray<string>
-  const headers = signedHeaders!
-    .split(";")
-    .map((name) => `${name}:${String(request.headers[name]).trim().replace(/\s+/g, " ")}\n`)
-    .join("")
-  const payload = String(request.headers["x-amz-content-sha256"] ?? sha256(request.body))
-  const canonical = ["POST", "/", "", headers, signedHeaders, payload].join("\n")
-  const scope = `${day}/${region}/${service}/aws4_request`
-  const toSign = [
-    "AWS4-HMAC-SHA256",
-    String(request.headers["x-amz-date"]),
-    scope,
-    sha256(canonical),
-  ]
-  const key = hmac(hmac(hmac(hmac(`AWS4${secret}`, day!), region!), service!), "aws4_request")
-  return hmac(key, toSign.join("\n")).toString("hex") === signature
-}
-
-const keyIdOf = (request: SeenRequest) =>
-  AUTHORIZATION.exec(String(request.headers.authorization))?.[1]
-
-/** Each request's key id, its session token, and whether `secrets[i]` signed it. */
-const wire = (requests: ReadonlyArray<SeenRequest>, secrets: ReadonlyArray<string>) =>
-  requests.map((request, i) => [
-    keyIdOf(request),
-    request.headers["x-amz-security-token"],
-    signedWith(request, secrets[i] ?? ""),
-  ])
 
 const clients = {
   DynamoClient: {

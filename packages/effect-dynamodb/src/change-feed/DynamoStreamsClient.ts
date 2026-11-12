@@ -39,6 +39,7 @@ import {
   type ClientOptionsFromConfig,
   type Credentials,
   readClientOptions,
+  readCredentials,
   sdkCredentials,
 } from "../internal/ClientOptions.js"
 import { redactCredentialRefusal } from "../internal/CredentialRefusal.js"
@@ -190,9 +191,10 @@ export class DynamoStreamsClient extends Context.Service<
 
   /**
    * A live layer reading its configuration from Effect `Config` providers. As
-   * on `DynamoClient.layerConfig`, `credentials` missing any part (an empty
-   * value counts as missing) is unset as a whole, and the SDK's default
-   * credential chain applies, which can sign as another identity.
+   * on `DynamoClient.layerConfig`, `credentials` wholly missing leaves the
+   * SDK's default credential chain, and `credentials` given in part fails the
+   * layer with the `Config`'s error for what is missing, under the same rule
+   * for what counts as a part.
    */
   static readonly layerConfig = (
     config: DynamoStreamsClientConfigFromConfig,
@@ -202,14 +204,12 @@ export class DynamoStreamsClient extends Context.Service<
       Effect.gen(function* () {
         const region = yield* config.region
         const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
-        const credentials = config.credentials
-          ? yield* Config.option(config.credentials)
-          : undefined
+        const credentials = yield* readCredentials(config.credentials)
         const options = yield* readClientOptions(config)
         return yield* buildService(
           region,
           endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
-          credentials && credentials._tag === "Some" ? credentials.value : undefined,
+          credentials,
           options,
         )
       }),

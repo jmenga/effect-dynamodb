@@ -1172,11 +1172,62 @@ DynamoClient.layerConfig({
 ```
 
 `DynamoStreamsClient.layer` and `layerConfig` take `credentials` in the same shape. Without
-`credentials`, both use the SDK's default credential chain. In `layerConfig`, `credentials` is
-unset as a whole when any part of it is missing (an empty value counts as missing), so the default
-chain applies then too, and may sign as another identity: read a part that may be absent, such as
-the token, with `Config.withDefault(undefined)`. The object is
-passed to the SDK as given, and read for every request.
+`credentials`, both use the SDK's default credential chain. In `layerConfig`, the default chain
+also applies when the provider holds none of the credentials' parts. When it holds one of them and
+another is missing (an empty value counts as missing), the layer fails with the `Config`'s own
+`ConfigError` for what is missing: read a part that may be absent, such as the token, with
+`Config.withDefault(undefined)`. The object is passed to the SDK as given, and read for every
+request.
+
+The layer fails only when the credentials are shown to be given in part: made of a value the
+provider holds and of values it doesn't. Two things must hold:
+
+1. With one or two of the missing values stood in for, the `Config` yields credentials, and every
+   stand-in is one of their three parts. What is missing is a part, not a mode, a flag or another
+   setting.
+2. A value the provider holds is one of the parts too (trimming and case aside). When it changes,
+   that part changes with it and the other parts don't. It is a part, not a selector.
+
+Anything else leaves the default chain, as before:
+
+- a profile, mode or flag that selects what to read, set with no keys, also when its value is the
+  fixed text of a part;
+- a setting that would be a part only under a mode that is missing and has a default;
+- a key whose value the `Config` takes for none (`KEY=none`);
+- another setting read in the same group that is given, or that has a default;
+- a part given and another missing when a setting the same `Config` requires is missing too (a
+  required label, account id or expiration read beside them): a required setting that is missing
+  can't be told from a mode that is missing;
+- a part the `Config` turns into other text (a prefix added, a list joined, a secret read from the
+  file or the store the value names) or reads as a list;
+- a part the `Config` accepts only in some form (a literal, a pattern, a length) that the changed
+  value or the stand-in (forty letters and digits) doesn't meet;
+- anything the `Config` would read only after what is missing, through `Config.flatMap`: a part
+  that is there when the `Config` stopped at a read before it (`KEY` then `SECRET`, with only the
+  secret given), a third part or a setting read after the keys when the key is given and its secret
+  is missing, a key that also names where its secret is read (`KEY`, then `<KEY>_SECRET`). The provider is asked no more
+  than the `Config` asks, and what it holds where it wasn't asked isn't known;
+- anything the `Config` reads from the provider in context by itself, in a `Config.mapEffect`;
+- a struct read through one schema (`Config.schema`) that is wholly missing, beside a token that is
+  given, and a value at a struct's path that is no struct;
+- an empty value a provider keeps, or a value of spaces only, alone;
+- more than six values missing among those the `Config` read;
+- a `Config` that yields credentials when evaluated again (its own state changed).
+
+Two shapes fail the layer that a stricter reading might leave to the default chain. A value that is
+a part only under a mode that is missing, when the mode's own text is a part too. And a name the
+`Config` maps to itself, when the `Config` maps other names to fixed keys and uses any unknown name
+as the key: from outside the `Config`, that name is the key.
+
+To show it, the `Config` is evaluated again from the answers the provider already gave, with the
+stand-in and changed values. The provider is read once, as before. The `Config`'s own functions
+(`Config.mapEffect`, `Config.flatMap`) run again, and that happens whenever the `Config` comes back
+absent although the provider held a value it read, a flag or a mode included.
+The answers are kept as the provider gave them: a provider of the caller's own that hands out one
+object for several paths and changes it between them is read by what that object holds last.
+
+The error is the `Config`'s own. With `Config.orElse`, that is the alternative's error, as Effect
+reports it.
 
 ---
 
