@@ -2421,9 +2421,8 @@ export const makeEngine = (config: EngineConfig) => {
         // left out only when the write, with it, stores every attribute the row holds under the
         // name the row holds it by (`keepsData`): one that drops one drops the others'
         // checkpoints with it, as 1.40.0 did, so they fold their streams again and put their data
-        // back. A rebuild over a live row carries none: it
-        // drops the other projections' contributions to the state, so they lose their checkpoints
-        // too and apply again.
+        // back. A rebuild over a live row carries none: it drops the other projections'
+        // contributions to the state, so they lose their checkpoints too and apply again.
         let item: Record<string, unknown> = mapped
         if (Option.isSome(row) && row.value.tombstone) {
           item = { ...mapped, ...onRow(carriedOf(row)) }

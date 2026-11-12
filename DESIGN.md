@@ -7421,9 +7421,11 @@ instance).
     every member's, aggregate's and event stream's index on the table
     included, its `created` / `updated` timestamp, the table's TTL attribute,
     or an outbox's key or index attribute on its table), its rows carry no
-    token: no write names it, reads one or carries anything for it, and its
-    projections write, keep and refuse exactly as on 1.40.0 (its
-    `EDD-9144` refusals included). Such a read model doesn't get the token's
+    token: no write names it, reads one or carries anything for it, its
+    projections write, keep and refuse as a read model with one layout does
+    (below: 1.40.0's requests, but for the terms and the read on read models
+    with `removal`), and `EDD-9144` never applies. Such a read model doesn't
+    get the token's
     protection; renaming the attribute that holds the name gets it. One
     function decides it, from the definitions and the table's TTL attribute
     (from the table's layer), never from what a stored row holds: a stored

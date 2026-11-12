@@ -126,7 +126,7 @@ const rowItemNames = (
  * free on them (`rowItemNames`). The one decision, from the definitions and the table's TTL
  * attribute (`ttlName`), never from a stored row: where anything the read model's definitions
  * name is `__edd_rt__`, its rows carry none, no write names it or reads one, and its projections
- * write, carry and refuse as on 1.40.0 (`rowTokened` only adds to this).
+ * write, carry and refuse as with one projection layout (`rowTokened` only adds to this).
  */
 export const rowTokenInUse = (entity: object, ttlName: string | undefined): boolean =>
   rowItemNames(entity, ttlName)?.has(ROW_TOKEN) === false
