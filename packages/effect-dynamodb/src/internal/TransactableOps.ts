@@ -664,7 +664,7 @@ export const marshalOrFail = <A>(
             new ValidationError({
               entityType,
               operation,
-              cause: `${error.describe(options.fieldOf)} ${options.outcome ?? "Nothing was written."}`,
+              cause: error.refusal(options.outcome ?? "Nothing was written.", options.fieldOf),
             }),
           )
         : isRefusedValue(error)

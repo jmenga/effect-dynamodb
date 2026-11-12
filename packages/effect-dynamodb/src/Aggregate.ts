@@ -2049,7 +2049,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
   /**
    * Refuses a write whose rows hold, where no schema types a value, a part DynamoDB doesn't store
    * (`EDD-9161`): a `Date` is written as an empty map and reads back as `{}`. Only an aggregate whose
-   * model holds such a position pays for the walk.
+   * model holds such a position pays for the walk. Run before anything is marshalled: a part behind
+   * a getter is marked here, and judged as the marshaller calls the getter.
    */
   const refuseLost = (
     groups: ReadonlyArray<TransactionGroup>,
@@ -2943,6 +2944,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
       }
 
+      // Ahead of anything marshalled: a part behind a getter is judged as it's marshalled.
+      yield* refuseLost(newGroups, "aggregate.update")
       // Packed AFTER the group diff above compared the decomposed values, so
       // an unchanged packed value is never rewritten (#147).
       const newPacked = yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update")
@@ -2965,7 +2968,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
         ),
       )
       yield* refuseOtherKindKeys(newGroups, "aggregate.update")
-      yield* refuseLost(newGroups, "aggregate.update")
       yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
@@ -4119,6 +4121,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
           // 5. Build DynamoDB items with composed keys (create only ever PUTs).
           //    Every row is new, so `created` has nothing to carry forward.
+          // Ahead of anything marshalled: a part behind a getter is judged as it's marshalled.
+          yield* refuseLost(groups, "aggregate.create")
           const packedGroups = yield* packAggregateGroups(
             groups,
             packedByType,
@@ -4137,7 +4141,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
             ),
           )
           yield* refuseOtherKindKeys(groups, "aggregate.create")
-          yield* refuseLost(groups, "aggregate.create")
           yield* refuseNotReadBack(
             dynamoGroups,
             assembled,

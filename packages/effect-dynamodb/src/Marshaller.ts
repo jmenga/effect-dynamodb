@@ -11,6 +11,12 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
 import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
+import {
+  type LostAt,
+  lostPath,
+  lostRefusal,
+  readJudged,
+} from "@effect-dynamodb/schema/internal/LostValues.js"
 import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import {
   COOKIE_MARKER,
@@ -56,6 +62,11 @@ const renderPath = (
 export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
   readonly path: ReadonlyArray<string | number>
   readonly reason: string
+  /**
+   * What of the value at `path` DynamoDB doesn't store, when that's why (`EDD-9161`): a getter at a
+   * position no schema types returned it as the marshaller called it (`readJudged`).
+   */
+  readonly lost?: LostAt
 }> {
   override get message(): string {
     return this.describe()
@@ -63,11 +74,49 @@ export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
 
   /** The refusal in words, naming a stored attribute by what `fieldOf` makes of it. */
   describe(fieldOf?: (attribute: string) => string): string {
+    if (this.lost !== undefined) {
+      const [attribute, ...within] = this.path
+      const root =
+        attribute === undefined
+          ? "value"
+          : fieldOf === undefined
+            ? String(attribute)
+            : fieldOf(String(attribute))
+      return lostRefusal(lostPath(root, within), this.lost)
+    }
     const refused =
       this.path.length === 0 ? this.reason : `"${renderPath(this.path, fieldOf)}": ${this.reason}`
     return `${refused.endsWith(".") ? refused : `${refused}.`} [EDD-9124]`
   }
+
+  /**
+   * The refusal as a write reports it, `outcome` (what wasn't done) after it; a lost value's refusal
+   * says that itself.
+   */
+  refusal(outcome: string, fieldOf?: (attribute: string) => string): string {
+    if (this.lost === undefined) return `${this.describe(fieldOf)} ${outcome}`
+    const refused = this.describe(fieldOf)
+    return `${refused[0]!.toUpperCase()}${refused.slice(1)}`
+  }
 }
+
+/** A lost value a getter returned, where it's stored: thrown out of the marshaller. */
+const refuseLost = (lost: LostAt): never => {
+  throw new UnstorableValue({
+    path: lost.path,
+    reason: lostRefusal(lostPath("value", lost.path), lost),
+    lost,
+  })
+}
+
+/**
+ * The item as the marshaller is to read it: where it holds a part `lostIn` marked, a getter it didn't
+ * call, a view (`readJudged`) that judges what each such getter returns as the marshaller calls it.
+ * Nothing of the item is read to find out, and the item itself when it holds none, so an item
+ * without one is marshalled exactly as it always was.
+ */
+const judgedAsRead = (item: Record<string, unknown>): Record<string, unknown> =>
+  readJudged(item, [], refuseLost) as Record<string, unknown>
 
 export const isUnstorableValue = (value: unknown): value is UnstorableValue =>
   value instanceof UnstorableValue
@@ -384,12 +433,13 @@ const finishingInstances = (
   return marshalled
 }
 
-/** Whether marshalling refuses a value. */
+/** Whether marshalling refuses a value. A lost value a getter returned is refused as itself. */
 const isRefused = (value: unknown): boolean => {
   try {
     marshall({ v: value }, MARSHALL_OPTIONS)
     return false
-  } catch {
+  } catch (error) {
+    if (isUnstorableValue(error)) throw error
     return true
   }
 }
@@ -435,12 +485,15 @@ const NO_EMPTY_SET =
  * marshalling follows until the stack runs out. What marshalling makes of a cookie is then given the
  * cookie's expiry, and what it makes of a named zone the zone's name ({@link finishingInstances}).
  */
-const marshallStorable = (item: Record<string, unknown>): Record<string, AttributeValue> => {
+const marshallStorable = (given: Record<string, unknown>): Record<string, AttributeValue> => {
+  const item = judgedAsRead(given)
   let written: Record<string, unknown> = item
   let marshalled: Record<string, AttributeValue>
   try {
     marshalled = marshall(item, MARSHALL_OPTIONS)
-  } catch {
+  } catch (error) {
+    // A lost value a getter returned: refused as it is, without reading anything again.
+    if (isUnstorableValue(error)) throw error
     const fresh = holdsCachedCycle(item) ? withoutCachedNormals(item) : item
     // Followed further, a value holding itself would run the stack out here too.
     const cycle = cycleIn(fresh)
@@ -449,6 +502,7 @@ const marshallStorable = (item: Record<string, unknown>): Record<string, Attribu
     try {
       marshalled = marshall(written, MARSHALL_OPTIONS)
     } catch (cause) {
+      if (isUnstorableValue(cause)) throw cause
       throw unstorableAt(written, [], cause instanceof Error ? cause.message : String(cause))
     }
   }
@@ -492,7 +546,12 @@ export const toAttributeValue = (value: unknown, name?: string): AttributeValue 
     return marshallStorable({ v: value }).v!
   } catch (error) {
     if (!isUnstorableValue(error)) throw error
-    throw new UnstorableValue({ path: [...at, ...error.path.slice(1)], reason: error.reason })
+    const path = [...at, ...error.path.slice(1)]
+    throw new UnstorableValue({
+      path,
+      reason: error.reason,
+      ...(error.lost !== undefined ? { lost: { ...error.lost, path } } : {}),
+    })
   }
 }
 

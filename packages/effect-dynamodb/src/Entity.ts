@@ -2960,7 +2960,7 @@ const makeImpl = <
           new ValidationError({
             entityType,
             operation,
-            cause: `${unstorable.describe()} Nothing was sent.`,
+            cause: unstorable.refusal("Nothing was sent."),
           }),
         )
   }
@@ -2982,7 +2982,7 @@ const makeImpl = <
           new ValidationError({
             entityType,
             operation,
-            cause: `${unstorable.describe()} Nothing was sent.`,
+            cause: unstorable.refusal("Nothing was sent."),
           }),
         )
   }
@@ -3596,9 +3596,9 @@ const makeImpl = <
   /**
    * An update's operand that wouldn't read back. An operand of `.add`, `.subtract` or `.deleteFromSet`
    * is a number or a set to apply, not a value of the field, so only what's stored as given counts.
-   * `unstorableOperand` goes first, so each of these has already been through the marshaller. A
-   * `pathIfNotExists` operand is judged by {@link encodeOperands} (`readBackIssue`): it is refused
-   * only where it would be stored.
+   * `unstorableOperand` goes first, so each of these has already been through the marshaller, and
+   * has looked through each at an untyped position. A `pathIfNotExists` operand is judged by
+   * {@link encodeOperands} (`readBackIssue`): it is refused only where it would be stored.
    */
   const notReadBackOperand = (uState: UpdateState): string | undefined => {
     if (readBacks.size === 0) return undefined
@@ -3628,15 +3628,9 @@ const makeImpl = <
         // A copy writes another attribute's value: it holds no value of its own to read back.
         if (op === "pathSet of" && isCopy(operand)) continue
         const { segments, value } = operand
-        if (!readBacks.has(String(segments[0]))) continue
-        const { encoded } = encodePathValue(segments, value, kind)
-        if (untypedFields.has(String(segments[0]))) {
-          const lost = lostIn(encoded)
-          if (lost !== undefined) {
-            return notReadBack(`${op} "${segments.join(".")}"`, lost, segments.join("."))
-          }
-        }
+        // An untyped position is looked through where the operand is marshalled (`unstorableOperand`).
         if (!customFields.has(String(segments[0]))) continue
+        const { encoded } = encodePathValue(segments, value, kind)
         const read = asRead(encoded)
         const issue =
           kind === "value"
@@ -3663,14 +3657,31 @@ const makeImpl = <
 
   /**
    * A value in an update that DynamoDB can't store, in words, before the update reads or
-   * sends anything: an operand of any operation, in the form it would be written.
+   * sends anything: an operand of any operation, in the form it would be written. An operand
+   * written as a value of a field holding an untyped position is looked through first, for a part
+   * DynamoDB doesn't store (`lostIn`, `EDD-9161`); a part behind a getter is judged as the
+   * marshaller here calls it.
    */
   const unstorableOperand = (
     uState: UpdateState,
     encodedUpdates: globalThis.Record<string, unknown>,
   ): string | undefined => {
-    const refused = (op: string, unstorable: UnstorableValue) =>
-      `${op} ${unstorable.describe()} Nothing was sent.`
+    const refused = (op: string, unstorable: UnstorableValue, what?: string) =>
+      unstorable.lost !== undefined
+        ? `${op} "${what ?? String(unstorable.path[0])}": ${unstorable.describe()}`
+        : `${op} ${unstorable.describe()} Nothing was sent.`
+    /** A part of an untyped operand DynamoDB doesn't store, in words. */
+    const lostOperand = (
+      op: string,
+      segments: ReadonlyArray<string | number>,
+      encoded: unknown,
+    ): string | undefined => {
+      if (!untypedFields.has(String(segments[0]))) return undefined
+      const lost = lostIn(encoded)
+      return lost === undefined
+        ? undefined
+        : notReadBack(`${op} "${segments.join(".")}"`, lost, segments.join("."))
+    }
     const appended = Object.fromEntries(
       Object.entries(uState.append ?? {}).map(([field, value]) => [
         field,
@@ -3686,6 +3697,12 @@ const makeImpl = <
       [".withVector() of", uState.withVectors ?? {}],
     ]
     for (const [op, record] of records) {
+      if (record === appended) {
+        for (const [field, encoded] of Object.entries(appended)) {
+          const lost = lostOperand(op, [field], encoded)
+          if (lost !== undefined) return lost
+        }
+      }
       const unstorable = unstorableIn(record)
       if (unstorable !== undefined) return refused(op, unstorable)
     }
@@ -3714,14 +3731,21 @@ const makeImpl = <
           kind === undefined
             ? operand.value
             : encodePathValue(operand.segments, operand.value, kind).encoded
+        if (kind !== undefined) {
+          const lost = lostOperand(op, operand.segments, value)
+          if (lost !== undefined) return lost
+        }
         const unstorable = unstorableIn({ value })
         if (unstorable !== undefined) {
+          const path = [...operand.segments, ...unstorable.path.slice(1)]
           return refused(
             op,
             new UnstorableValue({
-              path: [...operand.segments, ...unstorable.path.slice(1)],
+              path,
               reason: unstorable.reason,
+              ...(unstorable.lost !== undefined ? { lost: { ...unstorable.lost, path } } : {}),
             }),
+            operand.segments.join("."),
           )
         }
       }
@@ -4076,7 +4100,7 @@ const makeImpl = <
         return `.set() of immutable "${field}": ${String(encoded.issue)}`
       }
       const unstorable = unstorableIn({ [field]: encoded.encoded })
-      if (unstorable !== undefined) return `.set(): ${unstorable.describe()} Nothing was sent.`
+      if (unstorable !== undefined) return `.set(): ${unstorable.refusal("Nothing was sent.")}`
       out.push({
         field,
         attr: resolveDbName(field),
