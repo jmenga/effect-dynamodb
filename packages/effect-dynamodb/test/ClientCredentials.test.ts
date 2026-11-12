@@ -4,18 +4,62 @@
  * so keys changed in place, keys held in getters and a provider function an
  * untyped caller passes all reach the wire, as they did on 1.40.0. A copy taken
  * when the layer is built broke all three.
+ *
+ * The local server checks each request's SigV4 signature itself, so a secret
+ * that stopped following the caller's object fails here as a key id or token
+ * would.
  */
 
+import { createHash, createHmac } from "node:crypto"
 import { describe, expect, it } from "@effect/vitest"
 import { Config, Effect, type Layer } from "effect"
 import { DynamoStreamsClient } from "../src/change-feed/DynamoStreamsClient.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import type { Credentials } from "../src/internal/ClientOptions.js"
-import { localServer } from "./helpers/LocalServer.js"
+import { localServer, type SeenRequest } from "./helpers/LocalServer.js"
 
 type Via = "layer" | "layerConfig"
+const vias = ["layer", "layerConfig"] as const
 
-const keyIdOf = (authorization: unknown) => /Credential=([^/]+)\//.exec(String(authorization))?.[1]
+const AUTHORIZATION =
+  /^AWS4-HMAC-SHA256 Credential=([^/]+)\/(\d{8})\/([^/]+)\/([^/]+)\/aws4_request, SignedHeaders=([^,]+), Signature=([0-9a-f]{64})$/
+
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
+const hmac = (key: string | Buffer, text: string) => createHmac("sha256", key).update(text).digest()
+
+/** Whether `request` carries a valid SigV4 signature made with `secret`. */
+const signedWith = (request: SeenRequest, secret: string): boolean => {
+  const match = AUTHORIZATION.exec(String(request.headers.authorization))
+  if (match === null) return false
+  const [, , day, region, service, signedHeaders, signature] =
+    match as unknown as ReadonlyArray<string>
+  const headers = signedHeaders!
+    .split(";")
+    .map((name) => `${name}:${String(request.headers[name]).trim().replace(/\s+/g, " ")}\n`)
+    .join("")
+  const payload = String(request.headers["x-amz-content-sha256"] ?? sha256(request.body))
+  const canonical = ["POST", "/", "", headers, signedHeaders, payload].join("\n")
+  const scope = `${day}/${region}/${service}/aws4_request`
+  const toSign = [
+    "AWS4-HMAC-SHA256",
+    String(request.headers["x-amz-date"]),
+    scope,
+    sha256(canonical),
+  ]
+  const key = hmac(hmac(hmac(hmac(`AWS4${secret}`, day!), region!), service!), "aws4_request")
+  return hmac(key, toSign.join("\n")).toString("hex") === signature
+}
+
+const keyIdOf = (request: SeenRequest) =>
+  AUTHORIZATION.exec(String(request.headers.authorization))?.[1]
+
+/** Each request's key id, its session token, and whether `secrets[i]` signed it. */
+const wire = (requests: ReadonlyArray<SeenRequest>, secrets: ReadonlyArray<string>) =>
+  requests.map((request, i) => [
+    keyIdOf(request),
+    request.headers["x-amz-security-token"],
+    signedWith(request, secrets[i] ?? ""),
+  ])
 
 const clients = {
   DynamoClient: {
@@ -51,9 +95,9 @@ const clients = {
 } as const
 
 /**
- * Two calls through one layer, `between` run between them: the key id and the
- * session token each request was signed with. The local server answers every
- * request with an empty success, so a call fails only if signing does.
+ * The requests of two calls through one layer, `between` run between them. The
+ * local server answers every request with an empty success, so a call fails
+ * only if signing does, and then sends nothing.
  */
 const twoCalls = (
   name: keyof typeof clients,
@@ -71,20 +115,26 @@ const twoCalls = (
         options?.between?.()
         yield* Effect.exit(call)
       }).pipe(Effect.provide(layer as Layer.Layer<DynamoClient | DynamoStreamsClient, unknown>))
-      return server.requests.map((request) => [
-        keyIdOf(request.headers.authorization),
-        request.headers["x-amz-security-token"],
-      ])
+      return server.requests
     }),
   )
 
 describe.each(["DynamoClient", "DynamoStreamsClient"] as const)("%s credentials", (name) => {
-  it.live.each(["layer", "layerConfig"] as const)("a session token, through %s", (via) =>
+  it.live("the server's signature check holds the SDK's signature to its secret", () =>
+    Effect.gen(function* () {
+      const [request] = yield* twoCalls(name, { accessKeyId: "AKIDCHECK", secretAccessKey: "s" })
+      expect(request).toBeDefined()
+      expect(signedWith(request!, "s")).toBe(true)
+      expect(signedWith(request!, "t")).toBe(false)
+    }),
+  )
+
+  it.live.each(vias)("a session token, through %s", (via) =>
     Effect.gen(function* () {
       const credentials = { accessKeyId: "AKIDTOKEN", secretAccessKey: "s", sessionToken: "T1" }
-      expect(yield* twoCalls(name, credentials, { via })).toEqual([
-        ["AKIDTOKEN", "T1"],
-        ["AKIDTOKEN", "T1"],
+      expect(wire(yield* twoCalls(name, credentials, { via }), ["s", "s"])).toEqual([
+        ["AKIDTOKEN", "T1", true],
+        ["AKIDTOKEN", "T1", true],
       ])
     }),
   )
@@ -93,15 +143,15 @@ describe.each(["DynamoClient", "DynamoStreamsClient"] as const)("%s credentials"
     Effect.gen(function* () {
       const keys = { accessKeyId: "AKIDNONE", secretAccessKey: "s" }
       for (const sessionToken of [undefined, null]) {
-        expect(yield* twoCalls(name, { ...keys, sessionToken })).toEqual([
-          ["AKIDNONE", undefined],
-          ["AKIDNONE", undefined],
+        expect(wire(yield* twoCalls(name, { ...keys, sessionToken }), ["s", "s"])).toEqual([
+          ["AKIDNONE", undefined, true],
+          ["AKIDNONE", undefined, true],
         ])
       }
     }),
   )
 
-  it.live("keys changed in place between two calls", () =>
+  it.live.each(vias)("every key changed in place between two calls, through %s", (via) =>
     Effect.gen(function* () {
       const credentials = { accessKeyId: "AKIDOLD", secretAccessKey: "old", sessionToken: "OLD" }
       const between = () => {
@@ -109,14 +159,29 @@ describe.each(["DynamoClient", "DynamoStreamsClient"] as const)("%s credentials"
         credentials.secretAccessKey = "new"
         credentials.sessionToken = "NEW"
       }
-      expect(yield* twoCalls(name, credentials, { between })).toEqual([
-        ["AKIDOLD", "OLD"],
-        ["AKIDNEW", "NEW"],
+      expect(wire(yield* twoCalls(name, credentials, { via, between }), ["old", "new"])).toEqual([
+        ["AKIDOLD", "OLD", true],
+        ["AKIDNEW", "NEW", true],
       ])
     }),
   )
 
-  it.live("keys held in getters", () =>
+  it.live.each(vias)("the secret alone changed in place, through %s", (via) =>
+    Effect.gen(function* () {
+      const credentials = { accessKeyId: "AKIDSAME", secretAccessKey: "old" }
+      const between = () => {
+        credentials.secretAccessKey = "new"
+      }
+      const requests = yield* twoCalls(name, credentials, { via, between })
+      expect(wire(requests, ["old", "new"])).toEqual([
+        ["AKIDSAME", undefined, true],
+        ["AKIDSAME", undefined, true],
+      ])
+      expect(signedWith(requests[1]!, "old")).toBe(false)
+    }),
+  )
+
+  it.live.each(vias)("keys held in getters, through %s", (via) =>
     Effect.gen(function* () {
       class Held {
         get accessKeyId() {
@@ -129,26 +194,25 @@ describe.each(["DynamoClient", "DynamoStreamsClient"] as const)("%s credentials"
           return "HELD"
         }
       }
-      expect(yield* twoCalls(name, new Held())).toEqual([
-        ["AKIDHELD", "HELD"],
-        ["AKIDHELD", "HELD"],
+      expect(wire(yield* twoCalls(name, new Held(), { via }), ["s", "s"])).toEqual([
+        ["AKIDHELD", "HELD", true],
+        ["AKIDHELD", "HELD", true],
       ])
     }),
   )
 
-  it.live.each(["layer", "layerConfig"] as const)(
-    "a provider function an untyped caller passes, through %s",
-    (via) =>
-      Effect.gen(function* () {
-        const provider = async () => ({
-          accessKeyId: "AKIDPROVIDED",
-          secretAccessKey: "s",
-          sessionToken: "PROVIDED",
-        })
-        expect(yield* twoCalls(name, provider as unknown as Credentials, { via })).toEqual([
-          ["AKIDPROVIDED", "PROVIDED"],
-          ["AKIDPROVIDED", "PROVIDED"],
-        ])
-      }),
+  it.live.each(vias)("a provider function an untyped caller passes, through %s", (via) =>
+    Effect.gen(function* () {
+      const provider = async () => ({
+        accessKeyId: "AKIDPROVIDED",
+        secretAccessKey: "s",
+        sessionToken: "PROVIDED",
+      })
+      const requests = yield* twoCalls(name, provider as unknown as Credentials, { via })
+      expect(wire(requests, ["s", "s"])).toEqual([
+        ["AKIDPROVIDED", "PROVIDED", true],
+        ["AKIDPROVIDED", "PROVIDED", true],
+      ])
+    }),
   )
 })

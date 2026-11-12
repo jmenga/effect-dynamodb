@@ -116,6 +116,15 @@ describe("ClientOptions types", () => {
     DynamoClient.layer({ region, credentials: { accessKeyId: "a", sessionToken: "t" } })
 
     DynamoStreamsClient.layer({ region, credentials: keys })
+    DynamoStreamsClient.layer({ region, credentials: { ...keys, sessionToken: token } })
+    DynamoStreamsClient.layer({ region, credentials: nullable })
+    DynamoStreamsClient.layer({
+      region,
+      // @ts-expect-error a token is a string
+      credentials: { accessKeyId: "a", secretAccessKey: "s", sessionToken: 1 },
+    })
+    // @ts-expect-error the secret is required
+    DynamoStreamsClient.layer({ region, credentials: { accessKeyId: "a", sessionToken: "t" } })
     DynamoStreamsClient.layer({
       region,
       credentials: { accessKeyId: "a", secretAccessKey: "s", sessionToken: "t" },
@@ -150,7 +159,19 @@ describe("ClientOptions types", () => {
     })
     DynamoStreamsClient.layerConfig({
       region: Config.String("REGION"),
+      credentials: Config.all(keys),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
       credentials: Config.all({ ...keys, sessionToken: token }),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(undefined)) }),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(null)) }),
     })
     DynamoStreamsClient.layerConfig({
       region: Config.String("REGION"),

@@ -190,8 +190,9 @@ export class DynamoStreamsClient extends Context.Service<
 
   /**
    * A live layer reading its configuration from Effect `Config` providers. As
-   * on `DynamoClient.layerConfig`, `credentials` missing any part is unset as a
-   * whole, and the SDK's default credential chain applies.
+   * on `DynamoClient.layerConfig`, `credentials` missing any part (an empty
+   * value counts as missing) is unset as a whole, and the SDK's default
+   * credential chain applies, which can sign as another identity.
    */
   static readonly layerConfig = (
     config: DynamoStreamsClientConfigFromConfig,

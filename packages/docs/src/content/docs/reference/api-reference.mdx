@@ -1173,8 +1173,9 @@ DynamoClient.layerConfig({
 
 `DynamoStreamsClient.layer` and `layerConfig` take `credentials` in the same shape. Without
 `credentials`, both use the SDK's default credential chain. In `layerConfig`, `credentials` is
-unset as a whole when any part of it is missing, so the default chain applies then too: read a
-part that may be absent, such as the token, with `Config.withDefault(undefined)`. The object is
+unset as a whole when any part of it is missing (an empty value counts as missing), so the default
+chain applies then too, and may sign as another identity: read a part that may be absent, such as
+the token, with `Config.withDefault(undefined)`. The object is
 passed to the SDK as given, and read for every request.
 
 ---
