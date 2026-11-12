@@ -425,29 +425,56 @@ const steady = (node: unknown): unknown =>
  * `requests` without the read-model tag 1.41.0 writes on each outbox item (`__edd_rm__`, #237),
  * which is the projection's read model's, and how many items held it.
  */
+/**
+ * The requests without what 1.41.0 adds to an outbox item's `Put` (#237): the read model's tag on
+ * the item, and the condition that it replaces no other read model's item. Each is checked.
+ */
 const untagged = (requests: unknown): { readonly tagged: number; readonly as139: unknown } => {
   let tagged = 0
+  let guarded = 0
   const walk = (node: unknown): unknown => {
     if (Array.isArray(node)) return node.map(walk)
     if (typeof node !== "object" || node === null) return node
     const out: Record<string, unknown> = {}
+    const guard = (node as Record<string, unknown>).ConditionExpression
+    const outboxGuard = guard === "attribute_not_exists(#pk) OR #rm = :rm"
+    if (outboxGuard) {
+      expect((node as Record<string, unknown>).ExpressionAttributeNames).toEqual({
+        "#pk": "pk",
+        "#rm": "__edd_rm__",
+      })
+      expect((node as Record<string, unknown>).ExpressionAttributeValues).toEqual({
+        ":rm": { S: readModelTag(Summaries) },
+      })
+      guarded++
+    }
     for (const [name, value] of Object.entries(node)) {
       if (name === "__edd_rm__") {
         expect(value).toEqual({ S: readModelTag(Summaries) })
         tagged++
         continue
       }
+      if (
+        outboxGuard &&
+        (name === "ConditionExpression" ||
+          name === "ExpressionAttributeNames" ||
+          name === "ExpressionAttributeValues")
+      ) {
+        continue
+      }
       out[name] = walk(value)
     }
     return out
   }
-  return { as139: walk(requests), tagged }
+  const as139 = walk(requests)
+  expect(guarded).toBe(tagged)
+  return { as139, tagged }
 }
 
 describe("a cookie's expiry is written as ISO text wherever the cookie is written", () => {
   for (const [group, name, run, typed] of CASES) {
     it.effect(
-      `${group} ${name}: what 1.39.0 sent, but each cookie's expiry, and each outbox item's read model`,
+      `${group} ${name}: what 1.39.0 sent, but each cookie's expiry, and each outbox item's read model and condition`,
       () =>
         Effect.gen(function* () {
           const expected = scenarioOf(group, name)
