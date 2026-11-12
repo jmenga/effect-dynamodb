@@ -20,6 +20,15 @@ describe("a write landing between a vector entity's read and its write", () => {
   }
 })
 
+describe("a write landing between the read and the write of a reembed whose source is too wide for one expression", () => {
+  for (const scenario of VectorWriteRaces.wideSourceScenarios) {
+    it.live(scenario.name, () => scenario.run(harness))
+  }
+  // Only a table without the 400 KB item limit holds such an item: not on DynamoDB Local.
+  const unguardable = VectorWriteRaces.wideSourceUnguardable
+  it.live(unguardable.name, () => unguardable.run(harness))
+})
+
 describe("a reembed landing between a read-first write's read and its write", () => {
   for (const scenario of VectorWriteRaces.copyScenarios) {
     it.live(scenario.name, () => scenario.run(harness))

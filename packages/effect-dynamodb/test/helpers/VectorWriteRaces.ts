@@ -230,11 +230,207 @@ export const reembedScenarios: ReadonlyArray<VectorRaceScenario> = [false, true]
 )
 
 // ---------------------------------------------------------------------------
-// A `reembed` between a read-first write's read and its write
+// A `reembed` of an item whose source is too wide for one expression
 // ---------------------------------------------------------------------------
 
 /** Fields enough to make an update that sets them all too wide for one expression. */
 const WIDE_FIELDS = Array.from({ length: 350 }, (_, i) => `f${i}`)
+
+/** Item `x` of an entity whose vector is embedded from {@link WIDE_FIELDS}, partitioned by `tenant`. */
+const wideSourceWorld = (versioned: boolean) => {
+  const schema = DynamoSchema.make({ name: "vecwide", version: 1 })
+  const Wides = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      tenant: Schema.String,
+      note: Schema.optionalKey(Schema.String),
+      ...Object.fromEntries(WIDE_FIELDS.map((field) => [field, Schema.String])),
+    }),
+    entityType: "Wide",
+    primaryKey: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+    ...(versioned && { versioned: true }),
+    vectorIndexes: {
+      byText: {
+        name: "vec1",
+        dimensions: DIMENSIONS,
+        distance: "cosine",
+        source: { fields: WIDE_FIELDS },
+        partition: ["tenant"],
+      },
+    },
+  } as never) as any
+  const MainTable = Table.make({ schema, entities: { Wides } })
+  // Text holding `b` embeds as `b`, any other as `a`.
+  const embedder = Layer.succeed(Embedder, {
+    dimensions: DIMENSIONS,
+    embed: (text: string) => Effect.succeed([...(text.includes("b") ? VECTORS.b! : VECTORS.a!)]),
+  })
+  return {
+    MainTable,
+    client: DynamoClient.make({ entities: { Wides }, tables: { MainTable } } as never).pipe(
+      Effect.provide(embedder),
+    ) as Effect.Effect<any>,
+  }
+}
+
+/**
+ * {@link raceReembed} on {@link wideSourceWorld}: item `x` (tenant `t1`, every source field `a`)
+ * with a stale vector, `race` just before `reembed`'s write.
+ */
+const raceWideReembed = (
+  table: RepairTable,
+  db: any,
+  race: ((db: any) => Effect.Effect<unknown, unknown>) | undefined,
+) =>
+  Effect.gen(function* () {
+    const source = Object.fromEntries(WIDE_FIELDS.map((field) => [field, "a"]))
+    yield* db.entities.Wides.put({ id: "x", tenant: "t1", ...source }).withVector("byText", STALE)
+    let landed = 0
+    table.beforeUpdate((input) => {
+      if (race === undefined || !isReembed(input) || landed > 0) return Effect.void
+      landed++
+      return Effect.asVoid(race(db))
+    })
+    table.clear()
+    const rewritten: number = yield* db.entities.Wides.reembed({ concurrency: 1 })
+    const requests = table.requests()
+    const rows = (yield* table.rows()).filter((row: Row) => row.__edd_e__?.S === "Wide")
+    expect(rows).toHaveLength(1)
+    return { rewritten, row: rows[0]!, landed, requests }
+  })
+
+const wideScenario = (
+  name: string,
+  versioned: boolean,
+  body: (table: RepairTable, db: any) => Effect.Effect<void, unknown, any>,
+): VectorRaceScenario => ({
+  name,
+  run: (harness) => {
+    const world = wideSourceWorld(versioned)
+    return harness.on(world, (table) =>
+      Effect.gen(function* () {
+        yield* body(table, yield* world.client)
+      }),
+    )
+  },
+})
+
+/**
+ * Up to the second fix `reembed` held the source fields that fit one expression and left the rest
+ * out, so an update of one left out was overwritten with the old text's vector. Its vector and
+ * partition attributes as read now stand in for them.
+ */
+export const wideSourceScenarios: ReadonlyArray<VectorRaceScenario> = [false, true].flatMap(
+  (versioned) => {
+    const of = versioned ? "a versioned item" : "an item"
+    return [
+      wideScenario(
+        `reembed of ${of} with 350 source fields, an update changing the last in between: skipped, the update's vector kept`,
+        versioned,
+        (table, db) =>
+          Effect.gen(function* () {
+            const { rewritten, row, landed } = yield* raceWideReembed(table, db, (db) =>
+              db.entities.Wides.update({ id: "x" }).set({ f349: "b" }).asEffect(),
+            )
+            expect(landed).toBe(1)
+            expect(row.f349).toEqual({ S: "b" })
+            expect(vectorOf(row)).toEqual(VECTORS.b)
+            expect(rewritten).toBe(0)
+          }),
+      ),
+      wideScenario(
+        `reembed of ${of} with 350 source fields, an update moving its partition in between: skipped, the update's partition kept`,
+        versioned,
+        (table, db) =>
+          Effect.gen(function* () {
+            const { rewritten, row, landed } = yield* raceWideReembed(table, db, (db) =>
+              db.entities.Wides.update({ id: "x" }).set({ tenant: "t2" }).asEffect(),
+            )
+            expect(landed).toBe(1)
+            expect(row.__edd_vp_vec1__.S).toContain("t2")
+            expect(rewritten).toBe(0)
+          }),
+      ),
+      wideScenario(
+        `reembed of ${of} with 350 source fields, an update leaving its source and partition alone in between: rewritten`,
+        versioned,
+        (table, db) =>
+          Effect.gen(function* () {
+            const { rewritten, row, landed } = yield* raceWideReembed(table, db, (db) =>
+              db.entities.Wides.update({ id: "x" }).set({ note: "n" }).asEffect(),
+            )
+            expect(landed).toBe(1)
+            expect(row.note).toEqual({ S: "n" })
+            expect(vectorOf(row)).toEqual(VECTORS.a)
+            expect(rewritten).toBe(1)
+          }),
+      ),
+      wideScenario(
+        `reembed of ${of} with 350 source fields, nobody racing: the vector and partition held as read, then the source fields that fit`,
+        versioned,
+        (table, db) =>
+          Effect.gen(function* () {
+            const { rewritten, row, requests } = yield* raceWideReembed(table, db, undefined)
+            expect(rewritten).toBe(1)
+            expect(vectorOf(row)).toEqual(VECTORS.a)
+            const writes = requests.filter((request) => request.command !== "scan")
+            expect(writes.map((request) => request.command)).toEqual(["updateItem"])
+            const sent = writes[0]!.input
+            expect(sent.ConditionExpression).toMatch(
+              /^attribute_exists\(#pk\) AND #dv0 = :dv0 AND #dv1 = :dv1 AND #s0 = :s0 AND /,
+            )
+            expect(sent.ExpressionAttributeNames["#dv0"]).toBe("__edd_v_vec1__")
+            expect(sent.ExpressionAttributeNames["#dv1"]).toBe("__edd_vp_vec1__")
+            expect(sent.ExpressionAttributeValues[":dv0"]).toEqual({
+              L: STALE.map((n) => ({ N: String(n) })),
+            })
+            expect(sent.ExpressionAttributeValues[":dv1"]).toEqual(
+              expect.objectContaining({ S: expect.stringContaining("t1") }),
+            )
+            // Not every source field fits: this is the wide condition.
+            const held = new Set(Object.values(sent.ExpressionAttributeNames))
+            expect(WIDE_FIELDS.some((field) => !held.has(field))).toBe(true)
+          }),
+      ),
+    ]
+  },
+)
+
+/**
+ * An item whose stored vector alone is past DynamoDB's limit on one expression's substitutions (a
+ * row only a table without the 400 KB item limit holds, so a recording table's): neither its source
+ * nor its vector fits a condition, so `reembed` fails with a `ValidationError` naming it, and writes
+ * nothing.
+ */
+export const wideSourceUnguardable: VectorRaceScenario = wideScenario(
+  "reembed of an item no condition fits: a ValidationError naming it, nothing written",
+  false,
+  (table, db) =>
+    Effect.gen(function* () {
+      const source = Object.fromEntries(WIDE_FIELDS.map((field) => [field, "a"]))
+      yield* db.entities.Wides.put({ id: "x", tenant: "t1", ...source }).withVector("byText", STALE)
+      const [row] = (yield* table.rows()).filter((row: Row) => row.__edd_e__?.S === "Wide")
+      const huge = { L: Array.from({ length: 400_000 }, () => ({ N: "0.1234567890123" })) }
+      yield* table.seed({ ...row!, __edd_v_vec1__: huge })
+      table.clear()
+      const exit = yield* Effect.exit(db.entities.Wides.reembed({ concurrency: 1 }))
+      expect(exit._tag).toBe("Failure")
+      const error = (exit as any).cause.reasons?.[0]?.error ?? (exit as any).cause.failures?.[0]
+      expect(error?._tag).toBe("ValidationError")
+      expect(error.operation).toBe("reembed")
+      expect(String(error.cause)).toContain("vecwide#v1#wide#id_x")
+      expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+      const [after] = (yield* table.rows()).filter((row: Row) => row.__edd_e__?.S === "Wide")
+      expect(after!.__edd_v_vec1__).toEqual(huge)
+    }),
+)
+
+// ---------------------------------------------------------------------------
+// A `reembed` between a read-first write's read and its write
+// ---------------------------------------------------------------------------
 
 /**
  * Versioned vector entities, one per write that reads first: a soft delete (`Soft`), a retain

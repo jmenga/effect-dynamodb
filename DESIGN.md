@@ -6503,12 +6503,22 @@ the entity's items (Scan scoped by `__edd_e__`), re-derives source text, embeds,
 and writes the vector back. This is the migration path when the embedding model
 changes — DynamoDB will never recompute a vector for you. Each write is
 conditioned on the item existing with every attribute holding a source field or a
-partition composite as read (or still absent), as many as fit DynamoDB's limits on
-one expression (#240): a write that changed one in between wrote its own vector
-and partition, so `reembed`'s is cancelled, and the item is skipped, neither
-retried nor counted. A sparse map's entries are held as read; one added in between
-isn't seen. Up to 1.40.0 the condition was `attribute_exists(#pk)` alone, and such
-a write's vector was overwritten with the old text's. The option not taken is a
+partition composite as read (or still absent) (#240): a write that changed one in
+between wrote its own vector and partition, so `reembed`'s is cancelled, and the
+item is skipped, neither retried nor counted. A sparse map's entries are held as
+read; one added in between isn't seen. Up to 1.40.0 the condition was
+`attribute_exists(#pk)` alone, and such a write's vector was overwritten with the
+old text's. `reembed` is never unguarded (`reembedGuard`): when the source and
+partition terms don't all fit DynamoDB's limits on one expression (about 300 source
+fields), the write holds each vector index's vector and partition attributes as
+read instead (`vectorsAsRead`, the function `rekey`'s move uses; for an index it
+doesn't embed too), since a write that changed the source wrote its own vector,
+and then as many source terms as fit. When those don't fit either (a vector of
+hundreds of thousands of dimensions), the item isn't written: `reembed` fails
+with a `ValidationError` naming its key, as it fails on any item it can't write
+(one its embedding takes past 400 KB). A
+narrow source sends exactly the condition it sent before (`VectorWriteRaces.test.ts`,
+`wideSourceScenarios` and `wideSourceUnguardable`, and their connected twins). The option not taken is a
 revision attribute that every write bumps: `reembed` would hold it alone, one term
 that sees every write, a sparse map's new entry and the attributes past the limits
 included, and `rekey`'s guard would see a `reembed` too. Every item would then

@@ -75,6 +75,15 @@ describeConnected(
 )
 
 describeConnected(
+  "a write landing between the read and the write of a reembed whose source is too wide for one expression, on DynamoDB",
+  () => {
+    for (const scenario of VectorWriteRaces.wideSourceScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  },
+)
+
+describeConnected(
   "a reembed landing between a read-first write's read and its write, on DynamoDB",
   () => {
     for (const scenario of VectorWriteRaces.copyScenarios) {

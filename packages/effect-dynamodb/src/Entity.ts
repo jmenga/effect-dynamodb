@@ -692,7 +692,10 @@ export interface Entity<
 
   /** @internal Normalized vector index definitions keyed by logical name. */
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
-  /** @internal `reembed`'s condition that its inputs are as it read them. */
+  /**
+   * @internal `reembed`'s condition that its inputs are as it read them, or undefined when no
+   * condition proving it fits one expression.
+   */
   readonly _reembedGuard: (
     read: globalThis.Record<string, AttributeValue>,
     definitions: ReadonlyArray<VectorIndexDefinition>,
@@ -700,11 +703,13 @@ export interface Entity<
       readonly names: globalThis.Record<string, string>
       readonly values: globalThis.Record<string, AttributeValue>
     },
-  ) => {
-    readonly expression: string
-    readonly names: globalThis.Record<string, string>
-    readonly values: globalThis.Record<string, AttributeValue>
-  }
+  ) =>
+    | {
+        readonly expression: string
+        readonly names: globalThis.Record<string, string>
+        readonly values: globalThis.Record<string, AttributeValue>
+      }
+    | undefined
 
   /**
    * @internal `[EDD-9140]` for the attributes a table's configuration names (its TTL attribute):
@@ -4967,13 +4972,18 @@ const makeImpl = <
   }
 
   /**
-   * `reembed`'s condition that what it embedded and composed is still as it read it (#240):
-   * `attribute_exists(#pk)` and, for each of `definitions`, every attribute holding a source field
-   * or a partition composite equal to the value read, or still absent. A write that changed any of
-   * them between `reembed`'s read and its write wrote its own vector, so it cancels `reembed`'s. A
-   * sparse map's entries are held as read; one added in between isn't seen. Held while they fit
-   * DynamoDB's limits on one expression beside `update`'s names and values: the rest are left out,
-   * never refused.
+   * `reembed`'s condition that what it embedded and composed is still as it read it (#240), never
+   * left out: `attribute_exists(#pk)` and, for each of `definitions`, every attribute holding a
+   * source field or a partition composite equal to the value read, or still absent. A write that
+   * changed any of them between `reembed`'s read and its write wrote its own vector, so it cancels
+   * `reembed`'s. A sparse map's entries are held as read; one added in between isn't seen.
+   *
+   * When they don't all fit DynamoDB's limits on one expression beside `update`'s names and values
+   * (a source of some hundreds of fields), each of `definitions`' vector and partition attributes as
+   * read stands in for them ({@link vectorsAsRead}, the terms every write copying a vector holds),
+   * followed by the source attributes that still fit: the write that changed a source field wrote
+   * the index's vector, or, clearing its source, removed it; one that moved the partition wrote the
+   * partition attribute. Undefined when even those don't fit, so the item isn't written.
    */
   const reembedGuard = (
     read: globalThis.Record<string, AttributeValue>,
@@ -4982,17 +4992,13 @@ const makeImpl = <
       readonly names: globalThis.Record<string, string>
       readonly values: globalThis.Record<string, AttributeValue>
     },
-  ): {
-    readonly expression: string
-    readonly names: globalThis.Record<string, string>
-    readonly values: globalThis.Record<string, AttributeValue>
-  } => {
-    const names: globalThis.Record<string, string> = {
-      "#pk": config.indexes.primary.pk.field,
-      ...update.names,
-    }
-    const values: globalThis.Record<string, AttributeValue> = { ...update.values }
-    let expression = "attribute_exists(#pk)"
+  ):
+    | {
+        readonly expression: string
+        readonly names: globalThis.Record<string, string>
+        readonly values: globalThis.Record<string, AttributeValue>
+      }
+    | undefined => {
     const fields = [...new Set(definitions.flatMap((d) => [...d.sourceFields, ...d.partition]))]
     const attrs = [
       ...new Set(
@@ -5006,18 +5012,52 @@ const makeImpl = <
         }),
       ),
     ]
-    for (const [i, attr] of attrs.entries()) {
-      const value = read[attr]
-      const clause = value === undefined ? `attribute_not_exists(#s${i})` : `#s${i} = :s${i}`
-      const nextNames = { ...names, [`#s${i}`]: attr }
-      const nextValues = value === undefined ? values : { ...values, [`:s${i}`]: value }
-      if (!expressionFits(`${expression} AND ${clause}`)) continue
-      if (!substitutionsFit(nextNames, nextValues)) continue
-      Object.assign(names, nextNames)
-      Object.assign(values, nextValues)
-      expression = `${expression} AND ${clause}`
+    /** `start` followed by as many source terms as fit; `all` when none was left out. */
+    const sources = (start: {
+      readonly expression: string
+      readonly names: globalThis.Record<string, string>
+      readonly values: globalThis.Record<string, AttributeValue>
+    }) => {
+      const names = { ...start.names }
+      const values = { ...start.values }
+      let expression = start.expression
+      let all = true
+      for (const [i, attr] of attrs.entries()) {
+        const value = read[attr]
+        const clause = value === undefined ? `attribute_not_exists(#s${i})` : `#s${i} = :s${i}`
+        const nextNames = { ...names, [`#s${i}`]: attr }
+        const nextValues = value === undefined ? values : { ...values, [`:s${i}`]: value }
+        if (
+          !expressionFits(`${expression} AND ${clause}`) ||
+          !substitutionsFit(nextNames, nextValues)
+        ) {
+          all = false
+          continue
+        }
+        Object.assign(names, nextNames)
+        Object.assign(values, nextValues)
+        expression = `${expression} AND ${clause}`
+      }
+      return { guard: { expression, names, values }, all }
     }
-    return { expression, names, values }
+    const base = {
+      expression: "attribute_exists(#pk)",
+      names: { "#pk": config.indexes.primary.pk.field, ...update.names },
+      values: { ...update.values },
+    }
+    const narrow = sources(base)
+    if (narrow.all) return narrow.guard
+    const names: globalThis.Record<string, string> = { ...base.names }
+    const values: globalThis.Record<string, AttributeValue> = { ...base.values }
+    const others = new Set(
+      vectorIndexEntries
+        .filter(([, d]) => !definitions.some((e) => e.vectorField === d.vectorField))
+        .map(([logicalName]) => logicalName),
+    )
+    const vectors = vectorsAsRead(read, names, values, others)
+    const expression = [base.expression, ...vectors.terms].join(" AND ")
+    if (!expressionFits(expression) || !substitutionsFit(names, values)) return undefined
+    return sources({ expression, names, values }).guard
   }
 
   /**
@@ -16942,6 +16982,18 @@ export const bind = <
                   names: setNames,
                   values: setValues,
                 })
+                // Never written unguarded: an item no condition fits is a failure naming it.
+                if (guard === undefined) {
+                  return yield* new ValidationError({
+                    entityType: entity.entityType,
+                    operation: "reembed",
+                    cause:
+                      `The item at ${JSON.stringify(fromAttributeMap({ pk: marshalled[primary.pk.field]!, sk: marshalled[primary.sk.field]! }))} ` +
+                      "can't be re-embedded under a condition that its inputs are as read: neither its " +
+                      "source and partition attributes nor its vector and partition attributes fit " +
+                      "DynamoDB's limits on one expression, and reembed never writes without one.",
+                  })
+                }
                 const update = {
                   TableName: tableName,
                   Key: {
