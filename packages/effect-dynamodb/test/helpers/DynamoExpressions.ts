@@ -1568,9 +1568,11 @@ const keyAttributeRefusal = (attribute: string) =>
 
 /**
  * Apply an update's actions to `item` as DynamoDB Local applies them: every operand read from the
- * item as it was; an index past a list's end appends, in index order; the indexes `REMOVE` names
- * are the list's positions before the update. Of several refused actions, throws the
- * `ValidationException` of the last one Local visits (see {@link visitOrder}).
+ * item as it was, and every path naming a place in the item as it was, nested list positions
+ * included (`SET l[1][0] = :v REMOVE l[0]` writes the element that was `l[1]`). An index past a
+ * list's end appends, in index order; the indexes `REMOVE` names are the list's positions before
+ * the update. Of several refused actions, throws the `ValidationException` of the last one Local
+ * visits (see {@link visitOrder}).
  */
 const applyActions = (actions: ReadonlyArray<Action>, before: Item): Item => {
   const writes: Array<Write> = []
@@ -1586,23 +1588,29 @@ const applyActions = (actions: ReadonlyArray<Action>, before: Item): Item => {
   }
   if (refusal !== undefined) throw refusal
   const next = clone(before)
-  const index = (write: Write) => write.path[write.path.length - 1] as number
-  const indexed = writes.filter((write) => typeof write.path[write.path.length - 1] === "number")
+  // Every write's container, found before anything moves: a map or list is the same object
+  // wherever a removal from an outer list leaves it, so each write lands where its path named.
+  // Paths don't overlap (refused when read), so no write replaces another's container.
+  const keyed: Array<{ readonly map: Item; readonly key: string; readonly write: Write }> = []
+  const lists = new Map<Array<AttributeValue>, { readonly length: number; writes: Array<Write> }>()
   for (const write of writes) {
-    if (indexed.includes(write)) continue
-    const parent = containerOf(next, write.path) as Item
-    const last = write.path[write.path.length - 1] as string
-    if (write.value === undefined) delete parent[last]
-    else setOwn(parent, last, clone(write.value))
+    const container = containerOf(next, write.path)!
+    const last = write.path[write.path.length - 1]!
+    if (typeof last === "string") {
+      keyed.push({ map: container as Item, key: last, write })
+    } else {
+      const list = container as Array<AttributeValue>
+      const group = lists.get(list) ?? { length: list.length, writes: [] }
+      group.writes.push(write)
+      lists.set(list, group)
+    }
   }
-  const lists = new Map<string, Array<Write>>()
-  for (const write of indexed) {
-    const at = JSON.stringify(write.path.slice(0, -1))
-    lists.set(at, [...(lists.get(at) ?? []), write])
+  for (const { map, key, write } of keyed) {
+    if (write.value === undefined) delete map[key]
+    else setOwn(map, key, clone(write.value))
   }
-  for (const group of lists.values()) {
-    const list = containerOf(next, group[0]!.path) as Array<AttributeValue>
-    const length = list.length
+  const index = (write: Write) => write.path[write.path.length - 1] as number
+  for (const [list, { length, writes: group }] of lists) {
     const replaced = group.filter((w) => w.value !== undefined && index(w) < length)
     const appended = group.filter((w) => w.value !== undefined && index(w) >= length)
     const removed = group.filter((w) => w.value === undefined && index(w) < length)

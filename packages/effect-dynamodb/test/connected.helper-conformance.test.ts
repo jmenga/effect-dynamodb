@@ -692,6 +692,18 @@ const V: Record<string, AttributeValue> = {
   ":w": N("8"),
 }
 const NS = (...v: Array<string>): AttributeValue => ({ NS: v })
+/** An item of nested lists, for paths below a list element an outer `REMOVE` moves. */
+const NESTED_LISTS: Item = {
+  ...KEY,
+  ll: { L: [{ L: [N("0")] }, { L: [N("1")] }, { L: [N("2")] }] },
+  lm: {
+    L: [
+      { M: { a: N("0"), t: { SS: ["x", "y"] } } },
+      { M: { a: N("1"), t: { SS: ["x", "y"] } } },
+      { M: { a: N("2") } },
+    ],
+  },
+}
 
 /**
  * An update in brief: its expression, then any values beyond `V`, the stored item (`null`: none;
@@ -824,6 +836,33 @@ const UPDATES: ReadonlyArray<Brief> = [
   "SET #a = :v SET #c = :w",
   "SET #a = (:v)",
   "SET #a = if_not_exists (#zz, :v)",
+  // nested list paths, every one naming the item as it was before the update
+  ...[
+    "SET #ll[1][0] = :v REMOVE #ll[0]",
+    "REMOVE #ll[0] SET #ll[1][0] = :v",
+    "SET #ll[2][0] = :v REMOVE #ll[0], #ll[1]",
+    "REMOVE #ll[0] SET #ll[2][5] = :v",
+    "REMOVE #ll[1][0], #ll[0]",
+    "REMOVE #ll[2][0], #ll[1]",
+    "REMOVE #ll[2][0], #ll[0], #ll[1][0]",
+    "SET #ll[0][5] = :v, #ll[2][0] = :w REMOVE #ll[1]",
+    "SET #ll[5] = :v REMOVE #ll[3]",
+    "SET #ll[3] = :v REMOVE #ll[0]",
+    "SET #ll[1][1] = :v REMOVE #ll[0]",
+    "SET #ll[0][0] = :v REMOVE #ll[0]",
+    "ADD #lm[1].#a :one REMOVE #lm[0]",
+    "ADD #lm[1].#t :x REMOVE #lm[0]",
+    "DELETE #lm[1].#t :x REMOVE #lm[0]",
+    "DELETE #lm[0].#t :x, #lm[1].#t :x REMOVE #lm[2]",
+    "REMOVE #lm[0].#a, #lm[1]",
+    "REMOVE #lm[1].#t, #lm[0]",
+    "SET #lm[1].#t = :v REMOVE #lm[0]",
+    "SET #lm[2].#b = :v REMOVE #lm[0], #lm[1]",
+    "SET #a = #ll[1][0] REMOVE #ll[0]",
+    "SET #ll[2] = #ll[0] REMOVE #ll[0]",
+    "REMOVE #ll[0] SET #ll[1] = list_append(#ll[1], :L)",
+    "REMOVE #ll[0] SET #ll[1][0] = list_append(#ll[2], :L)",
+  ].map((expression): Brief => [expression, { ":x": { SS: ["x"] } }, NESTED_LISTS]),
 ]
 
 /** Numbers and number sets. */
