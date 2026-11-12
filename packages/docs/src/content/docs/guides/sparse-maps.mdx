@@ -193,7 +193,7 @@ yield* db.entities.VPages.update({ pageId: "v-1" })
   .set({ status: "reset" })
 ```
 
-The clear comes first: `.clearMap("metrics").set({ metrics: { "2026-06": { views: 1, clicks: 0 } } })` leaves only that entry, and an `.add()` to an entry starts from nothing. A `.subtract()` or a path operation into an entry the clear removes has nothing left to work on, and is refused with a `ValidationError` (`EDD-9151`) before anything is written.
+The clear comes first: `.clearMap("metrics").set({ metrics: { "2026-06": { views: 1, clicks: 0 } } })` leaves only that entry, an `.add()` or `pathAdd()` to an entry starts from nothing, a `pathIfNotExists()` sets it, and a `.removeEntries()`, `.deleteFromSet()` or `pathRemove()` below it has nothing left to remove. A `.subtract()`, an `.append()`, or a path operation writing below an entry the clear removes has nothing left to work on, and is refused with a `ValidationError` (`EDD-9151`) before anything is written. On a retained entity, `.subtract()` and `.append()` apply to the cleared map in memory, and start from nothing.
 
 **Race window:** between the read and the update, a concurrent writer can add a new bucket. The new bucket survives the clear.
 

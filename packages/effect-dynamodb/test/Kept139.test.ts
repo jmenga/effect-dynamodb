@@ -15,7 +15,11 @@ import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateListFiltersSuite } from "./helpers/AggregateListFilters.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
-import { clearWritesSuite, retainedEntryRemovalsSuite } from "./helpers/ClearWrites.js"
+import {
+  clearEveryOpSuite,
+  clearWritesSuite,
+  retainedEntryRemovalsSuite,
+} from "./helpers/ClearWrites.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { entryInQueriesSuite } from "./helpers/EntryInQueries.js"
 import { entrySelectsSuite } from "./helpers/EntrySelects.js"
@@ -130,6 +134,10 @@ describe("a select of a sparse map's entry", () => {
 
 describe("a clearMap with another write to the map", () => {
   clearWritesSuite(openRecordingTable)
+})
+
+describe("a clearMap beside every other kind of write to the map", () => {
+  clearEveryOpSuite(openRecordingTable)
 })
 
 describe("a retained entity's removal of a sparse map's entries", () => {

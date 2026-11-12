@@ -656,19 +656,31 @@ class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
 export { countOperators }
 
 /**
- * An update's clauses against the attributes its `.clearMap()` removes (`cleared`: what the
- * clear's read found of the map), so the request names no path twice (#238). The clear comes
- * first: a `SET` of a cleared attribute's whole value replaces it, and the clear doesn't remove
- * it; an `ADD` to one starts from nothing, so it's sent as that `SET`; a `REMOVE` of one is the
- * clear's own, and one below it, or a `DELETE` from it, is left out, the clear removing all of it.
- * Anything else reads the cleared value or writes below it (`.subtract()`, `.append()`, a path
- * operation), and there's nothing left for it: the update is refused (the reason returned), where
- * DynamoDB refused the overlapping request 1.40.0 sent. Updates the clause lists and `cleared` in
- * place.
+ * An update's clauses against the entries its `.clearMap()` removes, the one place that decides
+ * what any other write to a cleared map does (#238). `cleared`: the attributes the clear's read
+ * found of the map, which it removes; `inside`: the entries a renamed map's attribute held whole
+ * (`counts#a` for `sr.a`), which it removes with that attribute. The clear comes first, so an
+ * entry either held is gone when the rest of the update runs, and the request names no path twice:
+ *
+ * - a `SET` of its whole value replaces it (the clear doesn't remove it); one to
+ *   `if_not_exists(entry, v)` finds nothing, and is sent as `SET entry = v`;
+ * - an `ADD` to it starts from nothing, sent as that `SET` where the clear removes the attribute;
+ * - a `REMOVE` of it is the clear's own, and a `REMOVE` below it or a `DELETE` from it is left out:
+ *   nothing is left to remove;
+ * - anything else reads its value or writes below it (`.subtract()`, `.append()`, a `SET` or
+ *   `ADD` below it, a `DELETE` below it), and there's nothing left for it: the update is refused
+ *   (the reason returned), before anything is sent. 1.40.0 sent each, and DynamoDB refused it
+ *   (two paths overlapping, or an operand or a path naming nothing).
+ *
+ * An entry neither held, and a copy reading an entry into another (whose operand, like every
+ * operand in the request, reads the row as it was), are sent as they are. Updates the clause
+ * lists, `cleared`, and the names and values a clause left out no longer uses, in place.
  */
 const clearedOverlap = (
   cleared: Set<string>,
+  inside: ReadonlySet<string>,
   names: globalThis.Record<string, string>,
+  values: globalThis.Record<string, AttributeValue>,
   setClauses: Array<string>,
   addClauses: Array<string>,
   deleteClauses: Array<string>,
@@ -679,6 +691,7 @@ const clearedOverlap = (
     token.startsWith("#") && Object.hasOwn(names, token) ? names[token]! : token
   const headOf = (path: string) => named(path.split(/[.[]/)[0]!)
   const whole = (path: string) => !/[.[]/.test(path)
+  const held = (head: string) => cleared.has(head) || inside.has(head)
   const mentions = (text: string, attribute: string) =>
     (text.match(/#[A-Za-z0-9_]+/g) ?? []).some((token) => named(token) === attribute)
   const refusal = (attribute: string) =>
@@ -687,19 +700,28 @@ const clearedOverlap = (
     `Write the entry's new value with .set(), or update without clearing. Nothing was written. ` +
     `[EDD-9151]`
   const replaced = new Set<string>()
-  for (const clause of setClauses) {
+  const leftOut: Array<string> = []
+  for (const [i, clause] of setClauses.entries()) {
     const at = clause.indexOf(" = ")
     const path = clause.slice(0, at).trim()
     const head = headOf(path)
-    if (!cleared.has(head)) continue
-    if (!whole(path) || mentions(clause.slice(at + 3), head)) return refusal(head)
+    if (!held(head)) continue
+    const value = clause.slice(at + 3).trim()
+    const found = value.startsWith(`if_not_exists(${path}, `) && value.endsWith(")")
+    const otherwise = found ? value.slice(`if_not_exists(${path}, `.length, -1).trim() : undefined
+    if (whole(path) && otherwise !== undefined && !mentions(otherwise, head)) {
+      setClauses[i] = `${path} = ${otherwise}`
+    } else if (!whole(path) || mentions(value, head)) {
+      return refusal(head)
+    }
     replaced.add(head)
   }
   for (const [i, clause] of [...addClauses.entries()].reverse()) {
     const [path, value] = clause.trim().split(/\s+/) as [string, string]
     const head = headOf(path)
-    if (!cleared.has(head)) continue
+    if (!held(head)) continue
     if (!whole(path)) return refusal(head)
+    if (!cleared.has(head)) continue
     addClauses.splice(i, 1)
     setClauses.push(`${path} = ${value}`)
     replaced.add(head)
@@ -707,17 +729,24 @@ const clearedOverlap = (
   for (const [i, clause] of [...deleteClauses.entries()].reverse()) {
     const path = clause.trim().split(/\s+/)[0]!
     const head = headOf(path)
-    if (!cleared.has(head)) continue
+    if (!held(head)) continue
     if (!whole(path)) return refusal(head)
-    deleteClauses.splice(i, 1)
+    leftOut.push(...deleteClauses.splice(i, 1))
   }
   for (const [i, path] of [...removeClauses.entries()].reverse()) {
     const head = headOf(path.trim())
-    if (!cleared.has(head)) continue
+    if (!held(head)) continue
     if (whole(path.trim())) replaced.add(head)
-    else removeClauses.splice(i, 1)
+    else leftOut.push(...removeClauses.splice(i, 1))
   }
   for (const head of replaced) cleared.delete(head)
+  // DynamoDB refuses a name or a value no expression uses.
+  const kept = [...setClauses, ...addClauses, ...deleteClauses, ...removeClauses].join(" ")
+  for (const token of new Set(leftOut.join(" ").match(/[#:][A-Za-z0-9_]+/g) ?? [])) {
+    if (new RegExp(`${token}(?![A-Za-z0-9_])`).test(kept)) continue
+    if (token.startsWith("#")) delete names[token]
+    else delete values[token]
+  }
   return undefined
 }
 
@@ -11068,15 +11097,27 @@ const makeImpl = <
       // `field:` rename stores whole, the attribute it holds it in (#238).
       if (clearRead !== undefined) {
         const cleared = new Set<string>()
+        // The entries a renamed map's attribute holds whole, which the clear removes with it.
+        const inside = new Set<string>()
         for (const field of uState.sparseClearFields ?? []) {
           for (const attrName of Object.keys(clearRead)) {
             if (sparseMapOf(attrName) === field) cleared.add(attrName)
+          }
+          const attribute = renamedMapAttribute(field)
+          const map =
+            attribute !== undefined && Object.hasOwn(clearRead, attribute)
+              ? clearRead[attribute]!.M
+              : undefined
+          for (const key of Object.keys(map ?? {})) {
+            inside.add(`${sparseFields[field]!.prefix}#${key}`)
           }
         }
         // The clear comes first, and one request never names a path twice (#238).
         const overlap = clearedOverlap(
           cleared,
+          inside,
           names,
+          values,
           setClauses,
           addClauses,
           deleteClauses,
