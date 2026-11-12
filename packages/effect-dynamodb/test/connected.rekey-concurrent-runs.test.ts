@@ -4,9 +4,12 @@
  * `escapeKeys` setting are rekeyed to the other by two or three runs at once, then by one more, and
  * must end where one run over the same rows ends, with no unique sentinel naming a key its row
  * left. A run releasing orphans then releases nothing, and a new item taking any value a row holds
- * is refused. The table two 1.40.0 runs at once left (`fixtures/rekey-two-runs-1.40.0.json`) is
- * repaired by one run. Here the runs' requests interleave as DynamoDB Local answers them, and a
- * transaction touching an item another one is writing is cancelled as DynamoDB cancels it.
+ * is refused. No sentinel names a key its row left right after the runs at once either, before
+ * any later run could repair one. The table two 1.40.0 runs at once left
+ * (`fixtures/rekey-two-runs-1.40.0.json`) is repaired by one run. A sentinel brought to a row that
+ * stays, the row given another value meanwhile, is left where it was. Here the runs' requests
+ * interleave as DynamoDB Local answers them, and a transaction touching an item another one is
+ * writing is cancelled as DynamoDB cancels it.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -16,10 +19,11 @@
 import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
-import { Config, Effect } from "effect"
+import { Config, Effect, Layer } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import type * as Table from "../src/Table.js"
+import { type Around, gatedClient } from "./helpers/GatedClient.js"
 import {
   type Row,
   randomWorld,
@@ -93,7 +97,10 @@ const scanAll = (name: string) =>
     return rows
   })
 
-/** `runs` started together over `rows` under `escapeKeys`: the rows they leave. */
+/**
+ * Each group of `runs` started together over `rows` under `escapeKeys`, one group after another:
+ * the rows each group leaves.
+ */
 const leftBy = (
   escapeKeys: boolean,
   rows: ReadonlyArray<Row>,
@@ -101,8 +108,12 @@ const leftBy = (
 ) =>
   withTable(rows, (name) =>
     Effect.gen(function* () {
-      for (const together of runs) yield* rekeyRunsOn(escapeKeys, ClientLayer, name, together)
-      return yield* scanAll(name)
+      const left: Array<ReadonlyArray<Row>> = []
+      for (const together of runs) {
+        yield* rekeyRunsOn(escapeKeys, ClientLayer, name, together)
+        left.push(yield* scanAll(name))
+      }
+      return left
     }),
   )
 
@@ -136,12 +147,17 @@ describeConnected("rekey runs started together on DynamoDB Local", () => {
           () =>
             Effect.gen(function* () {
               const rows = yield* writeRandom(!escapeKeys, seed)
-              const alone = yield* leftBy(escapeKeys, rows, [[RUNS[0]]])
+              const [alone] = yield* leftBy(escapeKeys, rows, [[RUNS[0]]])
               // What a conflict left, one run alone takes.
-              const left = yield* leftBy(escapeKeys, rows, [RUNS.slice(0, together), [RUNS[0]]])
-              expect(strayed(left)).toEqual([])
-              expect(storedRows(left)).toEqual(storedRows(alone))
-              const after = yield* valuesStillReserved(escapeKeys, left)
+              const [atOnce, left] = yield* leftBy(escapeKeys, rows, [
+                RUNS.slice(0, together),
+                [RUNS[0]],
+              ])
+              // Before any later run could repair one, no sentinel names a key its row left.
+              expect(strayed(atOnce!)).toEqual([])
+              expect(strayed(left!)).toEqual([])
+              expect(storedRows(left!)).toEqual(storedRows(alone!))
+              const after = yield* valuesStillReserved(escapeKeys, left!)
               expect(after.reservations).toMatchObject({ orphaned: 0, released: 0, undecided: 0 })
               expect(after.accepted).toEqual([])
             }),
@@ -160,13 +176,62 @@ describeConnected("rekey runs started together on DynamoDB Local", () => {
         readFileSync(new URL("./fixtures/rekey-two-runs-1.40.0.json", import.meta.url), "utf8"),
       )
       expect(strayed(fixture.leftBy140)).toHaveLength(1)
-      const alone = yield* leftBy(false, fixture.written, [[RUNS[0]]])
-      const left = yield* leftBy(false, fixture.leftBy140, [[RUNS[0]]])
-      expect(strayed(left)).toEqual([])
-      expect(storedRows(left)).toEqual(storedRows(alone))
-      const after = yield* valuesStillReserved(false, left)
+      const [alone] = yield* leftBy(false, fixture.written, [[RUNS[0]]])
+      const [left] = yield* leftBy(false, fixture.leftBy140, [[RUNS[0]]])
+      expect(strayed(left!)).toEqual([])
+      expect(storedRows(left!)).toEqual(storedRows(alone!))
+      const after = yield* valuesStillReserved(false, left!)
       expect(after.reservations).toMatchObject({ orphaned: 0, released: 0, undecided: 0 })
       expect(after.accepted).toEqual([])
     }),
+  )
+
+  it.live(
+    "leaves a sentinel where it was when an update gives its row another value meanwhile",
+    () =>
+      withTable([], (name) =>
+        Effect.gen(function* () {
+          const off = randomWorld(false)
+          const on = randomWorld(true)
+          // The id's key text is the same both ways, so the row stays; its email's isn't.
+          yield* Effect.gen(function* () {
+            const db = yield* off.client
+            yield* db.entities.Members.put({ id: "plain", email: "a b", nick: "n" }).asEffect()
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, off.MainTable.layer({ name }))))
+          const update = Effect.gen(function* () {
+            const db = yield* on.client
+            yield* db.entities.Members.update({ id: "plain" }).set({ email: "c d" }).asEffect()
+          }).pipe(Effect.provide(Layer.merge(ClientLayer, on.MainTable.layer({ name }))))
+          let raced = false
+          const around: Around = (command, input, send) => {
+            const brings =
+              command === "transactWriteItems" &&
+              ((input as any).TransactItems ?? []).some(
+                (item: any) => item.Put?.Item?.pk?.S === "$fz#v1#member.email#a%20b",
+              )
+            if (raced || !brings) return send
+            raced = true
+            return Effect.andThen(update, send)
+          }
+          const gated = Layer.effect(
+            DynamoClient,
+            Effect.gen(function* () {
+              return gatedClient(yield* DynamoClient, around)
+            }),
+          ).pipe(Layer.provide(ClientLayer))
+          const [report] = yield* rekeyRunsOn(true, gated, name, [{}])
+          expect(raced).toBe(true)
+          expect(report!.conflicts).toEqual([])
+          const sentinels = (yield* scanAll(name))
+            .filter((row) => row.__edd_e__?.S === "Member._unique.email")
+            .map((row) => row.pk?.S)
+            .sort()
+          expect(sentinels).toEqual(["$fz#v1#member.email#a b", "$fz#v1#member.email#c%20d"])
+          const take = (value: string, n: number) =>
+            takeValueOn(true, ClientLayer, name, { member: "Members", value: `email:${value}` }, n)
+          expect(yield* take("a b", 1)).toBe("accepted")
+          expect(yield* take("c d", 2)).toBe("refused")
+        }),
+      ),
   )
 })
