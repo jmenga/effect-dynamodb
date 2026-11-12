@@ -21,10 +21,11 @@
  * them, and so is every write naming no entry. A plain `upsert` carries the same guard as an unread
  * update (`RenamedSparseMapWrites.ts`). `fixtures/renamed-sparse-map-1.40.0.json` holds what the published
  * 1.40.0 did in each case, every request whole (identical under `escapeKeys`); every case where
- * 1.40.0 left the map as the operation meant to leave it leaves the same rows here. Where the head
- * sends what 1.40.0 didn't, it differs only in the fields `REQUEST_FIELDS` names: a request's
- * expressions and the names and values they map (and a retained snapshot's map, which 1.40.0
- * emptied), or a request as a whole; never a key, a table or what a write returns.
+ * 1.40.0 left the map as the operation meant to leave it leaves the same rows here. Each case names
+ * the exact paths at which its requests differ from 1.40.0's (`expectedDifference`): a request's
+ * expressions and the placeholders they map (and a retained snapshot's map, which 1.40.0 emptied),
+ * or a request as a whole; never a key, a table or what a write returns. A case naming none sends
+ * what 1.40.0 sent.
  *
  * A read (`get`, a scan's filter or select) takes the map from whichever form the row holds:
  * 1.40.0's filter or select of `t.counts.a` named `counts.a` (no row holds it) and its `.entry()`
@@ -44,7 +45,7 @@ import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
-import { differingPaths } from "./WholeDiff.js"
+import { expectDiffersOnly } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: any
@@ -90,9 +91,18 @@ const entry = (key: string) =>
     .segments as ReadonlyArray<string>
 
 type Update = any
+/** The placeholders a condition on `t.counts.a` maps other than 1.40.0 did: it asks both forms. */
+const BY_PATH = ["#e1", "#e2", "#e4", "#e5", ":e2", ":e3", ":e6"]
+/** The placeholders a comparison of `t.counts.entry("a")` maps other than 1.40.0 did. */
+const BY_ENTRY = ["#e0", "#e1", "#e2", "#e4", "#e5", ":e1", ":e3", ":e6"]
+/** The placeholders an `exists` or `notExists` of an entry maps other than 1.40.0 did. */
+const EXISTS = ["#e0", "#e1", "#e2", "#e3", "#e4"]
+
 /**
  * Each update, with the map it leaves on a row holding `{ a: 1 }` (`undefined`: the row as it was;
- * `"refused"`: refused before sending, as 1.40.0 refused it), and whether it names an entry.
+ * `"refused"`: refused before sending, as 1.40.0 refused it), whether it names an entry, and the
+ * placeholders (`#name`, `:value`) it maps other than 1.40.0 did where it writes into `sr` (a
+ * condition: wherever it's sent).
  */
 const writes: ReadonlyArray<
   readonly [
@@ -100,89 +110,132 @@ const writes: ReadonlyArray<
     op: (u: Update) => Update,
     leaves: Record<string, number> | undefined | "refused" | "fails",
     namesEntry: boolean,
+    mapped: ReadonlyArray<string>,
   ]
 > = [
-  [".set({ counts: { b: 2 } })", (u) => u.set({ counts: { b: 2 } }), { a: 1, b: 2 }, true],
-  [".set({ counts: { a: 5 } })", (u) => u.set({ counts: { a: 5 } }), { a: 5 }, true],
-  [".add({ 'counts#a': 1 })", (u) => u.add({ "counts#a": 1 }), { a: 2 }, true],
-  [".subtract({ 'counts#a': 1 })", (u) => u.subtract({ "counts#a": 1 }), { a: 0 }, true],
-  [".removeEntries('counts', ['a'])", (u) => u.removeEntries("counts", ["a"]), {}, true],
-  [".clearMap('counts')", (u) => u.clearMap("counts"), {}, true],
+  [
+    ".set({ counts: { b: 2 } })",
+    (u) => u.set({ counts: { b: 2 } }),
+    { a: 1, b: 2 },
+    true,
+    ["#m0", "#m1", "#u0"],
+  ],
+  [
+    ".set({ counts: { a: 5 } })",
+    (u) => u.set({ counts: { a: 5 } }),
+    { a: 5 },
+    true,
+    ["#m0", "#m1", "#u0"],
+  ],
+  [
+    ".add({ 'counts#a': 1 })",
+    (u) => u.add({ "counts#a": 1 }),
+    { a: 2 },
+    true,
+    ["#a0", "#m0", "#m1"],
+  ],
+  [
+    ".subtract({ 'counts#a': 1 })",
+    (u) => u.subtract({ "counts#a": 1 }),
+    { a: 0 },
+    true,
+    ["#m0", "#m1", "#u0"],
+  ],
+  [
+    ".removeEntries('counts', ['a'])",
+    (u) => u.removeEntries("counts", ["a"]),
+    {},
+    true,
+    ["#m0", "#m1", "#sr0"],
+  ],
+  [".clearMap('counts')", (u) => u.clearMap("counts"), {}, true, []],
   [
     "pathSet(['counts#b'], 2)",
     (u) => u.pathSet({ segments: ["counts#b"], value: 2, isPath: false }),
     { a: 1, b: 2 },
     true,
+    ["#ps0", "#ps1", ":ps1", ":ps2"],
   ],
   [
     "pathAdd(['counts#a'], 1)",
     (u) => u.pathAdd({ segments: ["counts#a"], value: 1 }),
     { a: 2 },
     true,
+    ["#pad0", "#pad1", ":pad1", ":pad2"],
   ],
   [
     "pathSubtract(['counts#a'], 1)",
     (u) => u.pathSubtract({ segments: ["counts#a"], value: 1, isPath: false }),
     { a: 0 },
     true,
+    ["#psb0", "#psb1", ":psb1", ":psb2"],
   ],
   [
     "pathIfNotExists(['counts#b'], 2)",
     (u) => u.pathIfNotExists({ segments: ["counts#b"], value: 2 }),
     { a: 1, b: 2 },
     true,
+    ["#pi0", "#pi1", ":pi1", ":pi2"],
   ],
   [
     "pathSet of counts.entry('b'), 2",
     (u) => u.pathSet({ segments: entry("b"), value: 2, isPath: false }),
     { a: 1, b: 2 },
     true,
+    ["#ps0", "#ps1", ":ps1", ":ps2"],
   ],
   [
     "pathAdd of counts.entry('a'), 1",
     (u) => u.pathAdd({ segments: entry("a"), value: 1 }),
     { a: 2 },
     true,
+    ["#pad0", "#pad1", ":pad1", ":pad2"],
   ],
   [
     "pathSet(['counts', 'a'], 5)",
     (u) => u.pathSet({ segments: ["counts", "a"], value: 5, isPath: false }),
     "refused",
     false,
+    [],
   ],
-  ["pathRemove(['counts#a'])", (u) => u.pathRemove(["counts#a"]), "refused", false],
-  ["pathRemove of counts.entry('a')", (u) => u.pathRemove(entry("a")), "refused", false],
-  [".set({ 'counts#b': 2 })", (u) => u.set({ "counts#b": 2 }), undefined, false],
-  [".set({ note: 'n' })", (u) => u.set({ note: "n" }), { a: 1 }, false],
+  ["pathRemove(['counts#a'])", (u) => u.pathRemove(["counts#a"]), "refused", false, []],
+  ["pathRemove of counts.entry('a')", (u) => u.pathRemove(entry("a")), "refused", false, []],
+  [".set({ 'counts#b': 2 })", (u) => u.set({ "counts#b": 2 }), undefined, false, []],
+  [".set({ note: 'n' })", (u) => u.set({ note: "n" }), { a: 1 }, false, []],
   [
     "condition eq(t.counts.a, 1), which holds",
     (u) => u.set({ note: "n" }).condition((t: any, { eq }: any) => eq(t.counts.a, 1)),
     { a: 1 },
     true,
+    BY_PATH,
   ],
   [
     "condition eq(t.counts.a, 9), which doesn't hold",
     (u) => u.set({ note: "n" }).condition((t: any, { eq }: any) => eq(t.counts.a, 9)),
     "fails",
     true,
+    BY_PATH,
   ],
   [
     "condition eq(t.counts.entry('a'), 1), which holds",
     (u) => u.set({ note: "n" }).condition((t: any, { eq }: any) => eq(t.counts.entry("a"), 1)),
     { a: 1 },
     true,
+    BY_ENTRY,
   ],
   [
     "condition exists(t.counts.entry('a'))",
     (u) => u.set({ note: "n" }).condition((t: any, { exists }: any) => exists(t.counts.entry("a"))),
     { a: 1 },
     true,
+    EXISTS,
   ],
   [
     "condition eq(t.counts.entry('a'), 9), which doesn't hold",
     (u) => u.set({ note: "n" }).condition((t: any, { eq }: any) => eq(t.counts.entry("a"), 9)),
     "fails",
     true,
+    BY_ENTRY,
   ],
   [
     "condition notExists(t.counts.entry('b'))",
@@ -192,6 +245,7 @@ const writes: ReadonlyArray<
         .condition((t: any, { notExists }: any) => notExists(t.counts.entry("b"))),
     { a: 1 },
     true,
+    EXISTS,
   ],
 ]
 
@@ -289,21 +343,79 @@ const runCase = (
     )
   })
 
-/**
- * The fields of a request the head may send other than 1.40.0 did, each as a pattern of the path
- * `differingPaths` names: the expressions, the names and values they map, the row a refusal
- * returns, a retained snapshot's map (`snapshotsKept`), and a request as a whole (one the head
- * sends that 1.40.0 didn't, or the reverse).
- */
-const REQUEST_FIELDS =
-  /^\[\d+\](\.\w+)?$|^\[\d+\]\.\w+(\.TransactItems\[\d+\]\.\w+)?\.(UpdateExpression|ConditionExpression|FilterExpression|ProjectionExpression|ReturnValuesOnConditionCheckFailure|ExpressionAttributeNames\.#\w+|ExpressionAttributeValues\.:\w+|Item\.sr(\..*)?)$/
+/** The update an unread write sends, first. */
+const UNREAD = "[0].updateItem"
+/** The update a write that read the row sends, after the read: in a transaction, as a retained one. */
+const HELD = "[1].transactWriteItems.TransactItems[0].Update"
 
-/** Every field in which `got`'s requests differ from `was`'s is one {@link REQUEST_FIELDS} names. */
-export const expectRequestFieldsOnly = (
+/** The fields of `request` an expression and its placeholders (`#name`, `:value`) take. */
+const fieldsOf = (request: string, expression: string, placeholders: ReadonlyArray<string>) => [
+  `${request}.${expression}`,
+  ...placeholders.map(
+    (held) =>
+      `${request}.${held.startsWith("#") ? "ExpressionAttributeNames" : "ExpressionAttributeValues"}.${held}`,
+  ),
+]
+
+/**
+ * The paths at which a case's requests differ from 1.40.0's, exactly; none where the head sends
+ * what 1.40.0 sent.
+ *
+ * - A write naming no entry, or one refused before sending as 1.40.0 refused it: none.
+ * - A condition on an entry: its expression and the placeholders it maps (it asks both forms).
+ * - An unread write of an entry: its condition and `#fm0` (the guard `attribute_not_exists(sr)`).
+ * - A write that read the row, of an entry on a row holding entries: the same guard.
+ * - Of an entry on a row holding `sr`: the guard, the update expression and the placeholders the
+ *   write into `sr` maps. A retained entity's record operations (`.set`, `.add`, `.subtract`)
+ *   write the map whole, as 1.40.0 did, so they send what it sent, but for the version snapshot
+ *   `.removeEntries()` no longer empties. Where 1.40.0's write failed and the head's succeeds, a
+ *   retained update goes on to read the item back (`[2]`).
+ * - A `clearMap` on a row holding `sr` (not retained): its write (`[1]`), where 1.40.0 found no
+ *   entry to remove and read the item back.
+ */
+const expectedDifference = (
+  entity: string,
+  holdsWhole: boolean,
+  inTransaction: boolean,
+  [label, , leaves, namesEntry, mapped]: (typeof writes)[number],
+  was: Captured,
+): ReadonlyArray<string> => {
+  if (leaves === "refused" || leaves === undefined || !namesEntry) return []
+  const unread = !inTransaction && entity !== "Retained" && label !== ".clearMap('counts')"
+  if (label.startsWith("condition")) {
+    return fieldsOf(unread ? UNREAD : HELD, "ConditionExpression", mapped)
+  }
+  if (label === ".clearMap('counts')") {
+    return holdsWhole && entity !== "Retained"
+      ? ["[1].getItem", inTransaction ? "[1].transactWriteItems" : "[1].updateItem"]
+      : []
+  }
+  if (unread || !holdsWhole) {
+    return fieldsOf(unread ? UNREAD : HELD, "ConditionExpression", ["#fm0"])
+  }
+  if (entity === "Retained" && label.startsWith(".")) {
+    return label.startsWith(".removeEntries")
+      ? ["[1].transactWriteItems.TransactItems[1].Put.Item.sr.M.a"]
+      : []
+  }
+  return [
+    ...fieldsOf(HELD, "ConditionExpression", ["#fm0", ...mapped]),
+    `${HELD}.UpdateExpression`,
+    ...(entity === "Retained" && !inTransaction && was.outcome.fail !== undefined ? ["[2]"] : []),
+  ]
+}
+
+/**
+ * `got`'s requests differ from `was`'s at exactly the paths `named`, and equal them where it names
+ * none.
+ */
+const expectRequestsDifferAt = (
   was: ReadonlyArray<unknown>,
   got: ReadonlyArray<unknown>,
+  named: ReadonlyArray<string>,
 ) => {
-  for (const path of differingPaths(was, got)) expect(path).toMatch(REQUEST_FIELDS)
+  if (named.length === 0) expect(got).toEqual(was)
+  else expectDiffersOnly(was, got, named)
 }
 
 /** The commands a case sent, in order. */
@@ -354,7 +466,8 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
       const on = `${entity}, a row ${form} created`
       // Retained and unique upserts store the map whole too.
       const holdsWhole = form === "put" || entity !== "Plain"
-      for (const [label, op, leaves, namesEntry] of writes) {
+      for (const write of writes) {
+        const [label, op, leaves, namesEntry] = write
         for (const inTransaction of [false, true]) {
           const name = `${on}: ${label}${inTransaction ? ", in a transaction" : ""}`
           const was = fixture.cases[name]!
@@ -378,7 +491,12 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
                   return inTransaction ? Transaction.transactWrite([update]) : update.asEffect()
                 })
                 const { captured } = got
-                expectRequestFieldsOnly(was.sent, captured.sent)
+                const difference = expectedDifference(entity, holdsWhole, inTransaction, write, was)
+                expectRequestsDifferAt(was.sent, captured.sent, difference)
+                if (difference.includes("[2]")) {
+                  // The read back of a retained update whose write 1.40.0 failed.
+                  expect(commands(captured.sent)).toEqual([...commands(was.sent), "getItem"])
+                }
                 if (leaves === "refused") {
                   // Refused before sending, as 1.40.0 refused it.
                   expect(captured.outcome).toEqual(was.outcome)
@@ -470,12 +588,18 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
               return
             }
             expect(captured).toEqual(guardedUpsert(fixture.cases[name]!, before, says, holdsWhole))
-            expectRequestFieldsOnly(fixture.cases[name]!.sent, captured.sent)
+            expectRequestsDifferAt(
+              fixture.cases[name]!.sent,
+              captured.sent,
+              fieldsOf(UNREAD, "ConditionExpression", ["#fm0"]).concat(
+                `${UNREAD}.ReturnValuesOnConditionCheckFailure`,
+              ),
+            )
           }),
         )
       }
       if (entity !== "Plain") continue
-      for (const [label, body, outcome] of reads) {
+      for (const [label, body, outcome, differs] of reads) {
         const name = `${on}: ${label}`
         const was = fixture.cases[name]!
         const same = JSON.stringify(was.outcome) === JSON.stringify(outcome)
@@ -491,7 +615,7 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
               expect(captured.read).toEqual(was.read)
               expect(captured.rows).toEqual(was.rows)
               if (label === "get") expect(captured).toEqual(was)
-              expectRequestFieldsOnly(was.sent, captured.sent)
+              expectRequestsDifferAt(was.sent, captured.sent, differs)
             }),
         )
       }
@@ -499,15 +623,25 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
   }
 }
 
-/** Reads of the map on `Plain`, each with what it returns from a row holding `{ a: 1 }`. */
+const SCAN = "[0].scan"
+/** A scan whose filter on `t.counts.a` asks both forms: the filter and the placeholders it maps. */
+const FILTER_BY_PATH = fieldsOf(SCAN, "FilterExpression", BY_PATH)
+/** 1.40.0 threw before sending (`.entry()` outside a write), so the head's scan is all new. */
+const SENT_NEW = ["[0]"]
+
+/**
+ * Reads of the map on `Plain`, each with what it returns from a row holding `{ a: 1 }` and the paths
+ * at which its requests differ from 1.40.0's.
+ */
 const reads: ReadonlyArray<
   readonly [
     label: string,
     body: (db: any) => Effect.Effect<unknown, unknown, any>,
     outcome: unknown,
+    differs: ReadonlyArray<string>,
   ]
 > = [
-  ["get", (db) => db.entities.Plain.get({ id: "a" }), { ok: { id: "a", counts: { a: 1 } } }],
+  ["get", (db) => db.entities.Plain.get({ id: "a" }), { ok: { id: "a", counts: { a: 1 } } }, []],
   [
     "scan filter eq(t.counts.a, 1)",
     (db) =>
@@ -515,6 +649,7 @@ const reads: ReadonlyArray<
         .filter((t: any, { eq }: any) => eq(t.counts.a, 1))
         .collect(),
     { ok: [{ id: "a", counts: { a: 1 } }] },
+    FILTER_BY_PATH,
   ],
   [
     "scan filter eq(t.counts.entry('a'), 1)",
@@ -523,6 +658,7 @@ const reads: ReadonlyArray<
         .filter((t: any, { eq }: any) => eq(t.counts.entry("a"), 1))
         .collect(),
     { ok: [{ id: "a", counts: { a: 1 } }] },
+    SENT_NEW,
   ],
   [
     "scan filter eq(t.counts.a, 9)",
@@ -531,6 +667,7 @@ const reads: ReadonlyArray<
         .filter((t: any, { eq }: any) => eq(t.counts.a, 9))
         .collect(),
     { ok: [] },
+    FILTER_BY_PATH,
   ],
   [
     "scan filter notExists(t.counts.entry('b'))",
@@ -539,6 +676,7 @@ const reads: ReadonlyArray<
         .filter((t: any, { notExists }: any) => notExists(t.counts.entry("b")))
         .collect(),
     { ok: [{ id: "a", counts: { a: 1 } }] },
+    SENT_NEW,
   ],
   [
     "scan select((t) => [t.counts.entry('a'), t.note])",
@@ -547,11 +685,13 @@ const reads: ReadonlyArray<
         .select((t: any) => [t.counts.entry("a"), t.note])
         .collect(),
     { ok: [{ counts: { a: 1 } }] },
+    SENT_NEW,
   ],
   [
     "scan select(['counts'])",
     (db) => db.entities.Plain.scan().select(["counts"]).collect(),
     { ok: [{ counts: { a: 1 } }] },
+    fieldsOf(SCAN, "ProjectionExpression", ["#proj0"]),
   ],
   [
     "scan select((t) => [t.counts.a])",
@@ -560,6 +700,7 @@ const reads: ReadonlyArray<
         .select((t: any) => [t.counts.a])
         .collect(),
     { ok: [{ counts: { a: 1 } }] },
+    fieldsOf(SCAN, "ProjectionExpression", ["#proj0", "#proj1"]),
   ],
   [
     "scan select((t) => [t.counts.entry('a')])",
@@ -568,5 +709,6 @@ const reads: ReadonlyArray<
         .select((t: any) => [t.counts.entry("a")])
         .collect(),
     { ok: [{ counts: { a: 1 } }] },
+    SENT_NEW,
   ],
 ]
