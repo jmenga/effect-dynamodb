@@ -1778,16 +1778,15 @@ export const sharedPartitionSuite = (backend: Backend) => {
           db.aggregates.A.update({ id: "p" }, ({ state }: any) => ({ ...state, lines: [] })),
         )
         const expected = atForeign(scenario, "remove a")
+        expect(done.result).toEqual(expected.result)
         expect(done.requests).toEqual(named(expected.requests))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(done.rows).toContainEqual(created.find(lineOf("a")))
-        // 1.39.0 and 1.40.0 returned the state as mutated; a get after it reads A's row, which
-        // stays, and the update now returns what that get reads (DESIGN.md §11 "What `update`
-        // returns").
+        // The update returns the state as mutated, as 1.39.0 and 1.40.0 did; a get after it reads
+        // A's row, which stays (a difference DESIGN.md §11 "What `update` returns" lists, not changed).
         const after = yield* w.step((db) => db.aggregates.A.get({ id: "p" }))
         expect((after.result as any).ok.lines).toHaveLength(1)
-        expect((expected.result as any).ok.lines).toEqual([])
-        expect(done.result).toEqual(after.result)
+        expect((done.result as any).ok.lines).toEqual([])
         yield* w.opened.close
       }),
     )
@@ -1801,17 +1800,11 @@ export const sharedPartitionSuite = (backend: Backend) => {
           w.hooks.before = undefined
           return w.opened.put(taken)
         }
-        const before = yield* w.step((db) => db.aggregates.A.get({ id: "p" }))
         const done = yield* w.step((db) =>
           db.aggregates.A.update({ id: "p" }, ({ state }: any) => ({ ...state, lines: [] })),
         )
         const expected = atForeign(scenario, "race remove a")
-        // What a get right after the update would read had nothing else written: A's row stays,
-        // as read (B's replaced it in between). 1.39.0 returned the state as mutated.
-        expect((expected.result as any).ok.lines).toEqual([])
-        expect(done.result).toEqual({
-          ok: { ...(expected.result as any).ok, lines: (before.result as any).ok.lines },
-        })
+        expect(done.result).toEqual(expected.result)
         expect(done.requests).toEqual(named(expected.requests))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(done.rows).toContainEqual(taken)
@@ -1982,16 +1975,15 @@ export const sharedPartitionSuite = (backend: Backend) => {
             db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
           )
           const expected = atClaimed(scenario, "remove a")
+          expect(done.result).toEqual(expected.result)
           expect(done.requests).toEqual(named(expected.requests))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(done.rows.map((row) => row.sk?.S)).toContain(lineKey)
-          // 1.39.0 and 1.40.0 returned the state as mutated; a get after it reads A's row, which
-          // stays, and the update now returns what that get reads (DESIGN.md §11 "What `update`
-          // returns").
+          // The update returns the state as mutated, as 1.39.0 and 1.40.0 did; a get after it
+          // reads A's row, which stays (a difference DESIGN.md §11 "What `update` returns" lists, not changed).
           const after = yield* w.step((db) => db.aggregates.A.get({ id: "p q" }))
           expect((after.result as any).ok.lines).toHaveLength(1)
-          expect((expected.result as any).ok.lines).toEqual([])
-          expect(done.result).toEqual(after.result)
+          expect((done.result as any).ok.lines).toEqual([])
           yield* w.opened.close
         }),
       )
@@ -2009,17 +2001,11 @@ export const sharedPartitionSuite = (backend: Backend) => {
               w.hooks.before = undefined
               return w.opened.put(taken)
             }
-            const before = yield* w.step((db) => db.aggregates.A.get({ id: "p q" }))
             const done = yield* w.step((db) =>
               db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
             )
             const expected = atClaimed(scenario, "race remove a")
-            // What a get right after the update would read had nothing else written: A's row
-            // stays, as read (B's replaced it in between). 1.39.0 returned the state as mutated.
-            expect((expected.result as any).ok.lines).toEqual([])
-            expect(done.result).toEqual({
-              ok: { ...(expected.result as any).ok, lines: (before.result as any).ok.lines },
-            })
+            expect(done.result).toEqual(expected.result)
             expect(done.requests).toEqual(named(expected.requests))
             expect(done.rows).toEqual(byKey(expected.rows))
             expect(done.rows).toContainEqual(taken)
