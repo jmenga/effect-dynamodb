@@ -341,40 +341,44 @@ describe.each([
   ["to off", false],
 ] as const)("rekey finishes a dense table in one run, %s", (_direction, escapeKeys) => {
   for (let block = 0; block < 8; block++) {
-    it.effect(`seeds ${block * 50 + 1}–${block * 50 + 50}`, () =>
-      Effect.gen(function* () {
-        for (let seed = block * 50 + 1; seed <= block * 50 + 50; seed++) {
-          const rows = yield* written(seed, !escapeKeys)
-          const serial = yield* runs(
-            rows,
-            escapeKeys,
-            { segments: 1, concurrency: 1, pageSize: 100 },
-            0,
-          )
-          const shuffled = yield* runs(
-            rows,
-            escapeKeys,
-            { segments: 3, concurrency: 4, pageSize: 2 },
-            seed,
-          )
-          for (const [order, r] of [
-            ["in order", serial],
-            ["shuffled", shuffled],
-          ] as const) {
-            const at = `seed ${seed}, ${order}`
-            expect(r.untouched, at).toEqual(storedRows(rows))
-            expect(decided(r.dry), at).toEqual(decided(r.real))
-            expect(r.real.conflicts, at).toEqual([])
-            expect(r.real.scanned, at).toBe(rows.length)
-            expect(r.again.moved, at).toEqual(ZERO)
-            expect(r.again.sentinelsMoved, at).toBe(0)
-            expect(r.again.conflicts, at).toEqual([])
-            expect(contentOf(r.after), at).toEqual(contentOf(rows))
-            expect(misplacedSentinels(r.after, escapeKeys), at).toEqual([])
+    it.effect(
+      `seeds ${block * 50 + 1}–${block * 50 + 50}`,
+      () =>
+        Effect.gen(function* () {
+          for (let seed = block * 50 + 1; seed <= block * 50 + 50; seed++) {
+            const rows = yield* written(seed, !escapeKeys)
+            const serial = yield* runs(
+              rows,
+              escapeKeys,
+              { segments: 1, concurrency: 1, pageSize: 100 },
+              0,
+            )
+            const shuffled = yield* runs(
+              rows,
+              escapeKeys,
+              { segments: 3, concurrency: 4, pageSize: 2 },
+              seed,
+            )
+            for (const [order, r] of [
+              ["in order", serial],
+              ["shuffled", shuffled],
+            ] as const) {
+              const at = `seed ${seed}, ${order}`
+              expect(r.untouched, at).toEqual(storedRows(rows))
+              expect(decided(r.dry), at).toEqual(decided(r.real))
+              expect(r.real.conflicts, at).toEqual([])
+              expect(r.real.scanned, at).toBe(rows.length)
+              expect(r.again.moved, at).toEqual(ZERO)
+              expect(r.again.sentinelsMoved, at).toBe(0)
+              expect(r.again.conflicts, at).toEqual([])
+              expect(contentOf(r.after), at).toEqual(contentOf(rows))
+              expect(misplacedSentinels(r.after, escapeKeys), at).toEqual([])
+            }
+            expect(shuffled.last, `seed ${seed}`).toEqual(serial.last)
           }
-          expect(shuffled.last, `seed ${seed}`).toEqual(serial.last)
-        }
-      }),
+        }),
+      // 50 seeds, each run in two orders: about 1.5 s here, several times that on CI.
+      30_000,
     )
   }
 })
