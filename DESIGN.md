@@ -7430,8 +7430,10 @@ instance).
     function decides it, from the definitions and the table's TTL attribute
     (from the table's layer), never from what a stored row holds: a stored
     `__edd_rt__` is the user's value there, never a token, whatever the
-    number of projections. A versioned read model is refused (`EDD-9081`), so
-    the version attribute can't hold it; a sparse map's entries hold `#`, so
+    number of projections. An index attribute of that name declared only
+    through a second `Table.make` handle on the same physical table isn't
+    seen: the rows carry the token. A versioned read model is refused
+    (`EDD-9081`), so the version attribute can't hold it; a sparse map's entries hold `#`, so
     can't. An aggregate's ownership check, which knows no TTL attribute,
     counts the token where only the TTL attribute takes its name, which adds
     a writer of an attribute no key is made of
