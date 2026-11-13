@@ -3,7 +3,8 @@
  * empty part where none may be (`or()` with no parts, a `NaN` operand) is refused with a
  * `ValidationError` and nothing is written, where the transaction used to die with a defect. And
  * `Transaction.check` with a compiled condition (`Expression.condition`) names the attribute a
- * renamed field is stored in, so it holds on a row holding the value.
+ * renamed field is stored in, so it holds on a row holding the value, and sends a `DateTime`
+ * operand in the form its field stores it.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -12,7 +13,7 @@
 
 import { type AttributeValue, DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
-import { Cause, Config, Effect, Exit, Layer, Schema } from "effect"
+import { Cause, Config, DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { describe, expect } from "vitest"
 import * as Lib from "../src/index.js"
 
@@ -180,5 +181,44 @@ describeConnected("a transaction's conditions, on DynamoDB Local", () => {
           expect((yield* scan).map((row) => row.id?.S).sort()).toEqual(["a", "b"])
         }),
     ),
+  )
+
+  it.effect(
+    "Transaction.check of a compiled condition sends a DateTime as its field stores it",
+    () =>
+      onTable(
+        Lib.Entity.make({
+          model: Schema.Struct({ id: Schema.String, at: Schema.DateTimeUtc }),
+          entityType: "D",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+        } as never) as any,
+        (db, scan) =>
+          Effect.gen(function* () {
+            const at = DateTime.makeUnsafe("2024-01-02T03:04:05.000Z")
+            yield* db.entities.E.put({ id: "a", at }).asEffect()
+            const check = (condition: Lib.Expression.ExpressionResult, id: string) =>
+              Effect.exit(
+                Lib.Transaction.transactWrite([
+                  Lib.Transaction.check(db.entities.E.get({ id: "a" }), condition),
+                  db.entities.E.put({ id, at }),
+                ]),
+              )
+            // The row holds the ISO text: the check holds, and `b` is written.
+            expect(
+              Exit.isSuccess(yield* check(Lib.Expression.condition({ eq: { at } }), "b")),
+            ).toBe(true)
+            // And it fails where the instant differs, writing nothing.
+            const other = DateTime.makeUnsafe("2024-01-02T03:04:06.000Z")
+            const exit = yield* check(Lib.Expression.condition({ eq: { at: other } }), "c")
+            expect(Exit.isFailure(exit)).toBe(true)
+            if (Exit.isFailure(exit)) {
+              expect((Cause.squash(exit.cause) as any)._tag).toBe("TransactionCancelled")
+            }
+            expect((yield* scan).map((row) => row.id?.S).sort()).toEqual(["a", "b"])
+          }),
+      ),
   )
 })
