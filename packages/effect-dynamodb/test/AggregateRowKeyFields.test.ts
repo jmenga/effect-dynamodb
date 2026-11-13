@@ -14,7 +14,7 @@ let made = 0
 suite({
   onTable: (body, pk) => {
     const tableName = `row-key-fields-${made++}`
-    const table = makeRecordingTable({ pk })
+    const table = makeRecordingTable({ keys: { pk: pk ?? "pk", sk: "sk" } })
     tables.set(tableName, table)
     return body(tableName).pipe(
       Effect.provide(Layer.merge(table.layer, Main.layer({ name: tableName }))),

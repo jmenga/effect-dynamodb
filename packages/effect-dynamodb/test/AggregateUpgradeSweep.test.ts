@@ -14,7 +14,10 @@ let made = 0
 sweepSuite({
   onTable: (pk, body) => {
     const tableName = `upgrade-sweep-${made++}`
-    const table = makeRecordingTable({ pk, indexes: { [INDEX.name]: { pk, sk: INDEX.sk } } })
+    const table = makeRecordingTable({
+      keys: { pk, sk: "sk" },
+      indexes: { [INDEX.name]: { pk, sk: INDEX.sk } },
+    })
     const take = () =>
       table.take().map(({ command, input }) => ({
         command,
