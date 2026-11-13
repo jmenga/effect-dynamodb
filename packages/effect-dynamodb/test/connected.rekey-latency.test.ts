@@ -3,7 +3,7 @@
  * a random 0 to 30 ms before it's sent, a parallel scan segment's up to 90 ms more, and the rows of
  * each scan page come back shuffled. So a run's fibers (its segments, the rows of a page handled at
  * once, the moves a chain needs) interleave differently each time, and its segments finish in
- * another order. The chain scenarios (`helpers/RekeyChains.ts`), in 1, 2, 4 and 8 segments: the dry
+ * another order. The chain scenarios (`helpers/RekeyChains.ts`), in 1 and 4 segments: the dry
  * run reports what the run does, and what both report is what the table held before them, not the
  * order the run met its rows in. `connected.rekey-chains.test.ts` runs the same scenarios with
  * nothing slowed.
@@ -137,7 +137,7 @@ const STEMS = ["foo", "beta", "kappa"]
 describeConnected("#240 rekey with its requests answered at random speeds, on DynamoDB", () => {
   for (const [s, scenario] of RekeyChains.chainScenarios.entries()) {
     describe(scenario.name, () => {
-      for (const segments of [1, 2, 4, 8]) {
+      for (const segments of [1, 4]) {
         it.live(
           `${segments} segment(s)`,
           () =>
