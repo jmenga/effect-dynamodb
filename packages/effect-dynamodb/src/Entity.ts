@@ -20,7 +20,6 @@ import {
   type ExtractIdentifier,
   type ExtractPackedFields,
   type ExtractUnremovableFields,
-  getIdentifierField,
   getSparseFields,
   isConfiguredModel,
   isRefField,
@@ -48,6 +47,8 @@ import {
   UpdateAppliedButUnreadable,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import type { RefEntity } from "@effect-dynamodb/schema/internal/AggregateEdges.js"
+import { keyValueOf, refIdAttribute } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import {
   compositeKeyFormKind,
   keyFormValueKind,
@@ -836,8 +837,11 @@ export interface Entity<
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierField: string
+    /** The attribute of the referenced entity an id names (`refIdAttribute`). */
+    readonly keyField: string
     readonly refEntityType: string
+    /** The referenced entity: its `modelSchema` encodes what the ref stores (`refDataOf`). */
+    readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
   }>
 
   /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
@@ -911,6 +915,18 @@ export interface Entity<
    * differently-shaped item depending on which API wrote it.
    */
   readonly _renameToDynamo: (item: globalThis.Record<string, unknown>) => void
+  /**
+   * @internal A whole field as an `UpdateItem` SET writes it: the attribute it's stored in and its
+   * stored form (packed where the field is). A cascade writes a target's ref through it (#241).
+   */
+  readonly _setOf: (
+    field: string,
+    wire: unknown,
+    operation: string,
+  ) => Effect.Effect<
+    { readonly attribute: string; readonly value: AttributeValue },
+    ValidationError
+  >
   /** @internal The model field a stored attribute holds, for a message naming it. */
   readonly _fieldOfAttribute: (attribute: string) => string
 
@@ -2334,14 +2350,58 @@ export const make = <
 interface ResolvedRef {
   readonly fieldName: string
   readonly idFieldName: string
-  readonly identifierField: string
-  readonly identifierSchema: Schema.Top
+  /** The attribute of the referenced entity an id names (`refIdAttribute`). */
+  readonly keyField: string
+  readonly keySchema: Schema.Top
   readonly refEntity: Entity
   readonly refEntityType: string
 }
 
 /** @internal A definition that has had its operations attached (has `.get`). */
 const isOperational = (e: { readonly get?: unknown }): boolean => typeof e.get === "function"
+
+/**
+ * @internal A ref's id as the stored ref holds it, as a value of the referenced entity's key (#241).
+ * The stored ref is the referenced item in its entity's stored form ({@link refDataOf}), while a
+ * `${field}Id` is keyed as it's given, so a key stored in another form (a date stored as epoch
+ * milliseconds) is read back through that entity's own field. `None` when the stored value is no
+ * value of the key (a row written otherwise), which a caller reads as it's stored. What `rekey`
+ * judges a row's index keys by ({@link storedRefId}) and a `.within()` row check reads a stored
+ * ref's id by.
+ */
+export const storedRefIdOf = (
+  ref: {
+    readonly keyField: string
+    readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
+  },
+  stored: unknown,
+): Option.Option<unknown> => {
+  const field = getSchemaFields(ref.refEntity.schemas.modelSchema)?.[ref.keyField]
+  return field === undefined ? Option.none() : keyValueOf(field, stored)
+}
+
+/** @internal {@link storedRefIdOf}, or the value as it's stored when it's no value of the key. */
+const storedRefId = (ref: Parameters<typeof storedRefIdOf>[0], stored: unknown): unknown =>
+  Option.getOrElse(storedRefIdOf(ref, stored), () => stored)
+
+/**
+ * @internal What a ref stores of the item it names: the referenced entity's domain item encoded
+ * through that entity's `modelSchema`, so transform fields are in their wire form (a
+ * `Schema.Redacted` its string, a date its declared encoding, a `NumberFromString` its string),
+ * marshal-safe and decoded exactly once by the referencing entity (issue #72). Put-time hydration
+ * and a cascade from the referenced entity both store it, through this one function (#241): up to
+ * 1.40.0 a cascade marshalled the domain item as it was, so a `Schema.Redacted` was stored as an
+ * empty map (the row then failed every read) and a date as its `DateTime`'s internals.
+ */
+const refDataOf = (
+  refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } },
+  model: unknown,
+  entityType: string,
+  operation: string,
+): Effect.Effect<unknown, ValidationError> =>
+  Schema.encodeUnknownEffect(refEntity.schemas.modelSchema as Schema.Codec<any>)(model).pipe(
+    Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
+  )
 
 /** @internal Copy the schema + table tag a definition received via `_configure`
  * (Table.make injects them at table-definition time) onto a promoted entity. */
@@ -3095,7 +3155,10 @@ const makeImpl = <
     if (refId !== undefined) {
       return (
         `"${name}" is the id of the ref "${refId.fieldName}", which a row stores whole as ` +
-        `"${refId.fieldName}". Reassign it with .set({ ${name} })`
+        `"${refId.fieldName}". Reassign it with .set({ ${name} })` +
+        (writeLacks().canLack(refId.fieldName)
+          ? `, or remove the ref with .remove(["${refId.fieldName}"])`
+          : "")
       )
     }
     for (const [index, def] of Object.entries(allIndexes)) {
@@ -3177,6 +3240,18 @@ const makeImpl = <
     }
     const ref = resolvedRefs.find((r) => r.fieldName === field || r.idFieldName === field)
     if (ref !== undefined) {
+      // A ref the model declares optional is removed by its field (#241), by `.remove()` or
+      // `.set({ team: undefined })`, one form (`normalizeClears`): the row reads without it, and
+      // leaves the index keyed by its id (`removedSetOf`). A path removal isn't composed into that
+      // index, and the row stores the ref, not its id, so those are pointed at the field. Up to
+      // 1.40.0 every ref was refused here.
+      if (lacks.canLack(ref.fieldName)) {
+        if (field === ref.fieldName && (op === ".remove()" || op === ".set()")) return undefined
+        return (
+          `${op} of "${field}": "${ref.fieldName}" is a ref the model declares optional: remove ` +
+          `it with .remove(["${ref.fieldName}"]). Nothing was sent.`
+        )
+      }
       return (
         `${op} of "${field}": "${ref.fieldName}" is a ref, so a row without it could not be ` +
         `read. Reassign it with .set({ ${ref.idFieldName} }). Nothing was sent.`
@@ -4285,6 +4360,28 @@ const makeImpl = <
         attribute,
       ),
     )
+
+  /**
+   * A whole field as an `UpdateItem` SET writes it: the attribute it's stored in (`resolveDbName`,
+   * the naming every write uses) and its stored form, packed where the field is (#147). `update`,
+   * `upsert` and a cascade into one of this entity's refs each write a field through it (#241).
+   */
+  const setOf = (
+    field: string,
+    wire: unknown,
+    operation: string,
+  ): Effect.Effect<
+    { readonly attribute: string; readonly value: AttributeValue },
+    ValidationError
+  > => {
+    const attribute = resolveDbName(field)
+    return Object.hasOwn(packedFields, field)
+      ? Effect.map(packAttribute(attribute, wire, operation), (value) => ({
+          attribute,
+          value: value!,
+        }))
+      : Effect.succeed({ attribute, value: toAttributeValue(wire) })
+  }
 
   /**
    * Read, in place, the dispatch-eligible attributes of a stored-name row by
@@ -7412,6 +7509,40 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   /**
+   * A write's values as its index keys are composed from them (#241): hydration stores a ref
+   * (`team`) in place of its id (`teamId`), and an index keyed by the id (a cascade index) is
+   * composed from the id given, as `put` composes it. Up to 1.40.0 `upsert` and `update` composed
+   * from the hydrated values alone, so an upsert wrote no key for such an index and an update
+   * reassigning the ref kept its old one.
+   */
+  const withRefIds = (
+    hydrated: globalThis.Record<string, unknown>,
+    given: unknown,
+  ): globalThis.Record<string, unknown> => {
+    if (!hasRefs) return hydrated
+    const ids = given as globalThis.Record<string, unknown>
+    let keyed = hydrated
+    for (const ref of resolvedRefs) {
+      if (!Object.hasOwn(ids, ref.idFieldName) || ids[ref.idFieldName] === undefined) continue
+      if (keyed === hydrated) keyed = { ...hydrated }
+      keyed[ref.idFieldName] = ids[ref.idFieldName]
+    }
+    return keyed
+  }
+
+  /**
+   * What an update's `.remove()` removes, as the index key composer is told (`removedSet`): the
+   * fields named, and the id of each ref removed, which is the composite a cascade index is keyed
+   * by (#241), so the row leaves that index as it leaves the ref.
+   */
+  const removedSetOf = (removed: ReadonlyArray<string> | undefined): Set<string> | undefined => {
+    if (removed === undefined) return undefined
+    const set = new Set(removed)
+    for (const ref of resolvedRefs) if (set.has(ref.fieldName)) set.add(ref.idFieldName)
+    return set
+  }
+
+  /**
    * Hydrate ref fields by fetching referenced entities by ID and embedding
    * their core domain data. Returns a new object with ref fields populated.
    *
@@ -7427,15 +7558,30 @@ const makeImpl = <
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      const refsToProcess = refs ?? resolvedRefs
-      if (refsToProcess.length === 0) return decoded
+      // A ref whose id isn't given (an optional ref left out, #241) names nothing: nothing is
+      // fetched for it and nothing stored. Up to 1.40.0 its id was required.
+      const refsToProcess = (refs ?? resolvedRefs).filter(
+        (ref) => decoded[ref.idFieldName] !== undefined,
+      )
+      const hydrated = { ...decoded }
+      for (const ref of refs ?? resolvedRefs) {
+        if (hydrated[ref.idFieldName] === undefined) delete hydrated[ref.idFieldName]
+      }
+      if (refsToProcess.length === 0) return hydrated
 
       // Fetch all refs in parallel
-      const hydrated = { ...decoded }
       const fetchEffects = refsToProcess.map((ref) => {
         const id = decoded[ref.idFieldName] as string
         return Effect.gen(function* () {
-          const keyInput = { [ref.identifierField]: id }
+          // Fetched under the key composite the id is a value of, as an aggregate edge's id is
+          // (#214, #241): the referenced entity's identifier needn't be its key. `get` takes the
+          // key's own value, and the id here is in its stored form, which for a transformed key is
+          // another (`"5"` of a `NumberFromString`): read through `keyValueOf`, as an aggregate
+          // edge's id is. Up to 1.40.0 the stored form was handed over, and `get` refused it. An id
+          // that is no value of the key is handed over as it is, and `get` refuses it as before.
+          const keyInput = {
+            [ref.keyField]: Option.getOrElse(keyValueOf(ref.keySchema, id), () => id),
+          }
           // Use asModel to convert EntityGet to Effect<ModelType>
           const getEffect = asModel(ref.refEntity.get(keyInput) as EntityGet<any, any, any, any>)
           const model = yield* getEffect.pipe(
@@ -7451,26 +7597,9 @@ const makeImpl = <
             ),
           )
           // `asModel` returns the DECODED domain value (transform fields lifted to
-          // their domain form, e.g. `Schema.DateTimeUtcFromString` → `DateTime`).
-          // The parent decodes this nested ref field via the ref target's ORIGINAL
-          // `Schema.Class` (`substituteSchemas` does not recurse into nested
-          // classes), whose Encoded side is the wire primitive. Re-encode through
-          // the ref's substituted `modelSchema` so the spliced value is wire-form:
-          // marshall-safe for `toAttributeMap` AND decoded exactly once by the
-          // parent (issue #72 — without this, a put marshalls a `DateTime` and the
-          // return decode fails "Expected string, got DateTime.Utc").
-          const wire = yield* Schema.encodeUnknownEffect(
-            ref.refEntity.schemas.modelSchema as Schema.Codec<any>,
-          )(model).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "hydrateRefs.encode",
-                  cause,
-                }),
-            ),
-          )
+          // their domain form, e.g. `Schema.DateTimeUtcFromString` → `DateTime`): stored
+          // as `refDataOf` encodes it, as a cascade stores it (issue #72, #241).
+          const wire = yield* refDataOf(ref.refEntity, model, entityType, "hydrateRefs.encode")
           return { fieldName: ref.fieldName, idFieldName: ref.idFieldName, data: wire }
         })
       })
@@ -7522,11 +7651,17 @@ const makeImpl = <
     return fallback
   }
 
-  /** Cached source entity identifier field name (e.g., "playerId") */
-  const sourceIdentifierField = (() => {
-    const idField = getIdentifierField(config.model as Schema.Top)
-    return idField?.name
-  })()
+  /**
+   * The attribute of this entity a ref to it names (`refIdAttribute`, its key composite), read off
+   * an update's key as the id a cascade from it is keyed by: the id each target's ref was given and
+   * keyed by (#241). Up to 1.40.0 its identifier, absent from the key where that is another field,
+   * so such a cascade updated nothing.
+   */
+  const sourceIdentifierField = refIdAttribute({
+    model: config.model,
+    indexes: config.indexes,
+    entityType,
+  } as unknown as RefEntity)
 
   /**
    * Execute cascade updates after a source entity update completes.
@@ -7535,9 +7670,11 @@ const makeImpl = <
   const executeCascade = (
     cascadeConfig: CascadeConfig,
     sourceDomainData: globalThis.Record<string, unknown>,
-    sourceIdValue: string,
+    /** The source's id as its update's key holds it: what each target's ref id was given as. */
+    sourceId: unknown,
   ): Effect.Effect<void, CascadePartialFailure | DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
+      const sourceIdValue = String(sourceId)
       const { targets, filter, mode } = cascadeConfig
       const sourceEntityType = entityType
       const client = yield* Capacity.client
@@ -7550,7 +7687,8 @@ const makeImpl = <
         readonly key: globalThis.Record<string, AttributeValue>
         /** The target table's primary-key attributes, `[pk.field, sk.field]`. */
         readonly keyFields: readonly [string, string]
-        readonly refFieldName: string
+        /** The attribute the target stores its ref in. */
+        readonly refAttribute: string
         readonly refData: AttributeValue
       }> = []
 
@@ -7588,6 +7726,29 @@ const makeImpl = <
           })
         }
 
+        // What the target's ref stores of the source, as a put naming it stores it (`refDataOf`),
+        // in the attribute the target stores the ref in, in its stored form (`_setOf`). Up to
+        // 1.40.0 the domain item was marshalled as it was, under the ref's model field name: a
+        // renamed ref (`field:`) got a second attribute and kept its stale value (#241).
+        const refSet = yield* refDataOf(
+          matchingRef.refEntity,
+          sourceDomainData,
+          sourceEntityType,
+          "cascade.encode",
+        ).pipe(
+          Effect.flatMap((wire) => target._setOf(matchingRef.fieldName, wire, "cascade")),
+          Effect.mapError(
+            (error) =>
+              new CascadePartialFailure({
+                sourceEntity: sourceEntityType,
+                sourceId: sourceIdValue,
+                succeeded: 0,
+                failed: 0,
+                errors: [error],
+              }),
+          ),
+        )
+
         // Resolve target table name
         const { name: targetTableName } = yield* target._tableTag
 
@@ -7604,7 +7765,14 @@ const makeImpl = <
           targetSchema,
           target.entityType,
           cascadeIdx.indexDef,
-          keyFormFor(target, { [matchingRef.idFieldName]: sourceIdValue }),
+          // The id as a value of the key, through the target's own key form, as a `put` naming
+          // the source composed it, not its text: a number key's `5` composes the key `put` wrote
+          // (`teamid_0000000000000005`), where `"5"` composed `teamid_5` and found nothing, up to
+          // 1.40.0. The domain value, not the source key's stored form: a date stored as epoch
+          // milliseconds is keyed by the source in that form and by the target in its own (#241).
+          keyFormFor(target, {
+            [matchingRef.idFieldName]: sourceDomainData[sourceIdentifierField] ?? sourceId,
+          }),
         ).partitions
 
         // Build query parameters
@@ -7652,8 +7820,8 @@ const makeImpl = <
                 tableName: targetTableName,
                 key: { [keyFields[0]]: item[keyFields[0]]!, [keyFields[1]]: item[keyFields[1]]! },
                 keyFields,
-                refFieldName: matchingRef.fieldName,
-                refData: toAttributeValue(sourceDomainData),
+                refAttribute: refSet.attribute,
+                refData: refSet.value,
               })
             }
 
@@ -7675,7 +7843,7 @@ const makeImpl = <
             TableName: op.tableName,
             Key: op.key,
             UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refFieldName },
+            ExpressionAttributeNames: { "#ref": op.refAttribute },
             ExpressionAttributeValues: { ":refData": op.refData },
           },
         }))
@@ -7725,7 +7893,7 @@ const makeImpl = <
             TableName: op.tableName,
             Key: op.key,
             UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refFieldName },
+            ExpressionAttributeNames: { "#ref": op.refAttribute },
             ExpressionAttributeValues: { ":refData": op.refData },
           }
           return client.updateItem(update).pipe(
@@ -8501,13 +8669,13 @@ const makeImpl = <
           entityType,
           entityVersion,
           allIndexes,
-          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+          keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
           keyForm(encodedKey as globalThis.Record<string, unknown>),
           // The branches below know more: the retain path reads the whole item
           // first, so a shard it can compute is not refused here (#183).
           {
             onMissingShardSource: "keep",
-            ...(uState.remove === undefined ? {} : { removedSet: new Set(uState.remove) }),
+            ...(uState.remove === undefined ? {} : { removedSet: removedSetOf(uState.remove)! }),
           },
         ),
       )
@@ -8920,7 +9088,7 @@ const makeImpl = <
         // EDD-9024 was deprecated in v1.7.1 — hole patterns don't throw. A
         // Z-order value the composer can't place (EDD-9092, #171) fails the
         // update with a `ValidationError`.
-        const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
+        const retainRemovedSet = removedSetOf(uState.remove)
         // The payload's values are the write's own; the rest of `newItem` is the row as stored.
         const ownUpdate = ownPayload(hydratedUpdates as globalThis.Record<string, unknown>)
         const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
@@ -8929,7 +9097,7 @@ const makeImpl = <
             entityType,
             entityVersion,
             allIndexes,
-            keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+            keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
             keyForm(newItem),
             {
               ...(retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet }),
@@ -9526,7 +9694,7 @@ const makeImpl = <
               ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
               : undefined
           if (sourceId != null) {
-            yield* executeCascade(uState.cascade, domainData, String(sourceId))
+            yield* executeCascade(uState.cascade, domainData, sourceId)
           }
         }
 
@@ -9740,13 +9908,10 @@ const makeImpl = <
 
         const nameKey = `#u${counter}`
         const valKey = `:u${counter}`
-        const storedName = resolveDbName(attr)
-        names[nameKey] = storedName
         // A packed field is written whole, as its stored form (#147).
-        values[valKey] =
-          attr in packedFields
-            ? (yield* packAttribute(storedName, val, "update"))!
-            : toAttributeValue(val)
+        const set = yield* setOf(attr, val, "update")
+        names[nameKey] = set.attribute
+        values[valKey] = set.value
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -9822,7 +9987,7 @@ const makeImpl = <
       //     under v3 two-way classification, the structural composer just
       //     treats the attribute as absent. (EDD-9025 guarantees these
       //     are never composites.)
-      const removedSet = uState.remove ? new Set(uState.remove) : undefined
+      const removedSet = removedSetOf(uState.remove)
       if (uState.remove) {
         for (const attr of uState.remove) {
           const nameKey = `#r${removeClauses.length}`
@@ -9853,7 +10018,7 @@ const makeImpl = <
           entityType,
           entityVersion,
           allIndexes,
-          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+          keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
           keyForm(encodedKey as globalThis.Record<string, unknown>),
           {
             ...(removedSet === undefined ? {} : { removedSet }),
@@ -10222,7 +10387,7 @@ const makeImpl = <
             decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, "model"),
             "stored",
           )
-          yield* executeCascade(uState.cascade, { ...(domainData as object) }, String(sourceId))
+          yield* executeCascade(uState.cascade, { ...(domainData as object) }, sourceId)
         })
 
       if (retainSnapshot !== undefined) {
@@ -11650,7 +11815,7 @@ const makeImpl = <
           // One request sends every key the input composes: each is the upsert's own.
           const allKeys = yield* upsertKeys(
             stamped,
-            yield* composeAllKeys(stamped, "upsert", ownSchema()),
+            yield* composeAllKeys(withRefIds(stamped, encodedInput), "upsert", ownSchema()),
           )
           yield* refuseUncomposed(encodedInput, "upsert")
           const keyPlan = upsertKeyPlan(allKeys, item, suppliedCreatedAt !== undefined)
@@ -11737,13 +11902,10 @@ const makeImpl = <
 
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
-            const storedName = resolveDbName(attr)
-            names[nameKey] = storedName
             // A packed field is written whole, as its stored form (#147).
-            values[valKey] =
-              attr in packedFields
-                ? (yield* packAttribute(storedName, val, "upsert"))!
-                : toAttributeValue(val)
+            const set = yield* setOf(attr, val, "upsert")
+            names[nameKey] = set.attribute
+            values[valKey] = set.value
 
             placeholders.set(attr, [nameKey, valKey])
             // Immutable fields use if_not_exists — only set on first create
@@ -14616,9 +14778,9 @@ const makeImpl = <
     const withIds = { ...values }
     for (const ref of resolvedRefs) {
       const id = (values[ref.fieldName] as globalThis.Record<string, unknown> | undefined)?.[
-        ref.identifierField
+        ref.keyField
       ]
-      if (id !== undefined) withIds[ref.idFieldName] = id
+      if (id !== undefined) withIds[ref.idFieldName] = storedRefId(ref, id)
     }
     return withIds
   }
@@ -18223,6 +18385,7 @@ const makeImpl = <
     _domainKeyForm: domainKeyForm,
     _unstorableKey: unstorableKey,
     _renameToDynamo: renameToDynamo,
+    _setOf: setOf,
     _fieldOfAttribute: fieldOfAttribute,
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,

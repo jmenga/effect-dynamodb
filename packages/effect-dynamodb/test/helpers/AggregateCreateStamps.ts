@@ -47,6 +47,11 @@ const definitions: Record<
     readonly updated: string
     /** Dates the root declares optional: 1.39.0 stored a value passed for one. */
     readonly keeps: ReadonlyArray<string>
+    /**
+     * Dates the root declares `Schema.optional` around an epoch-ms encoding: 1.39.0 and 1.40.0 stored
+     * one as ISO text, and #241 stores it in its encoding, as epoch milliseconds.
+     */
+    readonly epochMsSince241?: ReadonlyArray<string>
     /** 1.39.0's `create` failed with `Missing key` without a value. */
     readonly missingKey: boolean
   }
@@ -65,6 +70,7 @@ const definitions: Record<
     },
     updated: "updated",
     keeps: ["updated"],
+    epochMsSince241: ["updated"],
     missingKey: false,
   },
   "the root declares optional `createdAt` and `updatedAt`": {
@@ -295,6 +301,21 @@ const stampedRows = (
 
 const isRoot = (row: Row) => row.__edd_e__?.S === "Match"
 
+/** 1.39.0's rows with each of `names` the root holds as ISO text as the same instant in epoch ms. */
+const inEpochMs = (rows: ReadonlyArray<Row>, names: ReadonlyArray<string>): ReadonlyArray<Row> =>
+  rows.map((row) =>
+    isRoot(row)
+      ? {
+          ...row,
+          ...Object.fromEntries(
+            names
+              .filter((name) => row[name]?.S !== undefined)
+              .map((name) => [name, { N: String(Date.parse(row[name]!.S!)) }]),
+          ),
+        }
+      : row,
+  )
+
 /** The scenarios, each a test against a table `open` makes. */
 export const aggregateCreateStampsSuite = (open: OpenTable) => {
   it("1.39.0 stored the stamp over a value passed, but under a date the root declares optional", () => {
@@ -326,7 +347,15 @@ export const aggregateCreateStampsSuite = (open: OpenTable) => {
   for (const name of Object.keys(definitions)) {
     const definition = definitions[name]!
     const { keeps } = definition
-    const [created, updated] = fixture.scenarios[name]!["a value supplied"] as readonly [Step, Step]
+    const [captured, updated] = fixture.scenarios[name]!["a value supplied"] as readonly [
+      Step,
+      Step,
+    ]
+    // What 1.39.0 stored, in the form #241 stores a date under `Schema.optional` in.
+    const created = {
+      ...captured,
+      rows: inEpochMs(captured.rows, definition.epochMsSince241 ?? []),
+    }
     const stamp = fixture.clock
     for (const supplied of ["a value supplied", "no value supplied"] as const) {
       it.effect(`${name}, ${supplied}: create stores what ${fixture.generatedFrom} stored`, () =>

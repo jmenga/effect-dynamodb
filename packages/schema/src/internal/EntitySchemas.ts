@@ -1883,6 +1883,9 @@ const refusesUndefinedPositions = (
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
+  // A ref held as less than its class (`refHeldTarget`) is another schema than the field it
+  // re-points, whatever its leaves.
+  if (heldStructs.has(schema)) return true
   if (opts?.undefinedPositionsOnly) return holdsUndefinedPosition(schema)
   if (opts?.absentReads === "only") return holdsAbsentRead(schema)
   if (opts?.absentReads && holdsUnwalkedAbsent(schema)) return true
@@ -2808,6 +2811,61 @@ export interface DerivedSchemas {
   readonly historyRecordSchema: Schema.Codec<any> | null
 }
 
+/**
+ * @internal The `DynamoModel.Hidden` fields of a model: a read in "model" or "record" mode leaves
+ * them out, of the entity's own items and of a ref to it ({@link refHeldSchema}).
+ */
+export const hiddenFieldNamesOf = (fields: SchemaFields): ReadonlySet<string> =>
+  new Set(Object.keys(fields).filter((name) => isHidden(fields[name] as Schema.Top)))
+
+/** The targets {@link refHeldTarget} decided, each once. */
+const refHeldTargets = new WeakMap<Schema.Top, Schema.Top>()
+/** The schemas {@link refHeldTarget} built: a target's fields without its hidden ones. */
+const heldStructs = new WeakSet<Schema.Top>()
+
+/**
+ * @internal What a ref to an entity of model `target` holds (#241), the one decision every ref
+ * position takes (an entity's `refs`, an aggregate's edges and the refs nested in their entities):
+ * what a read of that entity returns, which put-time hydration and a cascade store, both through
+ * `refDataOf` (the entity's own read schema encoding the item it read). A read leaves out the
+ * target's `DynamoModel.Hidden` fields ({@link hiddenFieldNamesOf}), so the stored ref holds none
+ * of them. Where a hidden field read absent fails, as a read decodes it (`Missing key`), the ref is
+ * the target's other fields, a plain object as the entity's own read decodes it: up to 1.40.0 it
+ * was the whole target, so the referencing row failed every read, after its write. Every other
+ * target is held as declared, a class read back as its instance, as up to 1.40.0: one whose hidden
+ * fields are optional, or read absent as a value (`Schema.Unknown`, `Schema.Any`,
+ * `Schema.UndefinedOr`, a decoding default).
+ */
+export const refHeldTarget = (target: Schema.Top): Schema.Top => {
+  const decided = refHeldTargets.get(target)
+  if (decided !== undefined) return decided
+  const fields = getSchemaFields(target)
+  const hidden = fields === undefined ? new Set<string>() : hiddenFieldNamesOf(fields)
+  // A hidden field read absent, as a read of the referencing row decodes it.
+  const failsAbsent = (name: string) =>
+    Option.isNone(
+      Schema.decodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [name]: fields![name] as Schema.Top }), {
+          legacyReads: true,
+          absentReads: true,
+        }) as unknown as Schema.Codec<unknown>,
+      )({}),
+    )
+  const held =
+    fields !== undefined && [...hidden].some(failsAbsent)
+      ? (Schema.Struct(
+          Object.fromEntries(Object.entries(fields).filter(([name]) => !hidden.has(name))),
+        ) as unknown as Schema.Top)
+      : target
+  if (held !== target) heldStructs.add(held)
+  refHeldTargets.set(target, held)
+  return held
+}
+
+/** @internal {@link refHeldTarget}, substituted as a read or a write takes it (`options`). */
+export const refHeldSchema = (target: Schema.Top, options: DeepSubstitutionOptions): Schema.Top =>
+  substituteSchemaDeep(refHeldTarget(target), options)
+
 export const buildDerivedSchemas = (
   modelFields: SchemaFields,
   indexes: globalThis.Record<string, IndexDefinition>,
@@ -2815,7 +2873,7 @@ export const buildDerivedSchemas = (
   resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierSchema: Schema.Top
+    readonly keySchema: Schema.Top
     readonly refEntity?: { readonly model: Schema.Top } | undefined
   }> = [],
   immutableFields: ReadonlySet<string> = new Set(),
@@ -2855,11 +2913,19 @@ export const buildDerivedSchemas = (
     const resolved = isConfiguredModel(targetModel)
       ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
       : targetModel
-    fields[ref.fieldName] = substituteSchemaDeep(resolved, { enforceChecks: true })
-    readFields[ref.fieldName] = substituteSchemaDeep(resolved, {
-      legacyReads: true,
-      absentReads: true,
-    })
+    // As optional as the model declares it (#241): a row an optional ref was left out of, or
+    // removed from, reads without it. Up to 1.40.0 the target replaced the declaration whole.
+    const optional = optionalField(modelFields[ref.fieldName] as Schema.Top)
+    const asDeclared = (target: Schema.Top) =>
+      optional === undefined ? target : optional.rewrap(target)
+    // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
+    fields[ref.fieldName] = asDeclared(refHeldSchema(resolved, { enforceChecks: true }))
+    readFields[ref.fieldName] = asDeclared(
+      refHeldSchema(resolved, {
+        legacyReads: true,
+        absentReads: true,
+      }),
+    )
   }
 
   // Each of Effect's look-alike declarations (a `BigDecimal`, a `Duration`, an address, a date in
@@ -2937,6 +3003,14 @@ export const buildDerivedSchemas = (
 
   // --- Input Schema: ref-aware (swap ref fields for ID fields when refs present) ---
   const refFieldSet = new Set(resolvedRefs.map((r) => r.fieldName))
+  // A ref's id is taken as the model takes the ref (#241): required where it's required, and left
+  // out (`Schema.optionalKey`) or `undefined` too (`Schema.optional`) where the model declares the
+  // ref optional, which then stores no ref. Up to 1.40.0 the id was always required.
+  const refIdInput = (ref: (typeof resolvedRefs)[number]): Schema.Top => {
+    const declared = modelFields[ref.fieldName]
+    const optional = declared === undefined ? undefined : optionalField(declared as Schema.Top)
+    return optional === undefined ? ref.keySchema : optional.rewrap(ref.keySchema)
+  }
   const buildInputFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
     const acc: globalThis.Record<string, Schema.Top> = {}
     for (const [key, field] of Object.entries(fields)) {
@@ -2945,7 +3019,7 @@ export const buildDerivedSchemas = (
       if (adjusted !== null) acc[key] = adjusted
     }
     for (const ref of resolvedRefs) {
-      acc[ref.idFieldName] = ref.identifierSchema
+      acc[ref.idFieldName] = refIdInput(ref)
     }
     return acc
   }
@@ -2964,7 +3038,7 @@ export const buildDerivedSchemas = (
   // Add ID fields for each ref (skip if the ref field is an omitted field)
   for (const ref of resolvedRefs) {
     if (createOmitFields.has(ref.fieldName)) continue
-    createFieldsAcc[ref.idFieldName] = ref.identifierSchema
+    createFieldsAcc[ref.idFieldName] = refIdInput(ref)
   }
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
@@ -2996,7 +3070,7 @@ export const buildDerivedSchemas = (
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optionalKey(ref.identifierSchema as Schema.Top)
+      acc[ref.idFieldName] = Schema.optionalKey(ref.keySchema as Schema.Top)
     }
     return acc
   }
@@ -3046,10 +3120,7 @@ export const buildDerivedSchemas = (
   // --- Hidden-aware decode schemas: strip DynamoModel.Hidden fields from model/record ---
   // These are used for "model" and "record" decode modes. Hidden fields are
   // still present in "item" and "native" modes.
-  const hiddenFieldNames = new Set<string>()
-  for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    if (isHidden(fieldSchema)) hiddenFieldNames.add(fieldName)
-  }
+  const hiddenFieldNames = hiddenFieldNamesOf(modelFields)
   const hasHiddenFields = hiddenFieldNames.size > 0
 
   const modelVisibleSchema = hasHiddenFields

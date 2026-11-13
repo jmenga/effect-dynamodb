@@ -17,6 +17,7 @@ import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
+import { renamedAttribute, storedAsNow } from "./AggregateWholeElements.js"
 
 type Row = Record<string, AttributeValue>
 
@@ -378,7 +379,8 @@ export const createResultFieldShapes = (): Record<string, () => Shape> =>
 /**
  * A `many` edge's elements, in a union whose other member renames a field (`line` stored, `text`
  * held), given the wrapping member whole or the other member's stored form. 1.39.0 stored the
- * latter as `create` decoded it, `text` and all, and couldn't read it back.
+ * latter as `create` decoded it, `text` and all, and couldn't read it back; it's now stored in its
+ * stored form, `line` (#241, `helpers/AggregateWholeElements.ts`).
  */
 export const renameShapes = (): Record<string, () => Shape> => {
   const build = manyShape(DynamoSchema.make({ name: "ren", version: 1 }))
@@ -506,9 +508,10 @@ const retitled = (rows: ReadonlyArray<unknown>) =>
  * A `createResultFieldShapes` or `renameShapes` run against what 1.39.0 did
  * (`fixtures/aggregate-create-result-1.39.0.json`). `create`, its requests and rows, and `get` are
  * 1.39.0's, and so is the update where 1.39.0's went through. Where 1.39.0 refused the update, it
- * goes through and sets the title. A renaming member given its stored form reads back, where 1.39.0
- * couldn't, with the row's attributes: in their stored order, and a sub-aggregate's
- * discriminator with them.
+ * goes through and sets the title. A renaming member given its stored form is stored in it, `line`
+ * where 1.39.0 stored `text`, and reads back, where 1.39.0 couldn't: through the member's
+ * transformation, which takes only its own fields, so a sub-aggregate's discriminator stays out of
+ * it (#241).
  */
 export const compareCreateResult = (
   group: "fields" | "renames",
@@ -519,14 +522,15 @@ export const compareCreateResult = (
   const as139 = (step: "create" | "get" | "update" | "getAfterUpdate") =>
     expect({ step, ...judged(actual[step]) }).toEqual({ step, ...judged(expected[step]) })
   as139("create")
-  expect(actual.requests).toEqual(expected.requests)
-  expect(actual.rows).toEqual(expected.rows)
   if (group === "renames" && label.endsWith("given its stored form")) {
+    const now = storedAsNow("Sheet", renamedAttribute("text", "line"))
+    expect(actual.requests).toEqual(now.requests(expected.requests as never))
+    expect(actual.rows).toEqual((expected.rows as ReadonlyArray<never>).map(now.row))
     expect(actual.updateRequests).toEqual(expected.updateRequests)
-    expect(actual.updateRows).toEqual(expected.updateRows)
+    expect(actual.updateRows).toEqual((expected.updateRows as ReadonlyArray<never>).map(now.row))
     const element = { kind: "own", qty: 3, text: "KEEP" }
     const read = label.startsWith("sub-aggregate, ")
-      ? { id: "a", part: { lines: [{ ...element, side: 1 }] } }
+      ? { id: "a", part: { lines: [element] } }
       : { id: "a", lines: [element] }
     for (const step of ["get", "update", "getAfterUpdate"] as const) {
       expect({ step, failed: expected[step].failed }).toEqual({ step, failed: "ValidationError" })
@@ -534,6 +538,8 @@ export const compareCreateResult = (
     }
     return
   }
+  expect(actual.requests).toEqual(expected.requests)
+  expect(actual.rows).toEqual(expected.rows)
   as139("get")
   if (expected.update.ok !== undefined) {
     as139("update")

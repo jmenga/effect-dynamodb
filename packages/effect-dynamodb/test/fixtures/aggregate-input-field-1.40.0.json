@@ -1,0 +1,4776 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0"
+ ],
+ "note": "Captured from published effect-dynamodb@1.40.0 on DynamoDB Local by running test/helpers/AggregateInputField.ts with its modules (the ref target put, create, then get). Never regenerate: it is what 1.40.0 did.",
+ "1.40.0": {
+  "escapeKeys off, under its field, at the root, no ref, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys off, under its field, at the root, no ref, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys off, under its field, at the root, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys off, under its field, at the root, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys off, under its field, beneath a sub-aggregate, no ref, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys off, under its field, beneath a sub-aggregate, no ref, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t2"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys off, under its field, beneath a sub-aggregate, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys off, under its field, beneath a sub-aggregate, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t2"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys off, under its inputField, at the root, no ref, element tenant root": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys off, under its inputField, at the root, no ref, element tenant other": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys off, under its inputField, at the root, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys off, under its inputField, at the root, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys off, under its inputField, beneath a sub-aggregate, no ref, element tenant root": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys off, under its inputField, beneath a sub-aggregate, no ref, element tenant other": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys off, under its inputField, beneath a sub-aggregate, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys off, under its inputField, beneath a sub-aggregate, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t2"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys on, under its field, at the root, no ref, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys on, under its field, at the root, no ref, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys on, under its field, at the root, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys on, under its field, at the root, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys on, under its field, beneath a sub-aggregate, no ref, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys on, under its field, beneath a sub-aggregate, no ref, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t2"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys on, under its field, beneath a sub-aggregate, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys on, under its field, beneath a sub-aggregate, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t2"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys on, under its inputField, at the root, no ref, element tenant root": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys on, under its inputField, at the root, no ref, element tenant other": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys on, under its inputField, at the root, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys on, under its inputField, at the root, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#l"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "lines": [
+      {
+       "id": "l",
+       "tenant": "t1"
+      }
+     ]
+    }
+   }
+  },
+  "escapeKeys on, under its inputField, beneath a sub-aggregate, no ref, element tenant root": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys on, under its inputField, beneath a sub-aggregate, no ref, element tenant other": {
+   "create": {
+    "failed": "ValidationError"
+   },
+   "requests": [],
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "escapeKeys on, under its inputField, beneath a sub-aggregate, with a ref hydrated, element tenant root": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "escapeKeys on, under its inputField, beneath a sub-aggregate, with a ref hydrated, element tenant other": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t2"
+       }
+      ]
+     }
+    }
+   },
+   "requests": [
+    {
+     "command": "BatchGetItem",
+     "input": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$alias#v1#target#tid_r"
+          },
+          "sk": {
+           "S": "$alias#v1#target"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Root"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#root"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tid": {
+           "S": "r"
+          },
+          "text": {
+           "S": "ref"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "__edd_e__": {
+           "S": "Ref"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#ref"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Part"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#part#side#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "l"
+          },
+          "tenant": {
+           "S": "t1"
+          },
+          "side": {
+           "N": "1"
+          },
+          "__edd_e__": {
+           "S": "Line"
+          },
+          "pk": {
+           "S": "$alias#v1#alias#a"
+          },
+          "sk": {
+           "S": "$alias#v1#line#side#0000000000000001#l"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$alias#v1#line#side#0000000000000001#l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "id": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#ref"
+     },
+     "text": {
+      "S": "ref"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tid": {
+      "S": "r"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Ref"
+     }
+    },
+    {
+     "sk": {
+      "S": "$alias#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$alias#v1#alias#a"
+     },
+     "tenant": {
+      "S": "t1"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t1",
+     "ref": {
+      "tid": "r",
+      "text": "ref"
+     },
+     "part": {
+      "lines": [
+       {
+        "id": "l",
+        "tenant": "t1"
+       }
+      ]
+     }
+    }
+   }
+  }
+ }
+}

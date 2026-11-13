@@ -1,0 +1,2481 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0",
+  "effect-dynamodb@1.39.0"
+ ],
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @1.39.0 (each with its @effect-dynamodb/schema and effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local: never regenerate or \"fix\" it. An aggregate (schema `ctx` v1, partition key `pk` composed from `id`, collection `ctx`, root `Root` holding `tenantId`, `context: [\"tenantId\"]` unless the shape binds a sub-aggregate with `side: 1`, which has none) whose edge value keeps what it's given (`Schema.Unknown`) or declares `tenantId` (helpers/AggregateContextRead.ts), holding no key of the context's (or the discriminator's, or the collection sort key copy's) name, the root's value, or another. Per shape: `create`'s outcome, the partition's rows (by sort key), `get`, a no-op `update` and `get` after it. 1.39.0 and 1.40.0 agreed on every shape.",
+ "1.40.0": {
+  "an Unknown one edge holding no tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   }
+  },
+  "an Unknown one edge holding the root's tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   }
+  },
+  "an Unknown one edge holding another tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "other"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   }
+  },
+  "an Unknown element holding no tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "an Unknown element holding the root's tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n",
+       "tenantId": "t1"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "an Unknown element holding another tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n",
+       "tenantId": "other"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "an Unknown element with a custom assemble holding another tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n",
+       "tenantId": "other"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "a struct one edge declaring tenantId, given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "a struct one edge declaring tenantId, given the root's": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "a struct one edge declaring tenantId, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "other"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "a sub-aggregate declaring tenantId, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "other"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "sub-aggregate, an Unknown element holding its discriminator's value": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "qty": 1,
+        "text": "n",
+        "side": 1
+       }
+      ]
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$ctx#v1#line#side#0000000000000001#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$ctx#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   }
+  },
+  "sub-aggregate, an Unknown element holding another value in its discriminator": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "qty": 1,
+        "text": "n",
+        "side": 2
+       }
+      ]
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$ctx#v1#line#side#0000000000000001#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$ctx#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   }
+  },
+  "an Unknown one edge holding csk, the collection sort key's copy": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "csk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "csk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "csk": {
+      "S": "$ctx#v1#ctx"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "csk": "$ctx#v1#note",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "csk": "$ctx#v1#note",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "csk": "$ctx#v1#note",
+      "text": "n"
+     }
+    }
+   }
+  }
+ },
+ "1.39.0": {
+  "an Unknown one edge holding no tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   }
+  },
+  "an Unknown one edge holding the root's tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   }
+  },
+  "an Unknown one edge holding another tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "other"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "text": "n"
+     }
+    }
+   }
+  },
+  "an Unknown element holding no tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "an Unknown element holding the root's tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n",
+       "tenantId": "t1"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "an Unknown element holding another tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n",
+       "tenantId": "other"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "an Unknown element with a custom assemble holding another tenantId": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "qty": 1,
+       "text": "n",
+       "tenantId": "other"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#line#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "lines": [
+      {
+       "tenantId": "t1",
+       "text": "n",
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "a struct one edge declaring tenantId, given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "a struct one edge declaring tenantId, given the root's": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "a struct one edge declaring tenantId, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "other"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "a sub-aggregate declaring tenantId, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "other"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "t1"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "name": "p",
+      "tenantId": "t1"
+     }
+    }
+   }
+  },
+  "sub-aggregate, an Unknown element holding its discriminator's value": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "qty": 1,
+        "text": "n",
+        "side": 1
+       }
+      ]
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$ctx#v1#line#side#0000000000000001#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$ctx#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   }
+  },
+  "sub-aggregate, an Unknown element holding another value in its discriminator": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "qty": 1,
+        "text": "n",
+        "side": 2
+       }
+      ]
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$ctx#v1#line#side#0000000000000001#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$ctx#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "part": {
+      "lines": [
+       {
+        "side": 1,
+        "text": "n",
+        "qty": 1
+       }
+      ]
+     }
+    }
+   }
+  },
+  "an Unknown one edge holding csk, the collection sort key's copy": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "text": "n",
+      "csk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#note"
+     },
+     "csk": {
+      "S": "$ctx#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "tenantId": {
+      "S": "t1"
+     },
+     "sk": {
+      "S": "$ctx#v1#root"
+     },
+     "csk": {
+      "S": "$ctx#v1#ctx"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$ctx#v1#ctx#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "csk": "$ctx#v1#note",
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "csk": "$ctx#v1#note",
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "tenantId": "t1",
+     "note": {
+      "tenantId": "t1",
+      "csk": "$ctx#v1#note",
+      "text": "n"
+     }
+    }
+   }
+  }
+ }
+}

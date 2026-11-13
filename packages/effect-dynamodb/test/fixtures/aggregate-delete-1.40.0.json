@@ -1,0 +1,105 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published package on DynamoDB Local: never regenerate or \"fix\" it. The requests an aggregate delete sends for a partition holding only its own rows (helpers/AggregateDeleteRows.ts, the team with a row of each of its types), the table name as <table>. Published 1.39.0 sent the same.",
+ "alone": {
+  "requests": [
+   {
+    "command": "Query",
+    "input": {
+     "TableName": "<table>",
+     "KeyConditionExpression": "#pk = :pk",
+     "ExpressionAttributeNames": {
+      "#pk": "pk"
+     },
+     "ExpressionAttributeValues": {
+      ":pk": {
+       "S": "$owned#v1#team#a"
+      }
+     }
+    }
+   },
+   {
+    "command": "BatchWriteItem",
+    "input": {
+     "RequestItems": {
+      "<table>": [
+       {
+        "DeleteRequest": {
+         "Key": {
+          "pk": {
+           "S": "$owned#v1#team#a"
+          },
+          "sk": {
+           "S": "$owned#v1#squadcaptain#n#0000000000000001"
+          }
+         }
+        }
+       },
+       {
+        "DeleteRequest": {
+         "Key": {
+          "pk": {
+           "S": "$owned#v1#team#a"
+          },
+          "sk": {
+           "S": "$owned#v1#team"
+          }
+         }
+        }
+       },
+       {
+        "DeleteRequest": {
+         "Key": {
+          "pk": {
+           "S": "$owned#v1#team#a"
+          },
+          "sk": {
+           "S": "$owned#v1#teamcoach"
+          }
+         }
+        }
+       },
+       {
+        "DeleteRequest": {
+         "Key": {
+          "pk": {
+           "S": "$owned#v1#team#a"
+          },
+          "sk": {
+           "S": "$owned#v1#teamline#l1"
+          }
+         }
+        }
+       },
+       {
+        "DeleteRequest": {
+         "Key": {
+          "pk": {
+           "S": "$owned#v1#team#a"
+          },
+          "sk": {
+           "S": "$owned#v1#teamline#l2"
+          }
+         }
+        }
+       },
+       {
+        "DeleteRequest": {
+         "Key": {
+          "pk": {
+           "S": "$owned#v1#team#a"
+          },
+          "sk": {
+           "S": "$owned#v1#teamsquad#n#0000000000000001"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   }
+  ],
+  "rowsAfter": []
+ }
+}

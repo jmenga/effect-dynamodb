@@ -668,7 +668,11 @@ describe("#133 nested transforms — key composition is unchanged", () => {
         .sort()
       expect(sks).toEqual([
         "$issue133#v1#rosterdob#2000-01-01t00:00:00.000z#umpire-1",
-        "$issue133#v1#rosterflat#12",
+        // The element's own `rank`, an encoded field of the entity's model: composed from its
+        // stored text under `escapeKeys: false`, from its value under `true` (#241).
+        ReproSchema.escapeKeys === true
+          ? "$issue133#v1#rosterflat#0000000000000012"
+          : "$issue133#v1#rosterflat#12",
         "$issue133#v1#rosteritem",
         "$issue133#v1#rosterrank#0000000000000005",
         "$issue133#v1#rosterrank#0000000000000012",

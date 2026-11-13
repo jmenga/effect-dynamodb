@@ -1,0 +1,811 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published package on DynamoDB Local: never regenerate or \"fix\" it. Each shape (helpers/EntityRefKeys.ts): Teams seeded, then a Player put with `teamId`, then the team updated with a cascade to Players. `put` and `cascade` are outcomes (a failure by tag, operation and cause text); requests are the commands and inputs sent, the table name as <table>; rows are the table's items after each step, sorted by key.",
+ "shapes": {
+  "identifier is the key": {
+   "put": {
+    "ok": {
+     "id": "p1",
+     "league": "l",
+     "team": {
+      "id": "t1",
+      "name": "Tigers"
+     }
+    }
+   },
+   "putRequests": [
+    {
+     "command": "GetItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#team#id_t1"
+       },
+       "sk": {
+        "S": "$refs#v1#team"
+       }
+      }
+     }
+    },
+    {
+     "command": "PutItem",
+     "input": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "p1"
+       },
+       "league": {
+        "S": "l"
+       },
+       "team": {
+        "M": {
+         "id": {
+          "S": "t1"
+         },
+         "name": {
+          "S": "Tigers"
+         }
+        }
+       },
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "pk": {
+        "S": "$refs#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$refs#v1#player"
+       },
+       "gsi2pk": {
+        "S": "$refs#v1#player#league_l"
+       },
+       "gsi2sk": {
+        "S": "$refs#v1#player#id_p1#teamid_t1"
+       },
+       "gsi1pk": {
+        "S": "$refs#v1#player#teamid_t1"
+       },
+       "gsi1sk": {
+        "S": "$refs#v1#player#id_p1"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "gsi1sk": {
+      "S": "$refs#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refs#v1#player#id_p1#teamid_t1"
+     },
+     "league": {
+      "S": "l"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refs#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refs#v1#player"
+     },
+     "gsi2pk": {
+      "S": "$refs#v1#player#league_l"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     },
+     "pk": {
+      "S": "$refs#v1#player#id_p1"
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refs#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "id": "t1",
+     "name": "Lions"
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#team#id_t1"
+       },
+       "sk": {
+        "S": "$refs#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    },
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#et = :et0",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#et": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Player"
+       },
+       ":pk": {
+        "S": "$refs#v1#player#teamid_t1"
+       }
+      }
+     }
+    },
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$refs#v1#player"
+       }
+      },
+      "UpdateExpression": "SET #ref = :refData",
+      "ExpressionAttributeNames": {
+       "#ref": "team"
+      },
+      "ExpressionAttributeValues": {
+       ":refData": {
+        "M": {
+         "id": {
+          "S": "t1"
+         },
+         "name": {
+          "S": "Lions"
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "gsi1sk": {
+      "S": "$refs#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refs#v1#player#id_p1#teamid_t1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refs#v1#player#teamid_t1"
+     },
+     "league": {
+      "S": "l"
+     },
+     "gsi2pk": {
+      "S": "$refs#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refs#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refs#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Lions"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refs#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "identifier is the key, a number": {
+   "put": {
+    "ok": {
+     "id": "p1",
+     "league": "l",
+     "team": {
+      "num": 5,
+      "name": "Tigers"
+     }
+    }
+   },
+   "putRequests": [
+    {
+     "command": "GetItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#team#num_0000000000000005"
+       },
+       "sk": {
+        "S": "$refs#v1#team"
+       }
+      }
+     }
+    },
+    {
+     "command": "PutItem",
+     "input": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "p1"
+       },
+       "league": {
+        "S": "l"
+       },
+       "team": {
+        "M": {
+         "num": {
+          "N": "5"
+         },
+         "name": {
+          "S": "Tigers"
+         }
+        }
+       },
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "pk": {
+        "S": "$refs#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$refs#v1#player"
+       },
+       "gsi2pk": {
+        "S": "$refs#v1#player#league_l"
+       },
+       "gsi2sk": {
+        "S": "$refs#v1#player#id_p1#teamid_0000000000000005"
+       },
+       "gsi1pk": {
+        "S": "$refs#v1#player#teamid_0000000000000005"
+       },
+       "gsi1sk": {
+        "S": "$refs#v1#player#id_p1"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "gsi1sk": {
+      "S": "$refs#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refs#v1#player#id_p1#teamid_0000000000000005"
+     },
+     "league": {
+      "S": "l"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refs#v1#player#teamid_0000000000000005"
+     },
+     "sk": {
+      "S": "$refs#v1#player"
+     },
+     "gsi2pk": {
+      "S": "$refs#v1#player#league_l"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "num": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$refs#v1#player#id_p1"
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "pk": {
+      "S": "$refs#v1#team#num_0000000000000005"
+     },
+     "num": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "num": 5,
+     "name": "Lions"
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#team#num_0000000000000005"
+       },
+       "sk": {
+        "S": "$refs#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    },
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#et = :et0",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#et": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Player"
+       },
+       ":pk": {
+        "S": "$refs#v1#player#teamid_5"
+       }
+      }
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "gsi1sk": {
+      "S": "$refs#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refs#v1#player#id_p1#teamid_0000000000000005"
+     },
+     "league": {
+      "S": "l"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refs#v1#player#teamid_0000000000000005"
+     },
+     "sk": {
+      "S": "$refs#v1#player"
+     },
+     "gsi2pk": {
+      "S": "$refs#v1#player#league_l"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "num": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$refs#v1#player#id_p1"
+     }
+    },
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "pk": {
+      "S": "$refs#v1#team#num_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "num": {
+      "N": "5"
+     }
+    }
+   ]
+  },
+  "identifier is another field": {
+   "put": {
+    "failed": "ValidationError",
+    "operation": "get.decode",
+    "cause": "Missing key\n  at [\"id\"]"
+   },
+   "putRequests": [],
+   "rows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "code": {
+      "S": "TIG"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refs#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "code": "TIG",
+     "id": "t1",
+     "name": "Lions"
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#team#id_t1"
+       },
+       "sk": {
+        "S": "$refs#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "code": {
+      "S": "TIG"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refs#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "identifier is another field, keyed by a number": {
+   "put": {
+    "failed": "ValidationError",
+    "operation": "put.decode",
+    "cause": "Expected string\n  at [\"teamId\"]"
+   },
+   "putRequests": [],
+   "rows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "code": {
+      "S": "TIG"
+     },
+     "pk": {
+      "S": "$refs#v1#team#num_0000000000000005"
+     },
+     "num": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "code": "TIG",
+     "num": 5,
+     "name": "Lions"
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#team#num_0000000000000005"
+       },
+       "sk": {
+        "S": "$refs#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refs#v1#team"
+     },
+     "code": {
+      "S": "TIG"
+     },
+     "pk": {
+      "S": "$refs#v1#team#num_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "num": {
+      "N": "5"
+     }
+    }
+   ]
+  },
+  "keyed by two composites": {
+   "put": {
+    "failed": "ValidationError",
+    "operation": "get.decode",
+    "cause": "Missing key\n  at [\"org\"]"
+   },
+   "putRequests": [],
+   "rows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refs#v1#team#code_tig"
+     },
+     "code": {
+      "S": "TIG"
+     },
+     "pk": {
+      "S": "$refs#v1#team#org_o"
+     },
+     "org": {
+      "S": "o"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "org": "o",
+     "code": "TIG",
+     "name": "Lions"
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$refs#v1#team#org_o"
+       },
+       "sk": {
+        "S": "$refs#v1#team#code_tig"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    },
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#et = :et0",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#et": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Player"
+       },
+       ":pk": {
+        "S": "$refs#v1#player#teamid_tig"
+       }
+      }
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refs#v1#team#code_tig"
+     },
+     "code": {
+      "S": "TIG"
+     },
+     "pk": {
+      "S": "$refs#v1#team#org_o"
+     },
+     "org": {
+      "S": "o"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  }
+ }
+}

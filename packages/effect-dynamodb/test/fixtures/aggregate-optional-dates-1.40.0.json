@@ -1,0 +1,5265 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.39.0",
+  "effect-dynamodb@1.40.0"
+ ],
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @1.40.0 (with @effect-dynamodb/schema at the same version and effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local at a test clock set to 1700000000000 ms: never regenerate or \"fix\" it. An aggregate whose dates are declared Schema.optional around epoch encodings (helpers/AggregateOptionalDates.ts): a root due (DateEpochMs) and createdAt / updatedAt (DateEpochMs, stamped), a one edge due (DateEpochSeconds), a many element due (DateEpochMs) and a sub-aggregate due (DateTimeUtc storedAs DateEpochMs), with the collection and list sort keys over the root due (`passed`) or over createdAt and updatedAt (`stamp`). Each step: its outcome (a date as { date }), the requests it sent (the table name as <table>) and the table rows after it. Both published versions stored each of these dates as ISO text; 1.39.0 refused the `stamp` shape (its create failed before sending).",
+ "clock": 1700000000000,
+ "1.39.0": {
+  "passed": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "tenant": {
+            "S": "t"
+           },
+           "title": {
+            "S": "t"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "Doc"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#doc"
+           },
+           "csk": {
+            "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+           },
+           "gpk": {
+            "S": "$dates#v1#docs#t"
+           },
+           "gsk": {
+            "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+           }
+          },
+          "ConditionExpression": "attribute_not_exists(#pk)",
+          "ExpressionAttributeNames": {
+           "#pk": "pk"
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "text": {
+            "S": "n"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocNote"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docnote"
+           },
+           "csk": {
+            "S": "$dates#v1#docnote"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l1"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l1"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l2"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l2"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "subName": {
+            "S": "s"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSub"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsub#slot#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "body": {
+            "S": "m"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSubMemo"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, changing nothing",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later, changing the title",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "tenant": {
+            "S": "t"
+           },
+           "title": {
+            "S": "t2"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "Doc"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#doc"
+           },
+           "csk": {
+            "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+           },
+           "gpk": {
+            "S": "$dates#v1#docs#t"
+           },
+           "gsk": {
+            "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "text": {
+            "S": "n"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocNote"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docnote"
+           },
+           "csk": {
+            "S": "$dates#v1#docnote"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l1"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l1"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l2"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l2"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later, changing the sub-aggregate",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s2",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "subName": {
+            "S": "s2"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSub"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsub#slot#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "body": {
+            "S": "m"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSubMemo"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s2",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s2"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      }
+     }
+    ]
+   }
+  ],
+  "stamp": [
+   {
+    "step": "create",
+    "outcome": {
+     "fail": "Error",
+     "message": "Missing composite attribute \"createdAt\" in record"
+    },
+    "requests": [],
+    "rows": []
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "fail": "AggregateAssemblyError",
+     "message": ""
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": []
+   },
+   {
+    "step": "update, changing nothing",
+    "outcome": {
+     "fail": "AggregateAssemblyError",
+     "message": ""
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": []
+   },
+   {
+    "step": "update, 5 s later, changing the title",
+    "outcome": {
+     "fail": "AggregateAssemblyError",
+     "message": ""
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": []
+   },
+   {
+    "step": "update, 5 s later, changing the sub-aggregate",
+    "outcome": {
+     "fail": "AggregateAssemblyError",
+     "message": ""
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": []
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "fail": "AggregateAssemblyError",
+     "message": ""
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": []
+   }
+  ]
+ },
+ "1.40.0": {
+  "passed": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "tenant": {
+            "S": "t"
+           },
+           "title": {
+            "S": "t"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "__edd_e__": {
+            "S": "Doc"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#doc"
+           },
+           "csk": {
+            "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+           },
+           "gpk": {
+            "S": "$dates#v1#docs#t"
+           },
+           "gsk": {
+            "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+           }
+          },
+          "ConditionExpression": "attribute_not_exists(#pk)",
+          "ExpressionAttributeNames": {
+           "#pk": "pk"
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "text": {
+            "S": "n"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocNote"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docnote"
+           },
+           "csk": {
+            "S": "$dates#v1#docnote"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l1"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l2"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "subName": {
+            "S": "s"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSub"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "body": {
+            "S": "m"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSubMemo"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, changing nothing",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later, changing the title",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "tenant": {
+            "S": "t"
+           },
+           "title": {
+            "S": "t2"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           },
+           "__edd_e__": {
+            "S": "Doc"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#doc"
+           },
+           "csk": {
+            "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+           },
+           "gpk": {
+            "S": "$dates#v1#docs#t"
+           },
+           "gsk": {
+            "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "text": {
+            "S": "n"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocNote"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docnote"
+           },
+           "csk": {
+            "S": "$dates#v1#docnote"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l1"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l2"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later, changing the sub-aggregate",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s2",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "subName": {
+            "S": "s2"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSub"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:30.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "body": {
+            "S": "m"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSubMemo"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:30.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s2",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2020-09-13t12:26:40.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2020-09-13t12:26:40.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "stamp": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "tenant": {
+            "S": "t"
+           },
+           "title": {
+            "S": "t"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "__edd_e__": {
+            "S": "Doc"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#doc"
+           },
+           "csk": {
+            "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+           },
+           "gpk": {
+            "S": "$dates#v1#docs#t"
+           },
+           "gsk": {
+            "S": "$dates#v1#docs#2023-11-14t22:13:20.000z"
+           }
+          },
+          "ConditionExpression": "attribute_not_exists(#pk)",
+          "ExpressionAttributeNames": {
+           "#pk": "pk"
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "text": {
+            "S": "n"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocNote"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docnote"
+           },
+           "csk": {
+            "S": "$dates#v1#docnote"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l1"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l2"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "subName": {
+            "S": "s"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSub"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "body": {
+            "S": "m"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSubMemo"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2023-11-14t22:13:20.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2023-11-14t22:13:20.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, changing nothing",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2023-11-14t22:13:20.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later, changing the title",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "tenant": {
+            "S": "t"
+           },
+           "title": {
+            "S": "t2"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           },
+           "__edd_e__": {
+            "S": "Doc"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#doc"
+           },
+           "csk": {
+            "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+           },
+           "gpk": {
+            "S": "$dates#v1#docs#t"
+           },
+           "gsk": {
+            "S": "$dates#v1#docs#2023-11-14t22:13:25.000z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "text": {
+            "S": "n"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocNote"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docnote"
+           },
+           "csk": {
+            "S": "$dates#v1#docnote"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l1"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l1"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "lineId": {
+            "S": "l2"
+           },
+           "__edd_e__": {
+            "S": "DocLine"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "csk": {
+            "S": "$dates#v1#docline#l2"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:25.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2023-11-14t22:13:25.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later, changing the sub-aggregate",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s2",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "subName": {
+            "S": "s2"
+           },
+           "due": {
+            "S": "2020-09-13T12:26:40.000Z"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSub"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsub#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:30.000Z"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "<table>",
+          "Item": {
+           "body": {
+            "S": "m"
+           },
+           "slot": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "DocSubMemo"
+           },
+           "pk": {
+            "S": "$dates#v1#doc#a"
+           },
+           "sk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "csk": {
+            "S": "$dates#v1#docsubmemo#slot#a"
+           },
+           "createdAt": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "updatedAt": {
+            "S": "2023-11-14T22:13:30.000Z"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2023-11-14t22:13:25.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "tenant": "t",
+      "title": "t2",
+      "due": {
+       "date": 1600000000000
+      },
+      "createdAt": {
+       "date": 1700000000000
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      },
+      "note": {
+       "text": "n",
+       "due": {
+        "date": 1600000000000
+       }
+      },
+      "lines": [
+       {
+        "lineId": "l1",
+        "due": {
+         "date": 1600000000000
+        }
+       },
+       {
+        "lineId": "l2"
+       }
+      ],
+      "sub": {
+       "subName": "s2",
+       "due": {
+        "date": 1600000000000
+       },
+       "memo": {
+        "body": "m"
+       }
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "<table>",
+       "IndexName": "lsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$dates#v1#doc#a"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Doc"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#doc#2023-11-14t22:13:20.000z"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "gpk": {
+       "S": "$dates#v1#docs#t"
+      },
+      "gsk": {
+       "S": "$dates#v1#docs#2023-11-14t22:13:25.000z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#doc"
+      },
+      "tenant": {
+       "S": "t"
+      },
+      "title": {
+       "S": "t2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "lineId": {
+       "S": "l1"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l1"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocLine"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "lineId": {
+       "S": "l2"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docline#l2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocNote"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docnote"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docnote"
+      },
+      "text": {
+       "S": "n"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSub"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "due": {
+       "S": "2020-09-13T12:26:40.000Z"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsub#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "subName": {
+       "S": "s2"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "DocSubMemo"
+      },
+      "body": {
+       "S": "m"
+      },
+      "createdAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      },
+      "csk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "pk": {
+       "S": "$dates#v1#doc#a"
+      },
+      "sk": {
+       "S": "$dates#v1#docsubmemo#slot#a"
+      },
+      "slot": {
+       "S": "a"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:30.000Z"
+      }
+     }
+    ]
+   }
+  ]
+ }
+}

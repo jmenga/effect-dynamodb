@@ -915,53 +915,99 @@ class Team extends Schema.Class<Team>("Team")({
   teamId: Schema.String,
   name: Schema.String,
 }) {}
-const Teams = Entity.make({
-  model: DynamoModel.configure(Team, { teamId: { identifier: true } }),
-  entityType: "Team",
-  primaryKey: { pk: { field: "pk", composite: ["teamId"] }, sk: { field: "sk", composite: [] } },
-})
+/** Each world its own: an entity is bound to the last table it was registered on. */
+const teamsEntity = () =>
+  Entity.make({
+    model: DynamoModel.configure(Team, { teamId: { identifier: true } }),
+    entityType: "Team",
+    primaryKey: { pk: { field: "pk", composite: ["teamId"] }, sk: { field: "sk", composite: [] } },
+  })
 class Member extends Schema.Class<Member>("Member")({
   id: Schema.String,
   team: Schema.optionalKey(Team.pipe(DynamoModel.ref)),
 }) {}
+class RequiredMember extends Schema.Class<RequiredMember>("RequiredMember")({
+  id: Schema.String,
+  team: Team.pipe(DynamoModel.ref),
+}) {}
 
+/**
+ * A ref is cleared by its field: one the model declares optional by `.remove(["team"])` or
+ * `.set({ team: undefined })`, one form, after which the row reads without it (#241); a path
+ * removal and its id are pointed there. A required ref is refused whatever the form, as on
+ * 1.40.0, since a row without it couldn't be read. On 1.40.0 an optional ref was refused too.
+ */
 export const refScenarios: ReadonlyArray<Scenario> = (() => {
-  const Rows = Entity.make({
-    model: Member,
-    entityType: "Row",
-    primaryKey,
-    refs: { team: { entity: Teams } },
-  } as never) as any
-  const world: World = {
-    Rows,
-    MainTable: Table.make({ schema, entities: { Rows, Teams } as never }),
+  const worldFor = (model: Schema.Top) => {
+    const Teams = teamsEntity()
+    const Rows = Entity.make({
+      model,
+      entityType: "Row",
+      primaryKey,
+      refs: { team: { entity: Teams } },
+    } as never) as any
+    return { Rows, Teams, MainTable: Table.make({ schema, entities: { Rows, Teams } as never }) }
   }
-  const seeded = (db: any) =>
+  const optional = worldFor(Member)
+  const required = worldFor(RequiredMember)
+  const seeded = (world: ReturnType<typeof worldFor>, db: any) =>
     Effect.gen(function* () {
       const teams = yield* DynamoClient.make({
-        entities: { Teams },
+        entities: { Teams: world.Teams },
         tables: { MainTable: world.MainTable },
       } as never) as Effect.Effect<any, never, any>
       yield* teams.entities.Teams.put({ teamId: "t", name: "T" }).asEffect()
       yield* db.entities.Rows.put({ id: "1", teamId: "t" }).asEffect()
     })
-  const ROWS: ReadonlyArray<readonly [string, Op, RegExp]> = [
-    ['.remove(["team"])', (u) => u.remove(["team"]), /"team" is a ref/],
-    ['pathRemove(["team"])', (u) => u.pathRemove(["team"]), /"team" is a ref/],
-    [".set({ team: undefined })", (u) => u.set({ team: undefined }), /"team" is a ref/],
-    [".set({ teamId: undefined })", (u) => u.set({ teamId: undefined }), /"team" is a ref/],
-    ['.remove(["teamId"])', (u) => u.remove(["teamId"]), /the id of the ref "team"/],
+  const A_REF = /"team" is a ref, so a row without it could not be read/
+  const OPTIONAL =
+    /"team" is a ref the model declares optional: remove it with \.remove\(\["team"\]\)/
+  const THE_ID = /the id of the ref "team"/
+  const ROWS: ReadonlyArray<readonly [string, Op, RegExp | "removes", RegExp]> = [
+    ['.remove(["team"])', (u) => u.remove(["team"]), "removes", A_REF],
+    [".set({ team: undefined })", (u) => u.set({ team: undefined }), "removes", A_REF],
+    ['pathRemove(["team"])', (u) => u.pathRemove(["team"]), OPTIONAL, A_REF],
+    [".set({ teamId: undefined })", (u) => u.set({ teamId: undefined }), OPTIONAL, A_REF],
+    ['.remove(["teamId"])', (u) => u.remove(["teamId"]), THE_ID, THE_ID],
   ]
-  return ROWS.map(([name, op, says]) => ({
-    name: `a ref: ${name}`,
-    run: (h: Harness) =>
-      h.on(world, (db, probe) =>
-        Effect.gen(function* () {
-          yield* seeded(db)
-          yield* refused(db, probe, () => op(db.entities.Rows.update(key)).asEffect(), says)
-        }),
-      ),
-  }))
+  return ROWS.flatMap(([name, op, whenOptional, whenRequired]) => [
+    {
+      name: `an optional ref: ${name}`,
+      run: (h: Harness) =>
+        h.on(optional, (db, probe) =>
+          Effect.gen(function* () {
+            yield* seeded(optional, db)
+            if (whenOptional !== "removes") {
+              return yield* refused(
+                db,
+                probe,
+                () => op(db.entities.Rows.update(key)).asEffect(),
+                whenOptional,
+              )
+            }
+            const updated = yield* op(db.entities.Rows.update(key)).asEffect()
+            expect(updated).not.toHaveProperty("team")
+            expect(live(yield* probe.rows())).not.toHaveProperty("team")
+            expect(yield* db.entities.Rows.get(key)).toEqual(updated)
+          }),
+        ),
+    },
+    {
+      name: `a required ref: ${name}`,
+      run: (h: Harness) =>
+        h.on(required, (db, probe) =>
+          Effect.gen(function* () {
+            yield* seeded(required, db)
+            yield* refused(
+              db,
+              probe,
+              () => op(db.entities.Rows.update(key)).asEffect(),
+              whenRequired,
+            )
+          }),
+        ),
+    },
+  ])
 })()
 
 // ---------------------------------------------------------------------------

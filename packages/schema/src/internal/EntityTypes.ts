@@ -94,15 +94,17 @@ type StoredWithoutForm<S> = S extends { readonly Encoded: infer E }
 
 /**
  * The names `.remove()` takes: model fields a row can lack, less what no update
- * may clear: primary-key composites, refs, library-managed fields, and the
- * fields configured immutable or stored as a sparse map (`TUnremovable`). A
- * timestamp is the library's when it's a date; one of another type is the caller's,
- * and so is one {@link StoredAsOtherKindDates} names.
+ * may clear: primary-key composites, library-managed fields, and the fields
+ * configured immutable or stored as a sparse map (`TUnremovable`). A timestamp
+ * is the library's when it's a date; one of another type is the caller's, and so
+ * is one {@link StoredAsOtherKindDates} names. A ref the model declares optional
+ * is one a row can lack, so it's removable (#241); up to 1.40.0 every ref was left
+ * out (`_TRefs` is kept so the arity is). A ref's `${ref}Id` is no model field.
  */
 export type RemovableFields<
   TModel extends Schema.Top,
   TIndexes,
-  TRefs,
+  _TRefs,
   TTimestamps,
   TVersioned,
   TUnremovable extends string,
@@ -112,7 +114,6 @@ export type RemovableFields<
     : Exclude<
         ClearableFields<TModel>,
         | (string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>)
-        | (keyof TRefs & string)
         | TUnremovable
         | ManagedDateField<
             ModelType<TModel>,
@@ -489,6 +490,27 @@ export type RefEntityIdentifierValue<E> = E extends {
  *  For an entity with `pk: { composite: ["id"] }` and `id: TeamId`, yields `TeamId`. */
 type EntityIdentifierValue<E> = RefEntityIdentifierValue<ExtractRefEntity<E>>
 
+/** The keys of `T` a value may leave out. */
+type OptionalKeysOf<T> = { [K in keyof T]-?: {} extends Pick<T, K> ? K : never }[keyof T]
+
+/**
+ * The `${ref}Id` fields a `put` / `create` input takes (#241): required where the model requires
+ * the ref, optional where it declares the ref optional (`Schema.optionalKey`, and `Schema.optional`,
+ * which takes `undefined` too), so an optional ref can be left out. Up to 1.40.0 every id was
+ * required.
+ */
+type RefIdInputFields<TModel extends Schema.Top, TRefs> = {
+  readonly [K in keyof TRefs & string as K extends OptionalKeysOf<ModelType<TModel>>
+    ? never
+    : `${K}Id`]: EntityIdentifierValue<TRefs[K]>
+} & {
+  readonly [K in keyof TRefs & string as K extends OptionalKeysOf<ModelType<TModel>>
+    ? `${K}Id`
+    : never]?:
+    | EntityIdentifierValue<TRefs[K]>
+    | Extract<ModelType<TModel>[K & keyof ModelType<TModel>], undefined>
+}
+
 /** Entity ref input type: when refs present, replace ref fields with branded ID fields */
 export type EntityRefInputType<
   TModel extends Schema.Top,
@@ -499,9 +521,7 @@ export type EntityRefInputType<
 > = [TRefs] extends [undefined]
   ? EntityInputType<TModel, TTimestamps, TVersioned, TTimeSeries>
   : WithSystemCollisions<
-      Omit<ModelType<TModel>, keyof TRefs & string> & {
-        readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
-      },
+      Omit<ModelType<TModel>, keyof TRefs & string> & RefIdInputFields<TModel, TRefs>,
       TTimestamps,
       TVersioned,
       TTimeSeries
@@ -521,15 +541,11 @@ export type EntityRefCreateType<
   : WithSystemCollisions<
       [TIdentifier] extends [string]
         ? Omit<
-            Omit<ModelType<TModel>, keyof TRefs & string> & {
-              readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
-            },
+            Omit<ModelType<TModel>, keyof TRefs & string> & RefIdInputFields<TModel, TRefs>,
             TIdentifier
           >
         : Omit<
-            Omit<ModelType<TModel>, keyof TRefs & string> & {
-              readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
-            },
+            Omit<ModelType<TModel>, keyof TRefs & string> & RefIdInputFields<TModel, TRefs>,
             PrimaryKeyComposites<TIndexes>
           >,
       TTimestamps,

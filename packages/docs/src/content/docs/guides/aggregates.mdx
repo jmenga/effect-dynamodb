@@ -85,7 +85,7 @@ Ref fields transform across Entity's derived types:
 
 | Type | Ref field shape | Example |
 |------|-----------------|---------|
-| `Entity.Input<E>` | ID field (derived from identifier name + "Id" suffix) | `teamId: string`, `playerId: string` |
+| `Entity.Input<E>` | ID field (derived from identifier name + "Id" suffix), optional where the model declares the ref optional | `teamId: string`, `playerId: string` |
 | `Entity.Record<E>` | Full domain object | `team: Team`, `player: Player` |
 | `Entity.Update<E>` | Optional ID field | `teamId?: string`, `playerId?: string` |
 
@@ -109,11 +109,19 @@ const selection = yield* db.entities.SquadSelections.get({
 
 ### Ref Hydration
 
-On `put` and `update`, Entity automatically:
+On `put`, `upsert` and `update`, Entity automatically:
 1. Extracts the ID from each ref field in the input
 2. Fetches the referenced entity by ID (parallel fetches for multiple refs)
 3. Embeds the entity's core domain data (Schema.Type — no system fields) in the DynamoDB item
 4. Returns `RefNotFound` if any referenced entity doesn't exist
+
+An ID is a value of the referenced entity's key composite, the one attribute its primary key is composed from, and it is fetched under that, as an aggregate edge's ID is. The entity's `identifier` needn't be its key: `teamId` names the team keyed by `id`, even where the team's identifier is `code`. Before 1.41.0 the ID was fetched under the identifier, so a `put` naming such an entity failed with a `ValidationError`. An entity keyed by more than one attribute is fetched under its identifier, as before: that works where the key's other attributes are filled in when the key is encoded (an encoding default), and fails with a `ValidationError` where they aren't.
+
+The ID is a value of the key's own type: `5` for a `Schema.NumberFromString` key, `5n` for a `Schema.BigIntFromString` one, a date for a `DynamoModel.DateEpochSeconds` one. Before 1.41.0 a write naming an entity keyed by such a field failed with a `ValidationError` (`get.decode`).
+
+An index keyed by a ref's ID (a cascade index, or one of your own such as `byPlayer` above) is keyed from the ID given, by every write: `put`, `upsert`, and an `update`, `patch` or `Transaction.transactWrite` update that reassigns the ref with `.set({ playerId })`, through the index's [policy](/effect-dynamodb/guides/index-policy/) like any other composite. Before 1.41.0 an `upsert` wrote no key for such an index, and an update reassigning the ref kept the old key, so a cascade from the newly named entity missed the row. To key the rows earlier versions wrote that way, run `db.tables.<Table>.rekey({ repairIndexKeys: true })`, which rewrites each index key that isn't what a `put` of the row's values writes (with `dryRun: true` it counts them).
+
+A ref the model declares optional (`Schema.optionalKey(Team.pipe(DynamoModel.ref))`, or `Schema.optional(Team).pipe(DynamoModel.ref)`) can be left out: its ID is optional in `put`, `create` and `upsert`, nothing is fetched, and the row stores no ref and no key of an index keyed by its ID, so a cascade skips it. `.remove(["team"])` removes it, and the row leaves that index. `.remove(["teamId"])`, `.set({ teamId: undefined })` and `pathRemove(["team"])` are refused, naming `.remove(["team"])`: the row stores the ref, not its ID, and a path removal doesn't take the row out of that index. A required ref can't be left out or removed: a row without it couldn't be read. Before 1.41.0 every ref's ID was required, and removing a ref was refused.
 
 ```typescript region="ref-not-found" example="guide-aggregates.ts"
   // #region ref-not-found
@@ -293,6 +301,8 @@ Two shapes need a declaration, because nothing about the element identifies it o
 
 Without one, decomposition fails with `AggregateDecompositionError` naming the edge and the colliding sort key — rather than the DynamoDB `ValidationException` ("Transaction request cannot include multiple operations on one item") that the collision would otherwise produce.
 
+With `escapeKeys: true`, a declared `sk.composite` is composed from the element's values, as a plain edge's is: a number is padded and a date is UTC ISO text, whatever the entity stores the field as. Up to 1.40.0 an `entity:` edge composed a composite starting at a field its entity's model encodes (`Schema.NumberFromString`, `DynamoModel.DateEpochMs`, `Schema.DateTimeZonedFromString`, a codec of your own, a `Schema.Class`, optional or not, so a path such as `entry.n` too) from the encoded text, `5` where a plain edge writes `0000000000000005`. With `escapeKeys: false` it still does, byte for byte. On an `escapeKeys: true` table the rows 1.40.0 wrote that way read as before, `delete` removes them, and a group's next changed `update` moves them to the new keys in its own transaction, each keeping its `created`. A group's update is one transaction of at most 100 items: one for each row of the group, and one more for each row it moves, the delete of the row under 1.40.0's text. A group whose rows plus such rows come to more than 100 (the root and 50 such rows are 101) can't be updated until `db.tables.<Table>.rekey()` has moved them, and its `AggregateTransactionOverflow` says how many of its items are those deletes. That group writes nothing; groups the update wrote before it stay written, as on any group's failure (the error's `committed` names them). Two elements whose 1.40.0 text differed only in letter case or in a date's zone compose one key now. They read as before, `rekey` reports the aggregate `failed` and moves none of its rows, and a changed `update` of their group that keeps both is refused as any collision is; remove or change one of them through an `update` to repair it.
+
 #### Step 3: Top-Level Aggregate
 
 Bind the full domain schema to a table, schema namespace, and partition key:
@@ -374,8 +384,13 @@ That row then works much like an entity:
   declares with `Schema.optional`, which keeps a value you supply to `create`, as it always did;
   one declared with `Schema.optionalKey` is stamped. (An entity's `put` keeps a value you supply.)
 - A stamp is stored the way the row stores any value of that field, on `create` and `update`: in
-  the model's own encoding, or as ISO text for a date declared with `Schema.optional`, whose
-  values are stored that way. A row that doesn't declare the field gets the root's form.
+  the model's own encoding, `Schema.optional` included. A row that doesn't declare the field gets
+  the root's form. Up to 1.40.0 a date declared with `Schema.optional` was stored as ISO text
+  whatever its encoding, stamps included. Those rows read as they are, and switch to the declared
+  encoding per group, on that group's next changed write, never on a no-op: an `update` that
+  changes a group rewrites every row of it in the declared form, keeping the same instants, and an
+  `update` that changes nothing writes nothing.
+  Until a group is next changed, a filter on such a field meets both forms. Key text is unchanged.
 - `create` and `update` return what they stored, and the value is decoded normally on read.
 - On `update`, `createdAt` stays what's stored whatever the mutation did. A mutation that
   changes `updatedAt` gives it; otherwise a rewritten row gets a new stamp.
@@ -472,6 +487,8 @@ Aggregate items store their values in their schema's **wire form**, the same for
 
 Other transforms follow the same rule. A `Schema.BigIntFromString` or `Schema.NumberFromString` is stored as a string, and self date schemas such as `Schema.DateTimeUtc` and `Schema.Date` default to an ISO string. In a union that mixes a date with another type (`Schema.Union([Schema.DateTimeUtcFromString, Schema.Number])`), each value is stored by the member it belongs to, so a `5` stays a number. A plain `Schema.BigInt` is stored as a number and reads back as a `bigint`. On read, each value is decoded back to its domain type, so the assembled aggregate holds real `DateTime` instances, and a zoned date keeps its named or offset zone.
 
+A `many` element whose schema shows no fields of its own is encoded through its schema as a whole, once, whether you give it its domain value or its stored form: a union (a member that renames a field among them), a `Schema.NullOr`, or a transformation of the whole element such as `Schema.encodeKeys` or a struct decoded to another. Up to 1.40.0 such an element was stored as the domain value it held: a member renaming `text` to `line` was stored under `text`, a `Schema.NumberFromString` in a member as a number, a date as a map. Those rows still read as before. They switch a group at a time, on the group's next `update` that changes it, and an `update` that changes nothing writes nothing. Until then an attribute can hold the domain value on some rows and the stored form on others, so write a filter on it for both.
+
 Self dates in unions follow the entity rules in [Dates in unions](/effect-dynamodb/guides/modeling/#dates-in-unions). A date next to a string member claims only its canonical ISO string, so a string member holding exactly such an instant reads back as a `DateTime`. An epoch-stored date next to a numeric member is rejected by `Aggregate.make` with `EDD-9058`. On an aggregate, that includes a `Schema.NumberFromString` or `Schema.BigIntFromString` member. These are stored as strings, but `update` re-decodes the aggregate's domain values, where they are numbers, and a number there could belong to either member. Entities accept those two.
 
 A ref in a `many` edge can be declared in any of these ways, and all of them round-trip through `create`, `get` and `update`:
@@ -511,7 +528,35 @@ On 1.39.0 a `many` edge held as a `Schema.Record` stored what `decompose` return
 
 #### What a custom `assemble` is handed
 
-A `many` edge's `assemble` is handed the rows read, unmarshalled, with packed fields unpacked, under their stored attribute names. Removed from each row: `__edd_e__`, the attributes named `pk` and `sk`, every attribute whose name begins with `gsi` or `lsi`, and the timestamps the library stamps that the edge's model doesn't declare. Everything else stays, including a collection sort-key mirror under another name, and discriminator and context attributes. Nothing is decoded: on a field that multiplies by 10 on decode, it's handed 5 where `get` returns 50. What it returns is decoded with the rest of the aggregate.
+A `many` edge's `assemble` is handed the rows read, unmarshalled, with packed fields unpacked, under their stored attribute names. Removed from each row: `__edd_e__`, the attributes named `pk` and `sk`, every attribute whose name begins with `gsi` or `lsi` that the edge's element doesn't declare (with no custom `decompose`), and the timestamps the library stamps that the edge's model doesn't declare. Everything else stays, including a collection sort-key mirror under another name, and discriminator and context attributes. Nothing is decoded: on a field that multiplies by 10 on decode, it's handed 5 where `get` returns 50. What it returns is decoded with the rest of the aggregate.
+
+Without a custom `assemble`, an edge's value is read from its row with the same attributes removed, except a field the value declares: a field named like `gsiNote` on a `one` edge, or `skills` on a sub-aggregate with edges of its own, reads back as given, unless the library writes a key of that name on the row (next section). Up to 1.40.0 such a field was removed too, and the read failed or left it out. Everything else the library writes on the row stays where the value's schema keeps it: the discriminators (a sub-aggregate's, on every row beneath it, and a `one` edge's own), the context attributes (the root fields `context` copies onto every edge's row), the partition key's attribute under a name other than `pk`, and the collection sort key's mirror. A struct or a class drops what it doesn't declare. A value that keeps what it's given, `Schema.Unknown` or `Schema.Any`, is stored as its row's attributes, so its row is its value, and it reads back with those attributes in it, as on 1.40.0: nothing stored tells them from keys the value held itself.
+
+#### Field names the library writes on a row
+
+Every row an aggregate writes holds attributes of the library's own, written over what the row's value holds there: `__edd_e__`, the partition key attribute, `sk`, the collection sort key's copy (with a collection index), on the root's row its list keys (when every list composite has a value), on every row beneath the root the context attributes, and the discriminators (a sub-aggregate's on every row beneath it, a `one` edge's own on its row). Up to 1.40.0 a value given there was replaced by the library's, and a read handed back the library's value, or nothing.
+
+`create` now refuses a value exactly where a `get` right after wouldn't return it, with `EDD-9159` and `AggregateDecompositionError`, nothing written. Each row is read as `get` reads it (packed fields unpacked, renamed, decoded by the member's own schema), and what it reads is compared with the value you gave: a set by its members, a date by its instant (and zone, where the type has one), a class, `Option` or `Data` value by its contents, and anything else exactly as a read returns it (`5n` isn't `5`, `-0` isn't `0`, a `BigDecimal` `1.5` isn't `1.50`). Equal, and the row is written as on 1.40.0. Different, or a read that fails there, and the `create` is refused. For example:
+
+- `pk`, `sk` or `__edd_e__` given a value at the top of a row's value;
+- the partition key attribute under a name other than `pk` (`pk: { field: "id", composite: ["id"] }` on a root declaring `id`), which every read handed back as the key text;
+- the collection sort key's copy, or a root list key on a write that composes the list keys, holding other text than the key;
+- a context attribute holding another value than the root's on a row beneath it (`{ text, tenantId: "t2" }` under `context: ["tenantId"]` on a root holding `t1`, which read back as `t1`);
+- a context attribute a member declares in another form than the root does, where the root's value doesn't read as it (a root's `Schema.NumberFromString` under a member's `Schema.Number`), whether or not you give the member a value for it.
+
+The message names the member and the field, and shows the value you gave and what the read returns, so the two can be told apart (`"5"` and `5`, `Set { "a", "c" }`, `6n`). It applies to the root's row, a `one` edge's value, a `many` element, a sub-aggregate's root (a union or `Schema.suspend` read whole) and a `many` edge with a custom `decompose` or `assemble` (read whole, through them), and to a `many` value given under its `inputField`. Not judged, written and read as on 1.40.0: a field left out whose read succeeds, and a decoding default; a discriminator, which the library fills whatever the value holds; a name the library doesn't write on that row (such as `gsi1pk` on an edge, which a read removes as before); and a key nested below the value's top level. `Aggregate.make` refuses nothing.
+
+`update` isn't judged: a value given there for such a name is replaced by the library's, as on 1.40.0. The state an update changes is what its read returned, and what the read filled in (a context copy, a key's text, a discriminator) can't be told from what you set. To fix a refused `create`, give the value the read returns, leave the field out, or rename it.
+
+#### What `update` returns
+
+`update` returns the state your mutation returned, decoded, as on 1.40.0: the same classes, element order and properties. One thing differs: where a member's value holds a copy of a `context` field, the copy is what its row holds after the write. Up to 1.40.0 it was the copy the state was read with, so an update changing the root's context field returned the old value on every member. A value whose copy changes is built as a read builds it, a `Schema.Class` instance by its class's constructor, so its methods and private fields work; an instance of a class of your own held by `Schema.Unknown` is returned as your mutation gave it. A `get` right after can still read otherwise, as on 1.40.0: `many` elements in key order rather than yours, a custom `assemble`'s derived values, a discriminator or a key the value holds another value in, and a key a read removes.
+
+When an update changes a context field and a later sub-aggregate's transaction fails after the root's committed, the rows of the groups not written keep the old value. The next `update`, a retry included, writes every group whose rows hold a context copy other than the root's value. An attribute the library writes on each row itself (a discriminator, a timestamp, a key) is never a copy, whatever `context` names, so an aggregate nobody left half-written sends exactly what it did: a no-op update is one `Query`.
+
+#### Turning `escapeKeys` over
+
+A `many` element's sort key or a discriminator value composes different text under the two `escapeKeys` settings when it holds a `$`, `#` or other escaped character, a number other than a non-negative integer, or a negative `bigint`; so does an `entity:` edge's key over a field its model encodes, such as `Schema.NumberFromString`. Rows written before you turn the setting over stay under the old text until `db.tables.<Table>.rekey()` moves them. An `update` that would write such a group before that is refused with `EDD-9160`, a `ValidationError` naming the member, the row and `rekey`, and writes nothing: up to 1.40.0 it stored the group's rows a second time under the new text, so every element read twice. Run `rekey`, then update.
 
 #### Which rows are the aggregate's: `ownsRows`
 
@@ -674,7 +719,7 @@ Returns `RefNotFound` if a ref ID doesn't resolve. Each sub-aggregate group is i
 
 Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first. Each sub-aggregate is still its own transaction, so if a later one fails, the ones before it stay written.
 
-The guard is on the root item only. Edge and sub-aggregate rows left without a root, for example by an earlier write that failed partway, don't stop `create`. `get` then reads them back together with the new aggregate's rows, merging stale edges into it. Before creating an aggregate where an earlier write may have failed partway, `delete` its key: `delete` removes every row in the partition, orphans included. The library doesn't check for orphan rows on `create`, because that would add a partition read to every create.
+The guard is on the root item only. Edge and sub-aggregate rows left without a root, for example by an earlier write that failed partway, don't stop `create`. `get` then reads them back together with the new aggregate's rows, merging stale edges into it. Before creating an aggregate where an earlier write may have failed partway, `delete` its key: `delete` removes every row of the aggregate's entity types in the partition, orphans included. The library doesn't check for orphan rows on `create`, because that would add a partition read to every create.
 
 #### update — Diff and Write
 
@@ -755,13 +800,13 @@ The mutation function can return either a class instance (from spreading `curren
 
 #### delete — Remove All Items
 
-Remove all items in the aggregate's partition:
+Remove the aggregate's items from its partition:
 
 ```typescript region="aggregate-delete" example="guide-aggregates.ts"
 yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
 ```
 
-Queries all items in the partition and batch-deletes them.
+Queries the partition and batch-deletes every row whose entity type (`__edd_e__`) is one of the aggregate's own: its root's, each edge's and each sub-aggregate's, whoever wrote them. Any other row in the partition, an entity's or another aggregate's, stays. A partition holding none of the aggregate's rows fails with `AggregateAssemblyError`, as an empty one does. Up to 1.40.0, `delete` removed every row in the partition.
 
 #### list — Page Through Aggregates
 
@@ -909,6 +954,8 @@ After updating the player, the cascade:
 1. Identifies all ref fields on `SquadSelections` that reference `Players`
 2. Queries the target entity's GSI (whose PK composite includes the player's ID field) to find all items embedding this player
 3. Updates each matching item with the new denormalized player data
+
+The player's ID is read from the update's key, under the attribute a ref ID names (its key composite), so it's the ID each selection's ref was given. Before 1.41.0 it was read under the player's identifier, so a cascade from an entity whose identifier isn't its key updated nothing, and one from an entity keyed by a number queried a partition no `put` wrote. A row an earlier version upserted, or whose ref an earlier update reassigned, holds no key or the old entity's in that index, so a cascade misses it until `rekey({ repairIndexKeys: true })` rewrites its key (see [Ref Hydration](#ref-hydration)).
 
 ### Configuration
 

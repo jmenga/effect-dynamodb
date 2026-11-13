@@ -1,0 +1,1488 @@
+{
+  "generatedFrom": [
+    "effect-dynamodb@1.40.0"
+  ],
+  "note": "Captured once on DynamoDB Local (#241): a group this release (escapeKeys: true) wrote, then read and updated by the published effect-dynamodb 1.40.0. Per scenario: before, the rows this release wrote (input, as 1.40.0 found them); get, 1.40.0's read; update, 1.40.0's update (title: the title changed; label: t2's label changed to B; remove: t3 removed; add: t4 added); after, the rows 1.40.0 left; getAfter, 1.40.0's read of them. Timestamps are the wall clock's. Models: test/helpers/AggregateMixedWriters.ts. Never regenerate or fix this file.",
+  "scenarios": {
+    "title": {
+      "before": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "title"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "title": {
+            "S": "t"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "title",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "title",
+          "title": "t2",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      },
+      "after": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "title"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "title": {
+            "S": "t2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.702Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.647Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.702Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#1"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.702Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.702Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#2"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.702Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.702Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#3"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#title"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.702Z"
+          }
+        }
+      ],
+      "getAfter": {
+        "ok": {
+          "id": "title",
+          "title": "t2",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            },
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      }
+    },
+    "label": {
+      "before": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "label"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "title": {
+            "S": "t"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "label",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "label",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "B"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      },
+      "after": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "label"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "title": {
+            "S": "t"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.769Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.730Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.769Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#1"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.769Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.769Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#2"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "B"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.769Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.769Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#3"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#label"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.769Z"
+          }
+        }
+      ],
+      "getAfter": {
+        "ok": {
+          "id": "label",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            },
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "B"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      }
+    },
+    "remove": {
+      "before": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "remove"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "title": {
+            "S": "t"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "remove",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "remove",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            }
+          ]
+        }
+      },
+      "after": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "remove"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "title": {
+            "S": "t"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.834Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.793Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.834Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#1"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.834Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.834Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#2"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#remove"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.834Z"
+          }
+        }
+      ],
+      "getAfter": {
+        "ok": {
+          "id": "remove",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            },
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            }
+          ]
+        }
+      }
+    },
+    "add": {
+      "before": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "add"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "title": {
+            "S": "t"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "add",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "add",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            },
+            {
+              "tallyId": "t4",
+              "n": 4,
+              "label": "l4"
+            }
+          ]
+        }
+      },
+      "after": [
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "Bulk"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulk"
+          },
+          "id": {
+            "S": "add"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "title": {
+            "S": "t"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000001"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000002"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#0000000000000003"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.859Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#1"
+          },
+          "tallyId": {
+            "S": "t1"
+          },
+          "label": {
+            "S": "l1"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "1"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#2"
+          },
+          "tallyId": {
+            "S": "t2"
+          },
+          "label": {
+            "S": "l2"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "2"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#3"
+          },
+          "tallyId": {
+            "S": "t3"
+          },
+          "label": {
+            "S": "l3"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "3"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          }
+        },
+        {
+          "createdAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          },
+          "__edd_e__": {
+            "S": "BulkTally"
+          },
+          "sk": {
+            "S": "$mixed#v1#bulktally#4"
+          },
+          "tallyId": {
+            "S": "t4"
+          },
+          "label": {
+            "S": "l4"
+          },
+          "pk": {
+            "S": "$mixed#v1#bulk#add"
+          },
+          "n": {
+            "S": "4"
+          },
+          "updatedAt": {
+            "S": "2026-11-11T23:27:04.902Z"
+          }
+        }
+      ],
+      "getAfter": {
+        "ok": {
+          "id": "add",
+          "title": "t",
+          "tallies": [
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            },
+            {
+              "tallyId": "t1",
+              "n": 1,
+              "label": "l1"
+            },
+            {
+              "tallyId": "t2",
+              "n": 2,
+              "label": "l2"
+            },
+            {
+              "tallyId": "t3",
+              "n": 3,
+              "label": "l3"
+            },
+            {
+              "tallyId": "t4",
+              "n": 4,
+              "label": "l4"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
