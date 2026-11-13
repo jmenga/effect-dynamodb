@@ -14959,9 +14959,9 @@ const makeImpl = <
           "item",
           values,
           read!,
-          // Its sentinels name the key it's stored under, or, where 1.39.0's `restore` moved it
-          // (`restoredObjectReading`), the item's key under the text `put` composed.
-          (key) => sameStoredKey(key, from) || targets.isLive(key),
+          // Where 1.39.0's `restore` moved it (`restoredObjectReading`), its sentinels name the
+          // item's key under the text `put` composed: adopted (`all`), as no row holds that key.
+          (key) => sameStoredKey(key, from),
           to,
           true,
           undefined,
