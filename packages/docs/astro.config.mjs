@@ -45,6 +45,7 @@ export default defineConfig({
             { label: "Queries", slug: "guides/queries" },
             { label: "Expressions", slug: "guides/expressions" },
             { label: "Data Integrity", slug: "guides/data-integrity" },
+            { label: "Add-only Writes", slug: "guides/add-only-writes" },
             { label: "Lifecycle", slug: "guides/lifecycle" },
             { label: "Time-series", slug: "guides/timeseries" },
             { label: "Aggregates & Refs", slug: "guides/aggregates" },

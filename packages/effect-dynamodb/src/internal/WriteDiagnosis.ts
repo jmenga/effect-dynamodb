@@ -66,6 +66,7 @@ import {
   IN_MAX_OPERANDS,
   largestInOperands,
 } from "./ExpressionLimits.js"
+import { STATEMENT_MAX_LENGTH } from "./InsertStatement.js"
 import {
   attributeBytes,
   batchWriteBodyBytes,
@@ -179,6 +180,8 @@ export type SentWrite =
       readonly target: () => TransactItemTarget
       readonly callerCondition?: (() => string | undefined) | undefined
       readonly input?: Readonly<Record<string, unknown>> | undefined
+      /** The PartiQL statement it was sent as, when it wasn't sent as `item` itself. */
+      readonly statements?: ReadonlyArray<string> | undefined
     }
   | {
       readonly _tag: "Transaction"
@@ -186,6 +189,8 @@ export type SentWrite =
       readonly targets: () => ReadonlyArray<TransactItemTarget>
       readonly callerCondition?: ((index: number) => string | undefined) | undefined
       readonly input?: Readonly<Record<string, unknown>> | undefined
+      /** The PartiQL statement each entry was sent as, when not as `items` themselves. */
+      readonly statements?: ReadonlyArray<string> | undefined
     }
   | {
       readonly _tag: "Batch"
@@ -334,6 +339,13 @@ export type Diagnosis =
       readonly caller:
         | { readonly length: number; readonly operators: number; readonly inOperands: number }
         | undefined
+    }
+  | {
+      /** A PartiQL `INSERT` over the statement length limit: it lists every attribute name. */
+      readonly _tag: "StatementTooLong"
+      readonly target: TransactItemTarget
+      readonly length: number
+      readonly attributes: number
     }
   | {
       /** A write puts an empty string (or binary) in a key attribute. */
@@ -1083,12 +1095,33 @@ const oversizedRequest = (sent: SentWrite): Diagnosis | undefined => {
   }
 }
 
+/** The first statement sent over the length limit, measured from the request. */
+const statementTooLong = (sent: SentWrite): Diagnosis | undefined => {
+  if ((sent._tag !== "Item" && sent._tag !== "Transaction") || sent.statements === undefined) {
+    return undefined
+  }
+  const index = sent.statements.findIndex((statement) => statement.length > STATEMENT_MAX_LENGTH)
+  if (index < 0) return undefined
+  const item = sent._tag === "Item" ? sent.item : sent.items[index]
+  const target = sent._tag === "Item" ? sent.target() : sent.targets()[index]
+  return item === undefined || target === undefined
+    ? undefined
+    : {
+        _tag: "StatementTooLong",
+        target,
+        length: (sent.statements[index] as string).length,
+        attributes: Object.keys(writtenAttributes(item)).length,
+      }
+}
+
 const diagnoseRequest = (
   failure: { readonly message: string; readonly tooLarge: boolean },
   sent: SentWrite,
   keys: KeyAttributes,
 ): Diagnosis | undefined => {
   const message = failure.message
+  const overLong = statementTooLong(sent)
+  if (overLong !== undefined) return overLong
   if (failure.tooLarge) return oversizedRequest(sent)
   if (REQUEST_SIZE.test(message)) {
     const found = oversizedRequest(sent)
@@ -1400,6 +1433,13 @@ export const explainDiagnosis = (
       ? `This request wrote nothing; ${options.committed}.`
       : "Nothing was written."
   switch (diagnosis._tag) {
+    case "StatementTooLong":
+      return (
+        `${operation}: DynamoDB rejected the PartiQL statement for ${named(diagnosis.target)}: ` +
+        `it is ${diagnosis.length} characters, over the limit of ${STATEMENT_MAX_LENGTH}. ` +
+        `An INSERT statement lists every attribute name, and this item has ` +
+        `${diagnosis.attributes}. put() and create() have no such limit. ${outcome}`
+      )
     case "ItemTooLarge":
       return (
         `${operation}: DynamoDB rejected the write because an item exceeds its limit of ` +
@@ -1649,6 +1689,7 @@ export const diagnosedEntityType = (diagnosis: Diagnosis, fallback: string): str
     case "ExpressionTooLarge":
     case "EmptyKey":
     case "OperandType":
+    case "StatementTooLong":
       return diagnosis.target.entityType
     case "EmptyIn":
       return diagnosis.target?.entityType ?? fallback

@@ -36,6 +36,8 @@ export function buildParams(op: DetectedOperation): DynamoDBParams | undefined {
       return entity ? buildPutParams(entity, op.arguments) : undefined
     case "create":
       return entity ? buildCreateParams(entity, op.arguments) : undefined
+    case "insert":
+      return entity ? buildInsertParams(entity, op.arguments) : undefined
     case "update":
       return entity ? buildUpdateParams(entity, op.arguments, op.updateCombinators) : undefined
     case "delete":
@@ -109,6 +111,18 @@ function buildCreateParams(
     Item: item,
     ConditionExpression: condition,
     ExpressionAttributeNames: names,
+    entityType: entity.entityType,
+  }
+}
+
+function buildInsertParams(
+  entity: ResolvedEntity,
+  args: Record<string, unknown> | undefined,
+): DynamoDBParams {
+  return {
+    command: entity.unique !== undefined ? "ExecuteTransactionCommand" : "ExecuteStatementCommand",
+    TableName: "{TableName}",
+    Item: buildItemFields(entity, args),
     entityType: entity.entityType,
   }
 }

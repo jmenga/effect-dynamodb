@@ -88,6 +88,8 @@ const recording = () => {
     deleteItem: write("deleteItem"),
     transactWriteItems: write("transactWriteItems"),
     batchWriteItem: write("batchWriteItem"),
+    executeStatement: write("executeStatement"),
+    executeTransaction: write("executeTransaction"),
     // Only what's seeded in `CustomDeclarationPaths` is found: an entity's row and an aggregate's root.
     getItem: (input: { readonly Key?: unknown }) =>
       Effect.succeed(JSON.stringify(input.Key).includes("#row") ? { Item: row } : {}) as never,

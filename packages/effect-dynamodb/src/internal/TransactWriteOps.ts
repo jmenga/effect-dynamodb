@@ -38,7 +38,7 @@ import type { ConditionInput, ExpressionResult } from "../Expression.js"
 import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundUpdateOp, BoundWriteOp } from "./BoundCrud.js"
-import { withGuard } from "./EntityOps.js"
+import { type PutKind, withGuard } from "./EntityOps.js"
 import {
   compileExpr,
   type Expr,
@@ -348,7 +348,7 @@ type BuiltPut = Effect.Success<ReturnType<typeof validateAndBuildPutItem>>
 /** One caller op, with everything its items need that takes no read. */
 interface PreparedOp {
   readonly type: "put" | "delete" | "conditionCheck" | "planned"
-  readonly putKind?: "put" | "create" | "upsert" | undefined
+  readonly putKind?: PutKind | undefined
   readonly entity: Entity
   /** Index into the caller's `operations` array — preserved for provenance. */
   readonly opIndex: number
@@ -769,7 +769,6 @@ export const buildTransactWriteItems = (
             userCondition: op.condition,
             create: op.putKind === "create",
             operation,
-            key: op.input!,
             composeKeys: built.composeKeys,
           })
           guarded.push({ opIndex: op.opIndex, start: items.length, plan })

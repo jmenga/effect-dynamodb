@@ -1,16 +1,135 @@
+import { inspect } from "node:util"
+import { Cause, Effect, Equal, Hash, Logger, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   AggregateTransactionOverflow,
+  ConcurrentModification,
   ConditionalCheckFailed,
+  DeleteAppliedButUnreadable,
   DynamoError,
+  ItemAlreadyExists,
   ItemDeleted,
   ItemNotFound,
+  isAwsDuplicateItem,
+  isDuplicateItemReason,
   OptimisticLockError,
+  StaleAppend,
   StreamSealed,
   TransactionCancelled,
   UniqueConstraintViolation,
   ValidationError,
 } from "../src/Errors.js"
+
+const SECRET = "hunter2"
+
+/** Each error whose field holds an item or the caller's values, made with `value` in that field. */
+const holdingValues = [
+  {
+    field: "fields",
+    make: (value: string) =>
+      new UniqueConstraintViolation({
+        entityType: "T",
+        constraint: "email",
+        fields: { email: value },
+      }),
+  },
+  {
+    field: "item",
+    make: (value: string) =>
+      new DeleteAppliedButUnreadable({
+        entityType: "T",
+        key: { id: "1" },
+        item: { id: "1", secret: value },
+        cause: "undecodable",
+      }),
+  },
+  {
+    field: "current",
+    make: (value: string) =>
+      new ConditionalCheckFailed({
+        entityType: "T",
+        key: { id: "1" },
+        current: Option.some({ id: "1", secret: value }),
+      }),
+  },
+  {
+    field: "current",
+    make: (value: string) =>
+      new ConcurrentModification({
+        entityType: "T",
+        key: { id: "1" },
+        attributes: ["email"],
+        current: Option.some({ id: "1", secret: value }),
+      }),
+  },
+  {
+    field: "current",
+    make: (value: string) =>
+      new StaleAppend({
+        entityType: "T",
+        orderByField: "at",
+        attemptedOrderBy: 1,
+        current: Option.some({ id: "1", secret: value }),
+      }),
+  },
+] as const
+
+/** What each of Effect's log formats prints for `error` logged as the message. */
+const logged = (error: unknown): Promise<Array<string>> => {
+  const lines: Array<string> = []
+  const formats = [
+    Logger.formatSimple,
+    Logger.formatLogFmt,
+    Logger.formatJson,
+    Logger.formatStructured,
+  ]
+  const loggers = formats.map((format) =>
+    Logger.make((options) => {
+      lines.push(inspect(format.log(options), { depth: 10 }))
+    }),
+  )
+  return Effect.runPromise(
+    Effect.logError(error).pipe(Effect.provide(Logger.layer(loggers)), Effect.as(lines)),
+  )
+}
+
+describe("a field holding values is read, never printed", () => {
+  for (const { field, make } of holdingValues) {
+    const name = `${make(SECRET)._tag}.${field}`
+
+    it(`${name} is left out of what Effect, JSON.stringify and inspect print`, async () => {
+      const error = make(SECRET)
+      const printed = [
+        JSON.stringify(error),
+        String(error),
+        inspect(error, { depth: 10 }),
+        Cause.pretty(Cause.fail(error)),
+        ...(await logged(error)),
+      ]
+      for (const text of printed) {
+        expect(text).not.toContain(SECRET)
+        expect(text).not.toMatch(new RegExp(`\\b${field}\\b`))
+      }
+    })
+
+    it(`${name} is still read, copied and compared, as before`, () => {
+      const error = make(SECRET) as unknown as Record<string, unknown>
+      expect(JSON.stringify(error[field])).toContain(SECRET)
+      expect({ ...error }[field]).toBe(error[field])
+      expect(Object.keys(error)).toContain(field)
+      // Two errors that differ only in the field are not equal, by Effect or by vitest.
+      const same = make(SECRET)
+      const other = make("other")
+      expect(Equal.equals(error, same)).toBe(true)
+      expect(Equal.equals(error, other)).toBe(false)
+      expect(Hash.hash(error)).not.toBe(Hash.hash(other))
+      expect(error).toEqual(same)
+      expect(error).not.toEqual(other)
+      expect(error).not.toStrictEqual(other)
+      expect(error).toMatchObject({ [field]: same[field as keyof typeof same] })
+    })
+  }
+})
 
 describe("Errors", () => {
   describe("AggregateTransactionOverflow has a readable message (#144)", () => {
@@ -136,5 +255,32 @@ describe("Errors", () => {
     })
     expect(error._tag).toBe("ItemDeleted")
     expect(error.deletedAt).toBe("2024-01-15T10:30:00Z")
+  })
+
+  describe("a PartiQL INSERT finding the key taken (#189)", () => {
+    it("ItemAlreadyExists names the entity and its key", () => {
+      const error = new ItemAlreadyExists({ entityType: "User", key: { userId: "u-1" } })
+      expect(error._tag).toBe("ItemAlreadyExists")
+      expect(error.key).toEqual({ userId: "u-1" })
+    })
+
+    it("recognises the error under AWS's name and DynamoDB Local's", () => {
+      const named = (name: string) => Object.assign(new Error("x"), { name })
+      expect(isAwsDuplicateItem(named("DuplicateItemException"))).toBe(true)
+      expect(isAwsDuplicateItem(named("DuplicateItem"))).toBe(true)
+      expect(isAwsDuplicateItem(named("ConditionalCheckFailedException"))).toBe(false)
+      expect(isAwsDuplicateItem(undefined)).toBe(false)
+      expect(isAwsDuplicateItem("DuplicateItem")).toBe(false)
+    })
+
+    it("recognises a cancellation reason in both forms, and no other", () => {
+      const message = "Duplicate primary key exists in table"
+      expect(isDuplicateItemReason({ Code: "DuplicateItem" })).toBe(true)
+      expect(isDuplicateItemReason({ Code: "ValidationError", Message: message })).toBe(true)
+      expect(isDuplicateItemReason({ Code: "ValidationError", Message: "other" })).toBe(false)
+      expect(isDuplicateItemReason({ Code: "AccessDenied", Message: message })).toBe(false)
+      expect(isDuplicateItemReason({ Code: "None" })).toBe(false)
+      expect(isDuplicateItemReason(undefined)).toBe(false)
+    })
   })
 })

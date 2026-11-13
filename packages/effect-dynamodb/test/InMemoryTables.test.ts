@@ -1312,7 +1312,16 @@ describe("what the tables don't model fails by name", () => {
     ],
     InMemoryClient: [
       "modelled by the in-memory tables (InMemoryClient)",
-      ["getItem", "putItem", "updateItem", "deleteItem", "query", "transactWriteItems"],
+      [
+        "getItem",
+        "putItem",
+        "updateItem",
+        "deleteItem",
+        "query",
+        "transactWriteItems",
+        "executeStatement",
+        "executeTransaction",
+      ],
     ],
   }
   const OPERATIONS = Object.keys(mockDynamoClient())

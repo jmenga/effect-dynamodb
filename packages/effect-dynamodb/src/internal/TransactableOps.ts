@@ -22,7 +22,7 @@ import type { ConditionInput } from "../Expression.js"
 import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig, tableKeyAttributes } from "../Table.js"
 import { isRefusedValue } from "./Capacity.js"
-import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
+import type { PutKind, ReturnValuesMode, UpdateState } from "./EntityOps.js"
 import { encodeInput } from "./InputForm.js"
 
 /**
@@ -829,7 +829,7 @@ export const rejectUnsupportedOp = (
   entity: Entity,
   operation: string,
   opType: "put" | "update" | "delete",
-  putKind: "put" | "create" | "upsert" | undefined,
+  putKind: PutKind | undefined,
   /**
    * The op's own input, for the one gate whose dependency the caller can
    * remove. `undefined` for a delete (which carries a key, not an input) and
@@ -863,6 +863,16 @@ export const rejectUnsupportedOp = (
         "upsert is an UpdateItem whose SET clause uses if_not_exists for createdAt, " +
           "immutable fields and the version counter. Compiling it as a Put would reset " +
           "them. Use put() or create() here, or run the upsert as its own operation.",
+      ),
+    )
+  }
+  if (opType === "put" && putKind === "insert") {
+    return Effect.fail(
+      fail(
+        "insert",
+        "insert is a PartiQL INSERT, and this request would send a PutItem, which a role " +
+          "limited to dynamodb:PartiQLInsert can't run. Use put() or create() here, or run " +
+          "the insert as its own operation.",
       ),
     )
   }

@@ -99,6 +99,8 @@ When a unique value is already taken, the write fails with `UniqueConstraintViol
   // Blocked: constraint="email", fields={"email":"alice@example.com"}
 ```
 
+`insert` enforces constraints too, in a transaction of PartiQL `INSERT`s, for a role that isn't allowed to change anything. See [Add-only writes](/effect-dynamodb/guides/add-only-writes/).
+
 ### Compound Constraints
 
 Compound constraints combine multiple fields. The sentinel key includes all field values:

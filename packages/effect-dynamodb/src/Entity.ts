@@ -34,10 +34,13 @@ import {
   DynamoError,
   DynamoValidationError,
   EmbeddingError,
+  ItemAlreadyExists,
   ItemNotDeleted,
   ItemNotFound,
   isAwsConditionalCheckFailed,
+  isAwsDuplicateItem,
   isAwsTransactionCancelled,
+  isDuplicateItemReason,
   OptimisticLockError,
   RefNotFound,
   StaleAppend,
@@ -133,6 +136,7 @@ import {
   makeBoundAppend,
   makeBoundDelete,
   makeBoundGet,
+  makeBoundInsert,
   makeBoundPut,
   makeBoundUpdate,
 } from "./internal/BoundCrud.js"
@@ -176,6 +180,7 @@ import {
 import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
+import { insertStatement } from "./internal/InsertStatement.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
   decodeImage,
@@ -285,6 +290,7 @@ export {
   type EntityGet,
   EntityGetImpl,
   type EntityGetOpts,
+  type EntityInsert,
   type EntityOp,
   EntityOpTypeId,
   type EntityPut,
@@ -314,6 +320,7 @@ import {
   type EntityGet,
   EntityGetImpl,
   type EntityGetOpts,
+  type EntityInsert,
   EntityOpTypeId,
   type EntityPut,
   EntityPutImpl,
@@ -1172,7 +1179,6 @@ export interface Entity<
       | undefined
     readonly create: boolean
     readonly operation: string
-    readonly key: globalThis.Record<string, unknown>
     /** The item's keys, were these system fields what the plan carries over. */
     readonly composeKeys: (
       carried: globalThis.Record<string, unknown>,
@@ -1478,6 +1484,31 @@ export interface Entity<
     | OptimisticLockError
     | ConcurrentModification
     | ConditionalCheckFailed
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
+    DynamoClient | TableConfig
+  >
+
+  /**
+   * Add an item through a PartiQL `INSERT`, which cannot replace one, so a role
+   * holding only `dynamodb:PartiQLInsert` can add items and nothing else. Fails
+   * with `ItemAlreadyExists` if the key is taken. Sends one write and no reads;
+   * a `unique` entity sends an `INSERT`-only transaction. It takes no condition,
+   * cannot join a transaction or batch, and is refused on `versioned: { retain: true }`.
+   */
+  readonly insert: (
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
+  ) => EntityInsert<
+    ModelType<TModel>,
+    EntityRecordType<TModel, TTimestamps, TVersioned>,
+    | DynamoClientError
+    | TransactionOverflow
+    | ValidationError
+    | UniqueConstraintViolation
+    | ItemAlreadyExists
     | RefErrors<TRefs>
     | VectorErrors<TVectorIndexes>,
     DynamoClient | TableConfig
@@ -1986,6 +2017,30 @@ export interface BoundEntity<
     | VectorErrors<TVectorIndexes>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields
+  >
+
+  /**
+   * Add an item through a PartiQL `INSERT`, which cannot replace one, so a role
+   * holding only `dynamodb:PartiQLInsert` can add items and nothing else. Fails
+   * with `ItemAlreadyExists` if the key is taken. Sends one write and no reads;
+   * a `unique` entity sends an `INSERT`-only transaction. It takes no condition,
+   * cannot join a transaction or batch, and is refused on `versioned: { retain: true }`.
+   */
+  readonly insert: (
+    input: WithGeneratedId<
+      EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
+      TGeneratedId
+    >,
+  ) => import("./internal/BoundCrud.js").BoundInsert<
+    ModelType<TModel>,
+    | DynamoClientError
+    | TransactionOverflow
+    | ValidationError
+    | UniqueConstraintViolation
+    | ItemAlreadyExists
+    | RefErrors<TRefs>
+    | VectorErrors<TVectorIndexes>,
+    VectorIndexNames<TVectorIndexes>
   >
 
   /**
@@ -5369,6 +5424,20 @@ const makeImpl = <
     return view
   }
 
+  /**
+   * The key an error names: the primary key composites of a domain-keyed record,
+   * never the record itself. A whole input holds encoded values, so a redacted
+   * field would be in plaintext on the error, and from there in logs.
+   */
+  const primaryKeyOf = (
+    record: Readonly<globalThis.Record<string, unknown>>,
+  ): globalThis.Record<string, unknown> =>
+    Object.fromEntries(
+      [...config.indexes.primary.pk.composite, ...config.indexes.primary.sk.composite].map(
+        (field) => [field, record[field]],
+      ),
+    )
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -5649,6 +5718,8 @@ const makeImpl = <
     operation: string,
     item: TransactWriteItem,
     callerCondition?: () => string | undefined,
+    /** The PartiQL statement it was sent as (`insert`), when not as `item` itself. */
+    statements?: ReadonlyArray<string>,
   ) =>
     diagnoseFailure({
       sent: () => ({
@@ -5662,6 +5733,7 @@ const makeImpl = <
             () => `the ${entityType} ${operation}`,
           )[0]!,
         callerCondition,
+        statements,
       }),
       keys: entityKeys,
       rewrite: (diagnosis, original) =>
@@ -5677,6 +5749,8 @@ const makeImpl = <
     items: ReadonlyArray<TransactWriteItem>,
     /** The caller's own `.condition()` within the first item's (its main write's) condition. */
     callerCondition?: () => string | undefined,
+    /** The PartiQL statement each item was sent as (`insert`), when not as `items` themselves. */
+    statements?: ReadonlyArray<string>,
   ) =>
     diagnoseFailure({
       sent: () => ({
@@ -5687,6 +5761,7 @@ const makeImpl = <
             index === 0 ? "the item" : `item ${index} of the ${operation} transaction`,
           ),
         callerCondition: (index: number) => (index === 0 ? callerCondition?.() : undefined),
+        statements,
       }),
       keys: entityKeys,
       rewrite: (diagnosis, original): TransactionOverflow | ValidationError =>
@@ -8040,8 +8115,6 @@ const makeImpl = <
     /** `create`: the item must be missing — it is not read. */
     readonly create: boolean
     readonly operation: string
-    /** The key errors name. */
-    readonly key: globalThis.Record<string, unknown>
     /** The item's keys, were these system fields what the plan carries over (see `carriedSystemFields`). */
     readonly composeKeys: (
       carried: globalThis.Record<string, unknown>,
@@ -8052,6 +8125,7 @@ const makeImpl = <
       const pkField = config.indexes.primary.pk.field
       const skField = config.indexes.primary.sk.field
       const item: globalThis.Record<string, unknown> = { ...args.item }
+      const key = primaryKeyOf(toDomainView(args.item))
       const owner = { pk: item[pkField], sk: item[skField] }
       const current = args.create
         ? undefined
@@ -8265,13 +8339,13 @@ const makeImpl = <
         error: systemFields.version
           ? new OptimisticLockError({
               entityType,
-              key: args.key,
+              key,
               expectedVersion: storedVersion ?? 0,
               actualVersion: storedVersionOf(stored) ?? -1,
             })
           : new ConcurrentModification({
               entityType,
-              key: args.key,
+              key,
               attributes:
                 stored !== undefined && current !== undefined
                   ? changedFrom(stored).map(domainNameOf)
@@ -8326,7 +8400,7 @@ const makeImpl = <
               return {
                 _tag: "Retry",
                 stored: current,
-                error: releaseRaced(args.key, role.constraintName),
+                error: releaseRaced(key, role.constraintName),
               }
           }
         }
@@ -8384,7 +8458,10 @@ const makeImpl = <
           case "Fail":
             return yield* verdict.error
           case "Condition":
-            return yield* new ConditionalCheckFailed({ entityType, key: args.key })
+            return yield* new ConditionalCheckFailed({
+              entityType,
+              key: primaryKeyOf(toDomainView(args.item)),
+            })
           case "Retry":
             lost = verdict
         }
@@ -8841,6 +8918,110 @@ const makeImpl = <
   // dereference `self` when called by users, after make() has returned
   let self: Entity
 
+  /**
+   * `insert`'s write: one PartiQL `INSERT`, or an `INSERT`-only transaction when
+   * the item takes `unique` sentinels. One request and no reads, because a role
+   * limited to `dynamodb:PartiQLInsert` can do nothing else (#189), so it stays
+   * clear of `planPut`, whose guards read and whose transactions hold `Put`s.
+   */
+  const runInsert = (args: {
+    readonly tableName: string
+    readonly ttlAttrName: string
+    readonly now: DateTime.Utc
+    /** The item as built: stored attribute names, packed. */
+    readonly item: globalThis.Record<string, unknown>
+  }): Effect.Effect<
+    globalThis.Record<string, AttributeValue>,
+    | DynamoClientError
+    | TransactionOverflow
+    | ValidationError
+    | ItemAlreadyExists
+    | UniqueConstraintViolation,
+    DynamoClient
+  > =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      const { item, tableName } = args
+      const marshalled = yield* marshalOrFail(entityType, "insert", () => toAttributeMap(item), {
+        fieldOf: fieldOfAttribute,
+      })
+      const source = toDomainView(item)
+      const alreadyExists = () => new ItemAlreadyExists({ entityType, key: primaryKeyOf(source) })
+
+      const owner = {
+        pk: item[config.indexes.primary.pk.field],
+        sk: item[config.indexes.primary.sk.field],
+      }
+      const sentinels = Object.entries(
+        (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+      ).flatMap(([constraint, def]) => {
+        const next = composeUniqueSentinel(
+          schema,
+          entityType,
+          constraint,
+          def,
+          source,
+          storedSentinelValue,
+        )
+        return next === undefined
+          ? []
+          : [
+              {
+                constraint,
+                fields: next.fieldsRecord,
+                item: toAttributeMap(
+                  sentinelItemFor(constraint, def, next.key, owner, args.now, args.ttlAttrName),
+                ),
+              },
+            ]
+      })
+
+      if (sentinels.length === 0) {
+        const statement = insertStatement(tableName, marshalled)
+        yield* client.executeStatement(statement).pipe(
+          Effect.mapError((err): DynamoClientError | ItemAlreadyExists =>
+            isAwsDuplicateItem(err.cause) ? alreadyExists() : err,
+          ),
+          diagnoseItemWrite(
+            "insert",
+            { Put: { TableName: tableName, Item: marshalled } },
+            undefined,
+            [statement.Statement],
+          ),
+        )
+        return marshalled
+      }
+
+      const items = [marshalled, ...sentinels.map((sentinel) => sentinel.item)]
+      const statements = items.map((entry) => insertStatement(tableName, entry))
+      yield* client.executeTransaction({ TransactStatements: statements }).pipe(
+        Effect.mapError(
+          (err): DynamoClientError | ItemAlreadyExists | UniqueConstraintViolation => {
+            if (!isAwsTransactionCancelled(err.cause)) return err
+            const duplicate = (err.cause.CancellationReasons ?? []).findIndex((reason) =>
+              isDuplicateItemReason(reason),
+            )
+            if (duplicate < 0) return err
+            const sentinel = sentinels[duplicate - 1]
+            return sentinel === undefined
+              ? alreadyExists()
+              : new UniqueConstraintViolation({
+                  entityType,
+                  constraint: sentinel.constraint,
+                  fields: sentinel.fields,
+                })
+          },
+        ),
+        diagnoseTransactionWrite(
+          "insert",
+          items.map((entry) => ({ Put: { TableName: tableName, Item: entry } })),
+          undefined,
+          statements.map((statement) => statement.Statement),
+        ),
+      )
+      return marshalled
+    })
+
   const put = (input: unknown) =>
     new EntityPutImpl(
       (mode: DecodeMode, opts: EntityPutOpts) =>
@@ -8851,8 +9032,32 @@ const makeImpl = <
           const ttlAttrName = resolveTtlAttributeName(tc)
 
           // `upsert` creates through this path: its errors name it.
-          const operation = opts.operation ?? "put"
+          const operation = opts.operation ?? (opts.putKind === "insert" ? "insert" : "put")
           yield* checkWithVectorNames(opts.withVectors, operation)
+
+          if (opts.putKind === "insert") {
+            // The version number comes from a query the role can't run, and a
+            // v1 snapshot would collide with any history already there.
+            if (isRetainEnabled()) {
+              return yield* new ValidationError({
+                entityType,
+                operation,
+                cause:
+                  "[EDD-9110] insert() cannot write an entity with versioned: { retain: true }: " +
+                  "its version number comes from a query of the retained versions, which a " +
+                  "role limited to PartiQLInsert cannot run. Use create().",
+              })
+            }
+            // Types refuse this; here for untyped callers.
+            if (opts.condition !== undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation,
+                cause:
+                  "[EDD-9110] insert() takes no condition: a PartiQL INSERT has none. Use create().",
+              })
+            }
+          }
 
           // Auto-generated id: fill the configured primary-key field with a
           // fresh UUID BEFORE the encode, but only when the caller omitted it —
@@ -8999,6 +9204,16 @@ const makeImpl = <
           const projected = opts.projectionWrite
           if (projected !== undefined) Object.assign(item, projected.attributes)
 
+          if (opts.putKind === "insert") {
+            const marshalled = yield* runInsert({
+              tableName,
+              ttlAttrName,
+              now,
+              item,
+            })
+            return yield* decodeAs(item, marshalled, mode)
+          }
+
           // The caller's condition, ANDed onto `create`'s not-exists guard —
           // a guard no `.condition()` can replace (#133). `upsert`'s create
           // attempt brings its own (`runGuardedPut` requires the item missing).
@@ -9042,7 +9257,6 @@ const makeImpl = <
               userCondition,
               create: opts.putKind === "create",
               operation,
-              key: encoded as globalThis.Record<string, unknown>,
               composeKeys: (carried) =>
                 composeAllKeys({ ...keyValues, ...carried }, operation, ownSchema()),
             })
@@ -9083,7 +9297,7 @@ const makeImpl = <
                 if (userCondition && isAwsConditionalCheckFailed(err.cause)) {
                   return new ConditionalCheckFailed({
                     entityType,
-                    key: encoded as globalThis.Record<string, unknown>,
+                    key: primaryKeyOf(encodedInput as globalThis.Record<string, unknown>),
                     ...(projected?.returnOld === true && {
                       current: Option.fromNullishOr(
                         (err.cause as { readonly Item?: unknown }).Item,
@@ -9119,6 +9333,22 @@ const makeImpl = <
       op._condition,
       op._withVectors,
       "create",
+    )
+  }
+
+  // ---------------------------------------------------------------------------
+  // insert operation — the same item through PartiQL INSERT (#189)
+  // ---------------------------------------------------------------------------
+
+  const insert = (input: unknown) => {
+    const op = put(input)
+    return new EntityPutImpl(
+      op._builder,
+      op._entity,
+      op._input,
+      op._condition,
+      op._withVectors,
+      "insert",
     )
   }
 
@@ -13331,7 +13561,12 @@ const makeImpl = <
               if (keyGuards.length > 0 && err.cause.Item !== undefined) {
                 rejected.row = err.cause.Item as globalThis.Record<string, AttributeValue>
               }
-              if (opts.condition) return new ConditionalCheckFailed({ entityType, key: item })
+              if (opts.condition) {
+                return new ConditionalCheckFailed({
+                  entityType,
+                  key: primaryKeyOf(encodedInput as globalThis.Record<string, unknown>),
+                })
+              }
             }
             return err
           }
@@ -13349,7 +13584,10 @@ const makeImpl = <
           const result = yield* written
 
           if (!result.Attributes) {
-            return yield* new ItemNotFound({ entityType, key: item })
+            return yield* new ItemNotFound({
+              entityType,
+              key: primaryKeyOf(encodedInput as globalThis.Record<string, unknown>),
+            })
           }
 
           const raw = fromAttributeMap(result.Attributes)
@@ -14171,7 +14409,7 @@ const makeImpl = <
               return yield* userCondition !== undefined
                 ? new ConditionalCheckFailed({
                     entityType,
-                    key: encoded as globalThis.Record<string, unknown>,
+                    key: primaryKeyOf(encoded),
                     current: decoded,
                   })
                 : staleAppend(decoded)
@@ -14276,7 +14514,7 @@ const makeImpl = <
         if (userCondition !== undefined) {
           return yield* new ConditionalCheckFailed({
             entityType,
-            key: encoded as globalThis.Record<string, unknown>,
+            key: primaryKeyOf(encoded),
             current: Option.none(),
           })
         }
@@ -14299,7 +14537,7 @@ const makeImpl = <
         // could have rejected.
         return yield* new ConditionalCheckFailed({
           entityType,
-          key: encoded as globalThis.Record<string, unknown>,
+          key: primaryKeyOf(encoded),
           current: Option.some(currentModel),
         })
       }
@@ -19811,6 +20049,7 @@ const makeImpl = <
     get,
     put,
     create,
+    insert,
     patch,
     update,
     delete: del,
@@ -20197,6 +20436,7 @@ export const bind = <
       get: (key: Key) => makeBoundGet(entity.get(key) as any, boundCrudConfig),
       put: (input: Input) => makeBoundPut(entity.put(input), boundCrudConfig),
       create: (input: Input) => makeBoundPut(entity.create(input), boundCrudConfig),
+      insert: (input: Input) => makeBoundInsert(entity.insert(input), boundCrudConfig),
       update: (key: Key) => makeBoundUpdate(entity.update(key), boundCrudConfig),
       delete: (key: Key) => makeBoundDelete(entity.delete(key), boundCrudConfig),
       upsert: (input: Input) => makeBoundPut(entity.upsert(input), boundCrudConfig),

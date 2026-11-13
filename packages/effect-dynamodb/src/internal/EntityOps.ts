@@ -310,7 +310,29 @@ export interface EntityGet<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {}
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */
-export interface EntityPut<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {}
+export interface EntityPut<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
+  /** @internal Never `"insert"`: an {@link EntityInsert} is not a put. */
+  readonly _putKind?: Exclude<PutKind, "insert">
+}
+
+/**
+ * Lazy intermediate returned by `Entity.insert()`: one PartiQL `INSERT`, which
+ * a role with only `dynamodb:PartiQLInsert` can run.
+ * `yield*` returns the model type. Pipe to {@link asRecord}, {@link asItem}, or {@link asNative} for alternate decode modes.
+ *
+ * Not accepted by `Entity.condition()`, `Batch.write` or
+ * `Transaction.transactWrite`: a PartiQL `INSERT` has no conditions, and those
+ * paths would send a `PutItem`.
+ *
+ * @typeParam A - Decoded model type
+ * @typeParam Rec - Record type (model + system fields)
+ * @typeParam E - Error channel
+ * @typeParam R - Required services
+ */
+export interface EntityInsert<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
+  /** @internal */
+  readonly _putKind: "insert"
+}
 
 /**
  * Lazy intermediate returned by `Entity.update()`.
@@ -469,14 +491,15 @@ export interface EntityPutOpts {
 /**
  * @internal Which `put`-shaped entity operation produced an `EntityPutImpl`.
  *
- * All three share the `EntityPutImpl` carrier and the `_opType: "put"` tag, but
+ * All four share the `EntityPutImpl` carrier and the `_opType: "put"` tag, but
  * they do NOT share write semantics: `upsert` issues an `UpdateItem` whose SET
  * clause uses `if_not_exists` for `createdAt`, immutable fields and the version
  * counter, so a consumer that compiles it as a plain `Put` silently resets
- * `createdAt` and `version`. Consumers that cannot reproduce a kind's semantics
- * must reject it — see `internal/TransactWriteOps.ts` (#100).
+ * `createdAt` and `version`; `insert` is a PartiQL `INSERT`, so a `Put` needs a
+ * permission its role does not have. Consumers that cannot reproduce a kind's
+ * semantics must reject it — see `internal/TransactWriteOps.ts` (#100).
  */
-export type PutKind = "put" | "create" | "upsert"
+export type PutKind = "put" | "create" | "upsert" | "insert"
 
 export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly [EntityOpTypeId]: EntityOpTypeId = EntityOpTypeId as EntityOpTypeId

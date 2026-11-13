@@ -32,6 +32,10 @@ import type {
   DescribeTableCommandOutput,
   DescribeTimeToLiveCommandInput,
   DescribeTimeToLiveCommandOutput,
+  ExecuteStatementCommandInput,
+  ExecuteStatementCommandOutput,
+  ExecuteTransactionCommandInput,
+  ExecuteTransactionCommandOutput,
   ExportTableToPointInTimeCommandInput,
   ExportTableToPointInTimeCommandOutput,
   GetItemCommandInput,
@@ -84,6 +88,8 @@ import {
   DescribeTableCommand,
   DescribeTimeToLiveCommand,
   DynamoDBClient,
+  ExecuteStatementCommand,
+  ExecuteTransactionCommand,
   ExportTableToPointInTimeCommand,
   GetItemCommand,
   ListBackupsCommand,
@@ -227,6 +233,7 @@ import {
   zorderPlanner,
 } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
+import { hideReturnedItems } from "./internal/ReturnedItem.js"
 import {
   diagnoseFailure,
   explainDiagnosis,
@@ -1590,6 +1597,16 @@ export interface DynamoClientService {
   readonly transactWriteItems: (
     input: TransactWriteItemsCommandInput,
   ) => Effect.Effect<TransactWriteItemsCommandOutput, DynamoClientError>
+
+  /** Run one PartiQL statement. `Statement` is limited to 8,192 characters. */
+  readonly executeStatement: (
+    input: ExecuteStatementCommandInput,
+  ) => Effect.Effect<ExecuteStatementCommandOutput, DynamoClientError>
+
+  /** Atomically run up to 100 PartiQL statements (2x WCU cost for writes). */
+  readonly executeTransaction: (
+    input: ExecuteTransactionCommandInput,
+  ) => Effect.Effect<ExecuteTransactionCommandOutput, DynamoClientError>
 
   // --- Table management ---
 
@@ -3930,7 +3947,7 @@ const waitForVectorIndexReady = (
 export const classifyError =
   (operation: string) =>
   (thrown: unknown): DynamoClientError => {
-    const cause = redactCredentialRefusal(thrown)
+    const cause = hideReturnedItems(redactCredentialRefusal(thrown))
     if (isAwsThrottling(cause)) return new ThrottlingError({ operation, cause })
     if (isAwsValidationError(cause)) return new DynamoValidationError({ operation, cause })
     if (isAwsInternalServerError(cause)) return new InternalServerError({ operation, cause })
@@ -4023,6 +4040,17 @@ const buildService = (
           try: (signal) =>
             client.send(new TransactWriteItemsCommand(input), { abortSignal: signal }),
           catch: classifyError("TransactWriteItems"),
+        }),
+      executeStatement: (input) =>
+        Effect.tryPromise({
+          try: (signal) => client.send(new ExecuteStatementCommand(input), { abortSignal: signal }),
+          catch: classifyError("ExecuteStatement"),
+        }),
+      executeTransaction: (input) =>
+        Effect.tryPromise({
+          try: (signal) =>
+            client.send(new ExecuteTransactionCommand(input), { abortSignal: signal }),
+          catch: classifyError("ExecuteTransaction"),
         }),
       // --- Table management ---
       updateTable: (input) =>

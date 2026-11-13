@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 6735 core tests, 1231 schema tests, 68 geo tests, 252 language-service tests, 56 doctest tests, 42 examples, 1945 connected tests against DynamoDB Local.
+**Status:** All modules implemented. 15632 core tests, 4001 schema tests, 72 geo tests, 256 language-service tests, 57 doctest tests, 44 examples, 6331 connected tests against DynamoDB Local.
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -89,7 +89,7 @@ packages/effect-dynamodb/src/
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb; a value with no DynamoDB form throws the tagged UnstorableValue (EDD-9124), an attribute or a map entry named `__proto__` too (EDD-9165), which a read leaves out
 ├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value, valueBytes (stored size), each with a *Sync twin; limits
 ├── compression/zlib.ts # Subpath `effect-dynamodb/compression/zlib` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
-├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
+├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ItemAlreadyExists, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals
 │   ├── Expr.ts         # Expr ADT — 16 expression node types, ConditionOps, compileExpr, parseShorthand
 │   ├── PathBuilder.ts  # PathBuilder — recursive Proxy for type-safe attribute path access
@@ -111,6 +111,7 @@ packages/effect-dynamodb/src/
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
 │   ├── EntitySchemas.ts # Schema derivation (7 derived schemas)
 │   ├── CompositeCodec.ts # (schema pkg) THE composite key-form rule — every path uses it; see DESIGN §7
+│   ├── InsertStatement.ts # The PartiQL INSERT text and parameters `Entity.insert` sends
 │   ├── TransactableOps.ts # Shared Batch/Transaction helpers (table name resolution, key composition, put-item building)
 │   ├── Packed.ts       # Packed storage over items: pack/unpack attributes, stream-image normalisation (base64 B), EDD-9076 expression guards
 │   ├── TransactWriteOps.ts # Shared TransactWriteItems builder + ConditionCheckOp (Transaction.transactWrite AND EventStore.append additionalItems)
@@ -332,6 +333,7 @@ Do NOT:
 - Transactions: up to 100 items, 2x WCU for writes.
 - Interrupting aborts the request (#190): the connection closes and the SDK makes no further attempt, but a write already sent may still be applied. Timeouts are the application's to set (`requestHandler`, `maxAttempts` on the layers, no defaults; never import a platform handler). A timeout or abort is a `DynamoError` with the SDK's error as `cause`; Node's handler also names a dropped connection `TimeoutError`, and `cause.code` tells them apart.
 - AWS's reply to a signature or credential refusal can quote the session token. Anything that keeps an AWS SDK error as a `cause` must pass it through `redactCredentialRefusal` (`internal/CredentialRefusal.ts`) first, including any new SDK client (#186).
+- An error must not hold values the caller didn't ask to see, because errors reach logs. `key` on a write's error is the primary key composites (`primaryKeyOf`), never the input, which holds encoded values and so a `Schema.RedactedFromValue` field in plaintext. The stored rows `ALL_OLD` returns on an SDK exception stay readable but non-enumerable (`hideReturnedItems`, `internal/ReturnedItem.ts`, in `classifyError`), so read `.Item` directly and never copy an exception or a reason with a spread.
 
 **Key Limits:** Max item 400 KB | BatchWrite 25 | BatchGet 100 | Transaction 100 | GSIs 20 | Query/Scan response 1 MB | Per-partition 3,000 RCU / 1,000 WCU
 
@@ -361,6 +363,7 @@ Do NOT:
 | `tutorials/gamemanager.mdx` | `examples/cricket.ts` |
 | `tutorials/human-resources.mdx` | `examples/hr.ts` |
 | `guides/modeling.mdx` | `examples/guide-modeling.ts` |
+| `guides/add-only-writes.mdx` | `examples/guide-add-only-writes.ts` |
 | `guides/indexes.mdx` | `examples/guide-indexes.ts` |
 | `guides/zorder.mdx` | `examples/guide-zorder.ts` |
 | `guides/sharding.mdx` | `examples/guide-sharding.ts` |
@@ -549,6 +552,7 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Collection accessors auto-discovered.** Entities sharing the same `collection` name on the same GSI are grouped: `db.collections.assignments({ employee: "dfinlay" }).collect()` → `Effect<{ Employees: Employee[], Tasks: Task[] }>`. Collection queries support the same BoundQuery combinators (`.filter()`, `.limit()`, etc.) but `.where()` is not available.
 - **put/get/query return model type from BoundEntity.** Entity definitions return intermediates (`EntityOp`, `EntityDelete`) with `asRecord`/`asNative` terminals for advanced decode modes.
 - **`Entity.create()` = put + attribute_not_exists.** Returns `ConditionalCheckFailed` on duplicate.
+- **`Entity.insert()` = the item `put` builds, sent as a PartiQL `INSERT` (#189, `docs/designs/partiql-insert.md`, `guides/add-only-writes.mdx`).** It exists so IAM can forbid overwrites: a role with only `dynamodb:PartiQLInsert` can do nothing else, so **`insert` sends one write and no reads, and that must stay true on every path** (`refs` read the referenced items, documented). The put builder branches to `runInsert` right after `packFields`, before any guard: never route it through `planPut`, whose guards read and whose transactions hold `Put`s. `executeStatement` for one item; `unique` sentinels make it an `INSERT`-only `executeTransaction`, item first, so a duplicate at position 0 is `ItemAlreadyExists` and at a sentinel's position `UniqueConstraintViolation`. Duplicate forms differ: AWS `DuplicateItemException` / reason `DuplicateItem`, DynamoDB Local `DuplicateItem` / reason `ValidationError` with the message (`isAwsDuplicateItem`, `isDuplicateItemReason`). `versioned: { retain: true }` and an untyped caller's condition are refused (**EDD-9110**). `EntityInsert`'s `_putKind: "insert"` and `EntityPut`'s `_putKind?: Exclude<PutKind, "insert">` are what make `.condition()` and the multi-item paths compile errors: `EntityPut` otherwise has no members of its own and any op is assignable to it. The 8,192-character statement limit is diagnosed (`StatementTooLong`), not pre-checked. Values are always parameters, names inline with `'` doubled (`VALUE ?` is rejected).
 - **Conditional writes via `.condition()`.** Works on `BoundPut`, `BoundUpdate`, `BoundDelete` (and on unbound `EntityPut`/`EntityUpdate`/`EntityDelete` via `Entity.condition()` pipeable). User condition ANDed with optimistic lock condition on updates. Two APIs: callback `.condition((t, { eq }) => eq(t.status, "active"))` and equality shorthand `.condition({ status: "active" })` (each key ANDed as `=`; the operator form `{ eq: {...} }` is `Expression.condition` / unbound `Entity.condition`). A later `.condition()` replaces an earlier one; the op's own guard (`create`'s not-exists, `patch`'s and `deleteIfExists`'s exists, version/incarnation) is structural — derived from the op's kind (`putKind: "create"`, `patch: true`, `_mustExist`), never held as its condition — and always ANDed with the caller's condition (`withGuard`, compiled as one `and`), in the entity's own write and in `extractTransactable` (transactions, EventStore additional items, Batch refusal). The `condition` combinator is the one place an empty condition (`{}`, `and()`) becomes none (`nonEmptyCondition`); an empty part directly under `and` is left out, but one under `or` / `not`, or an `or()` with no parts, is refused with a `ValidationError` before sending (`emptyPartProblem`) — for conditions, entity/collection filters, aggregate `list` filters and `Transaction.check` alike. An `isIn` with no values is sent as `IN ()`, and DynamoDB's syntax-error rejection is diagnosed into a `ValidationError` naming the `isIn()` and its attribute (`EmptyIn`, #144). `compileExpr` itself throws on anything `emptyPartProblem` refuses (an assertion: every entry point must refuse first). `.consistentRead()` on a GSI (entity index or collection) is sent, and DynamoDB's rejection is diagnosed into a `ValidationError` naming the index (`ConsistentReadOnGsi`, #144); entity indexes are always treated as GSIs. `.expectedVersion()` on an unversioned entity is refused with a `ValidationError`. `patch()` of a missing item is `ConditionalCheckFailed` on every path, read-first included.
 - **Filter expressions on BoundQuery.** Callback `.filter((t, { gt }) => gt(t.price, 30))` or shorthand `.filter({ status: "active" })`.
 - **Projections on BoundQuery.** Callback `.select((t) => [t.name, t.price])` or shorthand `.select(["name", "price"])`. Returns partial records.
