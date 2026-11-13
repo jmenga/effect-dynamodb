@@ -37,6 +37,7 @@ const definitions = () => {
       id: Schema.String,
       email: Schema.String,
       counts: Schema.Record(Schema.String, Schema.Number),
+      note: Schema.optionalKey(Schema.String),
     }),
     { counts: { storedAs: DynamoModel.SparseMap(), field: "sr" } } as never,
   )
@@ -130,6 +131,57 @@ const writes: ReadonlyArray<readonly [label: string, op: (u: any) => any]> = [
 ]
 
 export const renamedSparseMapRacesSuite = (open: OpenTable) => {
+  // A condition the library can't judge from the row (`size()` of text beyond ASCII), which the
+  // table finds false, on a write whose row moves the map once: the refusal can't be told from
+  // the race's, so the plan is made again and the caller's error comes from the second
+  // transaction, in four requests where 1.40.0 took two (named in the changeset and DESIGN.md).
+  it.effect(
+    "Plain: a transaction's .set({ counts: { b: 2 } }) under a size() condition the table finds false, sent as the row moves the map: planned again, then the caller's error",
+    () =>
+      Effect.gen(function* () {
+        const entities = definitions()
+        const MainTable = Table.make({
+          schema: DynamoSchema.make({ name: "rr", version: 1 }),
+          entities,
+        } as never)
+        const armed = { on: false }
+        const log: Array<string> = []
+        const race = (raw: DynamoClientService, tableName: string) =>
+          reform(raw, tableName, "Plain", "entries")
+        const got = yield* onTable(
+          racing(open, armed, log, race),
+          0,
+          MainTable,
+          { entities },
+          (db) =>
+            Effect.gen(function* () {
+              yield* db.entities.Plain.put({
+                id: "a",
+                email: "a@x",
+                counts: { a: 1 },
+                note: "é",
+              }).asEffect()
+              armed.on = true
+              const exit = yield* Effect.exit(
+                Transaction.transactWrite([
+                  db.entities.Plain.update({ id: "a" })
+                    .set({ counts: { b: 2 } })
+                    .condition((t: any, { eq }: any) => eq(t.note.size(), 2)),
+                ]),
+              )
+              armed.on = false
+              const read = yield* db.entities.Plain.get({ id: "a" })
+              return { exit, read }
+            }),
+        )
+        expect(got.exit._tag).toBe("Failure")
+        if (got.exit._tag === "Failure") {
+          expect(String(got.exit.cause)).toContain("TransactionCancelled")
+        }
+        expect(log).toEqual(["getItem", "transactWriteItems", "getItem", "transactWriteItems"])
+        expect(got.read.counts).toEqual({ a: 1 })
+      }),
+  )
   for (const entity of ["Plain", "Versioned", "Retained", "Unique"]) {
     for (const [label, op] of writes) {
       if (entity === "Retained" && label.startsWith(".set")) continue
