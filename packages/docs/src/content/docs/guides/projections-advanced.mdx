@@ -305,6 +305,7 @@ Side effects driven from `applied` are at most once: a crash after the write los
 - It folds each instance's events keyed to the row from `initial`.
 - It writes every checkpoint from scratch, with the next revision.
 - A field-mapped scalar goes to the first instance in fold order, which repairs a row adopted by the wrong instance.
+- It writes no outbox item: effects already pending are delivered once, and the events it applies that the row hadn't seen go without their effects (run `catchUp` first if those matter).
 
 ```typescript region="rebuild" example="guide-projections-advanced.ts"
 const rebuilt = yield* ShipmentProjection.rebuild(

@@ -1,0 +1,1897 @@
+{
+  "version": "1.40.0",
+  "scenarios": {
+    "single/live/off": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a#b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cp": {
+                      "N": "2"
+                    },
+                    "rev": {
+                      "N": "3"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    }
+                  },
+                  "ConditionExpression": "#g = :g",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":g": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "3"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a#b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        },
+        "cp": {
+          "N": "2"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "2:5",
+          "1:2",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    },
+    "single/live/on": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a%23b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cp": {
+                      "N": "2"
+                    },
+                    "rev": {
+                      "N": "3"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    }
+                  },
+                  "ConditionExpression": "#g = :g",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":g": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "3"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a%23b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        },
+        "cp": {
+          "N": "2"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "2:5",
+          "1:2",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    },
+    "single/absent/off": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a#b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cp": {
+                      "N": "2"
+                    },
+                    "rev": {
+                      "N": "1"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#g)",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "1"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a#b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        },
+        "cp": {
+          "N": "2"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "1:2",
+          "2:5",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    },
+    "single/absent/on": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a%23b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cp": {
+                      "N": "2"
+                    },
+                    "rev": {
+                      "N": "1"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#g)",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "projection"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "1"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a%23b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        },
+        "cp": {
+          "N": "2"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "1:2",
+          "2:5",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    },
+    "multi/live/off": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a#b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cpm": {
+                      "M": {
+                        "orders#s": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "rev": {
+                      "N": "3"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    }
+                  },
+                  "ConditionExpression": "#g = :g",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":g": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000003#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "cpm": {
+          "M": {
+            "orders#s": {
+              "N": "2"
+            }
+          }
+        },
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "3"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a#b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "2:5",
+          "1:2",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    },
+    "multi/live/on": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a%23b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cpm": {
+                      "M": {
+                        "orders#s": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "rev": {
+                      "N": "3"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    }
+                  },
+                  "ConditionExpression": "#g = :g",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":g": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000003#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "cpm": {
+          "M": {
+            "orders#s": {
+              "N": "2"
+            }
+          }
+        },
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "3"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a%23b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "2:5",
+          "1:2",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    },
+    "multi/absent/off": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a#b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cpm": {
+                      "M": {
+                        "orders#s": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "rev": {
+                      "N": "1"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#g)",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a#b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a#b#outbox#000000000001#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "cpm": {
+          "M": {
+            "orders#s": {
+              "N": "2"
+            }
+          }
+        },
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "1"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a#b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "1:2",
+          "2:5",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    },
+    "multi/absent/on": {
+      "sent": [
+        {
+          "operation": "query",
+          "input": {
+            "TableName": "events",
+            "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+            "FilterExpression": "#eddE IN (:et0)",
+            "ExpressionAttributeNames": {
+              "#eddE": "__edd_e__",
+              "#pk": "pk",
+              "#sk": "sk"
+            },
+            "ExpressionAttributeValues": {
+              ":et0": {
+                "S": "order.event"
+              },
+              ":pk": {
+                "S": "$rebuilt#v1#order#s"
+              },
+              ":sk": {
+                "S": "$rebuilt#v1#order.event_1#"
+              }
+            },
+            "ConsistentRead": true,
+            "ScanIndexForward": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rebuilt#v1#ledger#shop_north"
+              },
+              "sk": {
+                "S": "$rebuilt#v1#ledger#name_a%23b"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "shop": {
+                      "S": "north"
+                    },
+                    "name": {
+                      "S": "a#b"
+                    },
+                    "total": {
+                      "N": "5"
+                    },
+                    "cpm": {
+                      "M": {
+                        "orders#s": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "rev": {
+                      "N": "1"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger"
+                    },
+                    "pk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "sk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#g)",
+                  "ExpressionAttributeNames": {
+                    "#g": "rev"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0000"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "1"
+                        },
+                        "total": {
+                          "N": "2"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0000"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "outbox",
+                  "Item": {
+                    "opk": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "osk": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0001"
+                    },
+                    "__edd_e__": {
+                      "S": "Ledger#outbox"
+                    },
+                    "__edd_row_pk__": {
+                      "S": "$rebuilt#v1#ledger#shop_north"
+                    },
+                    "__edd_row_sk__": {
+                      "S": "$rebuilt#v1#ledger#name_a%23b"
+                    },
+                    "effect": {
+                      "M": {
+                        "n": {
+                          "N": "2"
+                        },
+                        "total": {
+                          "N": "5"
+                        }
+                      }
+                    },
+                    "source": {
+                      "S": "orders"
+                    },
+                    "streamId": {
+                      "S": "s"
+                    },
+                    "version": {
+                      "N": "2"
+                    },
+                    "eventType": {
+                      "S": "Added"
+                    },
+                    "__edd_kt__": {
+                      "N": "2"
+                    },
+                    "obpk": {
+                      "S": "Ledger#outbox"
+                    },
+                    "obsk": {
+                      "S": "$rebuilt#v1#ledger#shop_north#$rebuilt#v1#ledger#name_a%23b#outbox#000000000001#0001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "row": {
+        "cpm": {
+          "M": {
+            "orders#s": {
+              "N": "2"
+            }
+          }
+        },
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "1"
+        },
+        "shop": {
+          "S": "north"
+        },
+        "__edd_e__": {
+          "S": "Ledger"
+        },
+        "name": {
+          "S": "a#b"
+        },
+        "sk": {
+          "S": "$rebuilt#v1#ledger#name_a%23b"
+        },
+        "pk": {
+          "S": "$rebuilt#v1#ledger#shop_north"
+        }
+      },
+      "delivered": {
+        "before": [
+          "1:2"
+        ],
+        "after": [
+          "1:2",
+          "2:5",
+          "2:5"
+        ],
+        "live": [
+          "3:12"
+        ]
+      },
+      "left": 0
+    }
+  }
+}
