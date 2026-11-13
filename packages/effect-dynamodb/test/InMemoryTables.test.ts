@@ -790,6 +790,59 @@ for (const [name, make] of Object.entries(TABLES)) {
       }),
     )
   })
+
+  describe(`${name}: a list of 150,000 elements`, () => {
+    // The nesting check reads a list of any length: spreading its elements into one call exhausted
+    // the stack (a RangeError) on updates DynamoDB Local takes.
+    const LENGTH = 150_000
+    const long = (n: string): AttributeValue => ({
+      L: Array.from({ length: LENGTH }, () => ({ N: n })),
+    })
+    it.effect("an update appending to one, and a transaction setting one", () =>
+      Effect.gen(function* () {
+        const table = make()
+        table.seed({ ...key("big"), l: long("1") })
+        expect(
+          yield* failureOf(
+            withClient((client) =>
+              client.updateItem({
+                TableName: "t",
+                Key: key("big"),
+                UpdateExpression: "SET #l = list_append(#l, :v)",
+                ExpressionAttributeNames: { "#l": "l" },
+                ExpressionAttributeValues: { ":v": { L: [{ N: "2" }] } },
+              }),
+            ),
+            table.layer,
+          ),
+        ).toBe("ok")
+        const appended = table.read(key("big"))!.l!.L!
+        expect([appended.length, appended[LENGTH]]).toEqual([LENGTH + 1, { N: "2" }])
+        expect(
+          yield* failureOf(
+            withClient((client) =>
+              client.transactWriteItems({
+                TransactItems: [
+                  {
+                    Update: {
+                      TableName: "t",
+                      Key: key("big"),
+                      UpdateExpression: "SET #l = :l",
+                      ExpressionAttributeNames: { "#l": "l" },
+                      ExpressionAttributeValues: { ":l": long("3") },
+                    },
+                  },
+                ],
+              }),
+            ),
+            table.layer,
+          ),
+        ).toBe("ok")
+        const set = table.read(key("big"))!.l!.L!
+        expect([set.length, set[0], set[LENGTH - 1]]).toEqual([LENGTH, { N: "3" }, { N: "3" }])
+      }),
+    )
+  })
 }
 
 describe("an item is named by its table and its typed key", () => {

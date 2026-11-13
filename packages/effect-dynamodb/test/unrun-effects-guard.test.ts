@@ -925,6 +925,29 @@ it("c", () => Effect.gen(function* () { expect(1).toBe(2) }))
     it.effect("x", () => Effect.gen(function* () { const db = yield* DynamoClient.make({ entities: {} }); db.collections.assignments({ e: "a" }).collect(); db.aggregates.Order.get({ id: "1" }) }))`,
         want: ["dropped-effect", "dropped-effect"],
       },
+      {
+        name: "R4a registrar chosen by a conditional with a branch that runs the Effect: not reported",
+        source: `const t = true ? it : it.effect
+    t("x", () => Effect.sync(() => expect(1).toBe(2)))`,
+        want: [],
+      },
+      {
+        name: "R4b registrar chosen by a conditional called in place: not reported",
+        source: `;(cond ? it : it.skip)("x", () => Effect.sync(() => expect(1).toBe(2)))`,
+        want: [],
+      },
+      {
+        name: "R4c a local function running one Effect and returning another: read as a runner",
+        source: `const build = (e: Effect.Effect<void>) => { Effect.runSync(e); return Effect.sync(() => expect(1).toBe(2)) }
+    it("x", () => Effect.void.pipe(build))`,
+        want: [],
+      },
+      {
+        name: "R4d a returned Effect member that isn't an Effect: may be reported",
+        source: `it("x", () => Effect.map((n: number) => n + 1))
+    it("y", () => Effect.TypeId)`,
+        want: ["unrun-test-body", "unrun-test-body"],
+      },
     ]
     for (const { name, head = third, file = "sample.test.ts", source, want } of cases) {
       it(name, () => {

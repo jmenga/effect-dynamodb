@@ -71,6 +71,16 @@
  *   cancellation reason's): the AWS SDK fails to read it (a `TypeError`); the tables return it as
  *   the SDK reads one in a successful answer.
  *
+ * Four of the conformance rows in `KNOWN` are such a different answer, not a refusal (the other
+ * six are refusals of reads that depend on the order of tied rows, below):
+ *
+ * - `GetItem` of a table that doesn't exist: DynamoDB Local answers `ResourceNotFoundException`,
+ *   the tables `{}`.
+ * - A failed condition's item holding `__proto__`: a `TypeError` from the AWS SDK reading DynamoDB
+ *   Local's error; the tables' `ConditionalCheckFailedException` carries the item.
+ * - A cancellation reason's item holding `__proto__`: the same, for `TransactionCanceledException`.
+ * - Rows of one index key in one answer: DynamoDB Local returns `c, b, a`, the tables `a, b, c`.
+ *
  * Refused by name ({@link UnreadableRequest}), as not modelled:
  *
  * - A request field `checkFields` doesn't list: `ReturnItemCollectionMetrics`, a `Scan`'s
@@ -94,6 +104,10 @@
  * - A projection of a list element; an `attribute_type` whose type is a path or a `size`.
  * - A `Select` DynamoDB Local refuses in words unmeasured, and each check marked "unmeasured"
  *   below.
+ *
+ * Not modelled, as the library never sends it: a request member given as `null` (`Item: null`,
+ * `TableName: null`), which the AWS SDK leaves out of the request; what the tables answer to one
+ * is unchecked.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -458,13 +472,17 @@ const UPDATE_DEPTH = "Nesting Levels have exceeded supported limits"
 export const ITEM_LEVELS = 31
 const VALUE_LEVELS = 32
 
-/** The containers `value` nests, itself counted when it is one. */
-const levelsOf = (value: AttributeValue): number =>
-  value.L !== undefined
-    ? 1 + Math.max(0, ...value.L.map(levelsOf))
-    : value.M !== undefined
-      ? 1 + Math.max(0, ...Object.values(value.M).map(levelsOf))
-      : 0
+/**
+ * The containers `value` nests, itself counted when it is one. A loop, never a spread into
+ * `Math.max`: a list of any length (150,000 elements) is read without exhausting the stack.
+ */
+const levelsOf = (value: AttributeValue): number => {
+  const members = value.L ?? (value.M !== undefined ? Object.values(value.M) : undefined)
+  if (members === undefined) return 0
+  let deepest = 0
+  for (const member of members) deepest = Math.max(deepest, levelsOf(member))
+  return 1 + deepest
+}
 
 /**
  * Why DynamoDB refuses to store `value`, if it does, as DynamoDB Local finds it walking the value

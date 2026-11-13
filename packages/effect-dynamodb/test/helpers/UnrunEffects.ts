@@ -59,6 +59,11 @@
  * - a registrar reached by element access (`it["skip"](…)`); a wrapper that hands its test body on
  *   inside another function (`(n, f) => it(n, () => f())`), takes it in a destructured parameter,
  *   or is itself wrapped by another wrapper;
+ * - a registrar chosen by a conditional one of whose branches runs the Effect
+ *   (`const t = c ? it : it.effect`, a literal `true` / `false` condition included, as which branch
+ *   is taken isn't read), or by a conditional called in place (`(c ? it : it.skip)(…)`);
+ * - a local function that runs one Effect and returns another, unrun
+ *   (`(e) => { Effect.runSync(e); return Effect.sync(…) }`): it is read as a runner;
  * - an Effect returned from inside `Effect.gen` (it may be returned on purpose, for
  *   `Effect.flatten` or `Stream.unwrap`);
  * - an Effect or promise kept in a variable that is read but never yielded or awaited, in a `let`
@@ -69,6 +74,10 @@
  * - a `forEach` callback passed by name (`xs.forEach(check)`), or an `async` one that awaits a run;
  * - `void` on a run (`void Effect.runPromise(…)`), which says the promise is dropped on purpose;
  * - a `runFork` in an `async` test, which may await the fiber.
+ *
+ * May report, though nothing is left unrun: a value of an `Effect` member that isn't an Effect,
+ * returned or dropped, as every member other than those excluded above is read as one
+ * (`it("…", () => Effect.map(fn))`, the data-last form, a function; `Effect.TypeId`).
  *
  * `yield` without `*` inside `Effect.gen` is not reported: Effect 4 runs whatever is yielded.
  */

@@ -21,7 +21,7 @@
 import { readFileSync } from "node:fs"
 import { it } from "@effect/vitest"
 import { Effect } from "effect"
-import { afterEach, beforeEach, describe, expect, vi } from "vitest"
+import { afterAll, afterEach, beforeEach, describe, expect, vi } from "vitest"
 import * as Lib from "../src/index.js"
 import {
   type Case,
@@ -55,10 +55,30 @@ const OVERRIDES: Readonly<
   Record<string, { readonly reason: string; readonly requests: ReadonlyArray<SentRequest> }>
 > = {}
 
+type Overrides = typeof OVERRIDES
+
+/**
+ * The overrides, and which of them the run used. An override whose case never runs (skipped,
+ * filtered out, or in no group below) fails the file when it ends (`afterAll`), so none stands
+ * unchecked; a run filtered to other cases fails there too.
+ */
+const overridesOf = (overrides: Overrides) => {
+  const used = new Set<string>()
+  return {
+    take: (key: string) => {
+      if (!Object.hasOwn(overrides, key)) return undefined
+      used.add(key)
+      return overrides[key]
+    },
+    unused: () => Object.keys(overrides).filter((key) => !used.has(key)),
+  }
+}
+const overrides = overridesOf(OVERRIDES)
+
 /** Runs a case, checking it sends 1.40.0's requests, whole, or its override's, whole. */
 const capture = (each: Case) =>
   Effect.map(captureWithRequests(Lib as never, each), ({ outcome, requests }) => {
-    const override = OVERRIDES[each.key]
+    const override = overrides.take(each.key)
     if (override === undefined) expect(requests).toEqual(sent140.cases[each.key])
     else expect(requests, override.reason).toEqual(override.requests)
     return outcome
@@ -75,6 +95,9 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks()
 })
+afterAll(() => {
+  expect(overrides.unused(), "overrides whose case never ran").toEqual([])
+})
 
 it("the fixtures hold every case", () => {
   expect(Object.keys(fixture.cases)).toEqual(cases.map((each) => each.key))
@@ -87,6 +110,16 @@ it("every override names a case, with its reason and requests that differ from 1
     expect(reason.length, key).toBeGreaterThan(0)
     expect(requests, key).not.toEqual(sent140.cases[key])
   }
+})
+
+it("an override whose case never runs is left unused, and fails the file", () => {
+  const [first, second] = [cases[0]!.key, cases[1]!.key]
+  const override = { reason: "a reason", requests: [] }
+  const tracked = overridesOf({ [first]: override, [second]: override })
+  expect(tracked.unused()).toEqual([first, second])
+  expect(tracked.take(first)).toBe(override)
+  expect(tracked.take("not an override")).toBeUndefined()
+  expect(tracked.unused()).toEqual([second])
 })
 
 describe("an entry operation reaches the entry, whatever its key is called", () => {
