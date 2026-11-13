@@ -5293,7 +5293,15 @@ is looked for. Every getter is called exactly as often as published 1.40.0 calle
 every write path (`LostBehindGetters.test.ts`, counts measured with 1.40.0's own copy of
 `CustomDeclarationPaths`); an update's path operand no longer goes through the schema a
 third time to be looked through, which had added two calls. A getter the marshaller doesn't
-read (a class's own, not enumerable) isn't called or looked at.
+read (a class's own, not enumerable) isn't called or looked at. Left as 1.40.0 (named, not
+reworked): a getter a list inherits at an index (on the list's prototype) isn't looked
+behind, so a `Date` it returns is stored as `{}`, as 1.40.0 stored it
+(`LostBehindGetters.test.ts`). Only a `Proxy` sees what the walk reads: at an untyped
+position, `getPrototypeOf`, `getOwnPropertyDescriptor` and `ownKeys` traps and reads of a
+list's `length`; the payload and its declared fields see exactly 1.40.0's traps, a
+condition's or filter's operand one `getPrototypeOf` more (finding an instance), and once a
+getter in an untyped field has been met in the process, `readJudged` reads the
+descriptors of what each marshalled item holds (`ProxyTraps.test.ts`).
 
 **A named zone's name on any Effect 4.1 (1.41.0).** Effect 4.1.3 changed a named zone.
 It gained an own enumerable `resolvedId` (the name `Intl` resolves it to), and its `id`

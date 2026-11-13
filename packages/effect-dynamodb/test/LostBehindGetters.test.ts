@@ -377,3 +377,28 @@ describe("a put through the entity", () => {
     }),
   )
 })
+
+describe("named, left as 1.40.0: a getter a list inherits at an index", () => {
+  // The getter is on the list's prototype, not the list: `lostIn` reads a list's own indices, so
+  // what the getter returns is stored as 1.40.0 stored it, and the getter is called once, as then.
+  it("a Date it returns is stored as an empty map, as 1.40.0 stored it", () => {
+    let calls = 0
+    const prototype = Object.create(Array.prototype)
+    Object.defineProperty(prototype, "1", {
+      get: () => {
+        calls++
+        return new Date(0)
+      },
+      enumerable: true,
+    })
+    const list: Array<unknown> = new Array(3)
+    list[0] = "a"
+    list[2] = "c"
+    Object.setPrototypeOf(list, prototype)
+    expect(lostIn({ u: list })).toBeUndefined()
+    expect(toAttributeMap({ u: list })).toEqual({
+      u: { L: [{ S: "a" }, { M: {} }, { S: "c" }] },
+    })
+    expect(calls).toBe(1)
+  })
+})
