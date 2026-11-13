@@ -144,12 +144,16 @@ describe.each(
       it.effect(`${each.name}, ${transaction ? "in a transaction" : "alone"}`, () =>
         Effect.gen(function* () {
           const got = yield* run(config, transaction, each)
+          if (each.stored === undefined) {
+            // A number DynamoDB can't hold is sent as it is, and refused as DynamoDB refuses it.
+            expect(Exit.isFailure(got.exit)).toBe(true)
+            if (Exit.isFailure(got.exit)) {
+              expect((Cause.squash(got.exit.cause) as any)._tag).toBe("DynamoValidationError")
+            }
+            return
+          }
           if (Exit.isFailure(got.exit)) expect(Cause.pretty(got.exit.cause)).toBe("")
-          // A number DynamoDB can't hold is sent as it is, for DynamoDB to refuse: this table
-          // stores what it's sent.
-          expect(got.stored).toEqual(
-            sorted(each.stored ?? { N: "100000000000000000000000000000000000001" }),
-          )
+          expect(got.stored).toEqual(sorted(each.stored))
         }),
       )
     }
