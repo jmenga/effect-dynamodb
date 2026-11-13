@@ -2089,7 +2089,7 @@ export type TypedClient<
       infer Un
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
+          BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               PathModel<Schema.Schema.Type<M>, P>,
@@ -2116,7 +2116,7 @@ export type TypedClient<
             infer Un
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
+            BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 PathModel<Schema.Schema.Type<M>, P>,
@@ -2175,8 +2175,8 @@ type Resolve<T> = { [K in keyof T]: T[K] }
 
 /** Resolve EntityKeyType into a plain object type for clean hover display.
  * Uses conditional type to force eager evaluation by TypeScript. */
-type ResolveKey<M extends Schema.Top, I> =
-  EntityKeyType<M, I> extends infer K ? { [P in keyof K]: K[P] } : never
+type ResolveKey<M extends Schema.Top, I, R> =
+  EntityKeyType<M, I, R> extends infer K ? { [P in keyof K]: K[P] } : never
 
 /**
  * Force eager resolution of remaining SK fields for clean hover display.

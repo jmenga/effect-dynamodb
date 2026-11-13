@@ -1382,7 +1382,7 @@ export interface Entity<
 
   /** Fetch an item by primary key. Returns a lazy {@link EntityGet} intermediate. */
   readonly get: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityGet<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -1425,7 +1425,7 @@ export interface Entity<
    * Pipe to {@link set} to provide update fields and {@link expectedVersion} for optimistic locking.
    */
   readonly update: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityUpdate<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -1449,7 +1449,7 @@ export interface Entity<
    * A unique-constrained entity releases only the sentinels the item owns.
    */
   readonly delete: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityDelete<
     | DynamoClientError
     | TransactionOverflow
@@ -1519,7 +1519,7 @@ export interface Entity<
    * Equivalent to `update(key)` with an automatic `attribute_exists` condition on the PK field.
    */
   readonly patch: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityUpdate<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -1544,7 +1544,7 @@ export interface Entity<
    * Equivalent to `delete(key)` with an automatic `attribute_exists` condition on the PK field.
    */
   readonly deleteIfExists: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityDelete<
     | DynamoClientError
     | TransactionOverflow
@@ -1599,7 +1599,7 @@ export interface Entity<
 
   /** Fetch a specific version snapshot by version number. */
   readonly getVersion: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
     version: number,
   ) => EntityGet<
     ModelType<TModel>,
@@ -1610,12 +1610,12 @@ export interface Entity<
 
   /** Query version history for an item. Returns a Query for piping with limit, reverse, collect. */
   readonly versions: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => Query.Query<EntityRecordType<TModel, TTimestamps, TVersioned>>
 
   /** Restore a soft-deleted item. Recomposes index keys and re-establishes unique sentinels. */
   readonly restore: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityGet<
     ModelType<TModel>,
     EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -1636,14 +1636,14 @@ export interface Entity<
    * already deleted.
    */
   readonly purge: (
-    key: EntityKeyType<TModel, TIndexes>,
+    key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityDelete<DynamoClientError | ValidationError, DynamoClient | TableConfig>
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
     /** Get a specific soft-deleted item. */
     readonly get: (
-      key: EntityKeyType<TModel, TIndexes>,
+      key: EntityKeyType<TModel, TIndexes, TRefs>,
     ) => EntityGet<
       ModelType<TModel>,
       EntityRecordType<TModel, TTimestamps, TVersioned>,
@@ -1652,7 +1652,7 @@ export interface Entity<
     >
     /** List soft-deleted items within a partition. */
     readonly list: (
-      key: EntityKeyType<TModel, TIndexes>,
+      key: EntityKeyType<TModel, TIndexes, TRefs>,
     ) => Query.Query<EntityRecordType<TModel, TTimestamps, TVersioned>>
   }
 
@@ -1733,7 +1733,7 @@ export interface Entity<
    * Only available when the entity was built with `timeSeries: { ... }`.
    */
   readonly history: [TTimeSeries] extends [TimeSeriesConfig<any>]
-    ? (key: EntityKeyType<TModel, TIndexes>) => Query.Query<ModelType<TModel>>
+    ? (key: EntityKeyType<TModel, TIndexes, TRefs>) => Query.Query<ModelType<TModel>>
     : never
 
   // --- Update Combinators (entity-scoped, type-safe in both paths) ---
@@ -1930,7 +1930,7 @@ export interface BoundEntity<
   TModel extends Schema.Top,
   TIndexes extends globalThis.Record<string, IndexDefinition>,
   TRefs extends globalThis.Record<string, AnyRefValue> | undefined,
-  TKey = EntityKeyType<TModel, TIndexes>,
+  TKey = EntityKeyType<TModel, TIndexes, TRefs>,
   TTimeSeries extends TimeSeriesConfig<any> | undefined = undefined,
   TTimestamps extends TimestampsConfig | undefined = undefined,
   TVersioned extends VersionedConfig | undefined = undefined,
@@ -5412,6 +5412,11 @@ const makeImpl = <
    * actually written back (tombstone, restored item, snapshot) is unaffected and
    * `decodeAs` can still do its own in-place rename on it. Callers that decode
    * the row and discard it rename in place instead (see `decodeRecord`).
+   *
+   * Each ref's id is beside the ref, read from it ({@link storedRefId}): a `put` is given a ref's
+   * id (`projectId`) and stores the ref whole (`project: { projectId, ... }`, no `projectId`), so a
+   * key composed from a row read back, a primary key holding the id among them, reads it from
+   * there. Up to 1.40.0 such a key died with `Missing composite attribute "projectId"`.
    */
   const toDomainView = (
     raw: globalThis.Record<string, unknown>,
@@ -5421,6 +5426,12 @@ const makeImpl = <
     // an entry never stands in for a field of its name whose own attribute the row lacks.
     deserializeSparseFields(view)
     renameFromDynamo(view)
+    for (const ref of resolvedRefs) {
+      const id = (
+        ownValue(view, ref.fieldName) as globalThis.Record<string, unknown> | undefined
+      )?.[ref.keyField]
+      if (id !== undefined) view[ref.idFieldName] = storedRefId(ref, id)
+    }
     return view
   }
 
@@ -5437,6 +5448,18 @@ const makeImpl = <
         (field) => [field, record[field]],
       ),
     )
+
+  /**
+   * {@link primaryKeyOf} of an item as built (stored attribute names), a ref's id in it the one the
+   * caller gave (`given`) where there is a caller's input, else the stored ref's (`toDomainView`).
+   */
+  const errorKeyOf = (
+    item: globalThis.Record<string, unknown>,
+    given: globalThis.Record<string, unknown> | undefined,
+  ): globalThis.Record<string, unknown> => {
+    const view = toDomainView(item)
+    return primaryKeyOf(given === undefined ? view : withRefIds(view, given))
+  }
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -8119,13 +8142,15 @@ const makeImpl = <
     readonly composeKeys: (
       carried: globalThis.Record<string, unknown>,
     ) => Effect.Effect<globalThis.Record<string, unknown>, ValidationError>
+    /** The caller's input, where there is one: a ref's id an error's key names is the one given. */
+    readonly given?: globalThis.Record<string, unknown>
   }): Effect.Effect<PutPlan, ValidationError | DynamoClientError, DynamoClient> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const pkField = config.indexes.primary.pk.field
       const skField = config.indexes.primary.sk.field
       const item: globalThis.Record<string, unknown> = { ...args.item }
-      const key = primaryKeyOf(toDomainView(args.item))
+      const key = errorKeyOf(args.item, args.given)
       const owner = { pk: item[pkField], sk: item[skField] }
       const current = args.create
         ? undefined
@@ -8460,7 +8485,7 @@ const makeImpl = <
           case "Condition":
             return yield* new ConditionalCheckFailed({
               entityType,
-              key: primaryKeyOf(toDomainView(args.item)),
+              key: errorKeyOf(args.item, args.given),
             })
           case "Retry":
             lost = verdict
@@ -8930,6 +8955,8 @@ const makeImpl = <
     readonly now: DateTime.Utc
     /** The item as built: stored attribute names, packed. */
     readonly item: globalThis.Record<string, unknown>
+    /** The caller's input: a ref's id an error's key names is the one given. */
+    readonly given: globalThis.Record<string, unknown>
   }): Effect.Effect<
     globalThis.Record<string, AttributeValue>,
     | DynamoClientError
@@ -8946,7 +8973,8 @@ const makeImpl = <
         fieldOf: fieldOfAttribute,
       })
       const source = toDomainView(item)
-      const alreadyExists = () => new ItemAlreadyExists({ entityType, key: primaryKeyOf(source) })
+      const alreadyExists = () =>
+        new ItemAlreadyExists({ entityType, key: errorKeyOf(item, args.given) })
 
       const owner = {
         pk: item[config.indexes.primary.pk.field],
@@ -9210,6 +9238,7 @@ const makeImpl = <
               ttlAttrName,
               now,
               item,
+              given: encodedInput as globalThis.Record<string, unknown>,
             })
             return yield* decodeAs(item, marshalled, mode)
           }
@@ -9259,6 +9288,7 @@ const makeImpl = <
               operation,
               composeKeys: (carried) =>
                 composeAllKeys({ ...keyValues, ...carried }, operation, ownSchema()),
+              given: encodedInput as globalThis.Record<string, unknown>,
             })
             return yield* decodeAs(plan.item, plan.marshalled, mode)
           }
@@ -10228,8 +10258,10 @@ const makeImpl = <
         // `currentDomainItem` + domain-keyed updates) — no rename needed
         // here. Recompose all keys with the updated attributes.
         //
-        // Primary key always recomposes from `newItem` (Put-style).
-        const primaryKeyMap = composePrimaryKey(newItem)
+        // Primary key always recomposes from `newItem` (Put-style), a ref's id in it the caller's:
+        // a row stores the ref, not the id.
+        const keyedItem = withRefIds(newItem, encodedKey)
+        const primaryKeyMap = composePrimaryKey(keyedItem)
         Object.assign(newItem, primaryKeyMap)
 
         // GSI keys: route through the policy-aware composer so the
@@ -10255,7 +10287,7 @@ const makeImpl = <
             entityVersion,
             allIndexes,
             keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
-            keyForm(newItem),
+            keyForm(keyedItem),
             {
               ...(retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet }),
               stamped: keyForm(
@@ -13268,7 +13300,7 @@ const makeImpl = <
           )
           yield* refuseUncomposed(encodedInput, "upsert")
           const keyPlan = upsertKeyPlan(allKeys, item, suppliedCreatedAt !== undefined)
-          const primaryKey = composePrimaryKey(item)
+          const primaryKey = composePrimaryKey(withRefIds(item, encodedInput))
           const marshalledKey = toAttributeMap(primaryKey)
           // Build UpdateExpression with if_not_exists for immutable fields + createdAt
           const setClauses: Array<string> = []
@@ -15053,8 +15085,8 @@ const makeImpl = <
           // read-by-field-name below: key composition, vector-partition
           // recomposition and unique-sentinel composition. `restoredItem` itself
           // stays attribute-keyed — it is the row being written back, and
-          // `decodeAs` renames it in place at the end (#127).
-          const restoredDomain = toDomainView(restoredItem)
+          // `decodeAs` renames it in place at the end (#127). A ref's id in the key is the caller's.
+          const restoredDomain = withRefIds(toDomainView(restoredItem), encodedKey)
 
           // Recompose all keys (original SK, GSI keys)
           const restoredKeys = yield* composeAllKeys(restoredDomain, "restore")
@@ -16284,20 +16316,11 @@ const makeImpl = <
 
   /**
    * A stored row's values as a `put` composed from them. A `put` is given a ref's id and stores the
-   * ref (`team: { id, ... }`, no `teamId`), so it's read back from there, as `.within()` does.
+   * ref (`team: { id, ... }`, no `teamId`), so it's read back from there (`toDomainView`), as
+   * `.within()` does.
    */
-  const putValuesOf = (row: StoredRow): globalThis.Record<string, unknown> => {
-    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
-    if (resolvedRefs.length === 0) return values
-    const withIds = { ...values }
-    for (const ref of resolvedRefs) {
-      const id = (values[ref.fieldName] as globalThis.Record<string, unknown> | undefined)?.[
-        ref.keyField
-      ]
-      if (id !== undefined) withIds[ref.idFieldName] = storedRefId(ref, id)
-    }
-    return withIds
-  }
+  const putValuesOf = (row: StoredRow): globalThis.Record<string, unknown> =>
+    toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
 
   /** The stored attribute a composite is read from: a ref's id lives in the ref. */
   const compositeAttribute = (composite: string): string =>
@@ -20155,7 +20178,7 @@ export const bind = <
     TModel,
     TIndexes,
     TRefs,
-    EntityKeyType<TModel, TIndexes>,
+    EntityKeyType<TModel, TIndexes, TRefs>,
     TTimeSeries,
     TTimestamps,
     TVersioned,
@@ -20185,7 +20208,7 @@ export const bind = <
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
-    type Key = EntityKeyType<TModel, TIndexes>
+    type Key = EntityKeyType<TModel, TIndexes, TRefs>
     type Input = WithGeneratedId<
       EntityRefInputType<TModel, TRefs, TTimestamps, TVersioned, TTimeSeries>,
       TGeneratedId
@@ -20653,7 +20676,7 @@ export const bind = <
       TModel,
       TIndexes,
       TRefs,
-      EntityKeyType<TModel, TIndexes>,
+      EntityKeyType<TModel, TIndexes, TRefs>,
       TTimeSeries,
       TTimestamps,
       TVersioned,
@@ -21013,14 +21036,29 @@ export type Update<E extends { readonly model: Schema.Top; readonly indexes: any
 
 /**
  * Extract the key type from an Entity.
- * Primary index pk + sk composite attributes only.
+ * Primary index pk + sk composite attributes only, a ref's id among them (`projectId`).
  *
  * `Entity.Key<typeof Users>` = `{ userId: string }`
  */
-export type Key<E extends { readonly model: Schema.Top; readonly indexes: any }> = EntityKeyType<
-  E["model"],
-  E["indexes"]
->
+export type Key<E extends { readonly model: Schema.Top; readonly indexes: any }> =
+  E extends Entity<
+    infer M extends Schema.Top,
+    any,
+    infer I,
+    any,
+    any,
+    any,
+    any,
+    infer R,
+    any,
+    any,
+    any,
+    any,
+    infer _P extends string,
+    any
+  >
+    ? EntityKeyType<M, I, R>
+    : EntityKeyType<E["model"], E["indexes"]>
 
 /**
  * Extract the full DynamoDB item type (unmarshalled).

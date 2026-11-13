@@ -3224,7 +3224,8 @@ export const buildDerivedSchemas = (
       )
     }
     for (const ref of resolvedRefs) {
-      if (pkComposites.has(ref.fieldName)) continue
+      // A ref's id that is a primary key composite is part of the key, which no update changes.
+      if (pkComposites.has(ref.fieldName) || pkComposites.has(ref.idFieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
       setOwn(acc, ref.idFieldName, Schema.optionalKey(ref.keySchema as Schema.Top))
     }
@@ -3233,10 +3234,13 @@ export const buildDerivedSchemas = (
   const updateSchema = Schema.Struct(buildUpdateFieldsAcc() as Schema.Struct.Fields)
 
   // --- Key Schema: primary key composite attributes only ---
+  // A composite is a model field or a ref's id (`projectId` for `project`), which a key takes as
+  // the input does. Up to 1.40.0 a ref's id was left out, and every key-taking operation died.
   const keyCompositeNames = primaryKeyComposites(indexes)
   const keyFields: globalThis.Record<string, Schema.Top> = {}
   for (const name of keyCompositeNames) {
-    const field = ownValue(fields, name)
+    const field =
+      ownValue(fields, name) ?? resolvedRefs.find((ref) => ref.idFieldName === name)?.keySchema
     if (field) setOwn(keyFields, name, field)
   }
   const keySchema = Schema.Struct(keyFields)

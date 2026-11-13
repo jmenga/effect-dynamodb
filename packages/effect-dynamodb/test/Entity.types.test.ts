@@ -242,6 +242,23 @@ const BrandedRefSelectionEntity = Entity.make({
   },
 })
 
+/** A ref's id as a primary key composite: a key names it, an update can't change it. */
+class BrandedRoster extends Schema.Class<BrandedRoster>("BrandedRoster")({
+  id: Schema.String,
+  team: BrandedTeam,
+  role: Schema.String,
+}) {}
+
+const BrandedRosterEntity = Entity.make({
+  model: DynamoModel.configure(BrandedRoster, { team: { ref: true } }),
+  entityType: "BrandedRoster",
+  primaryKey: {
+    pk: { field: "pk", composite: ["teamId"] },
+    sk: { field: "sk", composite: ["id"] },
+  },
+  refs: { team: { entity: BrandedTeamEntity } },
+})
+
 const _MainTable = Table.make({
   schema: AppSchema,
   entities: {
@@ -255,6 +272,7 @@ const _MainTable = Table.make({
     BrandedPlayerEntity,
     BrandedSelectionEntity,
     BrandedRefSelectionEntity,
+    BrandedRosterEntity,
   },
 })
 
@@ -509,6 +527,39 @@ describe("Entity type extractors", () => {
 
     // Primary key should be excluded
     expectTypeOf<BSelUpdate>().not.toHaveProperty("id")
+  })
+
+  it("Entity.Key includes a ref's id that is a primary key composite; Entity.Update leaves it out", () => {
+    type RosterKey = Entity.Key<typeof BrandedRosterEntity>
+    expectTypeOf<RosterKey>().toEqualTypeOf<{
+      readonly teamId: BrandedTeamId
+      readonly id: string
+    }>()
+    const teamId = BrandedTeamId.make("t-1")
+    const key: RosterKey = { teamId, id: "r-1" }
+    // @ts-expect-error the ref's id is part of the key
+    const withoutTeam: RosterKey = { id: "r-1" }
+
+    type RosterUpdate = Entity.Update<typeof BrandedRosterEntity>
+    expectTypeOf<RosterUpdate>().toHaveProperty("role")
+    expectTypeOf<RosterUpdate>().not.toHaveProperty("teamId")
+    // @ts-expect-error no update changes the key
+    const repoint: RosterUpdate = { teamId }
+
+    // The entity's own key-taking operations, and a bound client's, take it.
+    const typed = () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { BrandedTeamEntity, BrandedRosterEntity },
+          tables: { _MainTable },
+        })
+        yield* db.entities.BrandedRosterEntity.get({ teamId, id: "r-1" })
+        yield* db.entities.BrandedRosterEntity.update({ teamId, id: "r-1" }).set({ role: "c" })
+        // @ts-expect-error no update changes the key
+        yield* db.entities.BrandedRosterEntity.update(key).set({ teamId })
+        return BrandedRosterEntity.delete(key)
+      })
+    expect([key, withoutTeam, repoint, typed]).toHaveLength(4)
   })
 
   // ---------------------------------------------------------------------------
