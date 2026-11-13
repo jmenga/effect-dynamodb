@@ -7515,7 +7515,13 @@ instance).
     model writing outbox items there composes keys that can never be its own)
     and no other projection of the read model writes outbox items (an item
     records its event, not its projection: the other projection's item of the
-    same event would be replaced, and its effect lost).
+    same event would be replaced, and its effect lost). Decided from the
+    `Table.make` definitions: a second handle on the same physical table isn't
+    seen, so read models whose keys meet only through it count as apart and
+    such an item is replaced, as on 1.40.0, even where it is the other's. A
+    drainer delivering the item between the cancelled `plain` transaction and
+    this one lets this one write it again: delivered twice (1.40.0 replaced it
+    in one request). Both need an item pending from before the upgrade.
   - `"beside"`: at the key followed by `#<mark>`, which only this effect
     writes, with `ReturnValuesOnConditionCheckFailure: ALL_OLD`.
 
@@ -7557,7 +7563,9 @@ instance).
   `Table.tableKeyAttributes`), the read model's items carry no mark, their Put
   no condition (`"none"`), and its drainers read no mark: exactly 1.40.0's
   requests, items and deliveries (`fixtures/outbox-mark-names-1.40.0.json`),
-  and none of this protection. Never decided by what a stored item holds.
+  and none of this protection. Never decided by what a stored item holds. An
+  index attribute of that name declared only through a second `Table.make`
+  handle on the same physical table isn't seen: the items carry the mark.
 
   `drain` claims the head item (a conditional update
   with an expiring claim), delivers it, deletes it on its claim, and repeats:

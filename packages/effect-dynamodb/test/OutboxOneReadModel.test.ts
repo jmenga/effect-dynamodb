@@ -619,6 +619,44 @@ describe("one projection: an item without a mark at its key", () => {
     )
   }
 
+  it.effect("of the same event, drained before the retry: delivered twice (documented)", () => {
+    // A drainer delivers and deletes the item between the cancelled transaction and the one sent
+    // next, which then writes it again (1.40.0 replaced it in one request).
+    const w = one()
+    return run(
+      w,
+      Effect.gen(function* () {
+        const events = yield* w.events("raced")
+        yield* w.apply(0, events.slice(0, 1))
+        w.unmark()
+        w.loseRow()
+        const seen: Array<number> = []
+        let sends = 0
+        const racing = new Proxy(w.routed.client as Record<string, any>, {
+          get: (target, operation) =>
+            operation === "transactWriteItems"
+              ? (input: unknown) =>
+                  ++sends === 2
+                    ? w.drained().pipe(
+                        Effect.provideService(DynamoClient, w.routed.client as any),
+                        Effect.andThen((drained) => {
+                          seen.push(...drained.seen)
+                          return target.transactWriteItems(input)
+                        }),
+                      )
+                    : target.transactWriteItems(input)
+              : target[operation as string],
+        })
+        yield* w
+          .apply(0, events.slice(0, 1))
+          .pipe(Effect.provideService(DynamoClient, racing as any))
+        expect(sends).toBe(2)
+        seen.push(...(yield* w.drained()).seen)
+        expect(seen).toEqual([2, 2])
+      }),
+    )
+  })
+
   it.effect("of another event: kept, and the new one beside it", () => {
     // Two streams fold into the row; it is lost with the first's item pending, and the second's
     // event then writes at revision 1 again.
