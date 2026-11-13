@@ -41,7 +41,8 @@ export type ManagedLib = {
 type Built = { readonly Main: any; readonly Agg: any; readonly input: unknown }
 
 const base = (lib: ManagedLib) => {
-  const schema = lib.DynamoSchema.make({ name: "mgd", version: 1 })
+  // The setting the fixture was captured under (1.40.0's default), whatever this run's default is.
+  const schema = lib.DynamoSchema.make({ name: "mgd", version: 1, escapeKeys: false })
   const Main = lib.Table.make({ schema, entities: {} })
   return { schema, Main, common: { schema, table: Main, pk: { field: "pk", composite: ["id"] } } }
 }
