@@ -4361,8 +4361,9 @@ judged (a value only another member takes stays refused as on 1.40.0). Two such
 writes are left as 1.40.0 behaves, and named: with the discriminator stored
 under different names, `kind = "b"` beside `y = 2` writes the given names, and
 the row reads as the member it held; and a discriminator set alone to another
-member's tag (`kind = "a"` on a row holding `b`, in a field or a sparse map's
-entry) is sent as 1.40.0 sent it, leaving a row no read takes. A path through a
+member's tag where 1.40.0 sent it (`kind = "a"` on a row holding `b` in a field,
+any member's tag in a sparse map's entry) is sent as 1.40.0 sent it, leaving a
+row no read takes. A path through a
 recursive union (`Schema.suspend`) is written as 1.40.0 wrote it
 (`helpers/UnionMemberWrites.ts`, `fixtures/union-member-writes-1.40.0.json`:
 standalone, transaction, retained and unique, both `escapeKeys`).
