@@ -358,11 +358,18 @@ export type WithGeneratedId<T, TGeneratedId> = [TGeneratedId] extends [undefined
       : T
     : T
 
-/** Entity key type: Pick model fields by primary key composites */
-export type EntityKeyType<TModel extends Schema.Top, TIndexes> = Pick<
-  ModelType<TModel>,
-  PrimaryKeyComposites<TIndexes> & keyof ModelType<TModel>
->
+/**
+ * Entity key type: the primary key composites, each a model field or a ref's id (`projectId` for
+ * `project`), which a key takes as the input does.
+ */
+export type EntityKeyType<TModel extends Schema.Top, TIndexes, TRefs = undefined> = [
+  TRefs,
+] extends [undefined]
+  ? Pick<ModelType<TModel>, PrimaryKeyComposites<TIndexes> & keyof ModelType<TModel>>
+  : Pick<
+      CompositeFields<TModel, TRefs>,
+      PrimaryKeyComposites<TIndexes> & keyof CompositeFields<TModel, TRefs>
+    >
 
 /** Entity record type: model fields + system fields */
 export type EntityRecordType<
@@ -567,7 +574,11 @@ export type EntityRefUpdateType<
         TModel,
         Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes> | (keyof TRefs & string)>
       > & {
-        readonly [K in keyof TRefs & string as `${K}Id`]?: EntityIdentifierValue<TRefs[K]>
+        // A ref's id that is a primary key composite is part of the key, which no update changes.
+        readonly [K in keyof TRefs & string as Exclude<
+          `${K}Id`,
+          string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>
+        >]?: EntityIdentifierValue<TRefs[K]>
       },
       TTimestamps,
       TVersioned,

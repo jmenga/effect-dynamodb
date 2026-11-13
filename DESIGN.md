@@ -5678,6 +5678,20 @@ an index keyed by its id stored) and the ref may be removed by its field
 `${field}Id`, is still refused by `.remove()`
 (`fixtures/entity-ref-writes-1.40.0.json`, `helpers/EntityRefWrites.ts`).
 
+**A ref's id may be a primary key composite.** With `primaryKey: { pk: ["projectId"] }`
+and `refs: { project: ... }`, the key schema (`keySchema`, `Entity.Key`) takes the id as
+the input does, so `get`, `update`, `delete` and every other key-taking operation name
+it; the update schema and type leave it out, since no update changes the key. A key
+composed from the caller's key takes the caller's id. A key composed from a row read
+back (a retained or unique update, a soft or retained delete, `restore`, `purge`,
+history) reads it from the stored ref: `toDomainView` puts each ref's id beside the ref
+(`storedRefId`), and where the operation also has the caller's key (a whole-item update,
+`restore`), and in an error's key (`errorKeyOf`, for `insert` and a guarded put), the
+caller's id wins (`withRefIds`). Up to 1.40.0 the key schema dropped the
+id, so every key-taking operation but `put` and `create` died with
+`Missing composite attribute "projectId"`, and `restore` wrote no key for an index keyed
+by a ref's id (`RefIdPrimaryKey.test.ts`, `connected.ref-id-primary-key.test.ts`).
+
 Every id is judged before anything is fetched. An entity keyed by more than
 one distinct composite, or none, has nothing one id names: `create` fails with
 a `ValidationError` (`EDD-9129`) naming the edge. An id of no type of the key
