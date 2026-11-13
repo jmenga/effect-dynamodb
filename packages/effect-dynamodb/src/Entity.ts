@@ -16767,6 +16767,13 @@ const makeImpl = <
               // Another of the item's rows' sentinel under other key text: it moves out first.
               const judged = yield* holderSentinelOut(ctx, other, constraintName, current)
               if (!ctx.vacated(toAttributeMap(sentinelKeyRecord(current)))) {
+                // Meanwhile another visit of this run moved this pass's sentinel there, out of a
+                // row's way: only this value's sentinel composes its current key, so the run put
+                // nothing else there. Settled, as when the chain says so.
+                if (judged !== "loop" && ctx.putting(currentAt)) {
+                  worked = true
+                  continue
+                }
                 refused(
                   judged === "loop" ? "contended" : "taken",
                   constraintName,
@@ -17648,7 +17655,12 @@ const makeImpl = <
         Key: toAttributeMap(at),
         ConsistentRead: true,
       })
-      if (fresh === undefined) return {}
+      // Taken since the scan read it, by a move whose answer may not be back yet: kept as counted,
+      // so that move, recording its take after this visit, doesn't count it again.
+      if (fresh === undefined) {
+        ctx.awaitsMove(row)
+        return {}
+      }
       const owner = yield* sentinelOwnerRow(ctx.tableName, fresh)
       const again = yield* judge(fresh, owner)
       if (again !== undefined) return again

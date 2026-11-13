@@ -1056,6 +1056,8 @@ interface KeyState {
    * planned — once per time it left each, at most {@link MAX_PRINTS}.
    */
   prints: Array<string> | undefined
+  /** The prints of a real run's puts here that are sent and not yet answered. */
+  sending: Array<string> | undefined
   /** The run left an image here it can't name: the scan passes whatever it finds. */
   any: boolean
   /** A dry run's updates to the row stored here, which it didn't put. */
@@ -1152,6 +1154,7 @@ class Journal {
       takenAt: undefined,
       last: undefined,
       prints: undefined,
+      sending: undefined,
       any: false,
       patches: undefined,
       partition: undefined,
@@ -1191,6 +1194,13 @@ class Journal {
   private dropPrint(state: KeyState, print: string): void {
     const at = state.prints?.indexOf(print) ?? -1
     if (at >= 0) state.prints!.splice(at, 1)
+  }
+
+  /** A put sent with `print` is answered (or failed): no longer on its way. */
+  private answered(state: KeyState, print: string): void {
+    const at = state.sending?.indexOf(print) ?? -1
+    if (at >= 0) state.sending!.splice(at, 1)
+    if (state.sending?.length === 0) state.sending = undefined
   }
 
   /** Whether the row at `key` is the run's own: one it put, or left by an update of one it put. */
@@ -1299,7 +1309,9 @@ class Journal {
     if (state === undefined) return
     state.takenAt = this.seq
     state.last = "taken"
-    state.prints = undefined
+    // A put here still on its way may land after the take (the take's answer came first): its
+    // print stays, so the scan passes the row it puts.
+    state.prints = state.sending === undefined ? undefined : [...state.sending]
     state.any = false
     state.patches = undefined
     if (state.partition !== undefined) this.placedIn.get(state.partition)?.delete(key)
@@ -1501,17 +1513,23 @@ class Journal {
         if (state === undefined) continue
         const print = fingerprint(item)
         this.addPrint(state, print)
+        if (state.sending === undefined) state.sending = [print]
+        else state.sending.push(print)
         sent.push({ state, print })
       }
       return send.pipe(
         Effect.tap((output) =>
           Effect.sync(() => {
+            for (const { state, print } of sent) this.answered(state, print)
             for (const item of done(output)) this.applied(item)
           }),
         ),
         Effect.tapError(() =>
           Effect.sync(() => {
-            for (const { state, print } of sent) this.dropPrint(state, print)
+            for (const { state, print } of sent) {
+              this.answered(state, print)
+              this.dropPrint(state, print)
+            }
           }),
         ),
       )
