@@ -41,6 +41,32 @@ export interface ClientOptions {
 }
 
 /**
+ * Static credentials for a layer. `sessionToken` is the third part of temporary
+ * credentials (an assumed role, STS), which the SDK sends as
+ * `x-amz-security-token`; `undefined` or `null` sends none. Nothing in the
+ * library reads them: the SDK client gets them, and AWS's reply to a refused
+ * signature, which can quote the token, is redacted
+ * (`internal/CredentialRefusal.ts`).
+ */
+export type Credentials = {
+  readonly accessKeyId: string
+  readonly secretAccessKey: string
+  readonly sessionToken?: string | null | undefined
+}
+
+/**
+ * The caller's credentials, as the SDK client's configuration types them. The
+ * object itself is passed, never a copy: the SDK reads it for every request, so
+ * an object changed in place, keys held in getters, and a provider function an
+ * untyped caller passes all keep working. Only the type differs: the SDK's has
+ * no `undefined` or `null` token, and sends none for either.
+ */
+export const sdkCredentials = (
+  credentials: Credentials,
+): NonNullable<DynamoDBClientConfig["credentials"]> =>
+  credentials as NonNullable<DynamoDBClientConfig["credentials"]>
+
+/**
  * The handler's options an operator tunes per environment, each read through
  * `Config`. One that is missing stays unset; one that doesn't parse fails the
  * layer with its `ConfigError`.

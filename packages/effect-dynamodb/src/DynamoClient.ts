@@ -187,7 +187,9 @@ import {
   acquireSdkClient,
   type ClientOptions,
   type ClientOptionsFromConfig,
+  type Credentials,
   readClientOptions,
+  sdkCredentials,
 } from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
 import { createConditionOps, type Expr, ExprTag } from "./internal/Expr.js"
@@ -1654,18 +1656,14 @@ export interface DynamoClientService {
 type ClientConfig = ClientOptions & {
   readonly region: string
   readonly endpoint?: string | undefined
-  readonly credentials?:
-    | { readonly accessKeyId: string; readonly secretAccessKey: string }
-    | undefined
+  readonly credentials?: Credentials | undefined
 }
 
 /** Config-provider client configuration accepted by {@link DynamoClient.layerConfig}. */
 type ClientConfigFromConfig = ClientOptionsFromConfig & {
   readonly region: Config.Config<string>
   readonly endpoint?: Config.Config<string> | undefined
-  readonly credentials?:
-    | Config.Config<{ readonly accessKeyId: string; readonly secretAccessKey: string }>
-    | undefined
+  readonly credentials?: Config.Config<Credentials> | undefined
 }
 
 /**
@@ -1700,7 +1698,8 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    *
    * @param config.region - AWS region
    * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
-   * @param config.credentials - Optional static credentials
+   * @param config.credentials - Optional static credentials, with a
+   *   `sessionToken` when they are temporary (an assumed role)
    * @param config.requestHandler - Optional HTTP handler, or the options of the
    *   runtime's handler (`{ socketTimeout: 5000 }`), passed to the SDK client.
    *   None is set by default, so without one a connection that stays open and
@@ -1751,7 +1750,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    *
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
-   * @param config.credentials - Optional Config for static credentials
+   * @param config.credentials - Optional Config for static credentials, with a
+   *   `sessionToken` when they are temporary (an assumed role). When any part
+   *   is missing from the provider (an empty value counts as missing),
+   *   `credentials` is unset as a whole and the SDK's default credential chain
+   *   applies, which can sign as another identity; to make the token alone
+   *   optional, read it with `Config.withDefault(undefined)`.
    * @param config.requestHandler - Optional Config for each of the handler's
    *   timeouts (`connectionTimeout`, `socketTimeout`, `requestTimeout`,
    *   `throwOnRequestTimeout`), which an operator tunes per environment, or an
@@ -3829,13 +3833,13 @@ export const classifyError =
 const buildService = (
   region: string,
   endpoint: string | undefined,
-  credentials: { readonly accessKeyId: string; readonly secretAccessKey: string } | undefined,
+  credentials: Credentials | undefined,
   options: ClientOptions,
 ) =>
   Effect.gen(function* () {
     const clientConfig: ConstructorParameters<typeof DynamoDBClient>[0] = { region }
     if (endpoint !== undefined) clientConfig.endpoint = endpoint
-    if (credentials !== undefined) clientConfig.credentials = credentials
+    if (credentials !== undefined) clientConfig.credentials = sdkCredentials(credentials)
     if (options.requestHandler !== undefined) clientConfig.requestHandler = options.requestHandler
     if (options.maxAttempts !== undefined) clientConfig.maxAttempts = options.maxAttempts
     const client = yield* acquireSdkClient(() => new DynamoDBClient(clientConfig))

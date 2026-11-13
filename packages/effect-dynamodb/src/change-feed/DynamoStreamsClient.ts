@@ -37,7 +37,9 @@ import {
   acquireSdkClient,
   type ClientOptions,
   type ClientOptionsFromConfig,
+  type Credentials,
   readClientOptions,
+  sdkCredentials,
 } from "../internal/ClientOptions.js"
 import { redactCredentialRefusal } from "../internal/CredentialRefusal.js"
 import { ShardIteratorExpired, StreamDataTrimmed } from "./Errors.js"
@@ -96,8 +98,6 @@ export const classifyStreamsError =
     return new DynamoError({ operation, cause })
   }
 
-type Credentials = { readonly accessKeyId: string; readonly secretAccessKey: string }
-
 /**
  * Static client configuration accepted by {@link DynamoStreamsClient.layer}, with
  * the HTTP handler's options and `maxAttempts`, as `DynamoClient.layer` takes them.
@@ -152,7 +152,7 @@ const buildService = (
   Effect.gen(function* () {
     const clientConfig: ConstructorParameters<typeof DynamoDBStreamsClient>[0] = { region }
     if (endpoint !== undefined) clientConfig.endpoint = endpoint
-    if (credentials !== undefined) clientConfig.credentials = credentials
+    if (credentials !== undefined) clientConfig.credentials = sdkCredentials(credentials)
     if (options.requestHandler !== undefined) clientConfig.requestHandler = options.requestHandler
     if (options.maxAttempts !== undefined) clientConfig.maxAttempts = options.maxAttempts
     const client = yield* acquireSdkClient(() => new DynamoDBStreamsClient(clientConfig))
@@ -188,7 +188,12 @@ export class DynamoStreamsClient extends Context.Service<
     client: DynamoDBStreamsClient,
   ): Layer.Layer<DynamoStreamsClient> => Layer.succeed(DynamoStreamsClient, fromSdkClient(client))
 
-  /** A live layer reading its configuration from Effect `Config` providers. */
+  /**
+   * A live layer reading its configuration from Effect `Config` providers. As
+   * on `DynamoClient.layerConfig`, `credentials` missing any part (an empty
+   * value counts as missing) is unset as a whole, and the SDK's default
+   * credential chain applies, which can sign as another identity.
+   */
   static readonly layerConfig = (
     config: DynamoStreamsClientConfigFromConfig,
   ): Layer.Layer<DynamoStreamsClient, Config.ConfigError> =>

@@ -5,7 +5,7 @@ import { DynamoDBServiceException } from "@aws-sdk/client-dynamodb"
 import { DynamoDBStreamsServiceException } from "@aws-sdk/client-dynamodb-streams"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Cause, Effect, Formatter, Layer, Schema } from "effect"
+import { Cause, Config, ConfigProvider, Effect, Formatter, Layer, Schema } from "effect"
 import { FetchHttpClient } from "effect/http"
 import { Otlp } from "effect/observability"
 import * as ConsumedCapacity from "../src/ConsumedCapacity.js"
@@ -15,6 +15,7 @@ import {
 } from "../src/change-feed/DynamoStreamsClient.js"
 import { classifyError, DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import type { Credentials } from "../src/internal/ClientOptions.js"
 import { REDACTED_REPLY, redactCredentialRefusal } from "../src/internal/CredentialRefusal.js"
 import * as Table from "../src/Table.js"
 import { hang, localServer } from "./helpers/LocalServer.js"
@@ -200,11 +201,8 @@ describe.each<
 // signatures.
 // ---------------------------------------------------------------------------
 
-/**
- * `credentials` declares no session token, but the SDK reads the object as
- * given. Assigned through a variable because the literal wouldn't type-check.
- */
-const credentials = {
+/** Temporary credentials: the SDK sends `sessionToken` as `x-amz-security-token`. */
+const credentials: Credentials = {
   accessKeyId: "AKIDEXAMPLE",
   secretAccessKey: "not-a-real-secret",
   sessionToken: SESSION_TOKEN,
@@ -427,6 +425,57 @@ describe("a reply that quotes the session token, through the real SDK", () => {
         for (const text of renderings(error)) expect(text).not.toContain(SESSION_TOKEN)
       }),
     ),
+  )
+})
+
+describe("a session token given to a layer", () => {
+  const refused = { type: "InvalidSignatureException", quoteToken: true } as const
+
+  it.live("reaches the SDK through layerConfig, and no rendering of the refusal", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const endpoint = yield* refusingEndpoint(refused)
+        const provider = ConfigProvider.fromUnknown({
+          REGION: "us-east-1",
+          ENDPOINT: endpoint.url,
+          KEY: credentials.accessKeyId,
+          SECRET: credentials.secretAccessKey,
+          TOKEN: SESSION_TOKEN,
+        })
+        const client = DynamoClient.layerConfig({
+          region: Config.String("REGION"),
+          endpoint: Config.String("ENDPOINT"),
+          credentials: Config.all({
+            accessKeyId: Config.String("KEY"),
+            secretAccessKey: Config.String("SECRET"),
+            sessionToken: Config.String("TOKEN"),
+          }),
+        }).pipe(Layer.provide(ConfigProvider.layer(provider)))
+        const error = yield* put.pipe(
+          Effect.provide(Layer.mergeAll(client, MainTable.layer({ name: "t" }))),
+          Effect.flip,
+        )
+
+        expect(endpoint.tokens).toEqual([SESSION_TOKEN])
+        const cause = rootOf(error) as SdkError
+        expect(cause.name).toBe("InvalidSignatureException")
+        expect(cause.message).toBe(REDACTED_REPLY)
+        for (const text of renderings(error)) expect(text).not.toContain(SESSION_TOKEN)
+      }),
+    ),
+  )
+
+  it.effect("is in no rendering of either client built with it", () =>
+    Effect.gen(function* () {
+      const options = { region: "us-east-1", endpoint: "http://127.0.0.1:1", credentials }
+      const dynamo = yield* DynamoClient.pipe(Effect.provide(DynamoClient.layer(options)))
+      const streams = yield* DynamoStreamsClient.pipe(
+        Effect.provide(DynamoStreamsClient.layer(options)),
+      )
+      for (const service of [dynamo, streams]) {
+        for (const text of renderings(service)) expect(text).not.toContain(SESSION_TOKEN)
+      }
+    }),
   )
 })
 

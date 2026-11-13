@@ -1152,12 +1152,31 @@ DynamoClient.layer({
   credentials: { accessKeyId: "local", secretAccessKey: "local" },
 })
 
-// Config-based (reads from Effect Config — e.g., env vars)
+// Temporary credentials (an assumed role) carry a session token
+DynamoClient.layer({
+  region: "us-east-1",
+  credentials: { accessKeyId, secretAccessKey, sessionToken },
+})
+
+// Config-based (reads from Effect Config — e.g., env vars). An optional
+// value missing from the provider is left unset.
 DynamoClient.layerConfig({
   region: Config.String("AWS_REGION"),
-  endpoint: Config.option(Config.String("DYNAMO_ENDPOINT")),
+  endpoint: Config.String("DYNAMO_ENDPOINT"),
+  credentials: Config.all({
+    accessKeyId: Config.String("APP_ACCESS_KEY_ID"),
+    secretAccessKey: Config.String("APP_SECRET_ACCESS_KEY"),
+    sessionToken: Config.String("APP_SESSION_TOKEN").pipe(Config.withDefault(undefined)),
+  }),
 })
 ```
+
+`DynamoStreamsClient.layer` and `layerConfig` take `credentials` in the same shape. Without
+`credentials`, both use the SDK's default credential chain. In `layerConfig`, `credentials` is
+unset as a whole when any part of it is missing (an empty value counts as missing), so the default
+chain applies then too, and may sign as another identity: read a part that may be absent, such as
+the token, with `Config.withDefault(undefined)`. The object is
+passed to the SDK as given, and read for every request.
 
 ---
 
