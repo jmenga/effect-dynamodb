@@ -413,6 +413,28 @@ export const operandsAsStored = (expr: Expr, storedAt: StoredFormAt): Expr => {
   }
 }
 
+/**
+ * The operands a compiled condition (`Expression.condition`) compares with a field, kept on it
+ * under this key, not enumerable (#236): each value placeholder with the attribute name it was
+ * built for and the value as given. The builder has no entity; `Transaction.check` has one, and
+ * sends each operand in the form its field stores it ({@link operandAsStored}).
+ */
+export const ComparedOperandsKey: unique symbol = Symbol.for(
+  "effect-dynamodb/Expression/ComparedOperands",
+)
+
+export type ComparedOperand = {
+  readonly placeholder: string
+  readonly name: string
+  readonly value: unknown
+}
+
+/** The operands a compiled condition carries, if it was built by `Expression.condition`. */
+export const comparedOperandsOf = (result: object): ReadonlyArray<ComparedOperand> | undefined =>
+  Object.getOwnPropertyDescriptor(result, ComparedOperandsKey)?.value as
+    | ReadonlyArray<ComparedOperand>
+    | undefined
+
 // ---------------------------------------------------------------------------
 // Compiler — convert Expr ADT to DynamoDB expression string
 // ---------------------------------------------------------------------------

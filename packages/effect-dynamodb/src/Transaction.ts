@@ -9,6 +9,7 @@
  * transactGet returns a typed tuple inferred per-position.
  */
 
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import {
   type ConcurrentModification,
   type ConditionalCheckFailed,
@@ -29,6 +30,7 @@ import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
+import { comparedOperandsOf, operandAsStored, type StoredFormAt } from "./internal/Expr.js"
 import { packedCompiledRefusal } from "./internal/Packed.js"
 import {
   composePrimaryKeyOrFail,
@@ -54,7 +56,7 @@ import {
   transactItemTarget,
   withCause,
 } from "./internal/WriteDiagnosis.js"
-import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
+import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
 // ---------------------------------------------------------------------------
@@ -93,7 +95,11 @@ export const check: {
     // Sync API — there is no error channel to fail into, so this stays a throw.
     throw new Error(getRejectReason("Transaction.check"))
   }
-  const stored = storedNames(info.entity._resolveDbName, condition)
+  const stored = storedOperands(
+    info.entity._storedFormAt,
+    condition,
+    storedNames(info.entity._resolveDbName, condition),
+  )
   // A packed field may be tested only as a whole (`[EDD-9076]`, #147).
   const refused = packedCompiledRefusal(
     stored.expression,
@@ -137,6 +143,30 @@ const storedNames = (
     names[key] = attribute
   }
   return names === undefined ? condition : { ...condition, names }
+}
+
+/**
+ * A compiled condition with each operand that is one of Effect's instances (a `DateTime`, a
+ * `BigDecimal`, a `Duration`, an `Option`, a `Redacted`, …) or a `Date` in the form its field
+ * stores it (#236), as a condition on the entity sends it (`operandAsStored`, #242). The builder
+ * has no entity, so it marshalled the instance as its own map, which no row holds. Only a
+ * condition `Expression.condition` built carries its operands (`comparedOperandsOf`); every other
+ * operand, every other condition, and one whose field's stored form the schema doesn't determine
+ * are sent as given.
+ */
+const storedOperands = (
+  storedAt: StoredFormAt,
+  built: ExpressionResult,
+  condition: ExpressionResult,
+): ExpressionResult => {
+  let values: Record<string, AttributeValue> | undefined
+  for (const { placeholder, name, value } of comparedOperandsOf(built) ?? []) {
+    const stored = operandAsStored(storedAt, [name], value, "value")
+    if (Object.is(stored, value)) continue
+    values ??= { ...condition.values }
+    values[placeholder] = toAttributeValue(stored)
+  }
+  return values === undefined ? condition : { ...condition, values }
 }
 
 // ---------------------------------------------------------------------------

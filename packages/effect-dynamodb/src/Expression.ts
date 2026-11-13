@@ -11,6 +11,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { type ComparedOperand, ComparedOperandsKey } from "./internal/Expr.js"
 import { toAttributeValue } from "./Marshaller.js"
 
 // --- Output shape ---
@@ -48,6 +49,7 @@ const buildComparisonClauses = (
   attrs: Record<string, unknown>,
   names: Record<string, string>,
   values: Record<string, AttributeValue>,
+  compared: Array<ComparedOperand>,
 ): ReadonlyArray<string> => {
   const clauses: Array<string> = []
   for (const [attr, val] of Object.entries(attrs)) {
@@ -55,6 +57,7 @@ const buildComparisonClauses = (
     const valKey = `:${nextPlaceholder()}`
     names[nameKey] = attr
     values[valKey] = toAttributeValue(val)
+    compared.push({ placeholder: valKey, name: attr, value: val })
     clauses.push(`${nameKey} ${op} ${valKey}`)
   }
   return clauses
@@ -65,24 +68,25 @@ const buildFromInput = (input: ConditionInput): ExpressionResult => {
   const names: Record<string, string> = {}
   const values: Record<string, AttributeValue> = {}
   const clauses: Array<string> = []
+  const compared: Array<ComparedOperand> = []
 
   if (input.eq) {
-    clauses.push(...buildComparisonClauses("=", input.eq, names, values))
+    clauses.push(...buildComparisonClauses("=", input.eq, names, values, compared))
   }
   if (input.ne) {
-    clauses.push(...buildComparisonClauses("<>", input.ne, names, values))
+    clauses.push(...buildComparisonClauses("<>", input.ne, names, values, compared))
   }
   if (input.lt) {
-    clauses.push(...buildComparisonClauses("<", input.lt, names, values))
+    clauses.push(...buildComparisonClauses("<", input.lt, names, values, compared))
   }
   if (input.le) {
-    clauses.push(...buildComparisonClauses("<=", input.le, names, values))
+    clauses.push(...buildComparisonClauses("<=", input.le, names, values, compared))
   }
   if (input.gt) {
-    clauses.push(...buildComparisonClauses(">", input.gt, names, values))
+    clauses.push(...buildComparisonClauses(">", input.gt, names, values, compared))
   }
   if (input.ge) {
-    clauses.push(...buildComparisonClauses(">=", input.ge, names, values))
+    clauses.push(...buildComparisonClauses(">=", input.ge, names, values, compared))
   }
 
   if (input.between) {
@@ -93,6 +97,8 @@ const buildFromInput = (input: ConditionInput): ExpressionResult => {
       names[nameKey] = attr
       values[lowKey] = toAttributeValue(low)
       values[highKey] = toAttributeValue(high)
+      compared.push({ placeholder: lowKey, name: attr, value: low })
+      compared.push({ placeholder: highKey, name: attr, value: high })
       clauses.push(`${nameKey} BETWEEN ${lowKey} AND ${highKey}`)
     }
   }
@@ -129,11 +135,15 @@ const buildFromInput = (input: ConditionInput): ExpressionResult => {
     }
   }
 
-  return {
-    expression: clauses.join(" AND "),
-    names,
-    values,
-  }
+  // The compared operands go on the result unseen (not enumerable): `Transaction.check` sends each
+  // in the form its field stores it (#236); everything else reads the result as before.
+  return Object.defineProperty(
+    { expression: clauses.join(" AND "), names, values },
+    ComparedOperandsKey,
+    {
+      value: compared,
+    },
+  )
 }
 
 /**
