@@ -1,0 +1,734 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0 + effect@4.1.3",
+ "note": "Captured once from the published effect-dynamodb 1.40.0 and @effect-dynamodb/schema 1.40.0 build running on effect 4.1.3 (not 4.1.2), on DynamoDB Local (Node 24, ICU 78.3). Never regenerate it.",
+ "describes": "One table on DynamoSchema { name: depth, version: 1 }, every entity pk [id]: ListKeyed (zl: Array(TimeZoneNamed), sk [zl], unique byZl [zl]), CodecKeyed (zc: Array(TimeZoneNamedFromString), sk [zc], unique byZc [zc], index byZc gsi1 pk [zc] sk []), OptionKeyed (zo: Option(Array(TimeZoneNamed)), sk [zo]), TupleKeyed (zt: Tuple([String, TimeZoneNamed]), sk [zt]), DatesKeyed (zd: Array(DateTimeZonedFromString), sk [zd]); each also note?: String. For each case n of [Etc/UTC], [Asia/Kolkata], [europe/london] and [Etc/UTC, GMT] (zones made from those names; a date is epoch 0 in each): ListKeyed l<n>, CodecKeyed c<n>, OptionKeyed o<n>, TupleKeyed t<n> (x and the first zone) and DatesKeyed d<n> put. rows is the table scanned afterwards, sorted by pk|sk; results each step outcome and what 1.40.0 found again on effect 4.1.3 (it refused every OptionKeyed put, EDD-9128).",
+ "results": {
+  "Etc/UTC": {
+   "listPut": "ok",
+   "codecPut": "ok",
+   "optionPut": {
+    "tag": "ValidationError",
+    "operation": "put",
+    "says": "Field \"zo\" is composed into the primary key, and the value given would read back as something else, whose key text isn't the one written: DynamoDB doesn't hand it back as it was written. A key composed again from the stored row wouldn't be this one. Nothing was written. Declare the field's kind, such as Schema.Number or Schema.BigInt, or store a value that reads back as written. [EDD-9128]"
+   },
+   "tuplePut": "ok",
+   "datesPut": "ok",
+   "listGet": "ok",
+   "codecGet": "ok",
+   "codecQuery": 1,
+   "tupleGet": "ok",
+   "datesGet": "ok"
+  },
+  "Asia/Kolkata": {
+   "listPut": "ok",
+   "codecPut": "ok",
+   "optionPut": {
+    "tag": "ValidationError",
+    "operation": "put",
+    "says": "Field \"zo\" is composed into the primary key, and the value given would read back as something else, whose key text isn't the one written: DynamoDB doesn't hand it back as it was written. A key composed again from the stored row wouldn't be this one. Nothing was written. Declare the field's kind, such as Schema.Number or Schema.BigInt, or store a value that reads back as written. [EDD-9128]"
+   },
+   "tuplePut": "ok",
+   "datesPut": "ok",
+   "listGet": "ok",
+   "codecGet": "ok",
+   "codecQuery": 1,
+   "tupleGet": "ok",
+   "datesGet": "ok"
+  },
+  "europe/london": {
+   "listPut": "ok",
+   "codecPut": "ok",
+   "optionPut": {
+    "tag": "ValidationError",
+    "operation": "put",
+    "says": "Field \"zo\" is composed into the primary key, and the value given would read back as something else, whose key text isn't the one written: DynamoDB doesn't hand it back as it was written. A key composed again from the stored row wouldn't be this one. Nothing was written. Declare the field's kind, such as Schema.Number or Schema.BigInt, or store a value that reads back as written. [EDD-9128]"
+   },
+   "tuplePut": "ok",
+   "datesPut": "ok",
+   "listGet": "ok",
+   "codecGet": "ok",
+   "codecQuery": 1,
+   "tupleGet": "ok",
+   "datesGet": "ok"
+  },
+  "Etc/UTC+GMT": {
+   "listPut": "ok",
+   "codecPut": "ok",
+   "optionPut": {
+    "tag": "ValidationError",
+    "operation": "put",
+    "says": "Field \"zo\" is composed into the primary key, and the value given would read back as something else, whose key text isn't the one written: DynamoDB doesn't hand it back as it was written. A key composed again from the stored row wouldn't be this one. Nothing was written. Declare the field's kind, such as Schema.Number or Schema.BigInt, or store a value that reads back as written. [EDD-9128]"
+   },
+   "tuplePut": "ok",
+   "datesPut": "ok",
+   "listGet": "ok",
+   "codecGet": "ok",
+   "codecQuery": 1,
+   "tupleGet": "ok",
+   "datesGet": "ok"
+  }
+ },
+ "rows": [
+  {
+   "sk": {
+    "S": "$depth#v1#codeckeyed.byzc"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#codeckeyed#zc_asia/kolkata"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed.byzc#asia/kolkata"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#codeckeyed#id_c1"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed._unique.byZc"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#codeckeyed.byzc"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#codeckeyed#zc_etc/utc,gmt"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed.byzc#etc/utc,gmt"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#codeckeyed#id_c3"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed._unique.byZc"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#codeckeyed.byzc"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#codeckeyed#zc_etc/utc"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed.byzc#etc/utc"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#codeckeyed#id_c0"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed._unique.byZc"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#codeckeyed.byzc"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#codeckeyed#zc_europe/london"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed.byzc#europe/london"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#codeckeyed#id_c2"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed._unique.byZc"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$depth#v1#codeckeyed"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed"
+   },
+   "gsi1pk": {
+    "S": "$depth#v1#codeckeyed#zc_etc/utc"
+   },
+   "sk": {
+    "S": "$depth#v1#codeckeyed#zc_etc/utc"
+   },
+   "zc": {
+    "L": [
+     {
+      "S": "Etc/UTC"
+     }
+    ]
+   },
+   "id": {
+    "S": "c0"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed#id_c0"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$depth#v1#codeckeyed"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed"
+   },
+   "gsi1pk": {
+    "S": "$depth#v1#codeckeyed#zc_asia/kolkata"
+   },
+   "sk": {
+    "S": "$depth#v1#codeckeyed#zc_asia/kolkata"
+   },
+   "zc": {
+    "L": [
+     {
+      "S": "Asia/Kolkata"
+     }
+    ]
+   },
+   "id": {
+    "S": "c1"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed#id_c1"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$depth#v1#codeckeyed"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed"
+   },
+   "gsi1pk": {
+    "S": "$depth#v1#codeckeyed#zc_europe/london"
+   },
+   "sk": {
+    "S": "$depth#v1#codeckeyed#zc_europe/london"
+   },
+   "zc": {
+    "L": [
+     {
+      "S": "Europe/London"
+     }
+    ]
+   },
+   "id": {
+    "S": "c2"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed#id_c2"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$depth#v1#codeckeyed"
+   },
+   "__edd_e__": {
+    "S": "CodecKeyed"
+   },
+   "gsi1pk": {
+    "S": "$depth#v1#codeckeyed#zc_etc/utc,gmt"
+   },
+   "sk": {
+    "S": "$depth#v1#codeckeyed#zc_etc/utc,gmt"
+   },
+   "zc": {
+    "L": [
+     {
+      "S": "Etc/UTC"
+     },
+     {
+      "S": "GMT"
+     }
+    ]
+   },
+   "id": {
+    "S": "c3"
+   },
+   "pk": {
+    "S": "$depth#v1#codeckeyed#id_c3"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#dateskeyed#zd_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "zd": {
+    "L": [
+     {
+      "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+     }
+    ]
+   },
+   "id": {
+    "S": "d0"
+   },
+   "pk": {
+    "S": "$depth#v1#dateskeyed#id_d0"
+   },
+   "__edd_e__": {
+    "S": "DatesKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#dateskeyed#zd_1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "zd": {
+    "L": [
+     {
+      "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+     }
+    ]
+   },
+   "id": {
+    "S": "d1"
+   },
+   "pk": {
+    "S": "$depth#v1#dateskeyed#id_d1"
+   },
+   "__edd_e__": {
+    "S": "DatesKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#dateskeyed#zd_1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "zd": {
+    "L": [
+     {
+      "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+     }
+    ]
+   },
+   "id": {
+    "S": "d2"
+   },
+   "pk": {
+    "S": "$depth#v1#dateskeyed#id_d2"
+   },
+   "__edd_e__": {
+    "S": "DatesKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#dateskeyed#zd_1970-01-01t00:00:00.000+00:00[etc/utc],1970-01-01t00:00:00.000+00:00[gmt]"
+   },
+   "zd": {
+    "L": [
+     {
+      "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+     },
+     {
+      "S": "1970-01-01T00:00:00.000+00:00[GMT]"
+     }
+    ]
+   },
+   "id": {
+    "S": "d3"
+   },
+   "pk": {
+    "S": "$depth#v1#dateskeyed#id_d3"
+   },
+   "__edd_e__": {
+    "S": "DatesKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed.byzl"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(asia/kolkata)"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed.byzl#timezone.named(asia/kolkata)"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#listkeyed#id_l1"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed._unique.byZl"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed.byzl"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(etc/utc),timezone.named(gmt)"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed.byzl#timezone.named(etc/utc),timezone.named(gmt)"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#listkeyed#id_l3"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed._unique.byZl"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed.byzl"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(etc/utc)"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed.byzl#timezone.named(etc/utc)"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#listkeyed#id_l0"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed._unique.byZl"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed.byzl"
+   },
+   "_entity_sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(europe/london)"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed.byzl#timezone.named(europe/london)"
+   },
+   "_entity_pk": {
+    "S": "$depth#v1#listkeyed#id_l2"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed._unique.byZl"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(etc/utc)"
+   },
+   "zl": {
+    "L": [
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Etc/UTC"
+       },
+       "resolvedId": {
+        "S": "UTC"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "l0"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed#id_l0"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(asia/kolkata)"
+   },
+   "zl": {
+    "L": [
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Asia/Kolkata"
+       },
+       "resolvedId": {
+        "S": "Asia/Calcutta"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "l1"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed#id_l1"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(europe/london)"
+   },
+   "zl": {
+    "L": [
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Europe/London"
+       },
+       "resolvedId": {
+        "S": "Europe/London"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "l2"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed#id_l2"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#listkeyed#zl_timezone.named(etc/utc),timezone.named(gmt)"
+   },
+   "zl": {
+    "L": [
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Etc/UTC"
+       },
+       "resolvedId": {
+        "S": "UTC"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     },
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "GMT"
+       },
+       "resolvedId": {
+        "S": "UTC"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "l3"
+   },
+   "pk": {
+    "S": "$depth#v1#listkeyed#id_l3"
+   },
+   "__edd_e__": {
+    "S": "ListKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#tuplekeyed#zt_x,timezone.named(etc/utc)"
+   },
+   "zt": {
+    "L": [
+     {
+      "S": "x"
+     },
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Etc/UTC"
+       },
+       "resolvedId": {
+        "S": "UTC"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "t0"
+   },
+   "pk": {
+    "S": "$depth#v1#tuplekeyed#id_t0"
+   },
+   "__edd_e__": {
+    "S": "TupleKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#tuplekeyed#zt_x,timezone.named(asia/kolkata)"
+   },
+   "zt": {
+    "L": [
+     {
+      "S": "x"
+     },
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Asia/Kolkata"
+       },
+       "resolvedId": {
+        "S": "Asia/Calcutta"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "t1"
+   },
+   "pk": {
+    "S": "$depth#v1#tuplekeyed#id_t1"
+   },
+   "__edd_e__": {
+    "S": "TupleKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#tuplekeyed#zt_x,timezone.named(europe/london)"
+   },
+   "zt": {
+    "L": [
+     {
+      "S": "x"
+     },
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Europe/London"
+       },
+       "resolvedId": {
+        "S": "Europe/London"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "t2"
+   },
+   "pk": {
+    "S": "$depth#v1#tuplekeyed#id_t2"
+   },
+   "__edd_e__": {
+    "S": "TupleKeyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$depth#v1#tuplekeyed#zt_x,timezone.named(etc/utc)"
+   },
+   "zt": {
+    "L": [
+     {
+      "S": "x"
+     },
+     {
+      "M": {
+       "format": {
+        "M": {}
+       },
+       "id": {
+        "S": "Etc/UTC"
+       },
+       "resolvedId": {
+        "S": "UTC"
+       },
+       "~effect/DateTime/TimeZone": {
+        "S": "~effect/DateTime/TimeZone"
+       },
+       "_tag": {
+        "S": "Named"
+       }
+      }
+     }
+    ]
+   },
+   "id": {
+    "S": "t3"
+   },
+   "pk": {
+    "S": "$depth#v1#tuplekeyed#id_t3"
+   },
+   "__edd_e__": {
+    "S": "TupleKeyed"
+   }
+  }
+ ]
+}

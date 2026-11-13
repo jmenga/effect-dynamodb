@@ -193,7 +193,7 @@ import {
   sdkCredentials,
 } from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
-import { createConditionOps, type Expr, ExprTag } from "./internal/Expr.js"
+import { createConditionOps, type Expr, ExprTag, type StoredFormAt } from "./internal/Expr.js"
 import {
   codecRequirements,
   collectionPackedQueryOptions,
@@ -2404,6 +2404,8 @@ interface EntityLike {
   readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
   /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
   readonly _resolveDbName?: ((domainName: string) => string) | undefined
+  /** What a write of a value at a path stores: a filter's operand is sent in it (#242). */
+  readonly _storedFormAt?: StoredFormAt | undefined
   /**
    * The entity's refs: a `${ref}Id` composite is not stored on the item, but
    * the ref it names is, as a map holding the referenced identifier.
@@ -2927,7 +2929,7 @@ const makeFromConfig = (config: {
                   }),
               }),
           skFields: accessorDef.sk.composite,
-          ...entityNaming(entityLike._resolveDbName),
+          ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
         return new BoundQueryImpl(pinnedQuery, bqConfig)
@@ -2947,7 +2949,7 @@ const makeFromConfig = (config: {
               pathBuilder: createPathBuilder(),
               conditionOps: createConditionOps(),
               provide,
-              ...entityNaming(entityLike._resolveDbName),
+              ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
               operation,
             }),
         )
@@ -3030,6 +3032,7 @@ const makeFromConfig = (config: {
           unpackAttributes: entityLike._dispatchAttributes,
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
+          storedAt: entityLike._storedFormAt,
         }
         accessors[logicalName] = (query: string | ReadonlyArray<number>) =>
           makeBoundVectorQuery(vqConfig, query)
@@ -3053,7 +3056,7 @@ const makeFromConfig = (config: {
           pathBuilder,
           conditionOps,
           provide,
-          ...entityNaming(entityLike._resolveDbName),
+          ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
           operation: { name: "Entity.scan", target: entityLike.entityType },
         }
         return new BoundQueryImpl(scanQuery, bqConfig)
@@ -3211,6 +3214,7 @@ const makeFromConfig = (config: {
               entityKey: m.entityKey,
               resolve: m.entityLike._resolveDbName ?? ((name: string) => name),
               fields: domainFieldsOf(m.entityLike),
+              storedAt: m.entityLike._storedFormAt,
             })),
           ),
           operation: { name: "Collection.query", target: collName },

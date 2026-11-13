@@ -38,6 +38,27 @@ export interface DynamoSchema {
    * sets it but `rekey`, which composes that text to find rows there.
    */
   readonly text136?: true | undefined
+  /**
+   * @internal Set only on the schema a write composes its own keys under (#242, `EDD-9162`). For a
+   * composite whose value composes `[object Object]` where a key is composed, it gives what composes
+   * it (`Field "u" is composed into index "byU"`), and the composer refuses the write; `undefined`
+   * where the value isn't the write's own. Absent, as on every read, delete and query, that text is
+   * composed as it always was.
+   */
+  readonly objectKeys?: ((site: ObjectKeySite) => string | undefined) | undefined
+}
+
+/**
+ * @internal Where a key composer composes a composite (#242): `attr` (absent for a time-series
+ * event's `orderBy`, which the composer is given as a value), its key-form `value`, the definition
+ * `key` whose key it is (the index, vector index, unique constraint or other definition the caller
+ * handed the composer), and the half of that key.
+ */
+export interface ObjectKeySite {
+  readonly attr: string | undefined
+  readonly value: unknown
+  readonly key: unknown
+  readonly half: "pk" | "sk" | undefined
 }
 
 /**

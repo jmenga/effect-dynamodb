@@ -231,6 +231,13 @@ export const DDB_PARTITION_KEY_AWS =
 export const ddbEmptyIn = (kind: string, near = "()"): string =>
   `Invalid ${kind}Expression: Syntax error; token: ")", near: "${near}"`
 /**
+ * A comparison of a value of a type its operator doesn't take, DynamoDB Local's wording
+ * (#242): `<` with a map (`M`), a list (`L`), a boolean (`BOOL`) or null (`NULL`).
+ */
+export const ddbOperandType = (operator: string, type: string, kind = "Condition"): string =>
+  `Invalid ${kind}Expression: Incorrect operand type for operator or function; operator or ` +
+  `function: ${operator}, operand type: ${type}`
+/**
  * AWS's standard member-constraint wording, for a member out of its range
  * (vector `dimensions`, `topK`). Unverified: DynamoDB Local has no vector
  * indexes or `SearchVectors`.

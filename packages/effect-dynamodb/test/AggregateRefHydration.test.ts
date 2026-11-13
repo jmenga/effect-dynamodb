@@ -127,8 +127,13 @@ const refusal = (create: Exit.Exit<unknown, unknown>) => {
   return String((error as ValidationError).cause)
 }
 
-/** Seeds the entity's rows, then runs `create` and `get` on a recording table. */
-const run = (shape: Shape) => {
+/**
+ * Seeds the entity's rows, then runs `create` and `get` on a recording table. A row keyed by an object
+ * can't be written since 1.41.0 (`EDD-9162`: every such key is `[object Object]`), so where `put`
+ * refuses one, the rows are the ones 1.39.0's `put` wrote (`written`, none where nothing is fetched);
+ * any other refusal fails the shape.
+ */
+const run = (shape: Shape, written?: ReadonlyArray<Row>) => {
   const table = makeRecordingTable()
   const Base = Table.make({
     schema: shape.schema ?? schema,
@@ -141,7 +146,15 @@ const run = (shape: Shape) => {
       entities: shape.entities,
       tables: { Base },
     } as never) as Effect.Effect<any>
-    for (const [member, item] of shape.seed) yield* edb.entities[member].put(item).asEffect()
+    for (const [member, item] of shape.seed) {
+      const seeded = yield* Effect.exit(edb.entities[member].put(item).asEffect())
+      if (Exit.isSuccess(seeded)) continue
+      const refused = Cause.squash(seeded.cause) as { readonly cause?: unknown }
+      if (!String(refused?.cause).includes("EDD-9162") || written === undefined) {
+        return yield* Effect.die(refused)
+      }
+      for (const row of written) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row as never)
+    }
     table.take()
     const db: any = yield* DynamoClient.make({
       entities: {},
@@ -359,7 +372,7 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     it.effect(`${label}: create fails with EDD-9131 as put refuses the id, nothing fetched`, () =>
       Effect.gen(function* () {
         const shape = SHAPES[label]!()
-        const { create, requests, rows } = yield* run(shape)
+        const { create, requests, rows } = yield* run(shape, fixture.shapes[label]!.seeded)
         const message = refusal(create)
         expect(message).toContain("[EDD-9131]")
         expect(message).toContain('entity "Line" can be keyed by: `put` refuses it')
@@ -370,10 +383,15 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
         // Not even the item of another value its key text names, seeded by 1.39.0's own `put`.
         expect(requests).toEqual([])
         expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.seeded))
-        // `put` refuses the same id, with the same words.
+        // `put` refuses the same id, with the same words; a struct first as an object composing
+        // `[object Object]`, which every struct composes alike (`EDD-9162`).
         const given = (shape.input.part ?? shape.input) as { readonly lineId: unknown }
         const put = yield* runPut(shape, { lineId: given.lineId, f: 5 })
-        expect(refusal(put)).toContain(`${at}: Special numeric value Infinity is not allowed.`)
+        expect(refusal(put)).toContain(
+          at === '"lineId.a"'
+            ? 'composes the key text "[object Object]"'
+            : `${at}: Special numeric value Infinity is not allowed.`,
+        )
         // 1.39.0 refused it as no string, before any request.
         expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
       }),
@@ -732,7 +750,8 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
         { a: 5 },
         { a: Infinity },
       ])
-      const { create, requests } = yield* run(shape)
+      // Keyed by a struct, which `put` can't seed (`EDD-9162`); nothing is fetched.
+      const { create, requests } = yield* run(shape, [])
       const message = refusal(create)
       expect(message).toContain("[EDD-9131]")
       expect(message).toContain('"lines[1].lineId"')

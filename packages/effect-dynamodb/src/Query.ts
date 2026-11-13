@@ -20,7 +20,15 @@ import { Effect, Function, Option, Pipeable, Result, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
 import * as Capacity from "./internal/Capacity.js"
 import * as Cursor from "./internal/Cursor.js"
-import { compileExpr, type Expr, ExprTag, emptyPartProblem, isEmptyExpr } from "./internal/Expr.js"
+import {
+  compileExpr,
+  type Expr,
+  ExprTag,
+  emptyPartProblem,
+  isEmptyExpr,
+  operandsAsStored,
+  type StoredFormAt,
+} from "./internal/Expr.js"
 import { batchGetRaw } from "./internal/Hydrate.js"
 import {
   type PackedAttributeGuard,
@@ -258,6 +266,13 @@ interface QueryState {
    * looks inside one is refused when it is added (`[EDD-9076]`).
    */
   readonly packed: ReadonlyArray<PackedAttributeGuard>
+  /**
+   * How the entity whose query this is stores a filter's operand at a path (#242): a filter added
+   * with {@link filterExpr} sends each operand that is one of Effect's instances or a `Date` in
+   * that form (`operandsAsStored`). `undefined` on a query no one entity's schema types (an event
+   * stream's, a collection's, one made by hand): operands are sent as given.
+   */
+  readonly storedAt: StoredFormAt | undefined
   /** Optional effect to resolve table name at execution time (for deferred resolution) */
   readonly resolveTableName: Effect.Effect<string, never, any> | undefined
   /**
@@ -505,12 +520,15 @@ export const make = <A>(config: {
   readonly rawRow?: QueryRawRow | undefined
   /** See {@link QueryState.packed}. */
   readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** See {@link QueryState.storedAt}. */
+  readonly storedAt?: StoredFormAt | undefined
   /** See {@link QueryState.operationTarget}. */
   readonly operationTarget?: string | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     rawRow: config.rawRow,
     packed: config.packed ?? [],
+    storedAt: config.storedAt,
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
@@ -574,10 +592,13 @@ export const makeScan = <A>(config: {
   readonly rawRow?: QueryRawRow | undefined
   /** See {@link QueryState.packed}. */
   readonly packed?: ReadonlyArray<PackedAttributeGuard> | undefined
+  /** See {@link QueryState.storedAt}. */
+  readonly storedAt?: StoredFormAt | undefined
 }): Query<A> =>
   new QueryImpl<A>({
     rawRow: config.rawRow,
     packed: config.packed ?? [],
+    storedAt: config.storedAt,
     liveRows: config.liveRows,
     prepare: config.prepare,
     keepRow: undefined,
@@ -1156,7 +1177,21 @@ export const selectRenamed = <A>(
 export const filterExpr: {
   (expr: Expr): <A>(self: Query<A>) => Query<A>
   <A>(self: Query<A>, expr: Expr): Query<A>
-} = Function.dual(2, <A>(self: Query<A>, expr: Expr): Query<A> => {
+} = Function.dual(
+  2,
+  <A>(self: Query<A>, expr: Expr): Query<A> =>
+    filterExprStored(
+      self,
+      self._state.storedAt === undefined ? expr : operandsAsStored(expr, self._state.storedAt),
+    ),
+)
+
+/**
+ * @internal {@link filterExpr} for an expression whose operands are already in the form its
+ * attributes hold (`operandsAsStored`, #242), with its paths' stored names: added as it is. A bound
+ * query's and `Entity.filter`'s, which put them so with the names their own owner resolves.
+ */
+export const filterExprStored = <A>(self: Query<A>, expr: Expr): Query<A> => {
   // A filter that asserts nothing (`.filter({})`, `and()`) is no filter: it is
   // dropped here, never sent as `FilterExpression: ""`, which DynamoDB
   // rejects (#133). An empty part anywhere else — under `or` or `not`, or an
@@ -1169,7 +1204,7 @@ export const filterExpr: {
     ...self._state,
     exprFilters: [...self._state.exprFilters, expr],
   })
-})
+}
 
 /**
  * Add a **client-side** predicate, evaluated on the decoded item.

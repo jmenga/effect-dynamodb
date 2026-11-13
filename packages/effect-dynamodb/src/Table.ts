@@ -1127,6 +1127,7 @@ export interface RekeyMemberReport {
   readonly unchanged: number
   readonly moved: RekeyCounts
   readonly indexKeysRewritten: number
+  readonly zonesRewritten: number
   readonly sentinelsMoved: number
   readonly conflicts: number
   readonly indexKeys: RekeyIndexKeys
@@ -1162,6 +1163,13 @@ export interface RekeyReport {
    * held 1.36 text, rewritten in place (`UpdateItem`).
    */
   readonly indexKeysRewritten: number
+  /**
+   * Rows of an entity (items, snapshots, tombstones, time-series events) holding a named zone or a
+   * zoned date's text that isn't what a write of its value stores now, rewritten (a dry run: rows
+   * that would be): a zone 1.38.0 to 1.40.0 stored on Effect 4.1.3 with its `resolvedId`, which an
+   * equality condition or filter doesn't match. Rewritten in place, or in the row's move.
+   */
+  readonly zonesRewritten: number
   /** Unique-constraint sentinels moved to their current keys. */
   readonly sentinelsMoved: number
   /** Index keys that aren't what a `put` of their row's values writes: {@link RekeyIndexKeys}. */

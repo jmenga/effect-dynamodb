@@ -850,6 +850,12 @@ A composite of an aggregate's keys can be optional. What happens without a value
 
 A `list` filter that leaves out a composite of the list's partition key is the same `ValidationError`.
 
+#### An object as a key composite
+
+An object nothing gives other text to (a struct, a `Data` class, an instance of a class of your own without a `toString`, a `Schema.Class` instance, whose key is composed from its encoded struct) composes the key text `[object Object]`, the same for every value. Up to 1.40.0, a second aggregate with another such value as its partition composite failed `create` as already there, and `get` given its value returned the first; aggregates with different list composites shared one list key, so a `list` given one value returned them all; and a sub-aggregate bound to such a discriminator was written but never read back.
+
+A write composing one of these keys from such an object is a `ValidationError` naming the field or the discriminator (`EDD-9162`), with nothing written: `create` for the partition key, the `collection` sort key, the `list` keys and every row's discriminators, and `update` for all of them but the partition key, which `update` composes from the key it's given. An `update` that leaves the value as it read it writes the row where it is, so an aggregate an earlier release wrote can still be updated, and `get`, `list` and `delete` compose the text as before. A `many` edge's sort key already refused every object, and still does. A value with a key form, such as a number, text or a `Duration`, is untouched.
+
 ### Type Extractors
 
 | Type | Description |

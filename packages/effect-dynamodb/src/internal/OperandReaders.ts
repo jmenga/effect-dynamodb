@@ -15,9 +15,11 @@
  * Only a schema issue is an answer: a reader or encoder that can't finish synchronously (an
  * asynchronous step, a defect) says nothing of the value, and the operand is sent as 1.40.0 sent
  * it (`SchemaIssue.issueOf`). An operand 1.40.0 stored as a row that reads is never refused or
- * written otherwise.
+ * written otherwise. Nor is one holding a part behind a getter (`LostValues.holdsMarked`): reading
+ * it back would call the getter once more than 1.40.0 called it.
  */
 
+import { holdsMarked } from "@effect-dynamodb/schema/internal/LostValues.js"
 import type { OperandKind } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { CANT_SAY, type CantSay, issueOf } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { Exit, Schema, type SchemaAST } from "effect"
@@ -152,6 +154,9 @@ export const judgeOperand = (
   sent: unknown,
   modelled: () => ReadonlyArray<unknown> | CantSay,
 ): OperandVerdict => {
+  // A part behind a getter is called as the marshaller calls it, as often as 1.40.0 called it
+  // (`readJudged`): reading it back here would call it once more, so it's sent as 1.40.0 sent it.
+  if (holdsMarked(sent)) return { encoded: sent, issue: undefined }
   const reading = positions.map(readerOf)
   const asSent = readBack(sent)
   // What can't be stored at all is the marshalling's to refuse, in its own words.

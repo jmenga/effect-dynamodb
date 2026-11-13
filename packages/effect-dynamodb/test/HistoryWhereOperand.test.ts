@@ -79,9 +79,14 @@ describe("history .where() bounds compose as append composes the event key", () 
             Effect.gen(function* () {
               if (values.length === 1) {
                 // An `Option` is stored as a map, and DynamoDB refuses append's ordering guard
-                // (`<`) on a map, as it did on 1.39.0 (the connected twin checks the same).
-                const failed = yield* Effect.flip(e.append({ id: "x", n: values[0] }).asEffect())
-                expect((failed as any)._tag).toBe("DynamoValidationError")
+                // (`<`) on a map, as it did on 1.39.0; the refusal is diagnosed as `EDD-9163`
+                // (#242), DynamoDB's error its cause (the connected twin checks the same).
+                const failed: any = yield* Effect.flip(
+                  e.append({ id: "x", n: values[0] }).asEffect(),
+                )
+                expect(failed._tag).toBe("ValidationError")
+                expect(String(failed.cause?.message)).toContain("[EDD-9163]")
+                expect(failed.cause?.cause?._tag).toBe("DynamoValidationError")
                 expect(table.items.size).toBe(0)
                 return
               }

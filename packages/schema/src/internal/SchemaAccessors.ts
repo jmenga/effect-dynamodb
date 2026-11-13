@@ -1024,6 +1024,42 @@ export const holdsCustomDeclaration = (
 }
 
 /**
+ * Whether a stored side holds a position no schema types (`Schema.Unknown`, `Schema.Any`), at any
+ * depth: what's written there is the caller's value as given, so only a value can say whether
+ * DynamoDB stores it (`internal/LostValues.ts`, `EDD-9161`). A declaration's type parameters count,
+ * as `Schema.Option(Schema.Unknown)` holds its value as given.
+ */
+export const holdsUntyped = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  const encoding = ast.encoding
+  if (encoding !== undefined) return holdsUntyped(encoding[encoding.length - 1]!.to, seen)
+  const within = (asts: ReadonlyArray<SchemaAST.AST>) =>
+    asts.some((part) => holdsUntyped(part, seen))
+  switch (ast._tag) {
+    case "Unknown":
+    case "Any":
+      return true
+    case "Declaration":
+      return within(ast.typeParameters)
+    case "Suspend": {
+      if (seen.has(ast)) return false
+      seen.add(ast)
+      return holdsUntyped(ast.thunk(), seen)
+    }
+    case "Union":
+      return within(ast.types)
+    case "Arrays":
+      return within([...ast.elements, ...ast.rest])
+    case "Objects":
+      return within([
+        ...ast.propertySignatures.map((property) => property.type),
+        ...ast.indexSignatures.map((signature) => signature.type),
+      ])
+    default:
+      return false
+  }
+}
+
+/**
  * The value on a stored side that DynamoDB can't store, if there is one. With
  * both in one union, `undefined` is what an absent attribute means.
  */

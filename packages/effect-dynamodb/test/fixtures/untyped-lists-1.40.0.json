@@ -1,0 +1,421 @@
+{
+  "generatedFrom": "effect-dynamodb@1.40.0",
+  "note": "Captured once from published effect-dynamodb 1.40.0 on DynamoDB Local, on effect@4.1.2 and on effect@4.1.3 (the two answered alike). Never regenerate it.",
+  "describes": "What 1.40.0 stored for a list in an untyped field (Schema.Unknown) holding holes, undefined or a function, or frozen, a Proxy, a subclass of Array or holding a named property: as the field's value ('alone'), and as { list, empty: new Set() } ('next to an empty set'), which sends marshalling down its second path. 'stored' is the attribute DynamoDB held; 'failure' is how the put failed.",
+  "cases": {
+    "a hole first": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a hole between": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a hole last": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "only holes": {
+      "alone": {
+        "stored": {
+          "L": []
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": []
+            }
+          }
+        }
+      }
+    },
+    "undefined between": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a function between": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "frozen": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "frozen with a hole": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a proxy over a list": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a proxy over a list with a hole": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a subclass of Array": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a list with a named property": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "N": "1"
+            },
+            {
+              "N": "2"
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                },
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "nested holes": {
+      "alone": {
+        "stored": {
+          "L": [
+            {
+              "L": [
+                {
+                  "N": "1"
+                }
+              ]
+            },
+            {
+              "L": [
+                {
+                  "N": "2"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "L": [
+                    {
+                      "N": "1"
+                    }
+                  ]
+                },
+                {
+                  "L": [
+                    {
+                      "N": "2"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "a hole in a map's list": {
+      "alone": {
+        "stored": {
+          "M": {
+            "list": {
+              "L": [
+                {
+                  "N": "1"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "next to an empty set": {
+        "stored": {
+          "M": {
+            "list": {
+              "M": {
+                "list": {
+                  "L": [
+                    {
+                      "N": "1"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "a hole before a Chunk": {
+      "alone": {
+        "failure": "defect RangeError"
+      },
+      "next to an empty set": {
+        "failure": "defect RangeError"
+      }
+    }
+  }
+}

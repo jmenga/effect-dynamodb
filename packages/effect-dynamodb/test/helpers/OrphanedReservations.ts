@@ -773,20 +773,15 @@ export const untouchedScenarios: ReadonlyArray<RepairScenario> = [
           const dry = yield* rekey(db, { ...options, dryRun: true })
           const real = yield* rekey(db, options)
           expect(rekeyOutcome(real)).toEqual(rekeyOutcome(dry))
-          expect(real.reservations).toMatchObject({ ...ZERO, undecided: 2 })
-          // p1 is live and stores a map, which composes `[object object]`: it may hold the
-          // sentinel or not, nothing says. p2 is gone, and a Duration composes no text that finds
-          // its sentinel, so p2 may live under another key: nothing proves it orphaned either.
+          expect(real.reservations).toMatchObject({ ...ZERO, undecided: 1 })
+          // p1 is live, and the map 1.39.0 stored reads back as the Duration whose text composed
+          // its sentinel's key: it holds it, and isn't listed (with escapeKeys on, the sentinel
+          // moves to the text the value composes now). p2 is gone, and a Duration composes no text
+          // that finds its sentinel, so p2 may live under another key: nothing proves it orphaned.
+          expect(real.sentinelsMoved).toBe(on ? 1 : 0)
           expect(
             entriesOf(real).map(({ owner, outcome, message }) => ({ owner, outcome, message })),
           ).toEqual([
-            {
-              owner: itemKey("plan", "p1"),
-              outcome: "undecided",
-              message:
-                "The values of the row it names, or of a tombstone in its partition, compose no " +
-                "exact sentinel key under some key text, so nothing says whether they hold it.",
-            },
             {
               owner: itemKey("plan", "p2"),
               outcome: "undecided",
@@ -795,8 +790,19 @@ export const untouchedScenarios: ReadonlyArray<RepairScenario> = [
                 "key text of their own, so the row may have moved without its sentinel.",
             },
           ])
-          expect(writesOf(table)).toEqual([])
-          expect(yield* table.rows()).toEqual(DURATION_ROWS_139)
+          const rows = yield* table.rows()
+          if (on) {
+            const expected = DURATION_ROWS_139.map((row) =>
+              row.pk?.S === "$vu#v1#plan.length#5000 millis"
+                ? { ...row, pk: { S: "$vu#v1#plan.length#5000%20millis" } }
+                : row,
+            )
+            expect(rows).toHaveLength(expected.length)
+            expect(rows).toEqual(expect.arrayContaining(expected))
+          } else {
+            expect(writesOf(table)).toEqual([])
+            expect(rows).toEqual(DURATION_ROWS_139)
+          }
           const p1 = (yield* db.entities.Plans.get({ id: "p1" })) as { length: Duration.Duration }
           expect(Duration.toMillis(p1.length)).toBe(5000)
         }),

@@ -1829,10 +1829,39 @@ reads it, decoded through the field and encoded again
 (`storedFormOfDeclaration`, in the key form and in `storedFormOfRead`), before
 its text is composed, and composes `some(5)` again. An object is judged by that
 text alone: one whose field decodes the map to the value written is stored, as
-on 1.39.0, and one whose field takes the map as it is (`Schema.Duration`,
-`[object Object]` for `1000 millis`) is refused. 1.39.0 composed the map's own
-text: a `restore` put the item back under `[object object]`, where `get` didn't
-find it, and a delete left its unique-constraint sentinel behind. A list or
+on 1.39.0, and one whose field takes the map as it is composes `[object Object]`
+and is refused. Effect's look-alike declarations (`Schema.Duration`,
+`Schema.BigDecimal`, the time zones, `Schema.UrlParams`, `Schema.SemVer` /
+`Schema.SemVerRange`, the network and DNS record types, a `DateTime` in a
+`Schema.Option` or a `Schema.Result`; "Effect's look-alike declarations on a
+read") take the map as it is, so 1.40.0 refused them all; since 1.41.0 the read
+decode of a key composite rebuilds them as a read does (`readingKeyInstances`,
+`internal/InstanceReads.ts`), so the text composed from a row is `put`'s,
+`1000 millis` for `1000 millis`, and they are stored, under the text 1.39.0
+composed from the value given (`fixtures/lookalike-keys-1.39.0.json`). A
+`BigDecimal` is keyed by `BigDecimal(1.5)`, where 1.39.0 died composing it.
+`Schema.Cookie` and `Schema.Cookies` stay the map in a key and stay refused: a
+cookie's key text is its whole printed form, options and all. 1.39.0 composed
+the map's own text: a `restore` put the item back under `[object object]`,
+where `get` didn't find it, and a delete left its unique-constraint sentinel
+behind. `rekey` moves an item 1.39.0's (or 1.40.0's) `restore` left under
+`[object object]` to the key `put` wrote, its index keys with it: a reading of
+the row for `rekey` alone (`restoredObjectReading`,
+`internal/RestoredKeyText.ts`) gives each composite stored as a map the key form
+makes an instance of its map's text, the text that `restore` composed, so the
+key is an earlier position of the row, moved from under the usual guards, in a
+dry run counted only; it is combined with the other earlier readings composite by
+composite (`keyReadings`, "Readings combined composite by composite"), so a key that
+also holds a zone under its given name is found. Nothing else composes that text for a
+write (`EDD-9162`).
+The sentinel that `restore` wrote under `[object object]` names the key the item
+left: `rekey` leaves it and counts it as `unrecognizedKey`. The value stays
+reserved by the sentinel `put` wrote, which that `restore`'s soft delete didn't
+release. It names the item's key under the text `put` composed, which the item
+moves to, so with `escapeKeys` off it is already in place. With `escapeKeys`
+turned on, a moving item takes as its own a sentinel naming any of its keys under
+other text (`isLive`), not only the key it's stored under, so that sentinel moves
+with it (`fixtures/restored-unique-1.39.0.json`). A list or
 struct of `Schema.BigInt` beneath a step (a decoding default, a transformation)
 comes back holding numbers, `[5]` for `[5n]`, which the field refuses; every
 entity read lifts them back (`legacyReads`), and the key form does the same
@@ -1851,6 +1880,61 @@ integer was restored, updated and listed under the `number`'s key, and a delete
 left its sentinel behind. A field once declared both and now one kind keeps rows
 under the other kind's text, and `rekey` moves them ("Rows under the other
 numeric kind's text", under `rekey`).
+
+**An object composed into a key for a write (`EDD-9162`, 1.41.0).** An object nothing
+gives other text to (a struct, a `Data` class, an instance of a class of one's own
+without a `toString`) composes `[object Object]`, the same for every such value, so up
+to 1.40.0 items written with different values shared one key and overwrote each other,
+and a unique constraint on one rejected every second value. `defaultObjectText`
+(`internal/ObjectKeyText.ts`, schema package) is the one decision: the key-form value is
+an object and its text is its `Object.prototype.toString` tag (`[object Object]`,
+`[object Map]`, ...). It's made **where a key is composed**, by the composer
+(`KeyComposer.siteCompositeText`, for every composite of every key: `extractKeyComposites`,
+a Z-order prefix, a time-series event's sort key, a unique sentinel), under the schema a
+write composes its own keys under (`ownSchema` in `Entity.ts`: `DynamoSchema.objectKeys`,
+internal, which names what composes the composite, or says it isn't the write's own). So
+only a key actually composed for the write refuses: an index or a unique constraint missing
+a value (sparse), a half an update skips, leaves out or drops, composes nothing and refuses
+nothing, and the item is stored as 1.40.0 stored it. The refusal names the field and what
+composed it (the primary key, an index, a unique constraint, a vector partition, a
+time-series `orderBy`), with nothing written: `put`, `create`, `upsert`, an update
+recomposing an index key from its payload (its key record and the row it read compose the
+key the row is stored under, as a read does, so only the payload's values are its own), a
+time-series `append`, and a transaction's and a batch's put. A put's unique sentinels and
+vector partitions are composed once more where every key is (`composeAllKeys`), so the
+refusal comes before the read or embedding that precedes their own composition. Only models
+with a key composite whose stored side can hold an object get a schema of their own
+(`storesObject`), so a model keyed by text and numbers pays nothing. **The asymmetry:** a
+key-taking read or delete (`get`, `delete`, a query accessor, an update's own key record,
+`restore`) composes `[object object]` as it always did, so a row an earlier release wrote
+under it is still reached, read, updated and deleted; only a new write is refused. A value
+with a key form is untouched: a look-alike the key form makes an instance of
+(`1500 millis`), a list (`x,y`), a class with a `toString` of its own. Pinned on both
+sides in `ObjectKeyComposites.test.ts`.
+
+An aggregate's write is refused by the same decision and the same words, where its keys are
+composed (`ownKeys`, `Aggregate.ts`: `create`'s partition key, and `buildDynamoItems`), naming
+the field (`Field "f" of "Root" is composed
+into its list sort key`) or the discriminator: `create` composing its partition key, its
+collection sort key, its list keys (sparse, as they're composed) or a row's static
+discriminator from such an object, and `update` composing any of them but the partition
+key, which `update` composes from the key it's given, as a read does. Up to 1.40.0 a second
+aggregate with another object as its partition composite failed `create` as already there,
+and `get` given its value returned the first; aggregates with different list composites
+shared one list key, so a `list` given one value returned them all; and a sub-aggregate
+bound to an object discriminator was written under `[object object]` and never read back.
+An `update` refuses only a value it changes: a root composite equal to the one the root read
+holds is the key that row is stored under (compared by the aggregate's own `deepEqual`), as
+an entity update's own key record is, so an aggregate 1.40.0 wrote can still be updated. A
+`get`, `list` and `delete` compose the text as before. A `many` element's sort key already
+refused every object ("non-scalar", `AggregateDecompositionError`), as did two bindings whose
+object discriminators compose one sort key; both still do. No object with a `toString` of
+its own round-tripped as an aggregate key composite on 1.40.0: a `Schema.Class`'s key form is
+its encoded struct, which composed `[object Object]` and is refused now; a class instance in
+a `Schema.Unknown` field reads back as a map and stays refused with `EDD-9128`; a
+discriminator holding one composed its own text and its rows were never read back, as
+before. Pinned in `AggregateObjectKeys.test.ts` and its connected twin against
+`fixtures/aggregate-object-keys-1.40.0.json`, captured from published 1.40.0.
 
 **A codec whose `encode` takes its own output keys its stored text.** A prefix
 codec (`x:` prepended by `encode`, stripped by `decode`), `Schema.StringFromBase64`,
@@ -2045,7 +2129,12 @@ history: the sort key composed from its own stored composites
 (`liveSkOf(toDomainView(composites))`, only those attributes unmarshalled) is not
 its stored sort key, or they don't compose, AND the sort key has a history
 layout — `#v#[…#]<7+ digits>` (retain), `#deleted#[…#]<ISO timestamp>`
-(softDelete), or `#e#` after the live key less its composites (timeSeries). A
+(softDelete), or `#e#` after the live key less its composites (timeSeries). The
+`…` item segment is any text, a line break included (`isSnapshotSkRest`,
+`isTombstoneSkRest`, also what `rekey` reads a row's kind by): a string composite
+can hold one, and a `UrlParams` composite's text always does. Up to 1.40.0 the
+layout test stopped at a line break, so such a snapshot or tombstone was read as
+an item and `rekey` skipped it as `unrecognizedKey`. A
 live row composes its own key, whatever its values or collection names hold
 (`#e#`, `deleted`, `v`); a row the current composer can't reproduce (an unpadded
 number composite written by 1.15, a row missing a composite) isn't history-shaped
@@ -2692,7 +2781,7 @@ EventStore.makeStream({ …, storedAs: { data: Packed(…) }, snapshot: { schema
 | `S` | `JSON.parse` |
 | `B` | byte 0 header `vvv ff ccc` (layout version `001`; format `00` json, `01` binary reserved; codec `000` none, `001` gzip, `010` brotli, `011` zstd) → decompress → `JSON.parse` |
 
-A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, dates as objects — are refused at write). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
+A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, a `Date` or any other class instance — are refused at write; one of Effect's own instances a native attribute stores as a map, a `DateTime`, a look-alike, an `Option` or a `Result`, is written as that map, `storedFormOf`). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
 
 **Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `Compression.layer(...)` merged into the application layer (recommended), `DynamoClient.make({ compressors })`, or `DynamoClient.layer({ compressors })` (whose `Compression` output does not survive a wrapper layer that consumes it through `Layer.provide`) — and read with `Effect.serviceOption`, so no operation gains an `R`. `node:zlib`-backed implementations ship from `effect-dynamodb/compression/zlib`; any runtime can register its own. A codec a `Packed` config names is checked where the registry is first resolvable: `DynamoClient.make` (every bound entity and aggregate edge) and `EventStore.bind` fail at bind, and an unbound stream on its first operation per registry, with the `[EDD-9078]` configuration defect. Past that, a value that needs an unregistered codec (an unbound entity write over the threshold, or a read of a `B` whose header names a codec the config no longer does) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
 
@@ -3358,7 +3447,8 @@ are in text order, so a range in numeric order can be reversed in text
 returned nothing. `beginsWith` on a numeric `orderBy` still compiles to `eq`
 (`test/HistoryWhereOperand.test.ts` and its connected twin, over events 1.39.0
 stored). An `Option` `orderBy` is stored as a map, and DynamoDB refuses `append`'s
-`<` guard on a map, as it did on 1.39.0, so no such event is ever written there.
+`<` guard on a map, as it did on 1.39.0, so no such event is ever written there
+(`EDD-9163`, below).
 
 **`append` on a string-encoded numeric `orderBy`.** The stored `orderBy` is `S`,
 which DynamoDB compares as text, so the CAS `attribute_not_exists(pk) OR
@@ -3382,6 +3472,37 @@ each cancellation, `.skipFollowUp()` included (its success is still `void`, and 
 stale or rejected append still `StaleAppend` with no current item). Every other
 `orderBy` keeps the single conditional transaction: DynamoDB orders `N`
 numerically and ISO-8601 text chronologically.
+
+**An `orderBy` stored as a type `<` doesn't take (#242, `EDD-9163`).** The guard
+`#orderBy < :new` takes numbers, strings and binary. An `orderBy` stored as a map
+(an `Option`, a `Result`, Effect 4's `Either`, a `Duration`, a `BigDecimal`, a
+named or an offset zone), a list or a boolean makes DynamoDB refuse the condition
+whatever the item holds, so such an entity can never append; a nullable `orderBy`
+fails each append holding null. Up to 1.40.0 each was DynamoDB's bare
+`DynamoValidationError`. `Entity.make` doesn't refuse such an entity and nothing is
+checked before sending: the append is sent, DynamoDB's refusal (`Incorrect operand
+type for operator or function; operator or function: <, operand type: M`) is
+recognised (`OperandType` in `internal/WriteDiagnosis.ts`), and it is confirmed on
+the request that was sent: its condition holds the guard on this `orderBy`
+(`#_tsob < :_tsNewOb`), DynamoDB named `<`, and the guard's own operand
+(`:_tsNewOb`, the new `orderBy` as stored) is of the type DynamoDB named. Only then
+is it a `ValidationError` naming `timeSeries.orderBy`, the field and the type, with
+DynamoDB's error as its cause and nothing written. DynamoDB judges the operands an
+expression is given, not what the item holds: measured on DynamoDB Local, a stored
+`orderBy` of another type (a null under a nullable field) makes the guard false, a
+stale append, never this refusal, so the stored side is never the culprit, and
+nothing is read to find it. Anything else is DynamoDB's error, passed through
+unchanged as 1.40.0 gave it: the caller's own condition comparing the `orderBy`
+(or any attribute) with a null, a map, a list or a boolean is refused on the first
+append to a missing item and on every later one, whatever the append's own value;
+one comparing it with a value of another primitive type (a string against a
+number) doesn't hold, `ConditionalCheckFailed`. `OperandType` is opt-in
+(`diagnoseFailure({ optIn })`): only `append` asks for it, and every other write
+passes the same refusal through as it did. A struct `orderBy` never reaches
+DynamoDB: its event key text is `[object Object]` (`EDD-9162`). A date (ISO text,
+or a number under `storedAs`), a `Schema.DurationFromMillis`, a number, a literal
+and a `Redacted` string are stored as numbers or strings and append as they did
+(`test/OrderByOperandType.test.ts` and its connected twin).
 
 **Cancellations every `append` tells apart (#171).** A transaction DynamoDB
 cancels for a `TransactionConflict` alone (another transaction in flight on the
@@ -3591,6 +3712,64 @@ error, and the rejection is diagnosed into a `ValidationError` naming the
 `Transaction.check()` with an empty condition is refused before sending.
 `compileExpr` itself throws on anything `emptyPartProblem` refuses, so no
 caller can compile one by skipping the check — reaching it is a library bug.
+
+**Operands in the form the attribute holds (#242).** A condition's or filter's
+operand that is one of Effect's instances (its prototype carries one of
+Effect's `~effect/…` markers: a `DateTime`, a zone, a `Duration`, a
+`BigDecimal`, a `Redacted`, an `Option`, …) or a `Date` is sent as a write of it
+at the path it's compared with stores it. One function decides: the path
+encoder's `operand` (`makePathValueEncoder`, schema package), which is the
+entity's `_storedFormAt`; `operandAsStored` / `operandsAsStored`
+(`internal/Expr.ts`) hand it every instance operand, and every operand position
+goes through them. Through 1.40.0 the instance was sent as its map, which no row
+holds where the field stores the value another way: `eq(t.at, at)` on a
+`Schema.DateTimeZoned` compared that map with the ISO text the row holds and
+never matched, and a condition naming it always failed; likewise a
+`Schema.DateTimeUtc` (ISO text, or a number under `storedAs`), a `Redacted` (its
+value), a `Schema.DurationFromMillis` (a number) and a `Date` on a `Schema.Date`
+(an empty map against ISO text or a number).
+
+*Only where the schema alone determines the stored form.* `operand` walks the
+path through EVERY union member that can hold it (a member that can't — a
+string, a literal, `null`, a struct without the field — is left out), and puts
+the operand in its stored form only when every position it reaches that takes
+the value stores it the same; a position that can't take the value holds no row
+it could match. Anywhere else the operand is sent as 1.40.0 sent it: union
+members storing the path differently (`{ kind: "encoded", when:
+DurationFromMillis } | { kind: "raw", when: Duration }`: a raw row holds the
+`Duration`'s map), an `Unknown` or `Any` at or on the path, a suspended schema,
+a declaration the walk doesn't follow (an `Option`, an opaque class), a record of
+such, a value no position takes, and one whose stored form DynamoDB can't store.
+A union AT the path is one schema: its encoding picks a member by the value,
+exactly as a write of that value does, so it is determined.
+
+*`contains` compares an element of what the field stores* (`containedKindOf`,
+`containedOperand`): an element of a list, as a list stores it; a member of a
+set (`Schema.ReadonlySet`, DynamoDB's `SS` / `NS` / `BS`), the single member of a
+write of a set holding it; a substring of text, the text a write of it stores.
+Anything else is sent as given.
+
+*Positions.* Each comparator, `between`, `isIn` and `contains`, in a callback or
+shorthand: an entity's conditions (put, update, delete, `append`, a planned or
+transactional op's), a bound query's, scan's, `history`'s and `deleted.list`'s
+filter, `Entity.filter`, `Query.filterExpr` on a query an entity made (the
+query carries its entity's `storedAt`), a collection's filter (members that hold
+the operand in different forms are judged each by its own, in the `OR` over
+`__edd_e__` that renamed fields already use), a vector search's equality filters,
+and an aggregate's `list` filter (the root's attribute encoder for a top-level
+field, `contains` included; anywhere deeper, as given). An instance whose map is
+the stored form (a zone, a `Duration`, a `BigDecimal`, an `Option` of a number,
+any value of an untyped field) is the bytes 1.40.0 sent, and an operand that
+isn't an instance or a `Date` (a primitive, a plain map or list, even one holding
+instances, a path) and a `begins_with` prefix are sent as given: reading inside
+a plain container would read the caller's values a second time. Finding an
+instance reads the operand's prototype once. A `.where()` bound composes key text
+through the key form, as it did. `Transaction.check` takes a condition
+`Expression.condition` compiled with no entity, and a query no one entity types
+(an event stream's, a collection made by `Collection.make`, one made by hand)
+has no stored form to give: their operands are sent as given. Pinned by
+`OperandsAsStored.test.ts`, `OperandStoredForm.test.ts` and
+`connected.operands-as-stored.test.ts`.
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first
@@ -4952,8 +5131,8 @@ A real date then has to be accepted wherever a read date was. Under
 `DynamoModel.Packed`, `stringifyStrict` refused an instance and let the plain
 look-alike through, so a read date packed and a new one was refused; `JSON.stringify`
 would call its `toJSON` and store ISO text, which the declaration refuses on read.
-So `check` accepts a real `DateTime` and `storingDates` stores it as `storedDate`:
-the same keys, in the order DynamoDB Local hands the map back, so what's packed from
+So `written` accepts a real `DateTime` and `stringifyStrict` stores it as `storedDate`
+(`internal/StoredForm.ts`): the same keys, in the order DynamoDB Local hands the map back, so what's packed from
 a date a read returned doesn't move by a byte (`fixtures/stream-dates-1.39.0.json`,
 stored by the published 1.39.0, pins this). Real DynamoDB's map order isn't
 guaranteed, so that text was never fixed on that path. Anything else JSON can't
@@ -5005,19 +5184,306 @@ as the same object. `effectDeclarationOf` recognises a declaration by its parse
 function, so a `.check()`, an annotation and a brand keep it, and a `Schema.declare`
 of one's own doesn't have it.
 
+**Effect's instances in a packed value (1.41.0).** A packed write refused every class
+instance but a `DateTime` ("an instance of Object"), so a `Duration`, a `BigDecimal`, a
+zone, a cookie, a `UrlParams`, a version or range, an address, a DNS record, an `Option`
+or a `Result` couldn't be written in a packed struct, a packed `Schema.Unknown`, event
+data or a snapshot state, though a native attribute stores each as a map and reads it
+back. `storedFormOf` (`internal/StoredForm.ts`, schema package) is the one function that
+says what packed storage writes for one of Effect's instances, and `stringifyStrict` is
+the one place that calls it (through `written`, which reads each property of the value
+once and writes what it read), so every packed write takes it: entity fields, aggregate
+edges, event data, snapshots and `StorageEncoding`. It's the map the marshaller stores:
+each enumerable property, its prototype's included, without a function, `undefined` or a
+decimal's cached normalized form (`isCachedNormal`, which `Marshaller.ts` imports from
+there, so a native and a packed write leave out the same property). Inside a look-alike
+(an instance carrying, on its prototype, one of the markers `EffectInstances` rebuilds
+by) every value is the library's, so it's what the unmarshaller hands back: a
+safe-integer bigint as a number, a cookie's expiry as the ISO text `finishingInstances`
+writes (`expiryText`, which `optionsWriteAs` uses too), a named zone's formatter as the
+empty map. An `Option` or a `Result` holds the caller's value, which is left as it is
+and packed by the rules every packed value follows: a bigint, a `Date` or bytes in it is
+refused where it is, and an instance in it is its stored map. Each map is put in the
+order DynamoDB Local hands a stored map back (`inStoredOrder`: Java `HashMap` bucket
+order, ties in write order, a table sized for the keys and doubled past three quarters
+full), measured against every map 1.39.0 stored for a look-alike, so a real instance
+packs to exactly the bytes 1.40.0 packed for the map a native read hands back for it
+(`fixtures/packed-lookalikes-1.40.0.json`, captured from the published 1.40.0, pins
+both that and every value 1.40.0 packed). A date keeps `storedDate`, which gives the
+same bytes. What JSON can't hold is left in place for `written` to refuse at its path: a
+`MacAddress`'s or a TLSA record's bytes, a `BigDecimal` or a `Duration` past 2^53, as
+1.40.0 refused the map of each. A packed look-alike reads back through
+`readingInstances` as the instance, as a native one does, and writing what was read
+stores the bytes read; an `Option` or a `Result` is rebuilt by its own declaration; in a
+`Schema.Unknown` it's the map, as natively. A map written in another key order (by hand,
+since no read hands one back) still reads as the instance, as it did on 1.40.0, and is
+written back in this order. A top-level packed field whose encoded side is one of these
+declarations is still refused at load (`EDD-9073`), since classification also decides
+which native fields a read dispatches on.
+
 **What the marshaller does beyond marshalling** (`Marshaller.ts`). It marshals first,
 exactly as `@aws-sdk/util-dynamodb` does. Only if that throws does it look for empty
 sets to leave out, and for a `BigDecimal` whose cached `normalized` form leads into a
 cycle, which it writes as a fresh decimal (`holdsCachedCycle` reads data descriptors
-and calls no getter, so an item holding none is handled as it always was). Then
-`datingCookies` looks through the marshalled output for a cookie's marker and writes
-the expiry of each of Effect's cookies (by prototype) as ISO text, where a `Date`
-marshals to an empty map; it finds the source cookie by descriptors, calls no getter,
-and touches nothing else. A typed cookie reads the text back as the `Date`
+and calls no getter, so an item holding none is handled as it always was). A value
+holding one it's inside, which marshalling follows until the stack runs out (an Effect
+`Chunk`, whose empty end holds itself), is refused there as `UnstorableValue`
+(`EDD-9124`, `cycleIn`, by data descriptors, naming the path where it meets itself), as a
+`HashSet` is, where 1.40.0 died with a stack overflow. Then
+`finishingInstances` looks through the marshalled output for a cookie's marker and a
+zone's. It writes the expiry of each of Effect's cookies (by prototype) as ISO text,
+where a `Date` marshals to an empty map, finding the cookie by descriptors and calling
+no getter; and a named zone's map as Effect 4.1.2 held it (below), decided on the map
+marshalling made. It touches nothing else. A typed cookie reads the text back as the `Date`
 (`cookieOptions`). Cookies are held to the write-back check like every kind but a
 date, comparing an expiry as the marshaller writes it (`optionsWriteAs`), so a cookie
 1.39.0 wrote with an expiry (an empty map), one holding properties of its own inside
 it, and a jar keyed other than by its cookies' names stay the map.
+
+**What an untyped position doesn't keep (1.41.0, `EDD-9161`).** At a position no schema
+types (`Schema.Unknown`, `Schema.Any`, at any depth, `holdsUntyped`), the value is
+marshalled as given, so only the value can say whether DynamoDB keeps it. Up to 1.40.0 a
+`Date` there was written as an empty map and read back as `{}`, with no error.
+`internal/LostValues.ts` (schema package) is the one decision: `lostAs` says what of one
+value is lost, `lostElement` what of a list's element, and `lostIn` walks a value as the
+marshaller does (data descriptors, prototypes included, no getter called; a cycle isn't
+followed) for the first such part, with its path. Lost: a `Date` (valid or not) and a
+`RegExp`; a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`; an
+`Error` whose `message` or `cause` isn't an enumerable property; a `Redacted`; a `Map`
+with a key that isn't a string; and the binary data 1.40.0 stored as less than it is
+or failed to send, measured kind by kind with the AWS SDK it locked
+(`fixtures/untyped-binary-kinds-1.40.0.json`) and named one by one, never as "any typed
+array": an `ArrayBuffer`, a `DataView` or a `Blob` (a `File` is one), stored as empty
+bytes, a `SharedArrayBuffer`, stored as an empty map, and an instance of a subclass of
+any of them, stored as the map of its enumerable properties, since each holds its bytes
+outside its properties (`instanceof`); and the ten typed arrays the SDK fails to send,
+each by its own prototype (`Int8Array`, `Uint8ClampedArray`, `Int16Array`,
+`Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`,
+`BigInt64Array`, `BigUint64Array`: a `DynamoError` holding the SDK's `TypeError`; the
+SDK takes a value for bytes by its constructor's name). Every other kind is stored as
+it was: a `Uint8Array` or a `Buffer` as bytes, and a `Float16Array`, a subclass of a
+typed array (a `Uint8Array`'s included) or a kind a later runtime adds as the map of
+its elements, which reads back as their numbers. A cookie's
+expiry is exempt (`finishingInstances` writes it as text), and so is `undefined`, a
+function or a hole in a list: the list closes up, a documented limit a caller can rely on
+(`NoStoredFormScenarios`). Every other value stores whole as the map of its enumerable properties and
+reads back as that map, a class instance included; a bigint or a boxed primitive is left
+to the rules it always had. `readBackOf` (`internal/RoundTrip.ts`) looks through a value
+at such a position before anything else, so every write path that checks a custom
+declaration checks this too (`encodeForWrite`, `_refuseNotReadBack`, `encodeToWire`, the
+outbox), with `unstorableOperand` for an update's `.append()` and path operands, just
+before it marshals each, and `refuseLost` for an aggregate's rows, before they're
+marshalled. A packed field asks the same functions in `written` (a map and binary
+data are refused first as not JSON), so it refuses the same values in the same words.
+Only a field or an aggregate whose schema holds an untyped position pays; reads are
+untouched, so a row 1.40.0 stored as `{}` reads as `{}`.
+
+A part behind a getter (an enumerable accessor, own or inherited, or an accessor at a
+list's index) is only known by calling the getter, and the marshaller calls it, once for
+each time it marshals the value. `lostIn` doesn't call it: it marks the value, and each
+object on the way to the getter (`holdsGetters`). `Marshaller.marshallStorable` reads an
+item holding a marked part through `readJudged`: a view, built from descriptors without
+reading anything, whose getters are judged by `lostIn` as the marshaller calls them, the
+refusal thrown as an `UnstorableValue` carrying `lost`, which every write path already
+turns into its `ValidationError`. The view forwards every read, so the marshaller takes
+the branch it took and stores the same keys in the same order; its target is a stand-in, so
+a frozen value can be viewed, and a copy the library made around a marked value (an
+event's `data`) leads to it through descriptors. Until anything has been marked nothing
+is looked for. Every getter is called exactly as often as published 1.40.0 called it, on
+every write path (`LostBehindGetters.test.ts`, counts measured with 1.40.0's own copy of
+`CustomDeclarationPaths`); an update's path operand no longer goes through the schema a
+third time to be looked through, which had added two calls. A getter the marshaller doesn't
+read (a class's own, not enumerable) isn't called or looked at. Left as 1.40.0 (named, not
+reworked): a getter a list inherits at an index (on the list's prototype) isn't looked
+behind, so a `Date` it returns is stored as `{}`, as 1.40.0 stored it
+(`LostBehindGetters.test.ts`). Only a `Proxy` sees what the walk reads: at an untyped
+position, `getPrototypeOf`, `getOwnPropertyDescriptor` and `ownKeys` traps and reads of a
+list's `length`; the payload and its declared fields see exactly 1.40.0's traps, a
+condition's or filter's operand one `getPrototypeOf` more (finding an instance), and once a
+getter in an untyped field has been met in the process, `readJudged` reads the
+descriptors of what each marshalled item holds (`ProxyTraps.test.ts`).
+
+**A named zone's name on any Effect 4.1 (1.41.0).** Effect 4.1.3 changed a named zone.
+It gained an own enumerable `resolvedId` (the name `Intl` resolves it to), and its `id`
+became the name it was made from, unless `Intl` resolves that only in another case. On
+4.1.2 the `id` was the resolved name and there was no `resolvedId`. So every named
+zone, native or packed, stored one more entry on 4.1.3, and a zone made from an alias
+(`Etc/UTC`, `GMT`, `Asia/Kolkata`, `US/Eastern`) stored another `id`, ISO text and key
+text: a consumer's stored bytes depended on the Effect patch installed. Now one rule
+names a zone and one rule writes it, whichever Effect is installed.
+
+- *The name* is `storedZoneName` (`internal/StoredForm.ts`): a zone's `resolvedId` where
+  it holds one as text, otherwise its `id`. That is the resolved name on either Effect,
+  for a zone made fresh or read back from a map of either form, and it's what 4.1.3's
+  `Equal` compares (`resolvedId` against `resolvedId ?? id`; 4.1.2's compares `id`), so
+  two zones Effect holds equal have one name. Key text (`zonesAsStored`), a unique
+  sentinel and a time-series event's sort key (composed from the value stored, which
+  `storedZoneText` names again: `storedSentinelValue`, `readSentinelValue`, `append`,
+  and a `history().where()` bound), the ISO text of `DynamoModel.DateTimeZoned` and of
+  a date stored as text (`zonedIsoText`), an aggregate's comparison and every write take
+  it from there.
+- *One walk reaches every zone.* `walkLeaves` (`internal/StoredForm.ts`) is the walk
+  every text naming a zone takes: `zonesAsStored`, `namesZone` (which decides whether
+  `storedZoneText` looks at a field's value) and `rekey`'s `givenZoneReading`. It goes
+  through a zoned date's zone, an `Option`, a `Result`, a list or tuple, a `Set`, a
+  `Map`, a record or struct and any other object's own properties (a `Schema.Class`
+  instance, one of Effect's collections), so a list of zones keys `timezone.named(utc)`
+  on either Effect, as does a tuple, an `Option` of a list, a struct or a record in an
+  `Option`, a `Result`, a union and a class instance in an `Option`. It reads each
+  property from its descriptor, so no getter is called (a zone behind one keeps the
+  text its getter gives), and leaves an object keeping its content in internal slots
+  (a `Date`, a typed array) unwalked. A field holding one of Effect's string codecs
+  inside it (`Schema.Array(Schema.TimeZoneNamedFromString)`, an `Option` of one) has no
+  encoding of its own, so the key form's case 3a keys its stored value: `storedZoneText`
+  now takes any field encoding somewhere inside it (`holdsEncoding`), and case 3a keys
+  that value with its zones named (`utc,utc`, `some("utc")`). A sentinel read back takes
+  the form `put` stored first (`storedFormOfRead`, an `Option` handed back as a map) and
+  then names its zones (`thenForm`). The stored form is the marshaller's own walk, which
+  reaches every map it writes and names each zone's map where it builds it
+  (`zoneEntriesWritten`). `ZoneDepth.test.ts` holds each container, on either Effect,
+  to one key text per resolved name (a literal table), one sentinel, and stored zones
+  under the resolved name, natively and packed, for zones made fresh, as each Effect
+  makes one, decoded from 4.1.3's form and read back from either Effect's map; the
+  property test in `ZoneNames.test.ts` does the same for a zone itself, with the ISO
+  text.
+- *The write* is `rewrittenZoneId` / `zoneEntriesWritten`: a named zone's map holding
+  `resolvedId` is written with `id` under the name and without `resolvedId`, which is
+  what 1.40.0 stored on 4.1.2. It's decided on the entries a write obtained, never by
+  finding the instance they came from: the map the marshaller made (`finishingInstances`),
+  the entries packed storage read (`written` in `PackedCodec.ts`, which reads each
+  property once and writes what it read), a zone's own properties (`libraryMap`,
+  `storedDate`, the write-back check's `writtenProperties`). So it holds for a zone made
+  fresh or read back, as an own property, behind a getter, inside a date, an `Option`,
+  a list, a record or an untyped field, and for a map that only looks like one.
+- *Reads* take both forms, forever. A typed zone's map holding `resolvedId` is rebuilt
+  as the zone `storedZoneName` names (`reviveTimeZone`), on either Effect, and the
+  write-back check compares the instance with the map as it's written again
+  (`asWrittenAgain`). Where no schema types it, either form reads back as the map it is,
+  as a 4.1.2 map always has. So a row holding `resolvedId` keeps it only until the item
+  is next written: a `put` of what `get` returned stores the 4.1.2 form, an aggregate
+  update compares both sides by the name and writes nothing when nothing else changed,
+  and an entity `update` that doesn't touch the field leaves the stored map alone.
+
+The resolved name is what the runtime's `Intl` makes of the name a zone was made from,
+and has been since 1.38.0 on 4.1.2: there `id` was `Intl`'s resolution. So it depends
+on the runtime's time zone data. `Asia/Kolkata` resolves to `Asia/Calcutta` on Node
+24 (ICU 78.3), and `Etc/UTC` to `UTC`; a runtime that canonicalises differently (the
+ECMA-402 change that stops `resolvedOptions().timeZone` canonicalising, which Firefox
+already follows) gives the same zone another name, so another key text, ISO text and
+stored `id`. Rows keyed under one runtime are not found by a key composed under the
+other. This is the runtime's, not the library's, and the library doesn't change it.
+Effect's own codecs are left as they are:
+`Schema.TimeZoneNamedFromString`, `Schema.TimeZoneFromString` and
+`Schema.DateTimeZonedFromString` write a zone made from an alias by the name it was
+made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`), and the attribute stores what
+they write, so it differs between the two (reads take both, and an equality condition
+or filter on it compares the stored string). Every key composed from it names the zone
+as above, so it's the same on both. `ZoneNames.test.ts` (both
+packages) makes 4.1.3's zone on the installed Effect's prototype and asserts the stored
+values literally, so it holds on either version, and `EffectValueTypes.test.ts` holds
+each of Effect's value types in each position (typed and untyped native attributes,
+packed, key text, aggregate comparison) to one literal table, and each of these codecs,
+given an alias zone made on the installed Effect, to one key text per position (sort
+key, index key, unique sentinel, event key, `history().where()`), with the attribute's
+text per version.
+
+**Rows keyed by a zone's given name (`rekey`, 1.41.0).** 1.38.0 to 1.40.0 composed a
+zone's key text from its `id`, so on Effect 4.1.3 they keyed an alias or a renamed zone
+by the name it was given (`…[asia/kolkata]`, `timezone.named(etc/utc)`), where every
+key now composes the resolved name, the text 1.40.0 composed on 4.1.2. Normal operation
+never looks there (no fallback read), so until `rekey` runs such a row is absent, as at
+any key holding nothing: `get` and `update` report `ItemNotFound` (an aggregate's `get`,
+`update` and `delete`, `AggregateAssemblyError`), a `delete` reports success and leaves it
+(`ItemNotFound` where it reads the item first: a unique constraint, soft delete), a `put`
+writes a second row, which `rekey` reports as `bothKeys` and leaves, and its unique value
+isn't enforced. Another item can take that value: every `rekey` then reports the row
+`taken` and leaves its sentinel where it is, both items holding the value, until the other
+item lets go of it, when the next `rekey` moves the sentinel (`ZoneKeyRekey.test.ts`).
+The upgrade note says to run `rekey` first. `rekey` alone looks: `givenZoneReading`
+(`internal/ZoneKeyText.ts`) takes a row's key-form record and its stored values, walks
+each key-form value as `walkLeaves` walks it, and takes each zone, or each text, under
+the name the row stores at the same place (the same index, property, `Option` value or
+zoned date's zone): a zone whose stored map holds `resolvedId` beside another `id` under
+that `id`, and text a codec or the library stored naming a zone by another name (a
+zone's name, a zoned date's ISO text) as stored. So a list holding `Etc/UTC` and `GMT`,
+both `UTC` now, reads `timezone.named(etc/utc),timezone.named(gmt)`, and a list through a
+codec `etc/utc,gmt`, as 1.40.0 keyed them (`ZoneDepthRekey.test.ts`, on rows published
+1.40.0 wrote on 4.1.3: `zone-depth-keys-1.40.0-effect-4.1.3.json`). It joins the
+readings `rowKeyForms` gives, so an entity row's table key (item, snapshot, tombstone,
+time-series event) and its index keys (`staleIndexKeys`, rewritten with
+`repairIndexKeys`) are recognised under it; `givenSentinelValues` gives a unique
+sentinel's old key from it (`otherSentinelKeys`, `sentinelHeldAt`); and an aggregate's
+`holdsPartition` takes it as a reading of the root's partition. A row naming no zone
+another way gets no extra reading, so its run costs nothing more; a row the head itself
+wrote on 4.1.3 through a codec (its attribute holds `Etc/UTC`, its keys `utc`) gets one,
+which finds nothing to move. A projection's row tombstones and outbox items hold no
+values, so their key can't be read this way, and they're left. An event stream's keys
+hold its stream id, which is text, so they hold no zone. Pinned by
+`ZoneKeyRekey.test.ts` on rows published 1.40.0 wrote on 4.1.3
+(`zone-keys-1.40.0-effect-4.1.3.json`: codecs, a zoned date stored as text, unique
+sentinels, snapshots, tombstones, events, an index, an aggregate) and 1.39.0 wrote on
+4.1.3 (`named-zone-keys-1.39.0-effect-4.1.3.json`: a zone itself), with a case-only
+zone and a zone of one name that don't move.
+
+**Readings combined composite by composite (`rekey`, 1.41.0).** One key can hold composites
+earlier releases each composed their own way: 1.39.0 on Effect 4.1.3 restored an item keyed
+by a `Duration` and a date zoned in `Etc/UTC` under `…#d_[object object]#at_…[etc/utc]`, the
+`Duration` as `restoredObjectReading` reads it and the zone as `givenZoneReading` does, a key
+no one reading composes. So `rowKeyForms` (and an aggregate's `holdsPartition`) hands the
+key form's record and each earlier reading (`keyForm139`, `givenZoneReading`,
+`restoredObjectReading`) to `keyReadings` (`internal/KeyReadings.ts`), which reads each
+composite as the key form does or as any earlier reading does, in every combination: the key
+form's reading first, then each earlier reading by itself, then the other combinations, fewest
+composites changed first, no reading twice (told apart by their values, not by the key text
+they compose: two composing one text, say under casing, are both tried and both count
+towards the cap; named, `KeyReadings.test.ts`). Each reading is composed under every form of key
+text (1.36's, 1.37's, the escaped one, the inverted index's), as every reading was, so the
+product covers both. The readings are capped at `READINGS_BOUND`, 64 per row: every
+combination of six composites read two ways, or three read four ways. Past it, the
+combinations changing the most composites aren't tried; a row stored under one of them isn't
+recognised, stays where it is and is counted `skipped.unrecognizedKey`, and the dry run
+counts it the same way. Each earlier reading by itself is always among the 64. A row no
+earlier reading reads differently has the key form's reading alone, so its run costs nothing
+more. Pinned by `MixedReadingsRekey.test.ts` on the rows published 1.39.0 wrote on 4.1.3
+(`mixed-restore-keys-1.39.0-effect-4.1.3.json`), under either `escapeKeys` setting.
+
+**Zones those releases stored as values (`rekey`, 1.41.0).** On Effect 4.1.3, 1.38.0 to
+1.40.0 stored every named zone's map with its `resolvedId` (any zone, not only an alias),
+and the library's ISO text of a zoned date under the name the zone was given. A write
+stores neither now, and an equality condition or filter's operand is what a write
+stores, so until `rekey` runs it matches none of those rows; reads are unaffected. No
+fallback is compiled into the expression: `rekey` rewrites them in the pass that moves
+rows. `staleZonesOf` (`internal/ZoneKeyText.ts`) takes a model field's read schema (the
+record schema's) and write schema (the input schema's) and, for a value read back, decodes
+it as a read does and encodes it as `put` does, then walks what that writes (`walkLeaves`)
+and compares each place with what the row holds there: a zone whose stored map holds
+`resolvedId` is a place, and so is the library's ISO text naming a zone by a name the
+runtime resolves to another. Text whose encoding follows the zone's `id` (Effect's string
+codecs, an application's) isn't: a write encodes it again with each zone a probe whose `id`
+differs from its name, and only text that stays the same is the library's. A value no
+schema types (`Schema.Unknown`) has no reader. A cheap look at the value read (a map with
+`resolvedId`, text naming an alias, by a cache of resolved names) gates the decode, so a
+row without one is never decoded. `staleZoneSets` (`Entity.ts`) puts what a write stores at
+each place, leaving the rest of the attribute as read (a packed attribute is packed again,
+as a write packs it), and the row is rewritten: under its current key in place, an item in
+the `UpdateItem` that rewrites its index keys and a snapshot, tombstone or event by one of
+its own (`rekeyHistoryZones`), each conditioned on every attribute it rewrites still
+holding what was read; a row it moves, in its move's Put (`movedRowOf`,
+`moveHistoryRow`). Each row counts once in `zonesRewritten`, and a dry run counts what it
+would rewrite. A row holding none sends no request (`ZoneValuesRekey.test.ts`, on rows
+published 1.40.0 wrote on 4.1.3 and on 4.1.2: `zone-values-1.40.0-effect-4.1.{3,2}.json`).
+A sparse map's entries, an aggregate's rows under their current keys and an event
+stream's events are not rewritten (left as 1.40.0, named: `ZoneValuesRekey.test.ts` pins a
+sparse entry and an aggregate's root row): an aggregate's rows `rekey` moves are rebuilt
+as any aggregate write builds them, and the rest keep their form until they're next
+written. An item under its current key is rewritten all or nothing: where its zones or
+index keys are due a rewrite, its unique sentinels move first, planned from the row as
+read (`rekeySentinels`), and a sentinel that can't move (`taken`, `bothKeys`,
+`uncomposable`, `contended`) leaves the row as it was, reported; a dry run judges the same
+(`ZoneUniqueRekey.test.ts`). Only then are its zones and index keys rewritten: a zone
+rewritten first lost its given name, and with it the key of the sentinel still under it.
+Each sentinel under other key text is a unit of its own, so another of the item's that can
+move does (`ZoneKeyRekey.test.ts`).
 
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
@@ -7118,6 +7584,7 @@ for unrelated errors and the collision was caught only at review.
 | 9096 | Numeric key text |
 | 9097 | Retired: transactions over rows under 1.36 keys |
 | 9098 | `rekey` options and resume tokens |
+| 9161–9164 | Effect value types: what DynamoDB doesn't store at an untyped position, object key composites (#242) |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -7229,7 +7696,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites; `Aggregate.make`, pure and operational (`AggregateSchemas.refuseAggregateKeyOverMovingValue`, `refuseManySortKeysOverMovingValue`) | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by`; a stamped `updatedAt` in an aggregate's partition key or a `many` edge's sort key (§7 "Composites the library stamps") |
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
-| `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
+| `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds, or a value holding one it's inside, such as an Effect `Chunk` in an untyped field (a stack overflow up to 1.40.0). A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
 | `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container, other than one between lists holding the same type: `Schema.Date`, `Schema.Redacted`. `Schema.Redacted` beneath a transformation onto another type, such as `Schema.OptionFromOptional`, on every owner. A union a read can't tell a bigint from something else stored as a number in (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field that a read would try first, or another event), since `5n` and `5` are stored the same: on a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
@@ -7240,6 +7707,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9133` | `internal/TransactableOps.ts` (`addProjectionLayout`, `projectionTtlConflict`), through `internal/ProjectionEngine.ts` (`EventStore.projection` / `multiProjection`, `preflight`) | On a projection read model one of whose projections has `removal`, one stored attribute one projection keeps in two roles: a checkpoint, checkpoint map, checkpoint owner or revision it also uses in another role, compared by stored name. Thrown by the definition that completes the conflict (the projection's own, or the first `removal`), with nothing recorded. Without `removal` nothing is refused, nor are two projections keeping one attribute in different roles. The table's TTL attribute, known only at run time, is checked by every entry point that writes a row (not the drains) before it sends anything: an attribute a projection keeps that is stored as it, while a projection's tombstones set it (`removal.ttl`), fails every projection on the read model with a `ValidationError`. |
 | `EDD-9134` | `internal/ProjectionEngine.ts` (`sharedOutboxKeySpace`, `refuseSharedOutboxKeySpace`), through `DynamoClient.make`, a table's `rekey` and `EventStore.processBatch` | Two read models whose projections' outboxes are on one table, in the same key space (the partition and sort key text their primary keys compose: schema name and version, primary collection, entity type, the composites' labels, and what each composite's type can compose: a number's or bigint's key text, a literal union's members, `true` and `false`, or any text). `DynamoClient.make` (among the entities it binds and its tables' members) and `processBatch` (among the read models of the projections it's handed) refuse two whose keys can be the same with values that hold no `#`: their items would overwrite each other. A defect, before anything runs. Two whose keys meet only through a value holding `#`, or part where one's value can't spell the other's text (a number beside a label), bind and run. `rekey` of the outbox's table refuses two whose items it could read as each other's, a value holding `#` included and a literal composite read as any text, as its reader reads one, with the outboxes of projections defined since the client was made; and a member of that table claiming the outbox items of a read model's entity type that could read them as its own, unless it composes its keys exactly as the read model does. A `ValidationError`, before it sends anything; `rekey` of other tables runs. Tables are compared by the physical name the context gives them, so two handles on one table are one table. Read models that never meet at one of these can't be checked: key spaces must be distinct per outbox table. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
+| `EDD-9161` | `internal/LostValues.ts` (schema, `lostAs`, `lostIn`, `readJudged`), through `internal/RoundTrip.ts` (`readBackOf`, `notReadBack`) on `Entity.ts` (`encodeForWrite`, `unstorableOperand`, `_refuseNotReadBack`), `Marshaller.ts` (`marshallStorable`: a part behind a getter, judged as it's called), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox), `Aggregate.ts` (`refuseLost`), and `internal/PackedCodec.ts` (`written`) | A write's value, at a position no schema types (`Schema.Unknown`, `Schema.Any`, at any depth, `holdsUntyped`), holding a part DynamoDB doesn't store: a `Date` (valid or not) or a `RegExp`, written as an empty map that reads back as `{}`; a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`; an `Error` holding a `message` or a `cause` that isn't an enumerable property; a `Redacted`, of which only the marker is stored; a `Map` with a key that isn't a string, whose keys read back as text; and the binary data 1.40.0 stored as less than it is or failed to send, kind by kind: an `ArrayBuffer`, a `DataView` or a `Blob` (a `File` is one), stored as empty bytes; a `SharedArrayBuffer`, stored as an empty map; an instance of a subclass of any of them, stored as the map of its enumerable properties; and the typed arrays `Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`, `BigInt64Array` and `BigUint64Array` themselves, which the AWS SDK fails to serialise (up to 1.40.0 a `DynamoError` holding its `TypeError`). Any other binary kind (a `Float16Array`, a subclass of a typed array, a kind a later runtime adds) is stored as 1.40.0 stored it. A cookie's expiry is stored as ISO text, so it isn't one, and a list holding `undefined`, a function or a hole closes up as it always has. A `ValidationError` naming the path, with nothing written, on every write path: `put` / `create` / `upsert`, an update's `.set` and path operations, `transactWrite`, `Batch.write`, a time-series `append`, an aggregate's `create` and `update`, an event stream's `append` (event and metadata) and snapshot, and a projection's outbox. A packed field refuses the same values with the same words, through the same function, where it refused them before as JSON can't hold them (a map and binary data still as not JSON). A part behind a getter is judged as the marshaller calls the getter, which is called as often as 1.40.0 called it. Only a schema holding an untyped position pays for the walk. Rows already stored as `{}` read as `{}`. |
+| `EDD-9162` | `internal/ObjectKeyText.ts` (schema, `defaultObjectText`, `objectKeyRefusal`, `judgeObjectKeyText`), decided where a key is composed (`KeyComposer.siteCompositeText`) under a write's own schema (`Entity.ts` `ownSchema`, `DynamoSchema.objectKeys`) | A write composing a key from an object whose key text is its default `[object …]` tag (a struct, a `Data` class, a class of one's own without a `toString`), which every such object composes alike: in the primary key, an index, a unique constraint, a vector partition or a time-series `orderBy`, on `put`, `create`, `upsert`, an update recomposing an index key, `append`, and a transaction's and a batch's put. A `ValidationError` naming the field and what composes it, with nothing written. A key-taking read or delete (`get`, `delete`, a query accessor, an update's own key record, `restore`) still composes the text, to reach a row an earlier release wrote under it. A value with a key form isn't refused. A key the write doesn't compose (sparse, a half an update leaves) refuses nothing. An aggregate's `create` and `update` too, through `Aggregate.ts` (`ownKeys`, `buildDynamoItems`): the partition key (`create`), the collection sort key, the list keys and a row's static discriminators; an `update` keeps a root composite equal to the one read. |
+| `EDD-9163` | `internal/WriteDiagnosis.ts` (`OperandType`, a site's opt-in diagnosis), rewritten by `Entity.ts` (the time-series `append`, `orderByRefusal`) | A time-series `append` whose `orderBy` value is stored as a type DynamoDB's `<` doesn't take: a map (an `Option`, a `Result`, a `Duration`, a `BigDecimal`, a zone), a list, a boolean or null. The append guards on the stored `orderBy` being below the new one (`#_tsob < :_tsNewOb`), and DynamoDB refuses that condition whatever the item holds, so such an entity can never `append` (a nullable one, each append holding null). It isn't checked: the append is sent, and DynamoDB's refusal (`Incorrect operand type for operator or function; operator or function: <, operand type: M`), confirmed on the request sent (the guard `#_tsob < :_tsNewOb` is in its condition and `:_tsNewOb` is of the type DynamoDB named), is rewritten into a `ValidationError` naming `timeSeries.orderBy`, its field and the type, with DynamoDB's error as the cause and nothing written. A refusal of the caller's own condition is DynamoDB's error, unchanged. A struct's `orderBy` is refused before that, as its key text (`EDD-9162`). |
 
 Next free code: none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` and `9113` are retired, don't reuse them); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 

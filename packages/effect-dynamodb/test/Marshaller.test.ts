@@ -228,10 +228,22 @@ describe("values with no stored form", () => {
     })
 
     it("what isn't a refusal isn't dressed up as one", () => {
+      const throwing = {
+        get x(): unknown {
+          throw new TypeError("boom")
+        },
+      }
+      expect(() => unstorableIn({ a: new Set(), throwing })).toThrow(TypeError)
+      expect(() => toAttributeValue({ a: new Set(), throwing })).toThrow(TypeError)
+    })
+
+    it("a value holding one it's inside is refused where it meets itself, not run to the stack's end", () => {
       const cyclic: Record<string, unknown> = {}
       cyclic.self = cyclic
-      expect(() => unstorableIn({ a: new Set(), cyclic })).toThrow(RangeError)
-      expect(() => toAttributeValue({ a: new Set(), cyclic })).toThrow(RangeError)
+      expect(unstorableIn({ a: new Set(), cyclic })?.describe()).toMatch(
+        /^"cyclic\.self": it holds a value it's inside, .* \[EDD-9124\]$/,
+      )
+      expect(refusal(() => toAttributeValue({ cyclic }, "v")).path).toEqual(["v", "cyclic", "self"])
     })
 
     it("says why: an empty set as itself, anything else as marshalling did", () => {

@@ -25,7 +25,27 @@ import * as IpNetwork from "effect/net/IpNetwork"
 import * as NetAddress from "effect/net/NetAddress"
 import * as SemVer from "effect/SemVer"
 import * as SemVerRange from "effect/SemVerRange"
-import { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./PackedCodec.js"
+import {
+  BETA_DATE_MARKER,
+  BIG_DECIMAL_MARKER as BIG_DECIMAL,
+  COOKIE_MARKER as COOKIE,
+  COOKIE_PROTO,
+  COOKIES_MARKER as COOKIES,
+  DATE_MARKER,
+  DNS_RECORD_MARKER as DNS_RECORD,
+  DURATION_MARKER as DURATION,
+  expiryText,
+  HOST_MARKER as HOST,
+  IP_INTERFACE_MARKER as IP_INTERFACE,
+  IP_NETWORK_MARKER as IP_NETWORK,
+  NET_ADDRESS_MARKER as NET_ADDRESS,
+  SEMVER_MARKER as SEMVER,
+  SEMVER_RANGE_MARKER as SEMVER_RANGE,
+  storedZoneName,
+  URL_PARAMS_MARKER as URL_PARAMS,
+  ZONE_MARKER,
+  zoneEntriesWritten,
+} from "./StoredForm.js"
 
 /** Which of Effect's declarations a node is: the rebuild it takes, and the rules it's held to. */
 export type InstanceKind =
@@ -197,19 +217,6 @@ const exactInteger = (value: unknown): bigint | undefined =>
 const isUint32 = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff
 
-const BIG_DECIMAL = "~effect/BigDecimal"
-const DURATION = "~effect/Duration"
-const COOKIE = "~effect/http/Cookies/Cookie"
-const COOKIES = "~effect/http/Cookies"
-const URL_PARAMS = "~effect/http/UrlParams"
-const SEMVER = "~effect/SemVer"
-const SEMVER_RANGE = "~effect/SemVerRange"
-const NET_ADDRESS = "~effect/net/NetAddress"
-const IP_NETWORK = "~effect/net/IpNetwork"
-const IP_INTERFACE = "~effect/net/IpInterface"
-const HOST = "~effect/net/Host"
-const DNS_RECORD = "~effect/net/Dns/DnsRecord"
-
 /**
  * A stored `normalized` is left where it is, in the map: on an instance it's the slot
  * `BigDecimal.normalize` caches in, and a map there would be handed out as the normalized decimal.
@@ -245,10 +252,16 @@ const rebuildDuration = (value: unknown): Duration.Duration | undefined => {
   }
 }
 
-/** A zone from its stored form: a named one from its id, an offset one from its offset. */
+/**
+ * A zone from its stored form: a named one from its name, an offset one from its offset. A named
+ * zone's map holds the name as `id`, as 4.1.2 held it, or as `resolvedId` beside the name it was made
+ * from, as 4.1.3 does: it's the zone {@link storedZoneName} names either way.
+ */
 export const reviveTimeZone = (zone: unknown): DateTime.TimeZone | undefined => {
   if (!isPlain(zone)) return undefined
   try {
+    const name = zone._tag === "Named" ? storedZoneName(zone.id, zone.resolvedId) : undefined
+    if (name !== undefined) return DateTime.zoneMakeNamedUnsafe(name)
     if (zone._tag === "Named" && typeof zone.id === "string") {
       return DateTime.zoneMakeNamedUnsafe(zone.id)
     }
@@ -299,8 +312,6 @@ const rebuildDateTime = (value: unknown): DateTime.DateTime | undefined =>
 
 const rebuildTimeZone = (value: unknown): DateTime.TimeZone | undefined =>
   markedBy(value, ZONE_MARKER) ? reviveTimeZone(value) : undefined
-
-const COOKIE_PROTO: object = Object.getPrototypeOf(Cookies.makeCookieUnsafe("a", "b"))
 
 /** An expiry as it's stored, ISO text, back as the `Date` it was written from. */
 const expiryOf = (text: string): Date | undefined => {
@@ -542,14 +553,38 @@ const REBUILDS: { readonly [K in InstanceKind]: (value: unknown) => unknown } = 
   DnsRecord: rebuildDnsRecord,
 }
 
-/** What marshalling stores of an object: its enumerable properties, its prototype's included. */
+/**
+ * What a native write stores of an object: its enumerable properties, its prototype's included, and
+ * a named zone's holding `resolvedId` as 4.1.2 held them ({@link zoneEntriesWritten}).
+ */
 const writtenProperties = (value: object): ReadonlyArray<readonly [string, unknown]> => {
   const properties: Array<readonly [string, unknown]> = []
   for (const key in value) {
     const property = (value as StoredMap)[key]
     if (property !== undefined && typeof property !== "function") properties.push([key, property])
   }
-  return properties
+  return zoneEntriesWritten(
+    properties,
+    ZONE_MARKER in value,
+    (property) => property,
+    (name) => name,
+  )
+}
+
+/**
+ * A stored map as a write stores it again: a named zone's holding `resolvedId` as 4.1.2 held it
+ * ({@link zoneEntriesWritten}), anything else as it is.
+ */
+const asWrittenAgain = (kind: InstanceKind, value: StoredMap): StoredMap => {
+  if (kind !== "TimeZone") return value
+  const entries = Object.entries(value)
+  const written = zoneEntriesWritten(
+    entries,
+    true,
+    (entry) => entry,
+    (name) => name,
+  )
+  return written === entries ? value : (Object.fromEntries(written) as StoredMap)
 }
 
 const sameNumber = (written: number | bigint, stored: unknown): boolean => {
@@ -573,14 +608,8 @@ const optionsWriteAs = (options: unknown, stored: unknown): boolean => {
     properties.length === Object.keys(stored).length &&
     properties.every(([key, property]) => {
       if (!Object.hasOwn(stored, key)) return false
-      const dated =
-        key === "expires" &&
-        property instanceof Date &&
-        !Number.isNaN(property.getTime()) &&
-        writtenProperties(property).length === 0
-      return dated
-        ? stored[key] === (property as Date).toISOString()
-        : writesAs(property, stored[key])
+      const expiry = key === "expires" ? expiryText(property) : undefined
+      return expiry !== undefined ? stored[key] === expiry : writesAs(property, stored[key])
     })
   )
 }
@@ -682,15 +711,18 @@ const EXACT: { readonly [K in InstanceKind]: boolean } = {
  *
  * The instance carries every stored property its rebuild made no use of ({@link carrying}), so
  * writing it again stores what was read. Where it still wouldn't (a property the rebuild dropped
- * from inside the map), the value isn't rebuilt, and stays the map it always was.
+ * from inside the map), the value isn't rebuilt, and stays the map it always was. A named zone's
+ * map holding `resolvedId` is the exception, and the one: it's read as the zone it names, and
+ * written as 4.1.2 held it ({@link asWrittenAgain}).
  */
 export const rebuildStored = (kind: InstanceKind, value: unknown): unknown => {
   const rebuilt = REBUILDS[kind](value)
   if (kind === "DateTime" || typeof rebuilt !== "object" || rebuilt === null || !isMap(value)) {
     return rebuilt
   }
-  const instance = carrying(rebuilt, value)
-  return EXACT[kind] && !writesAs(instance, value) ? undefined : instance
+  const stored = asWrittenAgain(kind, value)
+  const instance = carrying(rebuilt, stored)
+  return EXACT[kind] && !writesAs(instance, stored) ? undefined : instance
 }
 
 /**

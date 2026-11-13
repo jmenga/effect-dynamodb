@@ -301,6 +301,119 @@ export const not = (expr: Expr): Expr => ({
 })
 
 // ---------------------------------------------------------------------------
+// Operands in the form the attribute holds (#242)
+// ---------------------------------------------------------------------------
+
+/**
+ * A condition's or filter's operand as the attribute at the path `segments` (domain names) holds
+ * it: the value there (`"value"`), or what `contains` compares, an element of what's stored there
+ * (`"contained"`: an element of a list, a member of a set, a substring of text). `value` itself
+ * where the schema alone doesn't determine the stored form, or the path's schema doesn't take it.
+ * Each entity supplies its own (`Entity._storedFormAt`, the path encoder's `operand`); an
+ * aggregate its root's.
+ */
+export type StoredFormAt = (
+  segments: ReadonlyArray<string | number>,
+  value: unknown,
+  kind: "value" | "contained",
+) => unknown
+
+/**
+ * An instance a write puts into a form of its own: one of Effect's (a `DateTime`, a zone, a
+ * `Duration`, a `BigDecimal`, a `Redacted`, an `Option`, …: an object whose prototype carries one
+ * of Effect's markers, `~effect/…`) or a `Date`. The map DynamoDB hands back for one of Effect's
+ * carries its marker as its own, so it isn't one. Reads the value's prototype once, and property
+ * names of the prototypes above it, never a value.
+ */
+const isInstanceOperand = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  for (
+    let at = Object.getPrototypeOf(value);
+    at !== null && at !== Object.prototype;
+    at = Object.getPrototypeOf(at)
+  ) {
+    if (at === Date.prototype) return true
+    if (Object.getOwnPropertyNames(at).some((key) => key.startsWith("~effect/"))) return true
+  }
+  return false
+}
+
+/**
+ * One operand compared with the attribute at `segments`, in the form it holds there (#242): an
+ * instance ({@link isInstanceOperand}) as `storedAt` gives it, and any other value as given. Every
+ * operand position goes through it: {@link operandsAsStored} for an expression, a vector search's
+ * equality filters for theirs.
+ */
+export const operandAsStored = (
+  storedAt: StoredFormAt,
+  segments: ReadonlyArray<string | number>,
+  value: unknown,
+  kind: "value" | "contained",
+): unknown => (isInstanceOperand(value) ? storedAt(segments, value, kind) : value)
+
+/**
+ * A condition's or filter's operands in the form the attribute each is compared with holds
+ * (#242). An operand that is one of Effect's instances or a `Date` is sent as `storedAt` gives it
+ * for the path it's compared with: what a write of it there stores. It was sent as the instance's
+ * map, which no row holds where the field stores the value another way: `eq(t.at, at)` on a
+ * `Schema.DateTimeZoned` compared that map with the ISO text the row holds, and never matched.
+ * A comparison, `between` and `in` compare the path's value; `contains` an element of it. Where
+ * the schema alone doesn't determine the stored form, `storedAt` hands the operand back and it is
+ * sent as 1.40.0 sent it. Every other operand (a primitive, a plain object or list, even one
+ * holding instances, one compared with no path, a `begins_with` prefix) is sent as given, and an
+ * expression holding none is returned as it is.
+ */
+export const operandsAsStored = (expr: Expr, storedAt: StoredFormAt): Expr => {
+  const asStored = (
+    operand: Operand,
+    path: Operand | undefined,
+    kind: "value" | "contained",
+  ): Operand => {
+    if (path?._tag !== "path" || operand._tag !== "value") return operand
+    const stored = operandAsStored(storedAt, path.segments, operand.value, kind)
+    return Object.is(stored, operand.value) ? operand : { _tag: "value", value: stored }
+  }
+  const same = (a: ReadonlyArray<unknown>, b: ReadonlyArray<unknown>): boolean =>
+    a.every((item, at) => item === b[at])
+  switch (expr._tag) {
+    case "eq":
+    case "ne":
+    case "lt":
+    case "lte":
+    case "gt":
+    case "gte": {
+      const left = asStored(expr.left, expr.right, "value")
+      const right = asStored(expr.right, expr.left, "value")
+      return left === expr.left && right === expr.right ? expr : { ...expr, left, right }
+    }
+    case "between": {
+      const low = asStored(expr.low, expr.operand, "value")
+      const high = asStored(expr.high, expr.operand, "value")
+      return low === expr.low && high === expr.high ? expr : { ...expr, low, high }
+    }
+    case "in": {
+      const values = expr.values.map((value) => asStored(value, expr.operand, "value"))
+      return same(values, expr.values) ? expr : { ...expr, values }
+    }
+    case "contains": {
+      const value = asStored(expr.value, expr.operand, "contained")
+      return value === expr.value ? expr : { ...expr, value }
+    }
+    case "and":
+    case "or": {
+      const exprs = expr.exprs.map((part) => operandsAsStored(part, storedAt))
+      return same(exprs, expr.exprs) ? expr : { ...expr, exprs }
+    }
+    case "not": {
+      const inner = operandsAsStored(expr.expr, storedAt)
+      return inner === expr.expr ? expr : { ...expr, expr: inner }
+    }
+    default:
+      return expr
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Compiler — convert Expr ADT to DynamoDB expression string
 // ---------------------------------------------------------------------------
 

@@ -1,0 +1,283 @@
+{
+  "generatedFrom": "effect-dynamodb@1.40.0",
+  "note": "Captured once from published effect-dynamodb 1.40.0 on DynamoDB Local, with effect@4.1.2 and with effect@4.1.3 (identical). Never regenerate it.",
+  "describes": "Every proxy trap each case set off on a caller's values, in order, by label: the payload itself (put's item, update's .set record), its declared fields (a struct, a list in it, a list, a record) and a scan filter's operand on the struct field, each a recording Proxy. Each case ran once, then again (', after a getter') after a put holding a getter in the untyped field. The untyped field's own traps aren't kept: only typed positions are pinned. The cases are ProxyTraps.test.ts's.",
+  "cases": {
+    "put": {
+      "payload": [
+        "has id",
+        "get id",
+        "has n",
+        "get n",
+        "has s",
+        "get s",
+        "has tags",
+        "get tags",
+        "has rec",
+        "get rec",
+        "has u",
+        "get u"
+      ],
+      "typed struct": [
+        "has a",
+        "get a",
+        "has b",
+        "get b"
+      ],
+      "typed list in it": [
+        "get length",
+        "get 0",
+        "get 1"
+      ],
+      "typed list": [
+        "get length",
+        "get 0",
+        "get 1"
+      ],
+      "typed record": [
+        "ownKeys",
+        "getOwnPropertyDescriptor k",
+        "get k"
+      ]
+    },
+    "update .set": {
+      "payload": [
+        "ownKeys",
+        "getOwnPropertyDescriptor n",
+        "get n",
+        "getOwnPropertyDescriptor s",
+        "get s",
+        "getOwnPropertyDescriptor tags",
+        "get tags",
+        "getOwnPropertyDescriptor rec",
+        "get rec",
+        "getOwnPropertyDescriptor u",
+        "get u",
+        "ownKeys",
+        "getOwnPropertyDescriptor n",
+        "getOwnPropertyDescriptor s",
+        "getOwnPropertyDescriptor tags",
+        "getOwnPropertyDescriptor rec",
+        "getOwnPropertyDescriptor u",
+        "get n",
+        "get s",
+        "get tags",
+        "get rec",
+        "get u",
+        "get id",
+        "ownKeys",
+        "getOwnPropertyDescriptor n",
+        "getOwnPropertyDescriptor s",
+        "getOwnPropertyDescriptor tags",
+        "getOwnPropertyDescriptor rec",
+        "getOwnPropertyDescriptor u",
+        "get id",
+        "has n",
+        "get n",
+        "has s",
+        "get s",
+        "has tags",
+        "get tags",
+        "has rec",
+        "get rec",
+        "has u",
+        "get u"
+      ],
+      "typed struct": [
+        "getPrototypeOf",
+        "has a",
+        "get a",
+        "has b",
+        "get b"
+      ],
+      "typed list": [
+        "getPrototypeOf",
+        "get length",
+        "get 0",
+        "get 1"
+      ],
+      "typed record": [
+        "getPrototypeOf",
+        "ownKeys",
+        "getOwnPropertyDescriptor k",
+        "get k"
+      ],
+      "typed list in it": [
+        "get length",
+        "get 0",
+        "get 1"
+      ]
+    },
+    "filter": {
+      "typed operand": [
+        "get constructor",
+        "get constructor",
+        "get constructor",
+        "ownKeys",
+        "getPrototypeOf",
+        "getOwnPropertyDescriptor a",
+        "get a",
+        "getOwnPropertyDescriptor b",
+        "get b",
+        "get constructor",
+        "get constructor",
+        "get constructor",
+        "ownKeys",
+        "getPrototypeOf",
+        "getOwnPropertyDescriptor a",
+        "get a",
+        "getOwnPropertyDescriptor b",
+        "get b",
+        "getPrototypeOf",
+        "getPrototypeOf",
+        "get constructor",
+        "get constructor",
+        "get constructor",
+        "ownKeys",
+        "getPrototypeOf",
+        "getOwnPropertyDescriptor a",
+        "get a",
+        "getOwnPropertyDescriptor b",
+        "get b"
+      ]
+    },
+    "put, after a getter": {
+      "payload": [
+        "has id",
+        "get id",
+        "has n",
+        "get n",
+        "has s",
+        "get s",
+        "has tags",
+        "get tags",
+        "has rec",
+        "get rec",
+        "has u",
+        "get u"
+      ],
+      "typed struct": [
+        "has a",
+        "get a",
+        "has b",
+        "get b"
+      ],
+      "typed list in it": [
+        "get length",
+        "get 0",
+        "get 1"
+      ],
+      "typed list": [
+        "get length",
+        "get 0",
+        "get 1"
+      ],
+      "typed record": [
+        "ownKeys",
+        "getOwnPropertyDescriptor k",
+        "get k"
+      ]
+    },
+    "update .set, after a getter": {
+      "payload": [
+        "ownKeys",
+        "getOwnPropertyDescriptor n",
+        "get n",
+        "getOwnPropertyDescriptor s",
+        "get s",
+        "getOwnPropertyDescriptor tags",
+        "get tags",
+        "getOwnPropertyDescriptor rec",
+        "get rec",
+        "getOwnPropertyDescriptor u",
+        "get u",
+        "ownKeys",
+        "getOwnPropertyDescriptor n",
+        "getOwnPropertyDescriptor s",
+        "getOwnPropertyDescriptor tags",
+        "getOwnPropertyDescriptor rec",
+        "getOwnPropertyDescriptor u",
+        "get n",
+        "get s",
+        "get tags",
+        "get rec",
+        "get u",
+        "get id",
+        "ownKeys",
+        "getOwnPropertyDescriptor n",
+        "getOwnPropertyDescriptor s",
+        "getOwnPropertyDescriptor tags",
+        "getOwnPropertyDescriptor rec",
+        "getOwnPropertyDescriptor u",
+        "get id",
+        "has n",
+        "get n",
+        "has s",
+        "get s",
+        "has tags",
+        "get tags",
+        "has rec",
+        "get rec",
+        "has u",
+        "get u"
+      ],
+      "typed struct": [
+        "getPrototypeOf",
+        "has a",
+        "get a",
+        "has b",
+        "get b"
+      ],
+      "typed list": [
+        "getPrototypeOf",
+        "get length",
+        "get 0",
+        "get 1"
+      ],
+      "typed record": [
+        "getPrototypeOf",
+        "ownKeys",
+        "getOwnPropertyDescriptor k",
+        "get k"
+      ],
+      "typed list in it": [
+        "get length",
+        "get 0",
+        "get 1"
+      ]
+    },
+    "filter, after a getter": {
+      "typed operand": [
+        "get constructor",
+        "get constructor",
+        "get constructor",
+        "ownKeys",
+        "getPrototypeOf",
+        "getOwnPropertyDescriptor a",
+        "get a",
+        "getOwnPropertyDescriptor b",
+        "get b",
+        "get constructor",
+        "get constructor",
+        "get constructor",
+        "ownKeys",
+        "getPrototypeOf",
+        "getOwnPropertyDescriptor a",
+        "get a",
+        "getOwnPropertyDescriptor b",
+        "get b",
+        "getPrototypeOf",
+        "getPrototypeOf",
+        "get constructor",
+        "get constructor",
+        "get constructor",
+        "ownKeys",
+        "getPrototypeOf",
+        "getOwnPropertyDescriptor a",
+        "get a",
+        "getOwnPropertyDescriptor b",
+        "get b"
+      ]
+    }
+  }
+}

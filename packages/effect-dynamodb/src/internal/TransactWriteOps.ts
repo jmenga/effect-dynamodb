@@ -39,7 +39,14 @@ import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundUpdateOp, BoundWriteOp } from "./BoundCrud.js"
 import { withGuard } from "./EntityOps.js"
-import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
+import {
+  compileExpr,
+  type Expr,
+  emptyPartProblem,
+  isExpr,
+  operandsAsStored,
+  parseShorthand,
+} from "./Expr.js"
 import {
   composePrimaryKeyOrFail,
   rejectUnsupportedOp,
@@ -186,7 +193,11 @@ const compileOpCondition = (
 ): ExpressionResult | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>)
-  return compileExpr(expr, entity._resolveDbName) as ExpressionResult
+  // Its operands in the form the attribute holds, as the entity's own write sends them (#242).
+  return compileExpr(
+    operandsAsStored(expr, entity._storedFormAt),
+    entity._resolveDbName,
+  ) as ExpressionResult
 }
 
 /**

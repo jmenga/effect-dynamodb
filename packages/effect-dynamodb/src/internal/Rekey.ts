@@ -222,6 +222,7 @@ export interface RekeyTally {
   readonly unchanged?: number | undefined
   readonly moved?: Partial<Record<RekeyRowKind, number>> | undefined
   readonly indexKeysRewritten?: number | undefined
+  readonly zonesRewritten?: number | undefined
   readonly sentinelsMoved?: number | undefined
   readonly indexKeys?: Partial<RekeyIndexKeys> | undefined
   /** Unique sentinels no row holds, or that couldn't be judged, each by its outcome. */
@@ -434,6 +435,7 @@ interface MutableMember {
   unchanged: number
   moved: MutableCounts
   indexKeysRewritten: number
+  zonesRewritten: number
   sentinelsMoved: number
   indexKeys: MutableIndexKeys
   reservations: MutableReservations
@@ -489,6 +491,7 @@ class Totals {
   unchanged = 0
   moved = zeroCounts()
   indexKeysRewritten = 0
+  zonesRewritten = 0
   sentinelsMoved = 0
   indexKeys = zeroIndexKeys()
   reservations = zeroReservations()
@@ -514,6 +517,7 @@ class Totals {
       unchanged: 0,
       moved: zeroCounts(),
       indexKeysRewritten: 0,
+      zonesRewritten: 0,
       sentinelsMoved: 0,
       indexKeys: zeroIndexKeys(),
       reservations: zeroReservations(),
@@ -536,6 +540,9 @@ class Totals {
     const rewritten = tally.indexKeysRewritten ?? 0
     this.indexKeysRewritten += rewritten
     if (into !== undefined) into.indexKeysRewritten += rewritten
+    const zones = tally.zonesRewritten ?? 0
+    this.zonesRewritten += zones
+    if (into !== undefined) into.zonesRewritten += zones
     const sentinels = tally.sentinelsMoved ?? 0
     this.sentinelsMoved += sentinels
     if (into !== undefined) into.sentinelsMoved += sentinels
@@ -591,6 +598,7 @@ class Totals {
         unchanged: m.unchanged,
         moved: { ...m.moved },
         indexKeysRewritten: m.indexKeysRewritten,
+        zonesRewritten: m.zonesRewritten,
         sentinelsMoved: m.sentinelsMoved,
         indexKeys: { ...m.indexKeys },
         reservations: { ...m.reservations },
@@ -604,6 +612,7 @@ class Totals {
       unchanged: this.unchanged,
       moved: { ...this.moved } as RekeyCounts,
       indexKeysRewritten: this.indexKeysRewritten,
+      zonesRewritten: this.zonesRewritten,
       sentinelsMoved: this.sentinelsMoved,
       indexKeys: { ...this.indexKeys },
       // By member, then key: the same whatever order the run met them.
@@ -1922,12 +1931,14 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
   const guardGapRows: Array<RekeyGuardGapRow> = []
   let unchanged = 0
   let indexKeysRewritten = 0
+  let zonesRewritten = 0
   let sentinelsMoved = 0
   let worked = false
   for (const tally of tallies) {
     worked ||= tally.worked === true
     unchanged += tally.unchanged ?? 0
     indexKeysRewritten += tally.indexKeysRewritten ?? 0
+    zonesRewritten += tally.zonesRewritten ?? 0
     sentinelsMoved += tally.sentinelsMoved ?? 0
     for (const count of INDEX_KEY_COUNTS) {
       const n = tally.indexKeys?.[count]
@@ -1953,6 +1964,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     ...(unchanged > 0 && { unchanged }),
     ...(Object.keys(moved).length > 0 && { moved }),
     ...(indexKeysRewritten > 0 && { indexKeysRewritten }),
+    ...(zonesRewritten > 0 && { zonesRewritten }),
     ...(sentinelsMoved > 0 && { sentinelsMoved }),
     ...(Object.keys(indexKeys).length > 0 && { indexKeys }),
     ...(reservations.length > 0 && { reservations }),
