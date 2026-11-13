@@ -398,33 +398,37 @@ describe("rekey from a table a run cut short left part-moved finishes it in one 
   for (const segments of [1, 2, 3, 5]) {
     for (const seed of [0, 1, 2, 3]) {
       for (const concurrency of [1, 4]) {
-        it.effect(`${segments} segment(s), order ${seed}, ${concurrency} at once`, () =>
-          Effect.gen(function* () {
-            const written = yield* writtenOff
-            const finished = yield* runOn(written, { segments: 1, concurrency: 1 }, 0)
-            expect(finished.real.conflicts).toEqual([])
-            const cut = { segments: 6 - segments, concurrency: 5 - concurrency }
-            let after = 0
-            for (; ; after++) {
-              const start = yield* cutShort(written, after, cut, scanOrder(seed + 1))
-              if (start === undefined) break
-              const runs = yield* runOn(start, { segments, concurrency }, seed)
-              const at = `cut after ${after} write(s)`
-              expect(runs.untouched, at).toEqual(storedOf(start))
-              expect(decided(runs.dry), at).toEqual(decided(runs.real))
-              expect(runs.real.conflicts, at).toEqual([])
-              expect(runs.real.scanned, at).toBe(start.length)
-              expect(runs.after, at).toEqual(finished.after)
-              expect(
-                Object.values(runs.again.moved).every((n) => n === 0),
-                at,
-              ).toBe(true)
-              expect(runs.again.sentinelsMoved, at).toBe(0)
-              expect(runs.again.conflicts, at).toEqual([])
-            }
-            // A run sends a write or more for each unit: the run was cut at each.
-            expect(after).toBeGreaterThan(20)
-          }),
+        it.effect(
+          `${segments} segment(s), order ${seed}, ${concurrency} at once`,
+          () =>
+            Effect.gen(function* () {
+              const written = yield* writtenOff
+              const finished = yield* runOn(written, { segments: 1, concurrency: 1 }, 0)
+              expect(finished.real.conflicts).toEqual([])
+              const cut = { segments: 6 - segments, concurrency: 5 - concurrency }
+              let after = 0
+              for (; ; after++) {
+                const start = yield* cutShort(written, after, cut, scanOrder(seed + 1))
+                if (start === undefined) break
+                const runs = yield* runOn(start, { segments, concurrency }, seed)
+                const at = `cut after ${after} write(s)`
+                expect(runs.untouched, at).toEqual(storedOf(start))
+                expect(decided(runs.dry), at).toEqual(decided(runs.real))
+                expect(runs.real.conflicts, at).toEqual([])
+                expect(runs.real.scanned, at).toBe(start.length)
+                expect(runs.after, at).toEqual(finished.after)
+                expect(
+                  Object.values(runs.again.moved).every((n) => n === 0),
+                  at,
+                ).toBe(true)
+                expect(runs.again.sentinelsMoved, at).toBe(0)
+                expect(runs.again.conflicts, at).toEqual([])
+              }
+              // A run sends a write or more for each unit: the run was cut at each.
+              expect(after).toBeGreaterThan(20)
+            }),
+          // Three runs from each of 20-odd cuts: up to a second here, several times that on CI.
+          30_000,
         )
       }
     }

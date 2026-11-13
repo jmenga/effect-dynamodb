@@ -129,25 +129,29 @@ describe("rekey's journal", () => {
     120_000,
   )
 
-  it.effect("under its capacity, counts exactly what it moved and met", () =>
-    Effect.gen(function* () {
-      const on = world()
-      const table = tableToMove(3_000)
-      const report = yield* Effect.gen(function* () {
-        const db = yield* on.client
-        return yield* db.tables.MainTable.rekey({ pageSize: 100 })
-      }).pipe(Effect.provide(Layer.merge(table.layer, on.MainTable.layer({ name: "t" }))))
-      expect(report).toMatchObject({
-        scanned: 3_000,
-        unchanged: 0,
-        moved: { item: 3_000 },
-        conflicts: [],
-        journal: { capacity: 1_000_000, full: false, inexact: [] },
-      })
-      expect(keysOf(table.items.values())).toEqual(
-        keysOf(Array.from({ length: 3_000 }, (_, n) => itemRow(n, true))),
-      )
-    }),
+  it.effect(
+    "under its capacity, counts exactly what it moved and met",
+    () =>
+      Effect.gen(function* () {
+        const on = world()
+        const table = tableToMove(3_000)
+        const report = yield* Effect.gen(function* () {
+          const db = yield* on.client
+          return yield* db.tables.MainTable.rekey({ pageSize: 100 })
+        }).pipe(Effect.provide(Layer.merge(table.layer, on.MainTable.layer({ name: "t" }))))
+        expect(report).toMatchObject({
+          scanned: 3_000,
+          unchanged: 0,
+          moved: { item: 3_000 },
+          conflicts: [],
+          journal: { capacity: 1_000_000, full: false, inexact: [] },
+        })
+        expect(keysOf(table.items.values())).toEqual(
+          keysOf(Array.from({ length: 3_000 }, (_, n) => itemRow(n, true))),
+        )
+      }),
+    // 3,000 rows: under a second here, several times that on CI.
+    30_000,
   )
 
   it.effect(
@@ -211,6 +215,8 @@ describe("rekey's journal", () => {
           journal: { capacity: 100, used: 0, full: false, inexact: [] },
         })
       }),
+    // 3,000 rows, three runs: under a second here, several times that on CI.
+    30_000,
   )
 
   it.effect(
