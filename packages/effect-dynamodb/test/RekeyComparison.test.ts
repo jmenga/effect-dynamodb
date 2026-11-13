@@ -13,6 +13,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { indexesOf } from "./helpers/DynamoExpressions.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import {
   clientOf,
@@ -33,13 +34,7 @@ import {
 
 const harness: Harness = {
   on: (world, body) => {
-    const indexes: Record<string, { readonly pk: string; readonly sk: string }> = {}
-    for (const index of Object.values<KeyComposer.IndexDefinition>(world.Rows.indexes)) {
-      if (index.index !== undefined) {
-        indexes[index.index] = { pk: index.pk.field, sk: index.sk.field }
-      }
-    }
-    const table = makeRecordingTable({ indexes })
+    const table = makeRecordingTable({ indexes: indexesOf(Table.definition(world.MainTable)) })
     return Effect.gen(function* () {
       const db = yield* clientOf(world)
       return yield* body(db, {

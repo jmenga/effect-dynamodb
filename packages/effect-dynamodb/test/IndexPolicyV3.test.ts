@@ -41,9 +41,10 @@ import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as Clears from "./helpers/ClearScenarios.js"
+import { indexesOf } from "./helpers/DynamoExpressions.js"
 import { applyUpdate, mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
-import { harnessOn, RECORDING_INDEXES } from "./helpers/RekeyRepair.js"
+import { harnessOn } from "./helpers/RekeyRepair.js"
 import * as StampedComposites from "./helpers/StampedComposites.js"
 
 // ---------------------------------------------------------------------------
@@ -2976,7 +2977,7 @@ describe("a cleared composite, by canonical GSI-composite shape", () => {
     form: (typeof Clears.FORMS)[number],
   ) => {
     const world = Clears.shapedWorld(shape.index, policy, path.options)
-    const table = makeRecordingTable({ indexes: { gsi: { pk: "gpk", sk: "gsk" } } })
+    const table = makeRecordingTable({ indexes: indexesOf(Table.definition(world.MainTable)) })
     return Effect.gen(function* () {
       const db = yield* Clears.clientOf(world)
       yield* db.entities.Rows.put(Clears.shapedSeed).asEffect()
@@ -3019,8 +3020,8 @@ describe("a cleared composite, by canonical GSI-composite shape", () => {
 // ---------------------------------------------------------------------------
 
 describe("index keys over values the library stamps", () => {
-  const harness = harnessOn(() => {
-    const table = makeRecordingTable({ indexes: RECORDING_INDEXES })
+  const harness = harnessOn((world) => {
+    const table = makeRecordingTable({ indexes: indexesOf(Table.definition(world.MainTable)) })
     return { tableName: "t", client: table.layer, acquire: Effect.void, release: Effect.void }
   })
   for (const [name, scenarios] of StampedComposites.ALL_SCENARIOS) {

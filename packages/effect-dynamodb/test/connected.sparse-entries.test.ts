@@ -203,46 +203,49 @@ describeConnected(
     // Every operation that changes one entry by its attribute's name, on a plain, a retained and a
     // unique entity, with the entry present and absent, under an ordinary key and under the names
     // every object inherits. The update that reads the row and writes it whole looked an entry up
-    // on a plain object.
+    // on a plain object. One test per world and key, each sending 70 to 140 requests: all six keys
+    // in one test were 435 to 849 requests, and went over the 30 s budget when other suites shared
+    // DynamoDB Local and the machine (#243).
     const raw = new DynamoDBClient({ region: "us-east-1", endpoint: ENDPOINT, credentials })
     for (const world of WORLDS) {
-      it.effect(`on a ${world} entity`, () => {
-        const Docs = Lib.Entity.make({
-          entityType: "Doc",
-          primaryKey: entryKey,
-          model: counted(Lib as never),
-          ...(world === "retain" ? { versioned: { retain: true } } : {}),
-          ...(world === "unique" ? { unique: { note: ["note"] } } : {}),
-        } as never) as any
-        const MainTable = Lib.Table.make({
-          schema: Lib.DynamoSchema.make({ name: "ops", version: 1 }),
-          entities: { Docs },
-        } as never) as any
-        const tableName = `sparse-entry-ops-${Date.now()}-${tables++}`
-        return Effect.acquireUseRelease(
-          Effect.gen(function* () {
-            const client = yield* Lib.DynamoClient
-            yield* client.createTable({
-              TableName: tableName,
-              BillingMode: "PAY_PER_REQUEST",
-              KeySchema: [
-                { AttributeName: "pk", KeyType: "HASH" },
-                { AttributeName: "sk", KeyType: "RANGE" },
-              ],
-              AttributeDefinitions: [
-                { AttributeName: "pk", AttributeType: "S" },
-                { AttributeName: "sk", AttributeType: "S" },
-              ],
-            })
-          }),
-          () =>
+      for (const key of KEYS) {
+        it.effect(`on a ${world} entity, the entry \`${key}\``, () => {
+          const Docs = Lib.Entity.make({
+            entityType: "Doc",
+            primaryKey: entryKey,
+            model: counted(Lib as never),
+            ...(world === "retain" ? { versioned: { retain: true } } : {}),
+            ...(world === "unique" ? { unique: { note: ["note"] } } : {}),
+          } as never) as any
+          const MainTable = Lib.Table.make({
+            schema: Lib.DynamoSchema.make({ name: "ops", version: 1 }),
+            entities: { Docs },
+          } as never) as any
+          const tableName = `sparse-entry-ops-${Date.now()}-${tables++}`
+          return Effect.acquireUseRelease(
             Effect.gen(function* () {
-              const db: any = yield* Lib.DynamoClient.make({
-                entities: { Docs },
-                tables: { MainTable },
-              } as never)
-              let n = 0
-              for (const key of KEYS) {
+              const client = yield* Lib.DynamoClient
+              yield* client.createTable({
+                TableName: tableName,
+                BillingMode: "PAY_PER_REQUEST",
+                KeySchema: [
+                  { AttributeName: "pk", KeyType: "HASH" },
+                  { AttributeName: "sk", KeyType: "RANGE" },
+                ],
+                AttributeDefinitions: [
+                  { AttributeName: "pk", AttributeType: "S" },
+                  { AttributeName: "sk", AttributeType: "S" },
+                ],
+              })
+            }),
+            () =>
+              Effect.gen(function* () {
+                const db: any = yield* Lib.DynamoClient.make({
+                  entities: { Docs },
+                  tables: { MainTable },
+                } as never)
+                // The ids this key had when one test ran every key, so the requests are the same.
+                let n = KEYS.indexOf(key) * ENTRY_OPS.length * 2
                 for (const op of ENTRY_OPS) {
                   for (const present of [true, false]) {
                     const id = `a${n++}`
@@ -288,19 +291,19 @@ describeConnected(
                     expect(Exit.isSuccess(read) ? "read" : `${label}: not read back`).toBe("read")
                   }
                 }
-              }
-            }),
-          () =>
-            Effect.gen(function* () {
-              const client = yield* Lib.DynamoClient
-              yield* client.deleteTable({ TableName: tableName })
-            }).pipe(Effect.ignore),
-        ).pipe(
-          Effect.provide(
-            Layer.merge(ClientLayer, MainTable.layer({ name: tableName }) as Layer.Layer<never>),
-          ),
-        ) as Effect.Effect<void, unknown>
-      })
+              }),
+            () =>
+              Effect.gen(function* () {
+                const client = yield* Lib.DynamoClient
+                yield* client.deleteTable({ TableName: tableName })
+              }).pipe(Effect.ignore),
+          ).pipe(
+            Effect.provide(
+              Layer.merge(ClientLayer, MainTable.layer({ name: tableName }) as Layer.Layer<never>),
+            ),
+          ) as Effect.Effect<void, unknown>
+        })
+      }
     }
   },
 )

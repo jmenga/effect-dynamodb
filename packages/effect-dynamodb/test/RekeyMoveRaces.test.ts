@@ -9,6 +9,7 @@ import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import * as RekeyMoveRaces from "./helpers/RekeyMoveRaces.js"
 import * as RekeyRepair from "./helpers/RekeyRepair.js"
 
+// The fixture's tables: a table key and nothing else, as on DynamoDB Local.
 const harness = RekeyRepair.harnessOn(() => {
   const table = makeRecordingTable()
   return { tableName: "t", client: table.layer, acquire: Effect.void, release: Effect.void }

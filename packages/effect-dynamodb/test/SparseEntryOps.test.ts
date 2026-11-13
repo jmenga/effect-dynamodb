@@ -1,6 +1,8 @@
 /**
  * Operations on a sparse map's entries, against what the published 1.39.0 did
- * (`fixtures/sparse-entry-ops-1.39.0.json`, from `helpers/SparseEntryOps.ts`).
+ * (`fixtures/sparse-entry-ops-1.39.0.json`, from `helpers/SparseEntryOps.ts`), and the requests
+ * the published 1.40.0 sent (`fixtures/sparse-entry-ops-requests-1.40.0.json`): every case sends
+ * them, whole, unless `OVERRIDES` says why not and which it sends instead, whole.
  *
  * - **Every entry operation reaches the entry, whatever its key is called.** The record and the
  *   path operations, on a plain, a retained and a unique entity, alone and in a transaction, with
@@ -19,21 +21,68 @@
 import { readFileSync } from "node:fs"
 import { it } from "@effect/vitest"
 import { Effect } from "effect"
-import { afterEach, beforeEach, describe, expect, vi } from "vitest"
+import { afterAll, afterEach, beforeEach, describe, expect, vi } from "vitest"
 import * as Lib from "../src/index.js"
 import {
-  capture,
+  type Case,
+  captureWithRequests,
   cases,
   conditional,
   entryOps,
   type Outcome,
   refRead,
+  type SentRequest,
   ttlNamed,
 } from "./helpers/SparseEntryOps.js"
 
 const fixture = JSON.parse(
   readFileSync(new URL("./fixtures/sparse-entry-ops-1.39.0.json", import.meta.url), "utf8"),
 ) as { readonly cases: Record<string, Outcome> }
+
+/** Every request the published 1.40.0 sent for each case, whole (captured once; never regenerate it). */
+const sent140 = JSON.parse(
+  readFileSync(
+    new URL("./fixtures/sparse-entry-ops-requests-1.40.0.json", import.meta.url),
+    "utf8",
+  ),
+) as { readonly cases: Record<string, ReadonlyArray<SentRequest>> }
+
+/**
+ * Cases whose requests differ from the ones 1.40.0 sent: each with the reason, and the requests it
+ * sends instead, whole. None does.
+ */
+const OVERRIDES: Readonly<
+  Record<string, { readonly reason: string; readonly requests: ReadonlyArray<SentRequest> }>
+> = {}
+
+type Overrides = typeof OVERRIDES
+
+/**
+ * The overrides, and which of them the run used. An override whose case never runs (skipped,
+ * filtered out, or in no group below) fails the file when it ends (`afterAll`), so none stands
+ * unchecked; a run filtered to other cases fails there too.
+ */
+const overridesOf = (overrides: Overrides) => {
+  const used = new Set<string>()
+  return {
+    take: (key: string) => {
+      if (!Object.hasOwn(overrides, key)) return undefined
+      used.add(key)
+      return overrides[key]
+    },
+    unused: () => Object.keys(overrides).filter((key) => !used.has(key)),
+  }
+}
+const overrides = overridesOf(OVERRIDES)
+
+/** Runs a case, checking it sends 1.40.0's requests, whole, or its override's, whole. */
+const capture = (each: Case) =>
+  Effect.map(captureWithRequests(Lib as never, each), ({ outcome, requests }) => {
+    const override = overrides.take(each.key)
+    if (override === undefined) expect(requests).toEqual(sent140.cases[each.key])
+    else expect(requests, override.reason).toEqual(override.requests)
+    return outcome
+  })
 
 beforeEach(() => {
   // The fixture was captured with the clock and the random bytes fixed.
@@ -46,9 +95,31 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks()
 })
+afterAll(() => {
+  expect(overrides.unused(), "overrides whose case never ran").toEqual([])
+})
 
-it("the fixture holds every case", () => {
+it("the fixtures hold every case", () => {
   expect(Object.keys(fixture.cases)).toEqual(cases.map((each) => each.key))
+  expect(Object.keys(sent140.cases)).toEqual(cases.map((each) => each.key))
+})
+
+it("every override names a case, with its reason and requests that differ from 1.40.0's", () => {
+  for (const [key, { reason, requests }] of Object.entries(OVERRIDES)) {
+    expect(Object.hasOwn(sent140.cases, key), key).toBe(true)
+    expect(reason.length, key).toBeGreaterThan(0)
+    expect(requests, key).not.toEqual(sent140.cases[key])
+  }
+})
+
+it("an override whose case never runs is left unused, and fails the file", () => {
+  const [first, second] = [cases[0]!.key, cases[1]!.key]
+  const override = { reason: "a reason", requests: [] }
+  const tracked = overridesOf({ [first]: override, [second]: override })
+  expect(tracked.unused()).toEqual([first, second])
+  expect(tracked.take(first)).toBe(override)
+  expect(tracked.take("not an override")).toBeUndefined()
+  expect(tracked.unused()).toEqual([second])
 })
 
 describe("an entry operation reaches the entry, whatever its key is called", () => {
@@ -56,9 +127,20 @@ describe("an entry operation reaches the entry, whatever its key is called", () 
     it.live(each.key, () =>
       Effect.gen(function* () {
         const was = fixture.cases[each.key]!
-        const got = yield* capture(Lib as never, each)
-        if (each.expected === undefined) {
-          // DynamoDB refuses the operation on an attribute that isn't there: as on 1.39.0.
+        const got = yield* capture(each)
+        // Sent as an expression, an operation reading an entry the row doesn't hold is refused by
+        // DynamoDB ("The provided expression refers to an attribute that does not exist in the
+        // item"), and now by the recording table as DynamoDB Local refuses it (#243). The 1.39.0
+        // fixture recorded a table that took the update: 1.39.0 sent the same commands up to that
+        // one, and 1.40.0 the same requests, whole (`capture`).
+        const refused = each.expected === undefined && !each.whole
+        if (refused) {
+          const last = got.commands[got.commands.length - 1]
+          expect(got).toMatchObject({ ok: false, error: `DynamoValidationError ${last}` })
+          expect(got.commands).toEqual(was.commands.slice(0, got.commands.length))
+          expect(got.stored).toBeUndefined()
+        } else if (each.expected === undefined) {
+          // Written whole, the row takes it, as on 1.39.0.
           expect(got.ok).toBe(was.ok)
           if (got.ok) expect(got.stored).toEqual(was.stored)
         } else {
@@ -73,7 +155,9 @@ describe("an entry operation reaches the entry, whatever its key is called", () 
           got.stored !== undefined,
         )
         // Sent as an expression, the operation sends what 1.39.0 sent.
-        if (!each.whole) expect({ ...got, read: undefined }).toEqual({ ...was, read: undefined })
+        if (!each.whole && !refused) {
+          expect({ ...got, read: undefined }).toEqual({ ...was, read: undefined })
+        }
       }),
     )
   }
@@ -95,7 +179,7 @@ describe("an operation carrying an entry key it writes only into some rows ends 
   for (const each of conditional) {
     it.live(each.key, () =>
       Effect.gen(function* () {
-        expect(yield* capture(Lib as never, each)).toEqual(fixture.cases[each.key])
+        expect(yield* capture(each)).toEqual(fixture.cases[each.key])
       }),
     )
   }
@@ -106,7 +190,7 @@ describe("a write that reads a ref first refuses an entry key before that read",
     it.live(each.key, () =>
       Effect.gen(function* () {
         const was = fixture.cases[each.key]!
-        const got = yield* capture(Lib as never, each)
+        const got = yield* capture(each)
         // 1.39.0 refused it too, after reading the ref (and the row).
         expect(was.ok).toBe(false)
         expect(was.commands.length).toBeGreaterThan(0)
@@ -122,7 +206,7 @@ describe("the table's TTL attribute is the library's only on an entity that writ
       Effect.gen(function* () {
         const was = fixture.cases[each.key]!
         expect(was.ok).toBe(true)
-        expect(yield* capture(Lib as never, each)).toEqual(was)
+        expect(yield* capture(each)).toEqual(was)
       }),
     )
   }

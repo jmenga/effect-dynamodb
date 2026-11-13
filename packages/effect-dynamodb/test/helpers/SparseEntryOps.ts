@@ -2,8 +2,10 @@
  * Operations on a sparse map's entries, and what the published 1.39.0 did for each.
  *
  * `test/fixtures/sparse-entry-ops-1.39.0.json` holds, for every case here, what 1.39.0 stored and
- * how the operation ended, captured by running `capture` against it. `test/SparseEntryOps.test.ts`
- * runs the same cases against this source.
+ * how the operation ended, captured by running `capture` against it.
+ * `test/fixtures/sparse-entry-ops-requests-1.40.0.json` holds every request the published 1.40.0
+ * sent for each case, whole, captured by running `captureWithRequests` against it.
+ * `test/SparseEntryOps.test.ts` runs the same cases against this source.
  *
  * - `entryOps`: every operation that changes one entry by its attribute's name (the record
  *   operations and the path operations), on a plain, a retained and a unique entity, alone and
@@ -68,7 +70,19 @@ export interface Case {
   readonly attribute?: string
 }
 
-const run = (api: Api, each: Case): Effect.Effect<Outcome> => {
+/** A request as sent, as a fixture holds it. */
+export interface SentRequest {
+  readonly command: string
+  readonly input: unknown
+}
+
+/** What an operation did, and every request it sent. */
+export interface Captured {
+  readonly outcome: Outcome
+  readonly requests: ReadonlyArray<SentRequest>
+}
+
+const run = (api: Api, each: Case): Effect.Effect<Captured> => {
   const table = makeRecordingTable()
   return Effect.suspend(() => {
     // The others first: an entity with a ref names one of them.
@@ -92,10 +106,11 @@ const run = (api: Api, each: Case): Effect.Effect<Outcome> => {
       if (row !== undefined) each.inject?.(row)
       table.take()
       const exit = yield* Effect.exit(Effect.suspend(() => each.run(db, api)))
-      const commands = table.take().map((request) => request.command)
+      const sent = table.take()
+      const commands = sent.map((request) => request.command)
       const read = yield* Effect.exit(db.entities.Docs.get({ id: "a" }))
       const failure = Exit.isFailure(exit) ? (Cause.squash(exit.cause) as any) : undefined
-      return plain({
+      const outcome = plain({
         ok: Exit.isSuccess(exit),
         ...(failure === undefined
           ? {}
@@ -106,6 +121,7 @@ const run = (api: Api, each: Case): Effect.Effect<Outcome> => {
         ...(each.attribute === undefined ? {} : { stored: live()?.[each.attribute] }),
         ...(Exit.isSuccess(read) ? { read: read.value } : {}),
       }) as Outcome
+      return { outcome, requests: plain(sent) }
     }).pipe(
       Effect.provide(
         Main.layer({
@@ -121,20 +137,30 @@ const run = (api: Api, each: Case): Effect.Effect<Outcome> => {
         ),
       ),
     )
-  }) as unknown as Effect.Effect<Outcome>
+  }) as unknown as Effect.Effect<Captured>
 }
 
-/** Runs a case, and returns what it did. A definition the library refuses is an outcome too. */
-export const capture = (api: Api, each: Case): Effect.Effect<Outcome> =>
+/**
+ * Runs a case, and returns what it did and every request it sent. A definition the library refuses
+ * is an outcome too, sending nothing.
+ */
+export const captureWithRequests = (api: Api, each: Case): Effect.Effect<Captured> =>
   run(api, each).pipe(
     Effect.catchCause((cause) =>
       Effect.succeed({
-        ok: false,
-        error: `defect ${String(Cause.squash(cause)).slice(0, 80)}`,
-        commands: [],
+        outcome: {
+          ok: false,
+          error: `defect ${String(Cause.squash(cause)).slice(0, 80)}`,
+          commands: [],
+        },
+        requests: [],
       }),
     ),
-  ) as Effect.Effect<Outcome>
+  ) as Effect.Effect<Captured>
+
+/** Runs a case, and returns what it did. */
+export const capture = (api: Api, each: Case): Effect.Effect<Outcome> =>
+  Effect.map(captureWithRequests(api, each), (captured) => captured.outcome)
 
 // ---------------------------------------------------------------------------
 // Entry operations

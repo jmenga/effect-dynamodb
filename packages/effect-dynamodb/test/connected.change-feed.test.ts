@@ -192,10 +192,36 @@ const balanceOf = (accountId: string) =>
     return yield* db.entities.Balances.get({ accountId }).asEffect()
   })
 
+const ledgerTotalOf = (ledgerId: string) =>
+  Effect.gen(function* () {
+    const db = yield* DynamoClient.make({ entities: { LedgerTotals } })
+    return yield* db.entities.LedgerTotals.get({ ledgerId }).asEffect()
+  })
+
 const checkpointOf = (consumer: string) =>
   Effect.gen(function* () {
     const store = yield* CheckpointStore
     return yield* store.load({ streamArn, consumer })
+  })
+
+/** The sequence number the consumer's one shard is checkpointed at, if any. */
+const committedAt = (consumer: string) =>
+  Effect.map(checkpointOf(consumer), (checkpoints) => {
+    const [checkpoint] = [...checkpoints.values()]
+    return checkpoint?._tag === "Sequence" ? checkpoint.sequenceNumber : undefined
+  })
+
+const leaseOf = (consumer: string) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const { Item } = yield* client.getItem({
+      TableName: checkpointTableName,
+      Key: { pk: { S: `${consumer}#${streamArn}` }, sk: { S: "lease" } },
+      ConsistentRead: true,
+    })
+    return Item === undefined
+      ? undefined
+      : { owner: Item.owner?.S, expiresAt: Number(Item.expiresAt?.N) }
   })
 
 /** The first batch, committed. */
@@ -263,49 +289,69 @@ describeConnected("change feed (connected)", () => {
     }).pipe(provide),
   )
 
-  it.live("projects the feed, then resumes after a restart from the DynamoDB checkpoints", () =>
+  /**
+   * Run the feed into the projections, stop it, write while no consumer runs, and run it again:
+   * the restart reads from the DynamoDB checkpoint on. A run is stopped only once what the test
+   * asserts next has happened, never on the read model alone: the projections write the read
+   * model before `onBatch` runs and before the batch is committed, so a run stopped as soon as
+   * the read model shows an event can stop before `onBatch` has seen it or its checkpoint is
+   * written. `onBatch` is slowed by `onBatchDelay`, to hold that window open.
+   */
+  const restartScenario = (options: {
+    readonly consumer: string
+    readonly accounts: readonly [string, string]
+    readonly ledger: string
+    readonly onBatchDelay: Duration.Input
+  }) =>
     Effect.gen(function* () {
+      const { consumer, ledger } = options
+      const [account, other] = options.accounts
       yield* Accounts.append(
-        { accountId: "a1" },
+        { accountId: account },
         [new Opened({ owner: "ada" }), new Deposited({ amount: 5 })],
         0,
       )
-      yield* Accounts.append({ accountId: "a2" }, [new Opened({ owner: "bo" })], 0)
+      yield* Accounts.append({ accountId: other }, [new Opened({ owner: "bo" })], 0)
       yield* Ledgers.append(
-        { ledgerId: "l1" },
+        { ledgerId: ledger },
         [new Deposited({ amount: 7 }), new Deposited({ amount: 8 })],
         0,
       )
 
       const seen: Array<string> = []
       const run = () =>
-        runChangeFeed(changeFeed(feedOptions()), {
+        runChangeFeed(changeFeed(feedOptions(consumer)), {
           projections,
           onBatch: (batch: ChangeFeedBatch, result) =>
-            Effect.sync(() => {
-              expect(result.response.batchItemFailures).toEqual([])
-              for (const r of batch.records) seen.push(r.dynamodb!.SequenceNumber!)
-            }),
+            Effect.sleep(options.onBatchDelay).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  expect(result.response.batchItemFailures).toEqual([])
+                  for (const r of batch.records) seen.push(r.dynamodb!.SequenceNumber!)
+                }),
+              ),
+            ),
         }).pipe(Effect.forkChild)
 
-      // First run.
+      // First run: every event projected, and a checkpoint committed at a batch `onBatch` saw.
       const first = yield* run()
       yield* eventually(
-        balanceOf("a1").pipe(
-          Effect.map((b) => b.balance === 5),
-          Effect.orElseSucceed(() => false),
-        ),
-      )
-      yield* eventually(
         Effect.gen(function* () {
-          const db = yield* DynamoClient.make({ entities: { LedgerTotals } })
-          const total = yield* db.entities.LedgerTotals.get({ ledgerId: "l1" }).asEffect()
-          return total.total === 15
-        }).pipe(Effect.orElseSucceed(() => false)),
+          const projected = yield* Effect.all([
+            balanceOf(account),
+            balanceOf(other),
+            ledgerTotalOf(ledger),
+          ]).pipe(
+            Effect.map(([a, b, l]) => a.balance === 5 && b.version === 1 && l.total === 15),
+            Effect.orElseSucceed(() => false),
+          )
+          const at = yield* committedAt(consumer)
+          return projected && at !== undefined && seen.includes(at)
+        }),
       )
-      expect(yield* balanceOf("a2")).toMatchObject({ owner: "bo", version: 1 })
+      expect(yield* balanceOf(other)).toMatchObject({ owner: "bo", version: 1 })
       yield* Fiber.interrupt(first)
-      const checkpoints = yield* checkpointOf("projections")
+      const checkpoints = yield* checkpointOf(consumer)
       expect(checkpoints.size).toBe(1)
       const [checkpoint] = [...checkpoints.values()]
       expect(checkpoint?._tag).toBe("Sequence")
@@ -313,22 +359,45 @@ describeConnected("change feed (connected)", () => {
       expect(seen).toContain(committed)
 
       // Written while no consumer runs.
-      yield* Accounts.append({ accountId: "a1" }, [new Deposited({ amount: 10 })], 2)
+      yield* Accounts.append({ accountId: account }, [new Deposited({ amount: 10 })], 2)
       const before = seen.length
 
-      // Restart: reads from the checkpoint on, not from the trim horizon.
+      // Restart: reads from the checkpoint on, not from the trim horizon. Stopped once the
+      // deposit is projected and the restarted run has committed a checkpoint past `committed`,
+      // which it does only after `onBatch` has seen that batch.
       const second = yield* run()
       yield* eventually(
-        balanceOf("a1").pipe(
-          Effect.map((b) => b.balance === 15),
-          Effect.orElseSucceed(() => false),
-        ),
+        Effect.gen(function* () {
+          const balance = yield* balanceOf(account).pipe(
+            Effect.map((b) => b.balance),
+            Effect.orElseSucceed(() => 0),
+          )
+          const at = yield* committedAt(consumer)
+          return balance === 15 && at !== undefined && BigInt(at) > BigInt(committed)
+        }),
       )
       yield* Fiber.interrupt(second)
       const resumed = seen.slice(before)
       expect(resumed.length).toBeGreaterThan(0)
       for (const sequence of resumed) expect(BigInt(sequence) > BigInt(committed)).toBe(true)
-      expect(yield* balanceOf("a1")).toMatchObject({ owner: "ada", balance: 15, version: 3 })
+      expect(yield* balanceOf(account)).toMatchObject({ owner: "ada", balance: 15, version: 3 })
+    })
+
+  it.live("projects the feed, then resumes after a restart from the DynamoDB checkpoints", () =>
+    restartScenario({
+      consumer: "projections",
+      accounts: ["a1", "a2"],
+      ledger: "l1",
+      onBatchDelay: Duration.zero,
+    }).pipe(provide),
+  )
+
+  it.live("resumes after a restart the same way when onBatch is slower than the read model", () =>
+    restartScenario({
+      consumer: "projections-slow",
+      accounts: ["s1", "s2"],
+      ledger: "sl1",
+      onBatchDelay: "250 millis",
     }).pipe(provide),
   )
 
@@ -338,8 +407,8 @@ describeConnected("change feed (connected)", () => {
       const holder = yield* runChangeFeed(changeFeed(feedOptions("leased")), { projections }).pipe(
         Effect.forkChild,
       )
-      // The holder has taken the lease and started reading.
-      yield* Effect.sleep("500 millis")
+      // The holder has taken the lease.
+      yield* eventually(Effect.map(leaseOf("leased"), (lease) => lease !== undefined))
       const refused = yield* runChangeFeed(changeFeed(feedOptions("leased")), { projections }).pipe(
         Effect.exit,
       )
@@ -363,19 +432,6 @@ describeConnected("change feed (connected)", () => {
         DynamoClient.layer({ region: "us-east-1", endpoint: server.endpoint, credentials }),
       ),
     )
-
-  const leaseOf = (consumer: string) =>
-    Effect.gen(function* () {
-      const client = yield* DynamoClient
-      const { Item } = yield* client.getItem({
-        TableName: checkpointTableName,
-        Key: { pk: { S: `${consumer}#${streamArn}` }, sk: { S: "lease" } },
-        ConsistentRead: true,
-      })
-      return Item === undefined
-        ? undefined
-        : { owner: Item.owner?.S, expiresAt: Number(Item.expiresAt?.N) }
-    })
 
   it.live("every renewal hung on the wire is aborted, and the next process takes over", () =>
     Effect.gen(function* () {

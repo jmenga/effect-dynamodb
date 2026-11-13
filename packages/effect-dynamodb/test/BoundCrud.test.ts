@@ -192,7 +192,8 @@ describe("BoundGet", () => {
         entities: { Product: ProductEntity },
         tables: { MainTable },
       })
-      db.entities.Product.get({ productId: "p-1" })
+      const built = db.entities.Product.get({ productId: "p-1" })
+      expect(Effect.isEffect(built)).toBe(true)
       expect(mockGetItem).not.toHaveBeenCalled()
     }).pipe(Effect.provide(TestLayer)),
   )
