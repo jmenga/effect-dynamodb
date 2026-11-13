@@ -16,6 +16,7 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DateTime, Effect, Option, Schema } from "effect"
 import { describe, expect } from "vitest"
+import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
@@ -288,4 +289,75 @@ describe("named zones published 1.40.0 stored as values", () => {
         )
       }),
   )
+})
+
+describe("named, left as 1.40.0: a zone in a sparse map's entry or an aggregate's row", () => {
+  // `rekey` rewrites a zone where the schema puts one in an entity's field. A sparse map's entries
+  // (top-level attributes of their own) and an aggregate's rows under their current keys it leaves
+  // as 1.40.0 stored them on 4.1.3, `resolvedId` included, until they're next written.
+  const Sparse = Entity.make({
+    model: DynamoModel.configure(
+      Schema.Struct({
+        id: Schema.String,
+        zones: Schema.Record(Schema.String, Schema.TimeZoneNamed),
+      }),
+      { zones: { storedAs: DynamoModel.SparseMap() } },
+    ),
+    entityType: "Sparse",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const schema = DynamoSchema.make({ name: "zs", version: 1 })
+  const Base = Table.make({ schema, entities: { Sparse } })
+  const Roots = Aggregate.make(
+    Schema.Struct({ id: Schema.String, tz: Schema.TimeZoneNamed, note: Schema.String }),
+    {
+      table: Base,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "roots" },
+      root: { entityType: "Root" },
+      edges: {},
+    },
+  )
+  const Main = { ...Base, aggregates: { Roots } }
+  const kolkata = () => DateTime.zoneMakeNamedUnsafe("Asia/Kolkata")
+  // The map 1.40.0 stored on 4.1.3: the given name, and `resolvedId`.
+  const as140 = (value: AttributeValue | undefined) => ({
+    M: {
+      ...(value as { M: Record<string, AttributeValue> }).M,
+      id: { S: "Asia/Kolkata" },
+      resolvedId: { S: "Asia/Calcutta" },
+    },
+  })
+
+  it.effect("rekey leaves the zone as it is", () => {
+    const table = makeRecordingTable()
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Sparse },
+        aggregates: { Roots },
+        tables: { Main },
+      } as never) as Effect.Effect<any, never, any>
+      yield* db.entities.Sparse.put({ id: "s", zones: { a: kolkata() } }).asEffect()
+      yield* db.aggregates.Roots.create({ id: "r", tz: kolkata(), note: "n" })
+      const rows = [...table.items.entries()]
+      const [sparseKey, sparseRow] = rows.find(([, row]) => row.__edd_e__?.S === "Sparse")!
+      const [rootKey, rootRow] = rows.find(([, row]) => row.__edd_e__?.S === "Root")!
+      const entry = Object.keys(sparseRow).find((name) => name.startsWith("zones"))!
+      // As this release writes them: the resolved name, no `resolvedId`.
+      for (const written of [sparseRow[entry], rootRow.tz]) {
+        expect(written?.M?.id).toEqual({ S: "Asia/Calcutta" })
+        expect(written?.M?.resolvedId).toBeUndefined()
+      }
+      table.items.set(sparseKey, { ...sparseRow, [entry]: as140(sparseRow[entry]) })
+      table.items.set(rootKey, { ...rootRow, tz: as140(rootRow.tz) })
+      const before = structuredClone([...table.items.entries()])
+      const report = yield* db.tables.Main.rekey({})
+      expect(report.zonesRewritten).toBe(0)
+      expect([...table.items.entries()]).toEqual(before)
+    }).pipe(
+      Effect.provide(Base.layer({ name: "zs" })),
+      Effect.provide(table.layer),
+    ) as Effect.Effect<void, unknown>
+  })
 })
