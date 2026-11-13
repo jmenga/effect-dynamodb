@@ -482,8 +482,10 @@ describe("a session token given to a layer", () => {
 // ---------------------------------------------------------------------------
 // Errors that keep the SDK's error keep its non-enumerable `$response` too, and
 // that reaches the request's headers, session token and `Authorization` included
-// (`$response.body.req`). It is left in place because no exporter sends it: these
-// tests fail if an Effect or SDK upgrade changes that.
+// (`$response.body.req`). It is left in place because Effect's own error
+// rendering, logging and OTLP export don't send it (an application that puts
+// `$response` on a span itself does): these tests fail if an Effect or SDK
+// upgrade changes that.
 // ---------------------------------------------------------------------------
 describe("the SDK's $response on an error that keeps its wording", () => {
   const applicationHandling: Readonly<Record<string, Observed>> = {

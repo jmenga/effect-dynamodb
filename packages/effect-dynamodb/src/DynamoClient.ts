@@ -189,6 +189,7 @@ import {
   type ClientOptionsFromConfig,
   type Credentials,
   readClientOptions,
+  readCredentials,
   sdkCredentials,
 } from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
@@ -1751,11 +1752,14 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
    * @param config.credentials - Optional Config for static credentials, with a
-   *   `sessionToken` when they are temporary (an assumed role). When any part
-   *   is missing from the provider (an empty value counts as missing),
-   *   `credentials` is unset as a whole and the SDK's default credential chain
-   *   applies, which can sign as another identity; to make the token alone
-   *   optional, read it with `Config.withDefault(undefined)`.
+   *   `sessionToken` when they are temporary (an assumed role). With none of
+   *   them in the provider, the SDK's default credential chain applies. With
+   *   one of them there and another missing (an empty value counts as
+   *   missing), the layer fails with the `Config`'s error for what is missing;
+   *   a token that may be absent is read with `Config.withDefault(undefined)`.
+   *   Both must be shown to be parts of the credentials: a value given, or
+   *   one missing, that is a mode, a flag or another setting, or a part the
+   *   `Config` turns into other text, leaves the default chain, as before.
    * @param config.requestHandler - Optional Config for each of the handler's
    *   timeouts (`connectionTimeout`, `socketTimeout`, `requestTimeout`,
    *   `throwOnRequestTimeout`), which an operator tunes per environment, or an
@@ -1789,14 +1793,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
         Effect.gen(function* () {
           const region = yield* config.region
           const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
-          const credentials = config.credentials
-            ? yield* Config.option(config.credentials)
-            : undefined
+          const credentials = yield* readCredentials(config.credentials)
           const options = yield* readClientOptions(config)
           return yield* buildService(
             region,
             endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
-            credentials && credentials._tag === "Some" ? credentials.value : undefined,
+            credentials,
             options,
           )
         }),
