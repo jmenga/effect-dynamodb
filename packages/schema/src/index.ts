@@ -50,6 +50,7 @@ export {
   DynamoValidationError,
   EmbeddingError,
   InternalServerError,
+  ItemAlreadyExists,
   ItemDeleted,
   ItemNotDeleted,
   ItemNotFound,

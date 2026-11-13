@@ -34,6 +34,7 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 - **Change feed outside Lambda** — `effect-dynamodb/change-feed` polls a table's DynamoDB stream as an Effect `Stream` (shard lineage, checkpoints, a lease) and runs it into `EventStore` projections; works against DynamoDB Local.
 - **Packed storage (opt-in)** — store structured fields, event data and snapshot state as one JSON string, compressed (gzip / brotli / zstd) above a threshold, for ~2× faster bulk reads and far fewer write units on large values; readers decode each item by its stored form, so switching needs no rewrite.
 - **Tagged errors** — `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, and more — all `catchTag`-discriminable.
+- **Add-only writes** — `insert` writes through PartiQL `INSERT`, so a role holding only `dynamodb:PartiQLInsert` can add items and IAM stops it changing them.
 - **Stream pagination** — `Stream<A>` from `.paginate()`; the runtime handles DynamoDB's pagination protocol.
 - **Layer-based DI** — physical table names and AWS client config injected via Effect Layers, enabling clean test isolation.
 
@@ -184,7 +185,7 @@ const result = yield* db.entities.Users.get({ userId: "u-1" }).pipe(
 )
 ```
 
-Available errors include `DynamoError`, `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `TransactionOverflow`, `RefNotFound`, `ItemDeleted`, `VersionConflict`, and others — see the [API Reference](https://jmenga.github.io/effect-dynamodb/reference/api-reference) for the complete list.
+Available errors include `DynamoError`, `ItemNotFound`, `ConditionalCheckFailed`, `ItemAlreadyExists`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `TransactionOverflow`, `RefNotFound`, `ItemDeleted`, `VersionConflict`, and others — see the [API Reference](https://jmenga.github.io/effect-dynamodb/reference/api-reference) for the complete list.
 
 ## Examples
 
@@ -209,6 +210,7 @@ npx tsx packages/effect-dynamodb/examples/starter.ts
 | `cricket.ts` | Aggregate CRUD with ref hydration and cascade updates |
 | `event-sourcing.ts` | EventStore with the decider pattern |
 | `guide-packed-storage.ts` | JSON and compressed storage for entity fields and EventStore data |
+| `guide-add-only-writes.ts` | Add-only writes through PartiQL `INSERT` |
 
 ## vs ElectroDB
 

@@ -263,6 +263,21 @@ export const PATHS: ReadonlyArray<Path> = [
     run: (db, _, value) => asEffect(db.entities.Rows.create({ ...id, ...set(value) })),
   },
   {
+    operation: "Entity.insert",
+    name: "insert",
+    run: (db, _, value) => asEffect(db.entities.Rows.insert({ ...id, ...set(value) })),
+  },
+  {
+    operation: "Entity.insert",
+    name: "insert, in a list",
+    run: (db, _, value) => asEffect(db.entities.Rows.insert({ ...id, list: [value] })),
+  },
+  {
+    operation: "Entity.insert",
+    name: "insert, with a unique constraint",
+    run: (db, _, value) => asEffect(db.entities.Unique.insert({ ...id, code: "c", ...set(value) })),
+  },
+  {
     operation: "Entity.upsert",
     name: "upsert",
     run: (db, _, value) => asEffect(db.entities.Rows.upsert({ ...id, ...set(value) })),

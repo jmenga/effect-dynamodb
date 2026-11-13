@@ -200,6 +200,10 @@ export const planWrite = <A, E, R>(
       deleteItem: (input) => record("DeleteItem", [asDelete(input)]),
       transactWriteItems: (input) => record("TransactWriteItems", input.TransactItems ?? []),
       batchWriteItem: () => Effect.die(new UnplannableWrite({ operation })),
+      // A statement can't be recorded as a transaction item, and passing it
+      // through would send a write the plan never sees.
+      executeStatement: () => Effect.die(new UnplannableWrite({ operation })),
+      executeTransaction: () => Effect.die(new UnplannableWrite({ operation })),
     }
     const exit = yield* Effect.exit(effect.pipe(Effect.provideService(DynamoClient, recording)))
     // Checked first: the op may have swallowed the defect, but a plan of only

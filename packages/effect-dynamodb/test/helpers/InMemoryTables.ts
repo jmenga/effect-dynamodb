@@ -50,6 +50,8 @@ export const calls = {
   transactWriteItems: 0,
   updateItem: 0,
   deleteItem: 0,
+  executeStatement: 0,
+  executeTransaction: 0,
 }
 /** Every query's expression values, for asserting the range read. */
 export const queried: Array<Record<string, AttributeValue>> = []
@@ -115,6 +117,22 @@ export const keyOf = (table: string, item: Item) => {
     )
   }
   return [table, ...parts].map((part) => escapePart(part!)).join("|")
+}
+
+/** What a PartiQL `INSERT` writes: names from its text, values from its parameters. */
+export const insertedBy = (statement: {
+  readonly Statement?: string | undefined
+  readonly Parameters?: ReadonlyArray<AttributeValue> | undefined
+}) => {
+  const text = statement.Statement ?? ""
+  const table = /^INSERT INTO "([^"]+)" VALUE \{/.exec(text)?.[1] ?? ""
+  const names = [...text.matchAll(/'((?:[^']|'')*)': \?/g)].map((match) =>
+    (match[1] ?? "").replaceAll("''", "'"),
+  )
+  const item = Object.fromEntries(
+    names.map((name, i) => [name, statement.Parameters?.[i] as AttributeValue]),
+  )
+  return { table, item, key: keyOf(table, item) }
 }
 
 /** The rows `table` holds: those whose store key starts with its name. */
@@ -225,6 +243,44 @@ const operations: Partial<DynamoClientService> = {
         )
         return write("DeleteItem", table, input.Key!, outcome) as never
       }, failure("DeleteItem"))
+    }),
+  executeStatement: (input) =>
+    Effect.suspend(() => {
+      calls.executeStatement++
+      const { item, key } = insertedBy(input)
+      if (store.has(key)) {
+        return Effect.fail(
+          new DynamoError({
+            operation: "ExecuteStatement",
+            cause: Object.assign(new Error("Duplicate primary key exists in table"), {
+              name: "DuplicateItemException",
+            }),
+          }),
+        )
+      }
+      store.set(key, item)
+      return Effect.succeed({} as never)
+    }),
+  executeTransaction: (input) =>
+    Effect.suspend(() => {
+      calls.executeTransaction++
+      const inserts = (input.TransactStatements ?? []).map((statement) => insertedBy(statement))
+      const reasons = inserts.map(({ key }) => ({
+        Code: store.has(key) ? "DuplicateItem" : "None",
+      }))
+      if (reasons.some((reason) => reason.Code !== "None")) {
+        return Effect.fail(
+          new DynamoError({
+            operation: "ExecuteTransaction",
+            cause: Object.assign(new Error("Transaction cancelled"), {
+              name: "TransactionCanceledException",
+              CancellationReasons: reasons,
+            }),
+          }),
+        )
+      }
+      for (const { item, key } of inserts) store.set(key, item)
+      return Effect.succeed({} as never)
     }),
   transactWriteItems: (input) =>
     Effect.suspend(() => {

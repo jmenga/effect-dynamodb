@@ -420,6 +420,11 @@ const cases: ReadonlyArray<Case> = [
   ],
   ["Entity.create", () => Orders.create({ orderId: "o-2", customerId: "c", total: 1 }).asEffect()],
   [
+    "Entity.insert",
+    ({ db }) => db.entities.Orders.insert({ orderId: "o-3", customerId: "c", total: 1 }).asEffect(),
+  ],
+  ["Entity.insert", () => Orders.insert({ orderId: "o-4", customerId: "c", total: 1 }).asEffect()],
+  [
     "Entity.upsert",
     ({ db }) => db.entities.Orders.upsert({ orderId: "o-1", customerId: "c", total: 1 }).asEffect(),
   ],

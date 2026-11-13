@@ -5,6 +5,7 @@ export type OperationType =
   | "get"
   | "put"
   | "create"
+  | "insert"
   | "update"
   | "delete"
   | "query"
@@ -455,6 +456,8 @@ function methodToOpType(name: string): OperationType | undefined {
       return "put"
     case "create":
       return "create"
+    case "insert":
+      return "insert"
     case "update":
       return "update"
     case "delete":

@@ -55,6 +55,8 @@ const unusedDynamoClient = (by: string): DynamoClientService => ({
   batchWriteItem: notUsed("batchWriteItem", by),
   transactGetItems: notUsed("transactGetItems", by),
   transactWriteItems: notUsed("transactWriteItems", by),
+  executeStatement: notUsed("executeStatement", by),
+  executeTransaction: notUsed("executeTransaction", by),
   updateTable: notUsed("updateTable", by),
   listTables: notUsed("listTables", by),
   createBackup: notUsed("createBackup", by),

@@ -61,6 +61,10 @@ const READS_140: Readonly<Record<string, number>> = {
   "put, with a unique constraint": 2,
   "put, unbound": 1,
   create: 1,
+  // `insert` is new in 1.41.0: it marshals the value as often as `put` does.
+  insert: 1,
+  "insert, in a list": 1,
+  "insert, with a unique constraint": 2,
   upsert: 2,
   "upsert, omitting a defaulted index composite": 2,
   "update .set": 2,

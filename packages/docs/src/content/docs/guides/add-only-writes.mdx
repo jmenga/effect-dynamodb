@@ -1,0 +1,164 @@
+---
+title: "Add-only writes"
+description: "Write through PartiQL INSERT so that IAM, not application code, stops a role from changing what is already stored."
+---
+
+import { Aside } from "@astrojs/starlight/components"
+
+IAM can't limit `PutItem` to conditional writes, so a role that can put can overwrite. A `create` guards against that in application code, but the role itself still could.
+
+PartiQL's `INSERT` fails when the key exists, and IAM grants it separately as `dynamodb:PartiQLInsert`. A role holding only that action can add items and never change them: an append-only log enforced by IAM. `insert` writes through it.
+
+## Inserting an item
+
+Declare the entity as usual:
+
+```typescript region="entity" example="guide-add-only-writes.ts"
+class AuditEntry extends Schema.Class<AuditEntry>("AuditEntry")({
+  logId: Schema.String,
+  at: Schema.String,
+  action: Schema.String,
+}) {}
+
+const AuditLog = Entity.make({
+  model: AuditEntry,
+  entityType: "AuditEntry",
+  primaryKey: {
+    pk: { field: "pk", composite: ["logId"] },
+    sk: { field: "sk", composite: ["at"] },
+  },
+  timestamps: true,
+})
+```
+
+Then `insert` takes the input `put` takes and returns the same model:
+
+```typescript region="insert" example="guide-add-only-writes.ts"
+const entry = yield* db.entities.AuditLog.insert({
+  logId: "log-1",
+  at: "2026-11-06T10:00:00Z",
+  action: "login",
+})
+// entry.action → "login"
+```
+
+It stores what `put` would store, with the same keys, timestamps, version, renames, sparse fields, packing and vectors, and sends one `ExecuteStatement` with no reads.
+
+Spans and capacity reports call the operation `Entity.insert`. Like any statement, it costs what the same `PutItem` costs.
+
+## When the key is taken
+
+An existing item fails the write with `ItemAlreadyExists`, and the stored item is left as it was:
+
+```typescript region="duplicate" example="guide-add-only-writes.ts"
+const outcome = yield* db.entities.AuditLog.insert({
+  logId: "log-1",
+  at: "2026-11-06T10:00:00Z",
+  action: "logout",
+})
+  .asEffect()
+  .pipe(
+    Effect.as("added"),
+    Effect.catchTag("ItemAlreadyExists", (e) =>
+      Effect.succeed(`Already there: ${JSON.stringify(e.key)}`),
+    ),
+  )
+// Already there: {"logId":"log-1","at":"2026-11-06T10:00:00Z"}
+```
+
+`key` holds the primary key composites. The error carries no current item, because DynamoDB returns none, and the role couldn't read it anyway.
+
+If the SDK retries after losing a response, the retry reports `ItemAlreadyExists` for the caller's own write, as `create` reports `ConditionalCheckFailed` in that case.
+
+## The IAM policy
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "dynamodb:PartiQLInsert",
+  "Resource": "arn:aws:dynamodb:<region>:<account>:table/<table>",
+  "Condition": {
+    "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["<prefix>*"] },
+    "Null": { "dynamodb:LeadingKeys": "false" }
+  }
+}
+```
+
+The prefix matches the composed key text, such as `$my-app#v1#auditentry#*`. The `Null` check refuses a request that has no key at all, which `ForAllValues` alone would allow.
+
+<Aside type="note">
+  This was checked against DynamoDB itself: the role was refused `PutItem`, `UpdateItem`, `DeleteItem`, `GetItem`, `Query` and PartiQL `UPDATE`, `DELETE` and `SELECT`, and any key outside its prefix. DynamoDB Local doesn't enforce IAM, so a test against it shows the writes but not the limit.
+</Aside>
+
+## Unique constraints
+
+An entity with `unique` constraints sends an `ExecuteTransaction` holding only `INSERT`s: the item first, then one per sentinel. It still makes one request with no reads.
+
+```typescript region="unique-entity" example="guide-add-only-writes.ts"
+class Account extends Schema.Class<Account>("Account")({
+  accountId: Schema.String,
+  email: Schema.String,
+}) {}
+
+const Accounts = Entity.make({
+  model: Account,
+  entityType: "Account",
+  primaryKey: {
+    pk: { field: "pk", composite: ["accountId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  unique: { email: ["email"] },
+})
+```
+
+A taken value fails with `UniqueConstraintViolation` and writes nothing:
+
+```typescript region="unique" example="guide-add-only-writes.ts"
+yield* db.entities.Accounts.insert({ accountId: "a-1", email: "ada@example.com" })
+
+const taken = yield* db.entities.Accounts.insert({
+  accountId: "a-2",
+  email: "ada@example.com",
+})
+  .asEffect()
+  .pipe(
+    Effect.as("added"),
+    Effect.catchTag("UniqueConstraintViolation", (e) =>
+      Effect.succeed(`Taken: constraint="${e.constraint}"`),
+    ),
+  )
+// Taken: constraint="email"
+```
+
+The role's policy must list the sentinel prefix as well, `$my-app#v1#account._unique.email#*` here. Without it the whole transaction is refused and fails with a `DynamoError`, so nothing is written.
+
+## By entity configuration
+
+| Configuration | What `insert` does |
+|---|---|
+| Plain, GSIs, sharded indexes, sparse fields, packed fields, vectors | One `INSERT` of the item `put` would write |
+| `versioned` | The same, at version 1 |
+| `unique` | One `INSERT`-only transaction |
+| `softDelete` | Same as plain |
+| `timeSeries` | Writes the current row and no event, as `create` does |
+| `refs` | Reads each referenced item first, so the role also needs `dynamodb:GetItem` on those items |
+| `versioned: { retain: true }` | Refused |
+
+A retained entity is refused because its version number comes from a query of the retained versions, which the role can't run, and writing a first snapshot would collide with any history already there:
+
+```typescript region="refused" example="guide-add-only-writes.ts"
+const refused = yield* db.entities.Pages.insert({ pageId: "p-1", body: "Hello" })
+  .asEffect()
+  .pipe(Effect.flip)
+// refused._tag → "ValidationError"
+```
+
+## What it doesn't do
+
+- **No conditions.** A PartiQL `INSERT` has none, so `insert` has no `.condition()` method. Use `create` if you need one.
+- **No transactions or batches.** `Transaction.transactWrite`, `Batch.write` and `EventStore`'s `additionalItems` would send a `PutItem` the role can't run. Passing an `insert` to them is a compile error, and a `ValidationError` for untyped callers.
+- **A limit on attribute names.** DynamoDB limits a statement to 8,192 characters and the statement lists every attribute name, so an item can fail here that `PutItem` would accept. That takes about 370 attributes with 14-character names. Sparse fields are the likely way there, because they flatten into top-level attributes. The failure is a `ValidationError` naming the limit.
+
+## Existing data
+
+`INSERT` checks only the exact primary key it writes, and nothing looks for a key under other text. If a table holds rows under other key text, such as rows from 1.37 or 1.38, rows written before turning on `escapeKeys`, or rows keyed by a zoned date that 1.38 to 1.40 wrote on Effect 4.1.3, it can add a second row beside one of them, as `create` can. Run [`db.tables.<Table>.rekey()`](/effect-dynamodb/guides/upgrading/) on existing data before relying on `insert`.

@@ -1,9 +1,9 @@
 # Design: add-only writes through PartiQL `INSERT` (#189)
 
 **Issue:** [#189](https://github.com/jmenga/effect-dynamodb/issues/189)
-**Status:** Designed, owner decisions recorded in §10. Implemented in the same PR (single-PR
-workflow: this doc is commit 1).
-**Merge order:** after #184, which removes the key fallback (§6).
+**Status:** Implemented, owner decisions recorded in §10. Same PR as the code (single-PR workflow:
+this doc is commit 1).
+**Merge order:** after #184, which removed the key fallback (§6). Done: #184 merged first.
 **Affected packages:** `packages/effect-dynamodb`, `packages/schema` (one new tagged error,
 one guard), `packages/language-service` (one operation).
 **Semver impact:** `minor`. Additive, except that `DynamoClientService` gains two required
@@ -37,15 +37,16 @@ const entry = yield* db.entities.AuditLog.insert({ logId, at, action })
 ```
 
 - `Entity.insert(input)` returns `EntityInsert`. `db.entities.X.insert(input)` returns
-  `BoundInsert`. Both are yieldable and pipeable, and `EntityInsert` takes `asRecord`, `asItem` and
-  `asNative`, as `put` does.
+  `BoundInsert`. Both are yieldable and pipeable, and `EntityInsert` takes `Entity.asRecord`,
+  `Entity.asItem` and `Entity.asNative`, as `put` does.
 - `.withVector()` is available, because an embedding is computed before the write.
 - `.condition()` is not. PartiQL `INSERT` has no conditions, so offering one would silently do
-  nothing.
+  nothing. An untyped caller's condition is refused at run time with `EDD-9110`. An empty one
+  (`{}`, `and()`) is no condition, as on every write (`nonEmptyCondition`), so the insert is sent.
 - `EntityInsert` carries `_putKind: "insert"` and `EntityPut`'s `_putKind` excludes it, because
   `EntityPut` otherwise has no members of its own and any op would be assignable to it. So
-  `Entity.condition(op, ...)`, `Batch.write([op])` and `Transaction.transactWrite([op])` are compile
-  errors. `BoundInsert._boundOpType` is `"insert"`, which `BoundWriteOp` excludes likewise.
+  `op.pipe(entity.condition(...))`, `Batch.write([op])` and `Transaction.transactWrite([op])` are
+  compile errors. `BoundInsert._boundOpType` is `"insert"`, which `BoundWriteOp` excludes likewise.
 - At runtime the multi-item paths refuse it through `rejectUnsupportedOp`, the mechanism they
   already use for `upsert` (#100), because they would send a `PutItem` the role can't run.
 
@@ -103,8 +104,10 @@ about 370 attributes with 14-character names. Sparse maps are the realistic way 
 flatten into top-level attributes.
 
 There is no pre-check. On a validation failure, the library measures the statements it sent and, if
-one is over the limit, reports `ValidationError` naming the limit and the item. The other diagnoses
-(400 KB, key length, empty key) work as they do for `PutItem`, against the item that was sent.
+one is over the limit, reports `ValidationError` naming the limit and the item. DynamoDB checks the
+statement's length before anything else, so an over-long statement is what's reported even when the
+item is also over 400 KB or its key is taken. Below the limit, the other diagnoses (400 KB, key
+length, empty key) work as they do for `PutItem`, against the item that was sent.
 
 ## 5. Behaviour by entity configuration
 
@@ -114,6 +117,7 @@ one is over the limit, reports `ValidationError` naming the limit and the item. 
 | `versioned` without retain | One write, version 1 | Same item, one `INSERT` |
 | `unique` | Transaction with sentinels | `INSERT`-only transaction (§4) |
 | `versioned: { retain: true }` | Queries retained versions, writes a snapshot | Refused, `EDD-9110` |
+| Sharded indexes | One write, the shard in the index key | Same item, one `INSERT` |
 | Refs | Reads each referenced item | Same reads; the role also needs `GetItem` on those items |
 | `softDelete` | No special handling | Same as plain |
 | `timeSeries` | Writes the current row only | Same as `create`: current row, no event |
@@ -124,12 +128,14 @@ v1 snapshot would collide with any history already there.
 
 ## 6. Existing rows and the key fallback
 
-`INSERT` checks only the exact primary key it writes. On a table with rows under an older key text,
-it can add a second row beside one of them. The docs say to run `rekey` on existing data first.
+`INSERT` checks only the exact primary key it writes, as every operation has since #184 removed the
+key fallback and `legacyKeys`: nothing looks for a key under other text. On a table with rows under
+other key text, it can add a second row beside one of them, as `create` can. The docs say to run
+`rekey` on existing data first.
 
-There is no refusal or schema flag for this. #184 removes the key fallback and `legacyKeys`, so
-there is nothing to refuse. **This PR merges after #184.** Merged first, `main` would still have the
-fallback on by default, and `insert` could add a second row where `create` would fail.
+There is no refusal or schema flag for this, because there is nothing left to refuse. This PR had to
+merge after #184: merged first, `main` would still have had the fallback on by default, and `insert`
+could have added a second row where `create` failed.
 
 ## 7. IAM
 
@@ -163,6 +169,22 @@ All on real AWS unless marked, with the resources deleted afterwards.
 | Duplicate in a transaction | `TransactionCanceledException`, reason `DuplicateItem` at the failing position, rolled back |
 | Outside the prefix in a transaction | Same exception, reason `AccessDenied`, rolled back |
 | Awkward names | `'`, `"`, `#`, `.`, space and `?` all accepted |
+
+The library's own `insert` then ran on AWS through a role holding only `PartiQLInsert`, limited by
+`LeadingKeys` to the entities' prefixes, plus `GetItem` on the referenced entity's prefix:
+
+| Check | Result |
+|---|---|
+| `insert` | One `ExecuteStatement`, reported as `Entity.insert`: 3 capacity units for a row in two GSIs |
+| Again at the same key | `ItemAlreadyExists`, naming the key |
+| Awkward characters in a key | `'`, `"`, `#`, `.`, space and `?` written and read back |
+| `unique` | One `ExecuteTransaction`. A taken value is `UniqueConstraintViolation`, an existing key `ItemAlreadyExists` |
+| A sentinel prefix the role lacks | The transaction cancelled with `AccessDenied`, nothing written |
+| `refs` | The referenced item read with `GetItem`, the ref stored whole |
+| Over the statement limit | `ValidationError` naming the limit and the item (404 attributes, 8,492 characters) |
+| `retain` | `EDD-9110`, nothing sent |
+| `put`, `create`, `get`, `update`, `delete`, a query, an `insert` outside the prefix | `AccessDeniedException` |
+| The stored row | `put`'s attributes and types; values differ only in the key, the timestamps and the incarnation token |
 
 DynamoDB Local differs in three ways, so the code and tests handle both:
 
