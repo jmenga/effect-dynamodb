@@ -30,7 +30,13 @@ import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
-import { comparedOperandsOf, operandAsStored, type StoredFormAt } from "./internal/Expr.js"
+import {
+  comparedOperandsOf,
+  markUnsent,
+  operandAsStored,
+  type StoredFormAt,
+  unsentIn,
+} from "./internal/Expr.js"
 import { packedCompiledRefusal } from "./internal/Packed.js"
 import {
   composePrimaryKeyOrFail,
@@ -95,11 +101,19 @@ export const check: {
     // Sync API — there is no error channel to fail into, so this stays a throw.
     throw new Error(getRejectReason("Transaction.check"))
   }
-  const stored = storedOperands(
-    info.entity._storedFormAt,
-    condition,
-    storedNames(info.entity._resolveDbName, condition),
-  )
+  // A value that is no compiled condition (a string) goes on as given, refused where it's sent,
+  // as on 1.40.0.
+  const stored =
+    typeof condition?.expression === "string"
+      ? storedOperands(
+          info.entity._storedFormAt,
+          condition,
+          storedNames(info.entity._resolveDbName, condition),
+        )
+      : condition
+  // A condition compiled without a `__proto__` entry (`EDD-9165`) stays refused when sent.
+  const unsent = unsentIn(condition)
+  if (unsent !== undefined) markUnsent(stored, unsent)
   // A packed field may be tested only as a whole (`[EDD-9076]`, #147).
   const refused = packedCompiledRefusal(
     stored.expression,

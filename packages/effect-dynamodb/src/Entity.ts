@@ -69,6 +69,16 @@ import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal
 import { keyReadings } from "@effect-dynamodb/schema/internal/KeyReadings.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
+import {
+  given,
+  hasOwnName,
+  isUnreadableName,
+  lackedByName,
+  lacksAny,
+  ownValue,
+  setOwn,
+  type UnreadableName,
+} from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { unpackStoredSync } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { restoredObjectReading } from "@effect-dynamodb/schema/internal/RestoredKeyText.js"
 import {
@@ -235,6 +245,7 @@ import {
   fromAttributeValue,
   hasNoStoredForm,
   isEmptySet,
+  protoEntryAt,
   toAttributeMap,
   toAttributeValue,
   UnstorableValue,
@@ -476,16 +487,25 @@ const composeUniqueSentinel = (
       ? (defaulted as ReadonlySet<unknown>)
       : new Set(Array.isArray(defaulted) ? defaulted : [])
   if (fields.some((f) => defaultedFields.has(f))) return undefined
-  // Sparse: a constraint missing a value has no sentinel, and composes none of its values.
-  if (fields.some((f) => source[f] === undefined || source[f] === null)) return undefined
+  // Sparse: a constraint missing a value has no sentinel, and composes none of its values. What the
+  // source gives under a field, never what every object inherits under its name (`toString`): a
+  // field so named and left out holds no value, so no sentinel (#239).
+  if (
+    fields.some((f) => {
+      const value = given(source, f)
+      return value === undefined || value === null
+    })
+  ) {
+    return undefined
+  }
   const serialized: Array<string> = []
   const fieldsRecord: globalThis.Record<string, string> = {}
   for (const f of fields) {
-    const given = source[f]
-    const raw = stored(f, given) ?? given
+    const value = given(source, f)
+    const raw = stored(f, value) ?? value
     const s = KeyComposer.siteCompositeText(schema, raw, f, constraintDef, undefined)
     serialized.push(s)
-    fieldsRecord[f] = s
+    setOwn(fieldsRecord, f, s)
   }
   return {
     key: DynamoSchema.composeUniqueKey(
@@ -930,6 +950,19 @@ export interface Entity<
    * inside (`[EDD-9076]`), by domain AND stored name.
    */
   readonly _packedGuards: ReadonlyArray<PackedAttributeGuard>
+
+  /**
+   * @internal What a caller's key gives of `names` (the composites it can't be composed without),
+   * as a plain object to add to and hand on to a key composition (a geo index's `nearby` filter):
+   * its own enumerable properties, and, only where those lack one of `names` (where 1.40.0
+   * failed), each it lacks read by name (`keyEntries`). A name whose read threw from a getter the
+   * key inherits is held as a property that throws it again when read, so the query it's handed to
+   * fails with a `ValidationError` naming it (`UnreadableName`).
+   */
+  readonly _givenValues: (
+    record: object,
+    names: ReadonlyArray<string>,
+  ) => globalThis.Record<string, unknown>
 
   /**
    * @internal Decode a DynamoDB Streams image (DynamoDB JSON with `B` as bytes
@@ -3304,7 +3337,8 @@ const makeImpl = <
     const keyRecord = (key ?? {}) as globalThis.Record<string, unknown>
     const primary = allIndexes.primary
     for (const field of primary ? [...primary.pk.composite, ...primary.sk.composite] : []) {
-      if (record[field] === undefined || Equal.equals(record[field], keyRecord[field])) continue
+      const value = given(record, field)
+      if (value === undefined || Equal.equals(value, given(keyRecord, field))) continue
       return primaryCompositeRefusal(".set()", field)
     }
     const named = Object.keys(record).find((field) => isTableKeyAttribute(field))
@@ -3312,6 +3346,18 @@ const makeImpl = <
   }
 
   /** A record operation writing a primary-key composite or an attribute of the table's key. */
+  /** An operand record's value a builder kept in place of a read that threw (`UnreadableName`). */
+  const unreadableOperand = (uState: UpdateState): UnreadableName | undefined => {
+    for (const record of [uState.add, uState.subtract, uState.append, uState.deleteFromSet]) {
+      if (record === undefined) continue
+      const values = Object.values(record)
+      for (let index = 0; index < values.length; index++) {
+        if (isUnreadableName(values[index])) return values[index] as UnreadableName
+      }
+    }
+    return undefined
+  }
+
   const refusedRecordOperands = (uState: UpdateState): string | undefined => {
     const operands: ReadonlyArray<readonly [string, object | undefined]> = [
       [".add()", uState.add],
@@ -3362,15 +3408,52 @@ const makeImpl = <
     return Object.fromEntries(
       Object.entries(encoded).filter(
         ([field, value]) =>
-          !(field in packedFields) &&
+          !Object.hasOwn(packedFields, field) &&
           !(Number.isNaN(value) && (composites.has(field) || isPrimaryComposite(field))),
       ),
     )
   }
 
+  /**
+   * A field of `record` (domain names) holding a value that would be written as an attribute named
+   * `__proto__`, packed or not: the field `__proto__` stored under its own name, or a field renamed
+   * to it (`DynamoModel.configure`). The SDK drops it, so it is refused (`EDD-9165`). Under a
+   * rename `__proto__` is another attribute, and stores. A value written as no attribute is no
+   * attribute of that name: `undefined`, or, unpacked, a set holding nothing (`hasNoStoredForm`).
+   */
+  const protoAttributeIn = (
+    record: globalThis.Record<string, unknown>,
+  ): UnstorableValue | undefined => {
+    for (const field of Object.keys(record)) {
+      if (resolveDbName(field) !== "__proto__") continue
+      const value = ownValue(record, field)
+      const stores = Object.hasOwn(packedFields, field)
+        ? value !== undefined
+        : !hasNoStoredForm(value)
+      if (stores) return protoEntryAt([field])
+    }
+    return undefined
+  }
+
+  /**
+   * What in `record` (domain names) DynamoDB can't store, each field marshalled as the attribute it
+   * is. Only a field named `__proto__` stored under another attribute differs from marshalling the
+   * record as it is: it is that attribute, checked on its own and named as the field.
+   */
+  const unstorableFields = (
+    record: globalThis.Record<string, unknown>,
+  ): UnstorableValue | undefined => {
+    if (!Object.hasOwn(record, "__proto__") || resolveDbName("__proto__") === "__proto__") {
+      return unstorableIn(record)
+    }
+    const { ["__proto__"]: renamed, ...rest } = record
+    const unstorable = unstorableIn({ v: renamed })
+    return unstorableIn(rest) ?? unstorable?.at(["__proto__", ...unstorable.path.slice(1)])
+  }
+
   /** What in an encoded payload DynamoDB can't store, as `put` finds it when it marshals. */
   const unstorableOf = (encoded: globalThis.Record<string, unknown>): UnstorableValue | undefined =>
-    unstorableIn(fieldsToStore(encoded))
+    protoAttributeIn(encoded) ?? unstorableFields(fieldsToStore(encoded))
 
   /** `inputSchema`'s fields of a key record, once per set of names (`unstorableKey`). */
   const keyRecordSchemas = new Map<string, Schema.Codec<any>>()
@@ -3472,14 +3555,14 @@ const makeImpl = <
       if (!isModelField(field)) return true
       const known = omitted.get(field)
       if (known !== undefined) return known
-      const judged = rowOmits(modelFieldSchemas[field]!)
+      const judged = rowOmits(ownValue(modelFieldSchemas, field)!)
       omitted.set(field, judged)
       return judged
     }
     const reading = (field: string): AbsentReading | undefined => {
       if (!isModelField(field)) return undefined
       if (absent.has(field)) return absent.get(field)
-      const judged = absentReading(modelFieldSchemas[field]!)
+      const judged = absentReading(ownValue(modelFieldSchemas, field)!)
       absent.set(field, judged)
       return judged
     }
@@ -3655,8 +3738,12 @@ const makeImpl = <
    */
   const encodesToNothing = (field: string, value: unknown): boolean => {
     if (value === undefined) return !storesUndefined(field)
-    if (modelFieldSchemas[field]?.ast.encoding === undefined && !isEmptySet(value)) return false
-    const updateField = getSchemaFields(schemas.updateSchema as unknown as Schema.Top)?.[field]
+    if (ownValue(modelFieldSchemas, field)?.ast.encoding === undefined && !isEmptySet(value))
+      return false
+    const updateField = ownValue(
+      getSchemaFields(schemas.updateSchema as unknown as Schema.Top),
+      field,
+    )
     if (updateField === undefined) return false
     try {
       const encoded = Schema.encodeUnknownExit(
@@ -3665,7 +3752,7 @@ const makeImpl = <
           globalThis.Record<string, unknown>
         >,
       )({ [field]: value })
-      return Exit.isSuccess(encoded) && hasNoStoredForm(encoded.value[field])
+      return Exit.isSuccess(encoded) && hasNoStoredForm(ownValue(encoded.value, field))
     } catch {
       return false
     }
@@ -3692,6 +3779,9 @@ const makeImpl = <
       cleared = true
       delete payload[field]
       if (field === systemFields.updatedAt || Object.hasOwn(sparseFields, field)) continue
+      // No row holds an attribute named `__proto__` (`EDD-9165`): nothing to remove, as 1.40.0,
+      // whose payload schema didn't hold the field, removed nothing.
+      if (resolveDbName(field) === "__proto__") continue
       const refused = clearRefusal(".set()", field, lacks)
       if (refused !== undefined) return refused
       if (!remove.includes(field)) remove.push(field)
@@ -3704,7 +3794,7 @@ const makeImpl = <
    * writes as `"none"`. Setting it writes that, like any other value.
    */
   const storesUndefined = (field: string): boolean => {
-    const schema = modelFieldSchemas[field]
+    const schema = ownValue(modelFieldSchemas, field)
     if (schema === undefined) return false
     try {
       const encoded = Schema.encodeUnknownExit(schema as unknown as Schema.Codec<unknown, unknown>)(
@@ -3767,10 +3857,9 @@ const makeImpl = <
     Object.entries(data.modelFields as globalThis.Record<string, Schema.Top>).flatMap(
       ([field, schema]) => {
         // What's packed doesn't go through the marshaller's map, and packing refuses an instance itself.
-        const read =
-          field in data.packedFields
-            ? undefined
-            : getSchemaFields(schemas.recordSchema as unknown as Schema.Top)?.[field]
+        const read = Object.hasOwn(data.packedFields, field)
+          ? undefined
+          : ownValue(getSchemaFields(schemas.recordSchema as unknown as Schema.Top), field)
         const readBack = read === undefined ? undefined : readBackOf(schema, () => read)
         return readBack === undefined ? [] : [[field, readBack] as const]
       },
@@ -3802,7 +3891,7 @@ const makeImpl = <
       ? Effect.void
       : Effect.forEach(
           [...readBacks].filter(
-            ([field]) => (encoded as globalThis.Record<string, unknown>)[field] != null,
+            ([field]) => ownValue(encoded as globalThis.Record<string, unknown>, field) != null,
           ),
           ([field, readBack]) =>
             readBack((encoded as globalThis.Record<string, unknown>)[field]).pipe(
@@ -3911,7 +4000,7 @@ const makeImpl = <
       Object.entries(fields).flatMap(([field, schema]) => {
         const into = composedInto(field)
         if (into === undefined) return []
-        const reading = modelFieldSchemas[field] ?? schema
+        const reading = ownValue(modelFieldSchemas, field) ?? schema
         const readsOther = readsBackOtherwise(reading, {
           asRead,
           written: schema === reading ? undefined : schema,
@@ -3951,7 +4040,7 @@ const makeImpl = <
     reads: KindReads = kindReads().model,
   ): Effect.Effect<void, ValidationError> => {
     for (const [field, { into, readsOther }] of reads) {
-      const value = (encoded as globalThis.Record<string, unknown>)[field]
+      const value = ownValue(encoded as globalThis.Record<string, unknown>, field)
       const readsAs = value == null ? undefined : readsOther(value)
       if (readsAs === undefined) continue
       return Effect.fail(
@@ -4190,6 +4279,16 @@ const makeImpl = <
       [".deleteFromSet() of", uState.deleteFromSet ?? {}],
       [".withVector() of", uState.withVectors ?? {}],
     ]
+    const named: ReadonlyArray<readonly [string, globalThis.Record<string, unknown>]> = [
+      [".set() of", encodedUpdates],
+      [".add() of", uState.add ?? {}],
+      [".subtract() of", uState.subtract ?? {}],
+      [".append() of", uState.append ?? {}],
+    ]
+    for (const [op, record] of named) {
+      const unstorable = protoAttributeIn(record)
+      if (unstorable !== undefined) return refused(op, unstorable)
+    }
     for (const [op, record] of records) {
       if (record === appended) {
         for (const [field, encoded] of Object.entries(appended)) {
@@ -4197,7 +4296,7 @@ const makeImpl = <
           if (lost !== undefined) return lost
         }
       }
-      const unstorable = unstorableIn(record)
+      const unstorable = unstorableFields(record)
       if (unstorable !== undefined) return refused(op, unstorable)
     }
     type Operand = {
@@ -4219,6 +4318,14 @@ const makeImpl = <
     ]
     for (const [op, ops, kind] of pathOps) {
       for (const operand of ops ?? []) {
+        // A path to an attribute or through a map entry named `__proto__` writes it, and no read
+        // keeps it. The first segment is a field, stored under its attribute's name.
+        const proto = operand.segments.findIndex(
+          (segment, at) =>
+            (at === 0 && typeof segment === "string" ? resolveDbName(segment) : segment) ===
+            "__proto__",
+        )
+        if (proto !== -1) return refused(op, protoEntryAt(operand.segments.slice(0, proto + 1)))
         // A copy, or a subtraction of another attribute's value, writes no value of its own.
         if ((op === "pathSet of" || op === "pathSubtract of") && isCopy(operand)) continue
         const value =
@@ -4233,14 +4340,9 @@ const makeImpl = <
         }
         const unstorable = unstorableIn({ value })
         if (unstorable !== undefined) {
-          const path = [...operand.segments, ...unstorable.path.slice(1)]
           return refused(
             op,
-            new UnstorableValue({
-              path,
-              reason: unstorable.reason,
-              ...(unstorable.lost !== undefined ? { lost: { ...unstorable.lost, path } } : {}),
-            }),
+            unstorable.at([...operand.segments, ...unstorable.path.slice(1)]),
             operand.segments.join("."),
           )
         }
@@ -4741,10 +4843,14 @@ const makeImpl = <
           ...path,
         ])
         if (
-          pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...storedBelow(segments)], {
-            beside,
-            judgedBefore: false,
-          })
+          pathIsRequired(
+            ownValue(modelFieldSchemas, entry.field)!,
+            [entry.key, ...storedBelow(segments)],
+            {
+              beside,
+              judgedBefore: false,
+            },
+          )
         ) {
           return required(segments)
         }
@@ -4759,7 +4865,7 @@ const makeImpl = <
       if (derivedFrom(head) !== undefined) continue
       // Judged by the names the request removes it by (#238).
       const beside = besideOf(index, clauseAt(segments))
-      if (pathIsRequired(modelFieldSchemas[head]!, storedBelow(segments), { beside })) {
+      if (pathIsRequired(ownValue(modelFieldSchemas, head)!, storedBelow(segments), { beside })) {
         return required(segments)
       }
     }
@@ -4922,8 +5028,9 @@ const makeImpl = <
     const record = updates as globalThis.Record<string, unknown>
     const out: Array<AssertedImmutable> = []
     for (const field of immutableFields) {
-      if (record[field] === undefined) continue
-      const encoded = encodePathValue([field], record[field], "value")
+      // Read twice, as 1.40.0 read it.
+      if (given(record, field) === undefined) continue
+      const encoded = encodePathValue([field], given(record, field), "value")
       if (encoded.issue !== undefined) {
         return `.set() of immutable "${field}": ${String(encoded.issue)}`
       }
@@ -4934,7 +5041,7 @@ const makeImpl = <
         attr: resolveDbName(field),
         value: toAttributeValue(encoded.encoded),
         wire: encoded.encoded,
-        packed: field in packedFields,
+        packed: Object.hasOwn(packedFields, field),
       })
     }
     return out
@@ -4949,7 +5056,8 @@ const makeImpl = <
   ): string | undefined => {
     const changed = asserted.find(
       ({ attr, value, packed }) =>
-        !packed && !attributeValueEquals(stored[attr] as AttributeValue | undefined, value),
+        !packed &&
+        !attributeValueEquals(ownValue(stored, attr) as AttributeValue | undefined, value),
     )
     return changed === undefined ? undefined : immutableChangedMessage(changed.field)
   }
@@ -4965,7 +5073,7 @@ const makeImpl = <
     Effect.gen(function* () {
       for (const { field, attr, wire, packed } of asserted) {
         if (!packed) continue
-        const storedValue = stored[attr]
+        const storedValue = ownValue(stored, attr)
         if (storedValue === undefined) {
           if (wire === undefined || wire === null) continue
           return immutableChangedMessage(field)
@@ -4993,7 +5101,7 @@ const makeImpl = <
     if (typeof updates !== "object" || updates === null) return false
     const record = updates as globalThis.Record<string, unknown>
     const present = (field: string) =>
-      (record[field] !== undefined && record[field] !== null) ||
+      given(record, field) != null ||
       (removed.includes(field) && lacks.absentReading(field) !== undefined)
     const primary = allIndexes.primary
     if (primary && ![...primary.pk.composite, ...primary.sk.composite].every(present)) return false
@@ -5203,7 +5311,7 @@ const makeImpl = <
     ]
     for (const [op, values] of records) {
       for (const field of Object.keys(values ?? {})) {
-        if (field in packedFields) return refuse(op, field)
+        if (Object.hasOwn(packedFields, field)) return refuse(op, field)
       }
     }
     const pathOps: ReadonlyArray<
@@ -5222,14 +5330,14 @@ const makeImpl = <
       for (const { segments } of ops) {
         const head = segments[0]
         if (typeof head !== "string" || entryOfPath(segments) !== undefined) continue
-        if (head in packedFields) return refuse(op, head)
+        if (Object.hasOwn(packedFields, head)) return refuse(op, head)
       }
     }
     for (const { field } of uState.sparseRemoveEntries ?? []) {
-      if (field in packedFields) return refuse(".removeEntries()", field)
+      if (Object.hasOwn(packedFields, field)) return refuse(".removeEntries()", field)
     }
     for (const field of uState.sparseClearFields ?? []) {
-      if (field in packedFields) return refuse(".clearMap()", field)
+      if (Object.hasOwn(packedFields, field)) return refuse(".clearMap()", field)
     }
     return undefined
   }
@@ -5326,6 +5434,11 @@ const makeImpl = <
     { reads: readsKey },
   )
   const compositeStoredForm = makeCompositeStoredForm(schemas.inputSchema as unknown as Schema.Top)
+  /** The composites a primary key is made of: all a caller's key is read for (#239). */
+  const primaryKeyComposites: ReadonlyArray<string> = [
+    ...config.indexes.primary.pk.composite,
+    ...config.indexes.primary.sk.composite,
+  ]
 
   /**
    * PUBLIC key boundary. Converts a caller-supplied key record from the model's
@@ -5446,7 +5559,7 @@ const makeImpl = <
     const forms = new Map<string, ((value: unknown) => unknown) | undefined>()
     return (field: string, value: unknown): unknown => {
       if (!forms.has(field)) {
-        const fieldSchema = fields?.[field]
+        const fieldSchema = ownValue(fields, field)
         forms.set(
           field,
           fieldSchema === undefined
@@ -5472,7 +5585,7 @@ const makeImpl = <
     const forms = new Map<string, ((value: unknown) => unknown) | undefined>()
     return (field: string, value: unknown): unknown => {
       if (!forms.has(field)) {
-        const fieldSchema = fields?.[field]
+        const fieldSchema = ownValue(fields, field)
         forms.set(
           field,
           fieldSchema === undefined
@@ -5491,8 +5604,11 @@ const makeImpl = <
    * for a codec prepending `x:`) composes the key `put` wrote for it. Every
    * other composite composes exactly what `keyForm` alone does.
    */
-  const domainKeyForm = (record: globalThis.Record<string, unknown>) =>
-    keyForm(compositeStoredForm(record))
+  const domainKeyForm = (
+    record: globalThis.Record<string, unknown>,
+    required: ReadonlyArray<string> = primaryKeyComposites,
+    optional: ReadonlyArray<string> = [],
+  ) => keyForm(compositeStoredForm(record, required, optional))
 
   /**
    * The key form 1.39.0 composed from a stored record: a codec whose `encode`
@@ -5609,7 +5725,7 @@ const makeImpl = <
     encoded: globalThis.Record<string, unknown>,
     times: { readonly createdAt: DateTime.Utc; readonly updatedAt: DateTime.Utc },
   ): globalThis.Record<string, unknown> => ({
-    ...(systemFields.createdAt && encoded[systemFields.createdAt] === undefined
+    ...(systemFields.createdAt && ownValue(encoded, systemFields.createdAt) === undefined
       ? {
           [systemFields.createdAt]: generateTimestamp(
             systemFields.createdAtEncoding,
@@ -5617,7 +5733,7 @@ const makeImpl = <
           ),
         }
       : {}),
-    ...(systemFields.updatedAt && encoded[systemFields.updatedAt] === undefined
+    ...(systemFields.updatedAt && ownValue(encoded, systemFields.updatedAt) === undefined
       ? {
           [systemFields.updatedAt]: generateTimestamp(
             systemFields.updatedAtEncoding,
@@ -5647,9 +5763,11 @@ const makeImpl = <
     item: globalThis.Record<string, unknown>,
   ): globalThis.Record<string, unknown> => ({
     ...(systemFields.createdAt
-      ? { [systemFields.createdAt]: item[resolveDbName(systemFields.createdAt)] }
+      ? { [systemFields.createdAt]: ownValue(item, resolveDbName(systemFields.createdAt)) }
       : {}),
-    ...(systemFields.version ? { [systemFields.version]: item[systemFields.version] } : {}),
+    ...(systemFields.version
+      ? { [systemFields.version]: ownValue(item, systemFields.version) }
+      : {}),
   })
 
   /**
@@ -5678,7 +5796,7 @@ const makeImpl = <
         (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
       )) {
         for (const field of resolveUniqueFields(constraintDef)) {
-          const value = record[field]
+          const value = given(record, field)
           if (value !== undefined && value !== null) KeyComposer.compositeText(schema, value)
         }
       }
@@ -5732,7 +5850,7 @@ const makeImpl = <
     if (!generatedIdField) return Effect.succeed(input)
     if (typeof input !== "object" || input === null) return Effect.succeed(input)
     const rec = input as globalThis.Record<string, unknown>
-    if (rec[generatedIdField] !== undefined && rec[generatedIdField] !== null) {
+    if (given(rec, generatedIdField) != null) {
       return Effect.succeed(input)
     }
     return Effect.gen(function* () {
@@ -5791,7 +5909,7 @@ const makeImpl = <
       ),
     )
     return [...indexedDefaultFields()].filter(
-      (name) => unique.has(name) && record[name] === undefined,
+      (name) => unique.has(name) && given(record, name) === undefined,
     )
   }
 
@@ -5845,12 +5963,13 @@ const makeImpl = <
     }
     const record = input as globalThis.Record<string, unknown>
     const missing = defaultedFields.filter(
-      ([name]) => fills(name, record) && record[name] === undefined,
+      ([name]) => fills(name, record) && given(record, name) === undefined,
     )
     if (missing.length === 0) return Effect.succeed(input)
     return Schema.decodeUnknownEffect(
       Schema.Struct(Object.fromEntries(missing)) as unknown as Schema.Codec<any>,
     )({}).pipe(
+      // Copied as 1.40.0 copied it: a spread, and each default it lacks.
       Effect.map((defaults) => ({ ...record, ...(defaults as object) })),
       Effect.mapError(
         (cause) => new ValidationError({ entityType, operation: "put.default", cause }),
@@ -5862,7 +5981,7 @@ const makeImpl = <
   const omitsIndexedDefault = (input: unknown): boolean => {
     if (defaultedFields.length === 0 || typeof input !== "object" || input === null) return false
     const record = input as globalThis.Record<string, unknown>
-    return [...indexedDefaultFields()].some((name) => record[name] === undefined)
+    return [...indexedDefaultFields()].some((name) => given(record, name) === undefined)
   }
 
   /** A field an upsert keeps from the stored row (`if_not_exists`), where it isn't in the key anyway. */
@@ -5912,7 +6031,7 @@ const makeImpl = <
         )
       })
       for (const [indexName, index] of Object.entries(allIndexes)) {
-        if (indexName === "primary" || index.pk.field in composed) continue
+        if (indexName === "primary" || Object.hasOwn(composed, index.pk.field)) continue
         const known = KeyComposer.composeKnownHalves(
           under,
           entityType,
@@ -5921,7 +6040,7 @@ const makeImpl = <
           recordKeyForm,
         )
         for (const [field, composites] of halvesOf(index)) {
-          const value = known[field]
+          const value = ownValue(known, field)
           if (value !== undefined && written(composites)) keys[field] = value
         }
       }
@@ -5965,9 +6084,9 @@ const makeImpl = <
       if (indexName === "primary") continue
       for (const [field, composites] of halvesOf(index)) {
         const others = composites.filter((attr) => !keptByUpsert(attr) && !isPrimaryComposite(attr))
-        if (!(field in composed)) {
+        if (!Object.hasOwn(composed, field)) {
           for (const attr of others) {
-            if (input[attr] !== undefined) same.add(attr)
+            if (ownValue(input, attr) !== undefined) same.add(attr)
           }
           continue
         }
@@ -6005,7 +6124,7 @@ const makeImpl = <
   ): ValidationError | undefined =>
     systemFields.version &&
     item !== undefined &&
-    item[systemFields.version] === undefined &&
+    ownValue(item, systemFields.version) === undefined &&
     item[INCARNATION_TOKEN] !== undefined
       ? new ValidationError({
           entityType,
@@ -6537,7 +6656,7 @@ const makeImpl = <
   ): Effect.Effect<void, ValidationError, never> => {
     if (withVectors === undefined) return Effect.void
     for (const name of Object.keys(withVectors)) {
-      if (name in vectorIndexes) continue
+      if (Object.hasOwn(vectorIndexes, name)) continue
       const declared = Object.keys(vectorIndexes).sort().join(", ")
       return Effect.fail(
         new ValidationError({
@@ -6609,7 +6728,7 @@ const makeImpl = <
 
         if (!shouldEmbed) continue
 
-        const explicit = withVectors?.[logicalName]
+        const explicit = ownValue(withVectors, logicalName)
         if (explicit !== undefined) {
           sets[definition.vectorField] = yield* checkDimensions(logicalName, definition, explicit)
           continue
@@ -6650,7 +6769,7 @@ const makeImpl = <
   ): ReadonlyArray<readonly [string, VectorIndexDefinition]> =>
     vectorIndexEntries.filter(
       ([logicalName, definition]) =>
-        withVectors?.[logicalName] !== undefined ||
+        ownValue(withVectors, logicalName) !== undefined ||
         definition.sourceFields.some((field) => touchedFields.has(field)),
     )
 
@@ -6729,8 +6848,8 @@ const makeImpl = <
 
       const needsFullSource = needing.some(
         ([logicalName, definition]) =>
-          withVectors?.[logicalName] === undefined &&
-          definition.sourceFields.some((field) => !(field in merged)),
+          ownValue(withVectors, logicalName) === undefined &&
+          definition.sourceFields.some((field) => !Object.hasOwn(merged, field)),
       )
       if (needsFullSource) {
         const client = yield* Capacity.client
@@ -6776,7 +6895,7 @@ const makeImpl = <
         sets[definition.partitionField] = partition
 
         if (!isNeeded) continue
-        const explicit = withVectors?.[logicalName]
+        const explicit = ownValue(withVectors, logicalName)
         if (explicit !== undefined) {
           sets[definition.vectorField] = yield* checkDimensions(logicalName, definition, explicit)
           continue
@@ -6836,7 +6955,7 @@ const makeImpl = <
     item: Readonly<globalThis.Record<string, unknown>> | undefined,
   ): number | undefined => {
     if (item === undefined || !systemFields.version) return undefined
-    const attr = item[systemFields.version]
+    const attr = ownValue(item, systemFields.version)
     return attr !== undefined ? Number((attr as { readonly N?: string }).N) : 0
   }
 
@@ -6876,7 +6995,7 @@ const makeImpl = <
     const values: globalThis.Record<string, AttributeValue> = {}
     const same: Array<string> = []
     if (systemFields.version) {
-      const version = item[systemFields.version]?.N
+      const version = ownValue(item, systemFields.version)?.N
       same.push(
         versionIs(
           version === undefined ? 0 : Number(version),
@@ -6889,7 +7008,7 @@ const makeImpl = <
     }
     const sameAs = (attr: string, tag: string) => {
       names[`#${tag}`] = attr
-      const value = item[attr]
+      const value = ownValue(item, attr)
       if (value === undefined) {
         same.push(`attribute_not_exists(#${tag})`)
       } else {
@@ -7051,7 +7170,7 @@ const makeImpl = <
     if (systemFields.version) {
       names["#dver"] = systemFields.version
       // An item written before the entity was `versioned` has no version.
-      const readVersion = read[systemFields.version]
+      const readVersion = ownValue(read, systemFields.version)
       if (readVersion === undefined) {
         parts.push("attribute_not_exists(#dver)")
       } else {
@@ -7102,7 +7221,7 @@ const makeImpl = <
         : dependsOn
     const guardOf = (attr: string, i: number): string => {
       names[`#dg${i}`] = attr
-      if (read[attr] === undefined) return `attribute_not_exists(#dg${i})`
+      if (ownValue(read, attr) === undefined) return `attribute_not_exists(#dg${i})`
       values[`:dg${i}`] = read[attr]!
       return `#dg${i} = :dg${i}`
     }
@@ -7205,7 +7324,11 @@ const makeImpl = <
       )
     }
     const changed = inputs.filter(
-      (attr) => !attributeValueEquals(stored[attr] as AttributeValue | undefined, read[attr]),
+      (attr) =>
+        !attributeValueEquals(
+          ownValue(stored, attr) as AttributeValue | undefined,
+          ownValue(read, attr),
+        ),
     )
     if (changed.length === 0 && userCondition)
       return new ConditionalCheckFailed({ entityType, key })
@@ -7325,7 +7448,8 @@ const makeImpl = <
       ]
       for (const field of restored) {
         delete post[field]
-        if (replaced[field] !== undefined) post[field] = replaced[field]
+        const held = ownValue(replaced, field)
+        if (held !== undefined) post[field] = held
       }
       Object.assign(post, derivedSets)
       for (const field of derivedRemoves) delete post[field]
@@ -7359,10 +7483,11 @@ const makeImpl = <
             ? schemas.recordSchema
             : schemas.itemSchema
       const fields = (target as unknown as { readonly fields: Schema.Struct.Fields }).fields
-      const present = Object.fromEntries(Object.entries(fields).filter(([name]) => name in raw))
-      return Schema.decodeUnknownEffect(Schema.Struct(present) as unknown as Schema.Codec<any>)(
-        raw,
-      ).pipe(
+      const present = Object.fromEntries(
+        Object.entries(fields).filter(([name]) => hasOwnName(raw, name)),
+      )
+      const presentSchema = Schema.Struct(present)
+      return Schema.decodeUnknownEffect(presentSchema as unknown as Schema.Codec<any>)(raw).pipe(
         Effect.mapError((cause) => new ValidationError({ entityType, operation: "decode", cause })),
       )
     })
@@ -7490,7 +7615,7 @@ const makeImpl = <
         // Only the composites are unmarshalled: the row may be large.
         const composites: globalThis.Record<string, AttributeValue> = {}
         for (const attr of compositeAttrs) {
-          const value = row[attr]
+          const value = ownValue(row, attr)
           if (value !== undefined) composites[attr] = value
         }
         try {
@@ -7952,7 +8077,8 @@ const makeImpl = <
         }
         if (systemFields.createdAt && !args.createdAtSupplied) {
           const createdAttr = resolveDbName(systemFields.createdAt)
-          if (currentRaw[createdAttr] !== undefined) item[createdAttr] = currentRaw[createdAttr]
+          if (ownValue(currentRaw, createdAttr) !== undefined)
+            item[createdAttr] = ownValue(currentRaw, createdAttr)
         }
       } else if (systemFields.version && isRetainEnabled()) {
         item[systemFields.version] =
@@ -8102,7 +8228,9 @@ const makeImpl = <
       // Retain: the item replaced (at its version), or the new item at its own.
       if (isRetainEnabled()) {
         const version =
-          currentRaw !== undefined ? (storedVersion ?? 0) : (item[systemFields.version!] as number)
+          currentRaw !== undefined
+            ? (storedVersion ?? 0)
+            : (ownValue(item, systemFields.version!) as number)
         items.push({
           Put: snapshotPut(
             args.tableName,
@@ -8122,7 +8250,11 @@ const makeImpl = <
       /** The stored attributes that differ from the item read. */
       const changedFrom = (stored: globalThis.Record<string, AttributeValue>) =>
         guard.inputs.filter(
-          (attr) => !attributeValueEquals(stored[attr], current?.[attr] as AttributeValue),
+          (attr) =>
+            !attributeValueEquals(
+              ownValue(stored, attr),
+              ownValue(current, attr) as AttributeValue,
+            ),
         )
       /** A lost race on the main item: the error once retries run out. */
       const lostRace = (
@@ -8327,7 +8459,7 @@ const makeImpl = <
 
       // Fetch all refs in parallel
       const fetchEffects = refsToProcess.map((ref) => {
-        const id = decoded[ref.idFieldName] as string
+        const id = ownValue(decoded, ref.idFieldName) as string
         return Effect.gen(function* () {
           // Fetched under the key composite the id is a value of, as an aggregate edge's id is
           // (#214, #241): the referenced entity's identifier needn't be its key. `get` takes the
@@ -8841,7 +8973,7 @@ const makeImpl = <
           const guarded = hasUniqueConstraints || Boolean(systemFields.version)
           const createdAtSupplied =
             systemFields.createdAt !== null &&
-            ((encoded as globalThis.Record<string, unknown>)[systemFields.createdAt] !==
+            (ownValue(encoded as globalThis.Record<string, unknown>, systemFields.createdAt) !==
               undefined ||
               opts.createdAt !== undefined)
 
@@ -9095,6 +9227,12 @@ const makeImpl = <
     encoded?: globalThis.Record<string, unknown> | undefined,
   ) =>
     Effect.gen(function* () {
+      // An operand record's value whose read threw (a getter the record inherits): kept in its
+      // place by the builder, which has no error channel, and refused here, naming the field.
+      const unreadable = unreadableOperand(requested)
+      if (unreadable !== undefined) {
+        return yield* new ValidationError({ entityType, operation: "update", cause: unreadable })
+      }
       // A packed field takes only a whole-value .set() / .remove() (#147).
       const packedRefusal = refusedPackedUpdate(requested)
       if (packedRefusal !== undefined) {
@@ -9247,7 +9385,7 @@ const makeImpl = <
       const refsToHydrate = hasRefs
         ? resolvedRefs.filter(
             (ref) =>
-              ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
+              hasOwnName(encodedUpdates as globalThis.Record<string, unknown>, ref.idFieldName) &&
               (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !== undefined,
           )
         : []
@@ -9602,7 +9740,7 @@ const makeImpl = <
         const currentRaw = fromAttributeMap(currentResult.Item)
         // 0: written before the entity was `versioned` (#133).
         const currentVersion = systemFields.version
-          ? (((currentRaw as globalThis.Record<string, unknown>)[systemFields.version] as
+          ? ((ownValue(currentRaw as globalThis.Record<string, unknown>, systemFields.version) as
               | number
               | undefined) ?? 0)
           : 0
@@ -9643,7 +9781,7 @@ const makeImpl = <
         // no per-bucket GET dance needed here.
         if (uState.sparseClearFields) {
           for (const field of uState.sparseClearFields) {
-            if (!hasSparseFields || !(field in sparseFields)) continue
+            if (!hasSparseFields || !Object.hasOwn(sparseFields, field)) continue
             newItem[field] = {}
           }
         }
@@ -9667,8 +9805,8 @@ const makeImpl = <
             delete newItem[attr]
             continue
           }
-          if (hasSparseFields && attr in sparseFields && typeof val === "object") {
-            const existing = (newItem[attr] as globalThis.Record<string, unknown>) ?? {}
+          if (hasSparseFields && Object.hasOwn(sparseFields, attr) && typeof val === "object") {
+            const existing = (ownValue(newItem, attr) as globalThis.Record<string, unknown>) ?? {}
             newItem[attr] = { ...existing, ...(val as globalThis.Record<string, unknown>) }
           } else {
             newItem[attr] = val
@@ -9686,8 +9824,10 @@ const makeImpl = <
         // version snapshot is written from: removed in place, the snapshot lost the entries too.
         if (uState.sparseRemoveEntries) {
           for (const op of uState.sparseRemoveEntries) {
-            if (!hasSparseFields || !(op.field in sparseFields)) continue
-            const bucket = newItem[op.field] as globalThis.Record<string, unknown> | undefined
+            if (!hasSparseFields || !Object.hasOwn(sparseFields, op.field)) continue
+            const bucket = ownValue(newItem, op.field) as
+              | globalThis.Record<string, unknown>
+              | undefined
             if (!bucket) continue
             const kept: globalThis.Record<string, unknown> = Object.assign(
               Object.create(null),
@@ -9711,7 +9851,7 @@ const makeImpl = <
           if (entry === undefined) return [newItem, attr]
           const map: globalThis.Record<string, unknown> = Object.assign(
             Object.create(null),
-            newItem[entry.field] as globalThis.Record<string, unknown> | undefined,
+            ownValue(newItem, entry.field) as globalThis.Record<string, unknown> | undefined,
           )
           newItem[entry.field] = map
           return [map, entry.key]
@@ -9844,9 +9984,10 @@ const makeImpl = <
         const newVersion = currentVersion + 1
         if (systemFields.version) newItem[systemFields.version] = newVersion
         if (systemFields.updatedAt) {
-          const userSupplied = (hydratedUpdates as globalThis.Record<string, unknown>)[
-            systemFields.updatedAt
-          ]
+          const userSupplied = ownValue(
+            hydratedUpdates as globalThis.Record<string, unknown>,
+            systemFields.updatedAt,
+          )
           newItem[systemFields.updatedAt] =
             userSupplied !== undefined
               ? userSupplied
@@ -9887,7 +10028,9 @@ const makeImpl = <
             keyForm(newItem),
             {
               ...(retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet }),
-              stamped: keyForm(writeStamps(newItem[systemFields.updatedAt ?? ""], newVersion)),
+              stamped: keyForm(
+                writeStamps(ownValue(newItem, systemFields.updatedAt ?? ""), newVersion),
+              ),
             },
           ),
         )
@@ -9929,7 +10072,7 @@ const makeImpl = <
                 constraintDef,
                 newItem,
                 (field, value) =>
-                  Object.is(value, currentDomainItem[field])
+                  Object.is(value, ownValue(currentDomainItem, field))
                     ? readSentinelValue(field, value)
                     : storedSentinelValue(field, value),
               ),
@@ -9989,7 +10132,7 @@ const makeImpl = <
         // checked before the read (`checkUpdatePayload`), and the row's own entries go back under
         // the attributes they were read from, whatever their keys.
         for (const [field, sparse] of Object.entries(sparseFields)) {
-          const value = newItem[field]
+          const value = ownValue(newItem, field)
           delete newItem[field]
           if (value === null || typeof value !== "object") continue
           for (const [key, entry] of Object.entries(value))
@@ -10004,7 +10147,7 @@ const makeImpl = <
           "update",
           new Set(
             Object.entries(hydratedUpdates as globalThis.Record<string, unknown>)
-              .filter(([field, value]) => field in packedFields && value != null)
+              .filter(([field, value]) => Object.hasOwn(packedFields, field) && value != null)
               .map(([field]) => resolveDbName(field)),
           ),
         )
@@ -10049,11 +10192,13 @@ const makeImpl = <
         const setAttrs: globalThis.Record<string, AttributeValue> = {}
         for (const [attr, value] of Object.entries(marshalledNewItem)) {
           if (attr === pkField || attr === skField) continue
-          if (named.has(attr) || !attributeValueEquals(currentItem[attr], value)) {
+          if (named.has(attr) || !attributeValueEquals(ownValue(currentItem, attr), value)) {
             setAttrs[attr] = value
           }
         }
-        const removeAttrs = Object.keys(currentItem).filter((attr) => !(attr in marshalledNewItem))
+        const removeAttrs = Object.keys(currentItem).filter(
+          (attr) => !Object.hasOwn(marshalledNewItem, attr),
+        )
         const written = new Set<string>([...Object.keys(setAttrs), ...removeAttrs])
 
         const writeNames: globalThis.Record<string, string> = {}
@@ -10137,7 +10282,7 @@ const makeImpl = <
           for (const [i, field] of inputs.entries()) {
             const attr = resolveDbName(field)
             writeNames[`#g${i}`] = attr
-            const read = currentItem[attr]
+            const read = ownValue(currentItem, attr)
             if (read === undefined) {
               condParts.push(`attribute_not_exists(#g${i})`)
             } else {
@@ -10246,7 +10391,10 @@ const makeImpl = <
           if (stored === undefined) return missingItem()
           const changed = guardedAttrs.filter(
             (attr) =>
-              !attributeValueEquals(stored[attr] as AttributeValue | undefined, currentItem[attr]),
+              !attributeValueEquals(
+                ownValue(stored, attr) as AttributeValue | undefined,
+                ownValue(currentItem, attr),
+              ),
           )
           if (changed.length === 0 && userCond) {
             return new ConditionalCheckFailed({ entityType, key: encodedKey })
@@ -10477,7 +10625,7 @@ const makeImpl = <
           }
           const sourceId =
             sourceIdentifierField != null
-              ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
+              ? ownValue(encodedKey as globalThis.Record<string, unknown>, sourceIdentifierField)
               : undefined
           if (sourceId != null) {
             yield* executeCascade(uState.cascade, domainData, sourceId)
@@ -10534,7 +10682,7 @@ const makeImpl = <
         }
         const currentRaw = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
         const version = systemFields.version
-          ? ((currentRaw[systemFields.version] as number | undefined) ?? 0)
+          ? ((ownValue(currentRaw, systemFields.version) as number | undefined) ?? 0)
           : 0
         if (evExpected !== undefined && version !== evExpected) {
           return yield* new OptimisticLockError({
@@ -10628,7 +10776,7 @@ const makeImpl = <
       // `.removeEntries()` and `.clearMap()` name sparse maps, and `.removeEntries()` the keys a
       // read reads as their entries: refused before anything is read.
       for (const op of uState.sparseRemoveEntries ?? []) {
-        if (!hasSparseFields || !(op.field in sparseFields)) {
+        if (!hasSparseFields || !Object.hasOwn(sparseFields, op.field)) {
           return yield* new ValidationError({
             entityType,
             operation: "update.removeEntries",
@@ -10653,7 +10801,7 @@ const makeImpl = <
         }
       }
       for (const field of uState.sparseClearFields ?? []) {
-        if (!hasSparseFields || !(field in sparseFields)) {
+        if (!hasSparseFields || !Object.hasOwn(sparseFields, field)) {
           return yield* new ValidationError({
             entityType,
             operation: "update.clearMap",
@@ -10686,7 +10834,7 @@ const makeImpl = <
               string,
               unknown
             >
-            const version = (clearedRaw[systemFields.version] as number | undefined) ?? 0
+            const version = (ownValue(clearedRaw, systemFields.version) as number | undefined) ?? 0
             if (evExpected !== undefined && version !== evExpected) {
               return yield* new OptimisticLockError({
                 entityType,
@@ -10793,14 +10941,14 @@ const makeImpl = <
           // Sparse fields: clearing a sparse field with null is a no-op
           // here — the `.removeEntries` API is the explicit per-key
           // remove. Skip to avoid REMOVE'ing the whole prefix erroneously.
-          if (hasSparseFields && attr in sparseFields) continue
+          if (hasSparseFields && Object.hasOwn(sparseFields, attr)) continue
           nullClears.push(attr)
           continue
         }
 
         // Sparse fields: emit one SET per bucket. Whole-bucket replace
         // semantics — concurrent writers to disjoint buckets are safe.
-        if (hasSparseFields && attr in sparseFields) {
+        if (hasSparseFields && Object.hasOwn(sparseFields, attr)) {
           if (typeof val !== "object") continue
           const sparse = sparseFields[attr]!
           const entries = Object.entries(val as globalThis.Record<string, unknown>)
@@ -10854,7 +11002,9 @@ const makeImpl = <
       // form via encode); else fall back to a freshly generated wire
       // primitive.
       const suppliedUpdatedAt =
-        systemFields.updatedAt === null ? undefined : encodedUpdatesMap[systemFields.updatedAt]
+        systemFields.updatedAt === null
+          ? undefined
+          : ownValue(encodedUpdatesMap, systemFields.updatedAt)
       const stampedUpdatedAt =
         suppliedUpdatedAt !== undefined
           ? suppliedUpdatedAt
@@ -11385,7 +11535,7 @@ const makeImpl = <
           if (!uState.cascade) return
           const sourceId =
             sourceIdentifierField != null
-              ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
+              ? ownValue(encodedKey as globalThis.Record<string, unknown>, sourceIdentifierField)
               : undefined
           if (sourceId == null) return
           const domainData = yield* appliedUpdate(
@@ -11761,7 +11911,7 @@ const makeImpl = <
           // A pinned version the row no longer has is refused before sending,
           // as the read-first paths do — not retried as if it were a race.
           if (request.expectedVersion !== undefined && systemFields.version) {
-            const stored = fromAttributeMap(read.Item)[systemFields.version]
+            const stored = ownValue(fromAttributeMap(read.Item), systemFields.version)
             const actual = typeof stored === "number" ? stored : 0
             if (actual !== request.expectedVersion) {
               return yield* new OptimisticLockError({
@@ -11801,7 +11951,7 @@ const makeImpl = <
       if (mainPut === undefined) {
         for (const [field, delta] of Object.entries(request.deltas ?? {})) {
           if (typeof delta !== "number") continue
-          const base = read[field]
+          const base = ownValue(read, field)
           after[field] = (typeof base === "number" ? base : 0) + delta
         }
       }
@@ -11883,7 +12033,9 @@ const makeImpl = <
       ]
       const readVersion = storedVersionOf(ownRow)
       const changedFrom = (stored: globalThis.Record<string, AttributeValue>) =>
-        conditionAttrs.filter((attr) => !attributeValueEquals(stored[attr], ownRow?.[attr]))
+        conditionAttrs.filter(
+          (attr) => !attributeValueEquals(ownValue(stored, attr), ownValue(ownRow, attr)),
+        )
       // Versioned, the vector attributes the condition holds as read too (`vectorsAsRead`): a
       // `reembed` changes them under the version.
       const vectorAttrs = new Set(vectorKeyFields())
@@ -12334,7 +12486,7 @@ const makeImpl = <
                 let snapshotAt: { readonly index: number; readonly version: number } | undefined
                 if (isRetainEnabled()) {
                   const currentVersion = systemFields.version
-                    ? ((raw[systemFields.version] as number | undefined) ?? 0)
+                    ? ((ownValue(raw, systemFields.version) as number | undefined) ?? 0)
                     : 0
                   const snapshotItem = buildSnapshotItem(
                     raw,
@@ -12633,7 +12785,7 @@ const makeImpl = <
       const record = (input ?? {}) as globalThis.Record<string, unknown>
       const primary = config.indexes.primary
       const keyFields = [...primary.pk.composite, ...primary.sk.composite]
-      const key = Object.fromEntries(keyFields.map((field) => [field, record[field]]))
+      const key = Object.fromEntries(keyFields.map((field) => [field, given(record, field)]))
       const encodedKey = yield* encodeKey(key, "upsert.decodeKey")
       const marshalledKey = toAttributeMap(composePrimaryKey(encodedKey))
       const dropped = new Set<string>([
@@ -12654,24 +12806,25 @@ const makeImpl = <
               !(
                 value === undefined &&
                 (keyedDefaults.has(field) ||
-                  ((encodedInput as globalThis.Record<string, unknown>)[field] === undefined &&
+                  (ownValue(encodedInput as globalThis.Record<string, unknown>, field) ===
+                    undefined &&
                     lacks.absentReading(field) === undefined))
               ),
           ),
         ),
-        (field, given) => field in given,
+        (field, given) => Object.hasOwn(given, field),
       )) as globalThis.Record<string, unknown>
       // What the single-write upsert sets with `if_not_exists`: under whatever the row holds.
       const fill = {
         ...Object.fromEntries(
           [...immutableFields]
-            .filter((field) => encodedInput[field] !== undefined)
-            .map((field) => [field, encodedInput[field]]),
+            .filter((field) => ownValue(encodedInput, field) !== undefined)
+            .map((field) => [field, ownValue(encodedInput, field)]),
         ),
         ...(systemFields.createdAt
           ? {
               [systemFields.createdAt]:
-                encodedInput[systemFields.createdAt] ??
+                ownValue(encodedInput, systemFields.createdAt) ??
                 generateTimestamp(systemFields.createdAtEncoding, now),
             }
           : {}),
@@ -12799,7 +12952,7 @@ const makeImpl = <
           if (
             systemFields.createdAt !== null &&
             isPrimaryComposite(systemFields.createdAt) &&
-            (input as globalThis.Record<string, unknown>)[systemFields.createdAt] === undefined
+            given(input as object, systemFields.createdAt) === undefined
           ) {
             return yield* put(input)._builder(mode, {
               condition: opts.condition,
@@ -12841,7 +12994,7 @@ const makeImpl = <
               (field) =>
                 upsertClears(
                   field,
-                  (encodedInput as globalThis.Record<string, unknown>)[field],
+                  ownValue(encodedInput as globalThis.Record<string, unknown>, field),
                   lacks,
                 ) &&
                 field !== systemFields.createdAt &&
@@ -12858,13 +13011,13 @@ const makeImpl = <
 
           const item = encoded as globalThis.Record<string, unknown>
           const suppliedCreatedAt =
-            systemFields.createdAt === null ? undefined : item[systemFields.createdAt]
+            systemFields.createdAt === null ? undefined : ownValue(item, systemFields.createdAt)
           const upsertedCreatedAt =
             suppliedCreatedAt !== undefined
               ? suppliedCreatedAt
               : generateTimestamp(systemFields.createdAtEncoding, now)
           const suppliedUpdatedAt =
-            systemFields.updatedAt === null ? undefined : item[systemFields.updatedAt]
+            systemFields.updatedAt === null ? undefined : ownValue(item, systemFields.updatedAt)
           const upsertedUpdatedAt =
             suppliedUpdatedAt !== undefined
               ? suppliedUpdatedAt
@@ -12939,7 +13092,7 @@ const makeImpl = <
             // Sparse fields: expand into one SET per bucket. Each bucket
             // attribute is named `<prefix>#<key>` and goes through
             // ExpressionAttributeNames as a literal (the `#` survives).
-            if (hasSparseFields && attr in sparseFields) {
+            if (hasSparseFields && Object.hasOwn(sparseFields, attr)) {
               if (val === null || typeof val !== "object") continue
               const sparse = sparseFields[attr]!
               for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
@@ -13408,7 +13561,7 @@ const makeImpl = <
         ([name]) => requestedRemoves?.has(name) === true && indexedDefaultFields().has(name),
       )
       for (const [attr] of removedToDefault) {
-        if ((input as globalThis.Record<string, unknown>)[attr] !== undefined) {
+        if (given(input as object, attr) !== undefined) {
           return yield* new ValidationError({
             entityType,
             operation: "append.remove",
@@ -13449,7 +13602,7 @@ const makeImpl = <
       if (namedRemoves !== undefined) {
         for (const attr of namedRemoves) {
           if (
-            attr in encoded &&
+            Object.hasOwn(encoded, attr) &&
             (encoded as globalThis.Record<string, unknown>)[attr] !== undefined
           ) {
             return yield* new ValidationError({
@@ -13536,9 +13689,9 @@ const makeImpl = <
             currentSk,
             KeyComposer.eventOrderByValue(
               schema,
-              // A zone's text named as the key form names it (`storedZoneText`).
-              storedSentinelValue(orderByField, encoded[orderByField]) ?? encoded[orderByField],
-              appendKeyForm[orderByField],
+              storedSentinelValue(orderByField, ownValue(encoded, orderByField)) ??
+                ownValue(encoded, orderByField),
+              ownValue(appendKeyForm, orderByField),
             ),
           ),
         }
@@ -13559,7 +13712,7 @@ const makeImpl = <
       // is SET on the current item and written on the event item.
       const packedStored: globalThis.Record<string, unknown> = {}
       for (const field of Object.keys(packedFields)) {
-        if (serialisedInput[field] !== undefined) {
+        if (ownValue(serialisedInput, field) !== undefined) {
           packedStored[resolveDbName(field)] = serialisedInput[field]
         }
       }
@@ -13583,7 +13736,9 @@ const makeImpl = <
         const valKey = `:a${counter}`
         const storedName = resolveDbName(attr)
         names[nameKey] = storedName
-        values[valKey] = toAttributeValue(attr in packedFields ? packedStored[storedName] : val)
+        values[valKey] = toAttributeValue(
+          Object.hasOwn(packedFields, attr) ? packedStored[storedName] : val,
+        )
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -13634,13 +13789,19 @@ const makeImpl = <
         for (const [indexName, index] of Object.entries(allIndexes)) {
           if (indexName === "primary") continue
           for (const [field, composites] of halvesOf(index)) {
-            if (!(field in gsiUpdate.sets) || !composites.includes(systemFields.createdAt!)) {
+            if (
+              !Object.hasOwn(gsiUpdate.sets, field) ||
+              !composites.includes(systemFields.createdAt!)
+            ) {
               continue
             }
             keptKeys.add(field)
             for (const attr of composites) {
               if (attr !== systemFields.createdAt && !isPrimaryComposite(attr)) {
-                keptValues.set(resolveDbName(attr), toAttributeValue(serialisedInput[attr]))
+                keptValues.set(
+                  resolveDbName(attr),
+                  toAttributeValue(ownValue(serialisedInput, attr)),
+                )
               }
             }
           }
@@ -13715,7 +13876,7 @@ const makeImpl = <
       const pkName = primary.pk.field
       const orderByName = resolveDbName(orderByField)
       // The attempted orderBy as stored (the encoded value).
-      const newObValue = serialisedInput[orderByField]
+      const newObValue = ownValue(serialisedInput, orderByField)
       // The user's condition is ANDed after the CAS, its names and values
       // after the CAS's, as 1.36 sent them.
       const uc = userCondition !== undefined ? compileOwnCondition(userCondition) : undefined
@@ -13949,7 +14110,7 @@ const makeImpl = <
           // `APPEND_GUARD_ATTEMPTS` attempts in all. A key composed from a stored
           // `createdAt` needs the same read, and the same guard: an append that found
           // no item must not write a key for a `createdAt` another writer just created.
-          const attempted = appendKeyForm[orderByField] as number | bigint
+          const attempted = ownValue(appendKeyForm, orderByField) as number | bigint
           const storedKeyForm = (stored: AttributeValue) =>
             Effect.try({
               try: () =>
@@ -13960,7 +14121,7 @@ const makeImpl = <
             })
           let current = first ?? (yield* readCurrentRow())
           for (let attempt = 1; ; attempt++) {
-            const storedOb = current?.[orderByName]
+            const storedOb = ownValue(current, orderByName)
             // The CAS, decided on the numbers: an existing item takes the
             // append only when its stored orderBy is below the attempted one
             // (one without an orderBy never does, as under `<`).
@@ -13973,7 +14134,7 @@ const makeImpl = <
                 : staleAppend(Option.some(yield* decodeCurrent(current)))
             }
             if (createdAtKeyed) {
-              const stored = current?.[resolveDbName(systemFields.createdAt!)]
+              const stored = ownValue(current, resolveDbName(systemFields.createdAt!))
               const keys = yield* composeAppendKeys(
                 stored === undefined ? stampedCreatedAt : fromAttributeMap({ v: stored }).v,
               )
@@ -13999,7 +14160,7 @@ const makeImpl = <
             const again = yield* readCurrentRow()
             const moved =
               (current === undefined) !== (again === undefined) ||
-              (again !== undefined && !attributeValueEquals(again[orderByName], storedOb))
+              (again !== undefined && !attributeValueEquals(ownValue(again, orderByName), storedOb))
             if (!moved) {
               // The guard held: the user's condition rejected the write (or
               // something other than a condition cancelled it, which 1.36
@@ -14074,9 +14235,9 @@ const makeImpl = <
           : undefined
       if (
         rejectedRow !== undefined &&
-        ([...keptKeys].some((key) => rejectedRow[key] === undefined) ||
+        ([...keptKeys].some((key) => ownValue(rejectedRow, key) === undefined) ||
           keptValueGuards.some(
-            (guard) => !attributeValueEquals(rejectedRow[guard.name], guard.value),
+            (guard) => !attributeValueEquals(ownValue(rejectedRow, guard.name), guard.value),
           ))
       ) {
         return yield* appendOverRead(rejectedRow)
@@ -14132,7 +14293,7 @@ const makeImpl = <
       // encoded values read back. `decodeAs` mutated `rawCurrent` to rename
       // DB columns to domain field names, so `rawCurrent[orderByField]` is the
       // wire-form value under its domain name.
-      const casFired = isCasFailure(rawCurrent[orderByField], newObValue)
+      const casFired = isCasFailure(ownValue(rawCurrent, orderByField), newObValue)
       if (!casFired && userCondition !== undefined) {
         // CAS held; the user's `.condition()` is the only thing that
         // could have rejected.
@@ -14250,7 +14411,7 @@ const makeImpl = <
       // and same function the write path uses (see `CompositeCodec`). They are
       // the caller's DOMAIN values: the key `put` wrote for one is the key form
       // of the value it stores.
-      const pkKeyForm = domainKeyForm(rawPk)
+      const pkKeyForm = domainKeyForm(rawPk, indexDef.pk.composite, indexDef.sk.composite)
       // One partition, or a sharded index's several (#183).
       const read = KeyComposer.composeReadPartitions(schema, entityType, indexDef, pkKeyForm)
       const pkValue = read.partitions[0]!
@@ -14258,7 +14419,7 @@ const makeImpl = <
       // dimensions are bounded through `.within()` on the typed accessor, never
       // passed as accessor composites (EDD-9093).
       const misplaced = zorder
-        ? indexDef.sk.composite.filter((attr) => pkKeyForm[attr] !== undefined)
+        ? indexDef.sk.composite.filter((attr) => given(pkKeyForm, attr) !== undefined)
         : []
       if (misplaced.length > 0) {
         throw new Error(
@@ -14270,7 +14431,7 @@ const makeImpl = <
         )
       }
       const hasSkComposites =
-        !zorder && indexDef.sk.composite.some((attr) => pkKeyForm[attr] !== undefined)
+        !zorder && indexDef.sk.composite.some((attr) => given(pkKeyForm, attr) !== undefined)
       const query = Query.make({
         tableName: "",
         // A filter's operands in the form this entity stores them (#242).
@@ -14640,7 +14801,7 @@ const makeImpl = <
           // Increment version
           // 0: a tombstone of an item written before the entity was `versioned`.
           const currentVersion = systemFields.version
-            ? ((restoredItem[systemFields.version] as number | undefined) ?? 0)
+            ? ((ownValue(restoredItem, systemFields.version) as number | undefined) ?? 0)
             : 0
           const newVersion = currentVersion + 1
           if (systemFields.version) restoredItem[systemFields.version] = newVersion
@@ -14829,9 +14990,9 @@ const makeImpl = <
                             : []
                           const fieldsRecord: globalThis.Record<string, string> = {}
                           for (const f of uniqueFields) {
-                            const v = restoredDomain[f]
+                            const v = ownValue(restoredDomain, f)
                             if (v !== undefined && v !== null) {
-                              fieldsRecord[f] = KeyComposer.compositeText(schema, v)
+                              setOwn(fieldsRecord, f, KeyComposer.compositeText(schema, v))
                             }
                           }
                           return new UniqueConstraintViolation({
@@ -15172,7 +15333,7 @@ const makeImpl = <
       ...config.indexes.primary.pk.composite,
       ...config.indexes.primary.sk.composite,
     ]) {
-      const fieldSchema = fields?.[field]
+      const fieldSchema = ownValue(fields, field)
       kinds.set(field, fieldSchema === undefined ? undefined : keyFormValueKind(fieldSchema))
     }
     return kinds
@@ -15213,7 +15374,7 @@ const makeImpl = <
     kindReadingOf(
       record,
       fields,
-      (field) => row[resolveDbName(field)]?.N,
+      (field) => ownValue(row, resolveDbName(field))?.N,
       (reading) => compose(reading.record, reading.asOther),
       stored,
     )
@@ -15493,8 +15654,10 @@ const makeImpl = <
             KeyComposer.eventOrderByValue(
               form.sk,
               // As the other numeric kind, the value is its own Encoded form.
-              record[orderBy] === rowKeyForm[orderBy] ? appended : record[orderBy],
-              record[orderBy],
+              ownValue(record, orderBy) === ownValue(rowKeyForm, orderBy)
+                ? appended
+                : ownValue(record, orderBy),
+              ownValue(record, orderBy),
             ),
           ),
         ),
@@ -15530,7 +15693,9 @@ const makeImpl = <
   /** Is `held` the same snapshot state as `read` ({@link sameSnapshotAs}, as values)? */
   const sameSnapshotHeld = (held: StoredRow, read: StoredRow): boolean =>
     [systemFields.version, INCARNATION_TOKEN, systemFields.updatedAt].every(
-      (attr) => typeof attr !== "string" || attributeValueEquals(held[attr], read[attr]),
+      (attr) =>
+        typeof attr !== "string" ||
+        attributeValueEquals(ownValue(held, attr), ownValue(read, attr)),
     )
 
   const rekeyConflict = (
@@ -15943,7 +16108,7 @@ const makeImpl = <
         const { field, composite } = index[half]
         if (isTableKeyField(field) || judged.has(field)) continue
         judged.add(field)
-        const attribute = row[field]
+        const attribute = ownValue(row, field)
         const stored = attribute === undefined ? undefined : (attribute.S ?? attribute.B)
         if (attribute !== undefined && stored === undefined) continue
         const verdict = KeyComposer.judgeIndexHalf(judging, index, half, stored, rowKeyForm)
@@ -15989,11 +16154,11 @@ const makeImpl = <
     const guards: Array<string> = ["attribute_exists(#pk)"]
     const guardAs = (name: string, operand: string, attribute: string) => {
       names[name] = attribute
-      const read = row[attribute]
+      const read = ownValue(row, attribute)
       if (read === undefined) {
         guards.push(`attribute_not_exists(${name})`)
       } else {
-        operands[operand] = read
+        setOwn(operands, operand, read)
         guards.push(`${name} = ${operand}`)
       }
     }
@@ -16390,7 +16555,7 @@ const makeImpl = <
     const rewrite = (field: string, value: AttributeValue, attrs: ReadonlyArray<string>) => {
       if (isTableKeyField(field)) return
       sets[field] = value
-      olds[field] = row[field]!
+      olds[field] = ownValue(row, field)!
       for (const attr of attrs) composites.add(resolveDbName(attr))
     }
     const forms = KeyText136.forms(schema)
@@ -16423,7 +16588,7 @@ const makeImpl = <
         record: globalThis.Record<string, unknown>,
       ) => string | undefined,
     ) => {
-      const stored = row[field]?.S
+      const stored = ownValue(row, field)?.S
       if (stored === undefined) return
       // Its current text, which no other text is looked for behind: nothing to rewrite.
       const text = composing(now)
@@ -16770,7 +16935,7 @@ const makeImpl = <
           // A composite the row lacks (the gap of a truncated sort key) or one derived
           // from another attribute isn't stored: the key's text is what the guard holds on.
           // One whose zones are rewritten is guarded as read already.
-          if (row[attr] === undefined || Object.hasOwn(zones.sets, attr)) continue
+          if (ownValue(row, attr) === undefined || Object.hasOwn(zones.sets, attr)) continue
           names[`#c${i}`] = attr
           operands[`:c${i}`] = row[attr]!
           guards.push(`#c${i} = :c${i}`)
@@ -17054,8 +17219,8 @@ const makeImpl = <
   ) => {
     const lifted = { ...source }
     for (const field of resolveUniqueFields(constraintDef)) {
-      const value = readSentinelValue(field, source[field])
-      if (value !== undefined) lifted[field] = value
+      const value = readSentinelValue(field, ownValue(source, field))
+      if (value !== undefined) setOwn(lifted, field, value)
     }
     return lifted
   }
@@ -17166,10 +17331,10 @@ const makeImpl = <
     readonly mixes: () => ReadonlyArray<SentinelKey>
   } => {
     const lifted = liftedSentinelValues(constraintDef, source)
-    const digits = (field: string) => row[resolveDbName(field)]?.N
+    const digits = (field: string) => ownValue(row, resolveDbName(field))?.N
     const fields = otherKinds
       ? resolveUniqueFields(constraintDef).filter(
-          (field) => otherNumericKind(lifted[field], digits(field)) !== undefined,
+          (field) => otherNumericKind(ownValue(lifted, field), digits(field)) !== undefined,
         )
       : []
     const readings: Array<ReadonlySet<string>> = [new Set()]
@@ -17188,7 +17353,7 @@ const makeImpl = <
         for (const asOther of mixes) {
           const record = { ...lifted }
           for (const field of asOther)
-            record[field] = otherNumericKind(lifted[field], digits(field))
+            record[field] = otherNumericKind(ownValue(lifted, field), digits(field))
           const key = sentinelKeyUnder(under, constraintName, constraintDef, record, asOther)
           if (key === undefined || seen.has(Rekey.identity(key.pk, key.sk))) continue
           seen.add(Rekey.identity(key.pk, key.sk))
@@ -19115,7 +19280,7 @@ const makeImpl = <
     if (read === undefined) return undefined
     const declared = { ...read }
     for (const [attr, kind] of primaryKeyKinds) {
-      const value = read[attr]
+      const value = ownValue(read, attr)
       if (kind === "number" && typeof value === "bigint") declared[attr] = Number(value)
       if (kind === "bigint" && typeof value === "number") {
         if (!Number.isInteger(value)) return undefined
@@ -19502,6 +19667,11 @@ const makeImpl = <
     _unpackFields: unpackFields,
     _dispatchAttributes: dispatchAttributes,
     _packedGuards: packedGuards,
+    _givenValues: (record: object, names: ReadonlyArray<string>) => {
+      // 1.40.0's copy, a spread; read by name only where it lacks a composite (1.40.0 failed).
+      const copy: globalThis.Record<string, unknown> = { ...record }
+      return lacksAny(copy, names) ? lackedByName(record, copy, names, undefined, "getter") : copy
+    },
     _decodeImage: decodeImageItem,
     _resolvedRefs: resolvedRefs,
     /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
@@ -19520,7 +19690,7 @@ const makeImpl = <
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
     _keyForm: keyForm,
-    _domainKeyForm: domainKeyForm,
+    _domainKeyForm: (record: globalThis.Record<string, unknown>) => domainKeyForm(record),
     _unstorableKey: unstorableKey,
     _renameToDynamo: renameToDynamo,
     _setOf: setOf,
@@ -20072,7 +20242,10 @@ export const bind = <
           const field =
             orderBy === undefined
               ? undefined
-              : getSchemaFields(entity.schemas.inputSchema as unknown as Schema.Top)?.[orderBy]
+              : ownValue(
+                  getSchemaFields(entity.schemas.inputSchema as unknown as Schema.Top),
+                  orderBy,
+                )
           if (field === undefined) return (v: unknown) => v
           const codec = field as unknown as Schema.Codec<unknown, unknown>
           const encode = Schema.encodeUnknownOption(codec)

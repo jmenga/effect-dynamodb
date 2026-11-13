@@ -15,6 +15,7 @@
  */
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
@@ -255,7 +256,7 @@ const serializeRawCondition = (condition: RawSortKeyCondition): Query.SortKeyCon
 /** Build the runtime sk accessor object — each property returns its field name. */
 const buildSkAccessor = (fields: ReadonlyArray<string>): Record<string, string> => {
   const acc: Record<string, string> = {}
-  for (const f of fields) acc[f] = f
+  for (const f of fields) setOwn(acc, f, f)
   return acc
 }
 
@@ -1169,9 +1170,9 @@ export const collectionNaming = (
         const item: Record<string, unknown> = {}
         for (const head of heads) {
           if (!has(m, head)) continue
-          const value = raw[m.resolve(head)]
+          const value = ownValue(raw, m.resolve(head))
           if (value !== undefined) {
-            item[head] = Query.respelled(value, plans.get(m.entityType)?.get(head))
+            setOwn(item, head, Query.respelled(value, plans.get(m.entityType)?.get(head)))
           }
         }
         return { _memberKey: m.entityKey, _decoded: item }

@@ -24,6 +24,7 @@
 
 import type { AttributeValue, KeysAndAttributes } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
+import { ownValue } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { Effect } from "effect"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import {
@@ -78,7 +79,9 @@ const identity = (
   names: ReadonlyArray<string>,
   item: Record<string, AttributeValue>,
 ): string =>
-  [tableName, ...names.map((name) => `${name}=${scalarIdentity(item[name])}`)].join("\u0000")
+  [tableName, ...names.map((name) => `${name}=${scalarIdentity(ownValue(item, name))}`)].join(
+    "\u0000",
+  )
 
 /**
  * Fetch `requests` and return the raw items in input order, `undefined` where

@@ -25,6 +25,7 @@ import {
   ValidationError as ValidationErrorClass,
   VectorIndexBackfilling,
 } from "@effect-dynamodb/schema/Errors.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import type {
   Similarity,
@@ -537,8 +538,8 @@ const projectDomainNames = (
 ): Record<string, unknown> => {
   const out: Record<string, unknown> = {}
   for (const domainName of projection) {
-    const value = raw[resolveDbName(domainName)]
-    if (value !== undefined) out[domainName] = value
+    const value = ownValue(raw, resolveDbName(domainName))
+    if (value !== undefined) setOwn(out, domainName, value)
   }
   return out
 }

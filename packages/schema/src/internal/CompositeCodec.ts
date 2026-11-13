@@ -34,9 +34,10 @@
  */
 
 import { Equal, Option, Schema, SchemaAST } from "effect"
-import { substituteSchemaDeep } from "./EntitySchemas.js"
+import { isProtoAbsent, substituteSchemaDeep } from "./EntitySchemas.js"
 import { readingKeyInstances } from "./InstanceReads.js"
 import { isStoredNaN, KeyValueError, STORED_NAN } from "./NumericKey.js"
+import { given, keyEntries, ownValue, setOwn } from "./OwnNames.js"
 import {
   getSchemaFields,
   hasEncodingTransformation,
@@ -803,13 +804,17 @@ export const storedFieldAtPath = (
 /**
  * The field a model declares under `name`. Never a member every object
  * inherits: an attribute named `toString` that the model doesn't declare (a
- * version or timestamp attribute) is not a field.
+ * version or timestamp attribute) is not a field. Nor one a derived struct holds
+ * as 1.40.0's didn't hold it (`isProtoAbsent`): its value is key text as given,
+ * as it was.
  */
 const declared = (
   fields: Record<string, Schema.Top> | undefined,
   name: string,
-): Schema.Top | undefined =>
-  fields !== undefined && Object.hasOwn(fields, name) ? fields[name] : undefined
+): Schema.Top | undefined => {
+  const field = ownValue(fields, name)
+  return isProtoAbsent(field) ? undefined : field
+}
 
 const followPath = (
   fields: Record<string, Schema.Top> | undefined,
@@ -960,11 +965,11 @@ export const kindReadingOf = (
       return undefined
     }
   }
-  const given: KindReading = { record, asOther: new Set() }
-  const segments = composed(given)
+  const asGiven: KindReading = { record, asOther: new Set() }
+  const segments = composed(asGiven)
   if (segments === undefined) return undefined
   const base = segments.join("")
-  if (targets.has(base)) return given
+  if (targets.has(base)) return asGiven
   const offsets: Array<number> = []
   let offset = 0
   for (const segment of segments) {
@@ -974,7 +979,7 @@ export const kindReadingOf = (
   const others = new Map<string, number | bigint>()
   const edits: Array<KindEdit> = []
   for (const field of new Set(fields)) {
-    const other = otherNumericKind(record[field], digits(field))
+    const other = otherNumericKind(given(record, field), digits(field))
     if (other === undefined) continue
     const alone: KindReading = { record: { ...record, [field]: other }, asOther: new Set([field]) }
     const parts = composed(alone)
@@ -1048,7 +1053,7 @@ export const kindReadingOf = (
     const flipped = [...decided].filter(([, asOther]) => asOther).map(([field]) => field)
     if (flipped.length < 2 || !targets.has(`${text}${rest}`)) continue
     const values = { ...record }
-    for (const field of flipped) values[field] = others.get(field)
+    for (const field of flipped) setOwn(values, field, others.get(field))
     const reading: KindReading = { record: values, asOther: new Set(flipped) }
     const confirmed = composed(reading)
     if (confirmed !== undefined && targets.has(confirmed.join(""))) return reading
@@ -1084,9 +1089,14 @@ export const kindReadingOf = (
  */
 export const makeCompositeStoredForm = (
   source: Schema.Top,
-): ((record: Record<string, unknown>) => Record<string, unknown>) => {
+): ((
+  record: Record<string, unknown>,
+  required?: ReadonlyArray<string>,
+  optional?: ReadonlyArray<string>,
+) => Record<string, unknown>) => {
   const storedForm = compositeStoredForm(source)
-  return (record) => toCompositeKeyRecord(storedForm, record)
+  return (record, required, optional) =>
+    toCompositeKeyRecord(storedForm, record, required, optional)
 }
 
 /** {@link makeCompositeStoredForm}, one attribute at a time. */
@@ -1153,18 +1163,21 @@ export const makeCompositeDomainKeyForm = (
 
 /**
  * Apply a `CompositeKeyForm` across every entry of a record, so a whole key or
- * composite record can be normalised in one call.
+ * composite record can be normalised in one call. The result is a plain record
+ * of own entries: the record's own enumerable entries, read as 1.40.0 read them
+ * (`Object.entries`) and nothing else of the record, wherever they hold every
+ * composite in `required` (the composites the key can't be composed without).
+ * Only where they lack one, where 1.40.0 failed ("Missing composite
+ * attribute"), is each composite of `required` and `optional` they lack read by
+ * name (`keyEntries`): from a prototype, a class's getter or a proxy (#239),
+ * never a function there. A record the library built holds its entries itself.
  */
 export const toCompositeKeyRecord = (
   keyForm: CompositeKeyForm,
   record: Record<string, unknown>,
-): Record<string, unknown> => {
-  const out: Record<string, unknown> = {}
-  for (const [attr, value] of Object.entries(record)) {
-    out[attr] = keyForm(attr, value)
-  }
-  return out
-}
+  required: ReadonlyArray<string> = [],
+  optional: ReadonlyArray<string> = [],
+): Record<string, unknown> => keyEntries(record, required, optional, keyForm)
 
 /**
  * How a composite's key form is derived — the branch `makeCompositeKeyForm`
@@ -1181,7 +1194,7 @@ export type CompositeKeyFormKind = "absent" | "identity" | "type-numeric" | "enc
 
 /** Classify one composite attribute of a model/derived schema. */
 export const compositeKeyFormKind = (source: Schema.Top, attr: string): CompositeKeyFormKind => {
-  const field = getSchemaFields(source)?.[attr]
+  const field = declared(getSchemaFields(source), attr)
   if (field === undefined) return "absent"
   if (numericTypeWithStringEncoding(field)) return "type-numeric"
   if (!hasEncodingTransformation(field)) return "identity"

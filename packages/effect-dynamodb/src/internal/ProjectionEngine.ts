@@ -42,6 +42,7 @@ import {
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { fnv1a64 } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -1239,7 +1240,7 @@ export const makeEngine = (config: EngineConfig) => {
         const raw = fromAttributeMap(item) as Record<string, unknown>
         const values: Record<string, unknown> = {}
         for (const f of keptFields) {
-          const v = raw[dbName(f)]
+          const v = ownValue(raw, dbName(f))
           if (v !== undefined) values[f] = v
         }
         return Option.some<Row>({ values, tombstone: true, createdAt: undefined, item, token })
@@ -1251,12 +1252,13 @@ export const makeEngine = (config: EngineConfig) => {
       let values: Record<string, unknown> = decoded
       if (fields !== undefined) {
         values = {}
-        for (const f of fields) if (decoded[f] !== undefined) values[f] = decoded[f]
+        for (const f of fields)
+          if (ownValue(decoded, f) !== undefined) values[f] = ownValue(decoded, f)
       }
       return Option.some<Row>({
         values: readModel._attachPrototype?.(values) ?? values,
         tombstone: false,
-        createdAt: createdAtField === null ? undefined : decoded[createdAtField],
+        createdAt: createdAtField === null ? undefined : ownValue(decoded, createdAtField),
         item,
         token,
       })
@@ -1290,19 +1292,19 @@ export const makeEngine = (config: EngineConfig) => {
     const values = Option.isSome(row) ? row.value.values : undefined
     const layout = config.checkpoints
     if (layout.kind === "scalar") {
-      const v = values?.[layout.field]
+      const v = ownValue(values, layout.field)
       return { kind: "scalar", at: v === undefined ? 0 : Number(v) - layout.offset }
     }
     const mapped = layout.fields[source]
     const fromMap = (): Slot => {
-      const map = (values?.[layout.map!] ?? {}) as Record<string, number>
+      const map = (ownValue(values, layout.map!) ?? {}) as Record<string, number>
       const v = map[instanceKey(source, streamIdStr)]
       return { kind: "map", at: v === undefined ? 0 : Number(v) }
     }
     if (mapped === undefined) return fromMap()
-    const stored = values?.[mapped.instanceField]
+    const stored = ownValue(values, mapped.instanceField)
     const owner = claimed.get(source) ?? (stored === null || stored === "" ? undefined : stored)
-    const scalar = values?.[mapped.field]
+    const scalar = ownValue(values, mapped.field)
     const at = scalar === undefined ? 0 : Number(scalar) - mapped.offset
     // No owner recorded: a new row, or a legacy one — adopted by this instance.
     if (owner === undefined && !adopt) return { kind: "field", at }
@@ -1322,7 +1324,7 @@ export const makeEngine = (config: EngineConfig) => {
   /** The row's revision, when the projection keeps one. */
   const revisionOf = (row: Option.Option<Row>): number | undefined => {
     if (config.revision === undefined || Option.isNone(row)) return undefined
-    const v = row.value.values[config.revision.field]
+    const v = ownValue(row.value.values, config.revision.field)
     return v === undefined ? undefined : Number(v)
   }
 
@@ -1350,16 +1352,19 @@ export const makeEngine = (config: EngineConfig) => {
     } else {
       // Carry every field the layout owns over from the row, then advance.
       for (const f of Object.values(layout.fields)) {
-        if (target[f.field] === undefined && previous?.[f.field] !== undefined)
-          target[f.field] = previous[f.field]
-        if (target[f.instanceField] === undefined && previous?.[f.instanceField] !== undefined) {
-          target[f.instanceField] = previous[f.instanceField]
+        if (ownValue(target, f.field) === undefined && ownValue(previous, f.field) !== undefined)
+          target[f.field] = ownValue(previous, f.field)
+        if (
+          ownValue(target, f.instanceField) === undefined &&
+          ownValue(previous, f.instanceField) !== undefined
+        ) {
+          target[f.instanceField] = ownValue(previous, f.instanceField)
         }
       }
       const map: Record<string, number> =
         layout.map === undefined
           ? {}
-          : { ...((previous?.[layout.map] ?? {}) as Record<string, number>) }
+          : { ...((ownValue(previous, layout.map) ?? {}) as Record<string, number>) }
       for (const a of advanced) {
         if (a.slot.kind === "field") {
           const mapped = layout.fields[a.source]!
@@ -1370,7 +1375,7 @@ export const makeEngine = (config: EngineConfig) => {
       // An empty map stays absent on a row that had none.
       if (
         layout.map !== undefined &&
-        (Object.keys(map).length > 0 || previous?.[layout.map] !== undefined)
+        (Object.keys(map).length > 0 || ownValue(previous, layout.map) !== undefined)
       )
         target[layout.map] = map
     }
@@ -1409,7 +1414,7 @@ export const makeEngine = (config: EngineConfig) => {
         },
       }
     }
-    const stored = row.value.values[layout.field]
+    const stored = ownValue(row.value.values, layout.field)
     // A row written before the projection: no checkpoint yet.
     if (stored === undefined) {
       return {
@@ -2396,7 +2401,9 @@ export const makeEngine = (config: EngineConfig) => {
         target[config.revision.field] = nextRevisionOf(row)
       }
       const nextRevision =
-        config.revision === undefined ? undefined : (target[config.revision.field] as number)
+        config.revision === undefined
+          ? undefined
+          : (ownValue(target, config.revision.field) as number)
       let written: Option.Option<unknown>
       if (Option.isNone(state)) {
         // A tombstone keeps the layout's fields, and the bookkeeping of the other projections that
@@ -2628,7 +2635,8 @@ export const makeEngine = (config: EngineConfig) => {
   /** The fields the library owns, re-applied after `toItem`. */
   const pick = (target: Record<string, unknown>): Record<string, unknown> => {
     const out: Record<string, unknown> = {}
-    for (const f of keptFields) if (target[f] !== undefined) out[f] = target[f]
+    for (const f of keptFields)
+      if (ownValue(target, f) !== undefined) setOwn(out, f, ownValue(target, f))
     return out
   }
 

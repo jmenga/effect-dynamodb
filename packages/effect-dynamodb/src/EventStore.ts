@@ -78,6 +78,7 @@ import {
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { classOf, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import {
   isDispatchEligible,
   packedShape,
@@ -281,6 +282,30 @@ const streamCodecRequirements = (
 
 /** The attributes a stream image reads by stored form: event `data` only. */
 const DATA_ATTRIBUTES: ReadonlyArray<string> = ["data"]
+
+/**
+ * The type an appended event is stored under, read as 1.40.0 read it: its `_tag`, else its
+ * constructor's `identifier`, else the constructor's `name`, `event.constructor` read for each.
+ * Only where `event.constructor` reads no function, where 1.40.0 stored no type, is the event
+ * asked for its class: a field named `constructor` (given by `Object.create`, a class with
+ * getters, or as a `Schema.Class` instance's own field, #239) stands where 1.40.0 looked for it,
+ * so the class is its nearest prototype's ({@link classOf}).
+ */
+const eventTypeOf = (event: unknown): string | undefined => {
+  const tag = (event as { readonly _tag?: string })._tag
+  if (tag !== undefined && tag !== null) return tag
+  const made = (event as { readonly constructor?: unknown }).constructor
+  if (typeof made === "function") {
+    return (
+      (made as { readonly identifier?: string }).identifier ??
+      (event as { readonly constructor: { readonly name: string } }).constructor.name
+    )
+  }
+  const eventClass = classOf(event as object) as
+    | { readonly identifier?: string; readonly name?: string }
+    | undefined
+  return eventClass?.identifier ?? eventClass?.name
+}
 
 const EventEnvelope = Schema.Struct({
   streamId: Schema.String,
@@ -1899,7 +1924,7 @@ const parseStreamIdWith = (
   }
   const id: Record<string, string> = {}
   fields.forEach((field, i) => {
-    id[field] = parts[i]!
+    setOwn(id, field, parts[i]!)
   })
   return Effect.succeed(id)
 }
@@ -3920,10 +3945,19 @@ export const makeStream = <
             const version = expectedVersion + i + 1
             // In Effect v4, Schema.Class instances don't have _tag as an own property.
             // The identifier is on the constructor (class) itself.
-            const evtType =
-              ((event as Record<string, unknown>)._tag as string | undefined) ??
-              (event as { constructor: { identifier?: string } }).constructor.identifier ??
-              (event as { constructor: { name: string } }).constructor.name
+            const evtType = eventTypeOf(event)
+            // An event item without a type is one no read decodes, and 1.40.0 died here before
+            // sending anything: an event that names none (no `_tag`, no class) is refused.
+            if (evtType === undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "EventStore.append",
+                cause:
+                  `events[${i}] names no event type: it has no \`_tag\`, and no class whose ` +
+                  "`identifier` or `name` gives one (an object without a prototype, say). " +
+                  "Nothing was written.",
+              })
+            }
 
             const wire = yield* encodeToWire(
               memberSchemaFor(event) as Schema.Codec<any>,

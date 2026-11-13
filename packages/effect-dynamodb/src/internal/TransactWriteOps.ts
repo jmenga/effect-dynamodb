@@ -46,6 +46,7 @@ import {
   isExpr,
   operandsAsStored,
   parseShorthand,
+  unsentIn,
 } from "./Expr.js"
 import {
   andRaw,
@@ -447,6 +448,18 @@ export const prepareTransactWriteOps = (
             entityType: checkOp._entity.entityType,
             operation: `${operation}.check`,
             cause: `${operation}: Transaction.check() was given an empty condition. Nothing was sent.`,
+          })
+        }
+        // `Expression.condition` compiled an operand without its map entry keyed `__proto__`
+        // (`EDD-9165`), as 1.40.0 did, and DynamoDB refused what that left on every path.
+        const unsent = unsentIn(checkOp._condition)
+        if (unsent !== undefined) {
+          return yield* new ValidationError({
+            entityType: checkOp._entity.entityType,
+            operation: `${operation}.check`,
+            cause:
+              `${operation}: Transaction.check()'s condition compares with a value DynamoDB ` +
+              `can't store: ${unsent.describe()} Nothing was sent.`,
           })
         }
         ops.push({

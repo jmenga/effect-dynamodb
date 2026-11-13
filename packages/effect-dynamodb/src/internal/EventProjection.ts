@@ -888,6 +888,17 @@ export const refuseReadModel = (
   if (readModel.timeSeries) {
     refuse("the read model is a `timeSeries` entity, written by `append`, not `put`.")
   }
+  // The projection sets and reads each of these fields by name on every row it writes (#239), so
+  // whatever attribute stores it, a row can't hold one named `__proto__`.
+  if (options.fields.includes("__proto__")) {
+    throw new Error(
+      `[EDD-9152] ${label}: a field the projection writes on every row (a checkpoint, a ` +
+        `checkpoint map, an instance field or the revision) is named "__proto__". The projection ` +
+        `sets and reads that field by name on each row, and a JavaScript object can't hold a ` +
+        `property of that name by assignment (assigning it sets the object's prototype), so ` +
+        `whatever attribute stores it, the value would be lost. Name it otherwise.`,
+    )
+  }
   const declared = modelFields(readModel.model)
   for (const f of options.fields) {
     if (declared !== undefined && !declared.includes(f)) {

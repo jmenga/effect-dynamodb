@@ -10,6 +10,7 @@
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { refuseSharedKeyAttribute } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
@@ -332,7 +333,7 @@ export const mergeVectorIndexes = (
               `SearchSchema attribute must have one scalar type.`,
           )
         }
-        existing.filterStoredTypes[stored] = storedType
+        setOwn(existing.filterStoredTypes, stored, storedType)
         if (existing.filters.some((f) => existing.resolveDbName(f) === stored)) continue
         existing.filters.push(filter)
       }

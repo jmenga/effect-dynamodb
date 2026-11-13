@@ -17,8 +17,11 @@ import {
   KEY_DELIMITER,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
-import { encodeBigInt, encodeNumber, isStoredNaN } from "./internal/NumericKey.js"
+import { encodeBigInt, encodeNumber, isStoredNaN, KeyValueError } from "./internal/NumericKey.js"
 import { judgeObjectKeyText } from "./internal/ObjectKeyText.js"
+// A record composed from may be a caller's key or query composites: a composite's value is read as
+// a caller's payload is (`given`), so a member every object inherits is no value (#239).
+import { given, PROTO_ENTRY, setOwn } from "./internal/OwnNames.js"
 import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
 import { zonesAsStored } from "./internal/StoredForm.js"
 import {
@@ -495,7 +498,7 @@ export const extractComposites = (
   record: Record<string, unknown>,
 ): ReadonlyArray<string> =>
   composite.map((attr) => {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${attr}" in record`)
     }
@@ -513,7 +516,7 @@ export const tryExtractComposites = (
 ): ReadonlyArray<string> | undefined => {
   const values: Array<string> = []
   for (const attr of composite) {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) return undefined
     values.push(serializeValue(value))
   }
@@ -721,7 +724,7 @@ export const extractKeyComposites = (
   half?: "pk" | "sk",
 ): ReadonlyArray<string> =>
   composite.map((attr) => {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${attr}" in record`)
     }
@@ -795,7 +798,9 @@ const composedShardMarker = (
   const shards = index.shards
   if (shards === undefined) return undefined
   const source = boundShardSource(index, shards)
-  const absent = source.filter((attr) => record[attr] === undefined || record[attr] === null)
+  const absent = source.filter(
+    (attr) => given(record, attr) === undefined || given(record, attr) === null,
+  )
   if (absent.length > 0) {
     throw new ShardSourceError({
       message:
@@ -808,7 +813,7 @@ const composedShardMarker = (
   return shardMarker(
     shards.count,
     shardOf(
-      source.map((attr) => serializeValue(record[attr])),
+      source.map((attr) => serializeValue(given(record, attr))),
       shards.count,
     ),
   )
@@ -840,7 +845,7 @@ export const composeStoredPk = (
   const shards = index.shards
   if (
     shards !== undefined &&
-    !boundShardSource(index, shards).every((attr) => hasValue(record[attr]))
+    !boundShardSource(index, shards).every((attr) => hasValue(given(record, attr)))
   ) {
     return undefined
   }
@@ -916,11 +921,11 @@ const pinsShardSource = (
   const pins = new Set(index.pk.composite)
   if (!isZOrderHalf(index.sk)) {
     for (const attr of index.sk.composite) {
-      if (!hasValue(record[attr])) break
+      if (!hasValue(given(record, attr))) break
       pins.add(attr)
     }
   }
-  return source.every((attr) => pins.has(attr) && hasValue(record[attr]))
+  return source.every((attr) => pins.has(attr) && hasValue(given(record, attr)))
 }
 
 /**
@@ -986,7 +991,7 @@ export const composeReadPartitions = (
         partition(
           shards.count,
           shardOf(
-            source.map((attr) => serializeValue(record[attr])),
+            source.map((attr) => serializeValue(given(record, attr))),
             shards.count,
           ),
         ),
@@ -1098,7 +1103,7 @@ export const composeZOrderSk = (
   }
   const casing = effectiveCasing(schema, index)
   const segments = prefix.map((part) => {
-    const value = record[part.field]
+    const value = given(record, part.field)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${part.field}" in record`)
     }
@@ -1108,7 +1113,7 @@ export const composeZOrderSk = (
     )
   })
   const levels = layout.dimensions.map((dim) => {
-    const value = record[dim.field]
+    const value = given(record, dim.field)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${dim.field}" in record`)
     }
@@ -1156,6 +1161,25 @@ export const composeHistoryItemSegment = (
 }
 
 /**
+ * The attribute an index's `half` is stored under, for a write giving it a value. One named
+ * `__proto__` (an index whose composites a row may lack, so its definition loads) is refused
+ * (`[EDD-9165]`, a `KeyValueError`): the AWS SDK's marshaller drops it, and its unmarshaller drops
+ * one an update stored. A write that gives it no value (the index left out, or its half removed)
+ * is as it was.
+ */
+const keyAttribute = (index: IndexDefinition, half: "pk" | "sk"): string => {
+  const field = index[half].field
+  if (field !== "__proto__") return field
+  const which = half === "pk" ? "partition" : "sort"
+  const named = index.index === undefined ? "the table" : `index "${index.index}"`
+  throw new KeyValueError({
+    value: field,
+    reason: PROTO_ENTRY,
+    message: `The ${which} key attribute of ${named}: ${PROTO_ENTRY} [EDD-9165]`,
+  })
+}
+
+/**
  * Compose all key attributes for a single index.
  * Returns a record mapping field names to composed key values.
  */
@@ -1166,8 +1190,8 @@ export const composeIndexKeys = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): Record<string, KeyValue> => ({
-  [index.pk.field]: composePk(schema, entityType, index, record),
-  [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record),
+  [keyAttribute(index, "pk")]: composePk(schema, entityType, index, record),
+  [keyAttribute(index, "sk")]: composeSkValue(schema, entityType, entityVersion, index, record),
 })
 
 /**
@@ -1187,7 +1211,7 @@ export const tryComposeIndexKeys = (
   record: Record<string, unknown>,
 ): Record<string, KeyValue> | undefined => {
   const present = (composite: ReadonlyArray<string>) =>
-    composite.every((attr) => record[attr] !== undefined && record[attr] !== null)
+    composite.every((attr) => given(record, attr) !== undefined && given(record, attr) !== null)
   if (!present(index.pk.composite) || !present(index.sk.composite)) return undefined
   return composeIndexKeys(schema, entityType, entityVersion, index, record)
 }
@@ -1206,13 +1230,21 @@ export const composeKnownHalves = (
 ): Record<string, KeyValue> => {
   const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
   const complete = (composite: ReadonlyArray<string>) =>
-    composite.every((attr) => hasValue(record[attr]))
+    composite.every((attr) => hasValue(given(record, attr)))
   return {
     ...(complete([...index.pk.composite, ...shardSource])
-      ? { [index.pk.field]: composePk(schema, entityType, index, record) }
+      ? { [keyAttribute(index, "pk")]: composePk(schema, entityType, index, record) }
       : {}),
     ...(complete(index.sk.composite)
-      ? { [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record) }
+      ? {
+          [keyAttribute(index, "sk")]: composeSkValue(
+            schema,
+            entityType,
+            entityVersion,
+            index,
+            record,
+          ),
+        }
       : {}),
   }
 }
@@ -1394,7 +1426,7 @@ const classifyHalf = (
 
   let leadingLen = 0
   while (leadingLen < composites.length) {
-    const v = record[composites[leadingLen]!]
+    const v = given(record, composites[leadingLen]!)
     if (v === undefined || v === null) break
     leadingLen++
   }
@@ -1407,7 +1439,7 @@ const classifyHalf = (
   // Some absent. Check for hole (a present composite after the absent run).
   let hasHole = false
   for (let j = leadingLen + 1; j < composites.length; j++) {
-    const v = record[composites[j]!]
+    const v = given(record, composites[j]!)
     if (v !== undefined && v !== null) {
       hasHole = true
       break
@@ -1442,7 +1474,8 @@ const classifyZOrderHalf = (
   policy: IndexPolicyKey,
   halfHasRemoved: boolean,
 ): "set" | "drop" | "noop" => {
-  if (fields.every((field) => record[field] !== undefined && record[field] !== null)) return "set"
+  if (fields.every((field) => given(record, field) !== undefined && given(record, field) !== null))
+    return "set"
   if (policy === "sparse" || halfHasRemoved) return "drop"
   return "noop"
 }
@@ -1606,7 +1639,7 @@ export const judgeIndexHalf = (
   const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
   const policy = resolveIndexPolicy(index.indexPolicy)[half]
   try {
-    if (composites.every((attr) => hasValue(record[attr]))) {
+    if (composites.every((attr) => hasValue(given(record, attr)))) {
       const full =
         half === "pk"
           ? composePk(schema, entityType, index, record)
@@ -1630,7 +1663,7 @@ export const judgeIndexHalf = (
       }
       // `put` writes an index whole or not at all.
       const wholeIndex = [...index.pk.composite, ...index.sk.composite, ...shardSource].every(
-        (attr) => hasValue(record[attr]),
+        (attr) => hasValue(given(record, attr)),
       )
       if (!wholeIndex) return FINE
       const outsidePrimary = new Set(
@@ -1665,8 +1698,8 @@ const writerLeavesHalf = (
   updatePayload: Record<string, unknown>,
   keyRecord: Record<string, unknown>,
 ): boolean =>
-  composites.every((attr) => !(attr in updatePayload)) &&
-  composites.some((attr) => !hasValue(keyRecord[attr]))
+  composites.every((attr) => !Object.hasOwn(updatePayload, attr)) &&
+  composites.some((attr) => !hasValue(given(keyRecord, attr)))
 
 /**
  * Whether a write leaves a half holding a value it stamps itself (`DESIGN.md` §7, "Composites the
@@ -1682,10 +1715,14 @@ const writerLeavesStampedHalf = (
   updatePayload: Record<string, unknown>,
   keyRecord: Record<string, unknown>,
 ): boolean => {
-  const others = composites.filter((attr) => !(attr in stamped))
+  const others = composites.filter((attr) => !Object.hasOwn(stamped, attr))
   return (
-    others.some((attr) => !hasValue(updatePayload[attr]) && !hasValue(keyRecord[attr])) &&
-    others.every((attr) => !(attr in updatePayload) || hasValue(updatePayload[attr]))
+    others.some(
+      (attr) => !hasValue(given(updatePayload, attr)) && !hasValue(given(keyRecord, attr)),
+    ) &&
+    others.every(
+      (attr) => !Object.hasOwn(updatePayload, attr) || hasValue(given(updatePayload, attr)),
+    )
   )
 }
 
@@ -1722,8 +1759,9 @@ const shardedPkOutcome = (
   const pkComposites = index.pk.composite
   const refuse = (): HalfOutcome => {
     if (update.onMissing === "keep") return { kind: "noop" }
-    const absent = boundShardSource(index, shards).filter((attr) => !hasValue(merged[attr]))
-    const missing = absent.length > 0 ? absent : pkComposites.filter((a) => !hasValue(merged[a]))
+    const absent = boundShardSource(index, shards).filter((attr) => !hasValue(given(merged, attr)))
+    const missing =
+      absent.length > 0 ? absent : pkComposites.filter((a) => !hasValue(given(merged, a)))
     throw new ShardSourceError({
       message:
         `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
@@ -1736,18 +1774,20 @@ const shardedPkOutcome = (
   if (outcome.kind === "drop") {
     const pkExplicitlyGone =
       update.pkHasRemoved ||
-      pkComposites.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+      pkComposites.some(
+        (attr) => Object.hasOwn(updatePayload, attr) && !hasValue(given(updatePayload, attr)),
+      )
     return update.byTouched && !pkExplicitlyGone ? refuse() : outcome
   }
   if (outcome.kind === "noop") return update.byTouched ? refuse() : outcome
-  if (boundShardSource(index, shards).every((attr) => hasValue(merged[attr]))) {
+  if (boundShardSource(index, shards).every((attr) => hasValue(given(merged, attr)))) {
     // The shard follows `by`, and the sort key would stay at the old value: no pin
     // could reach the row, since each searches the shard its own value hashes to and
     // only the old value's text is stored. The update may name the value the row
     // already holds, but nothing was read to tell.
     if (update.byTouched && update.skKept) {
       if (update.onMissing === "keep") return { kind: "noop" }
-      const missing = index.sk.composite.filter((attr) => !hasValue(merged[attr]))
+      const missing = index.sk.composite.filter((attr) => !hasValue(given(merged, attr)))
       throw new ShardSourceError({
         message:
           `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
@@ -1763,7 +1803,7 @@ const shardedPkOutcome = (
   if (update.byCleared && policy === "sparse") return { kind: "drop" }
   // The source is incomplete: an update changing the partition or part of `by`
   // can't compute the shard; any other leaves the stored key alone.
-  return update.byTouched || pkComposites.some((attr) => hasValue(updatePayload[attr]))
+  return update.byTouched || pkComposites.some((attr) => hasValue(given(updatePayload, attr)))
     ? refuse()
     : { kind: "noop" }
 }
@@ -1870,7 +1910,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
   const removedSet = options?.removedSet
   const stamped = options?.stamped
   const leavesHalf = (composites: ReadonlyArray<string>): boolean =>
-    stamped !== undefined && composites.some((attr) => attr in stamped)
+    stamped !== undefined && composites.some((attr) => Object.hasOwn(stamped, attr))
       ? writerLeavesStampedHalf(composites, stamped, updatePayload, keyRecord)
       : writerLeavesHalf(composites, updatePayload, keyRecord)
 
@@ -1911,14 +1951,16 @@ export const composeGsiKeysForUpdatePolicyAware = (
     // touches it: the shard follows its value. Its presence in `keyRecord` is no
     // evidence of a change. The retain path's holds the whole item.
     const by = index.shards?.by ?? []
-    const byTouched = by.some((attr) => hasValue(updatePayload[attr]))
-    const byCleared = by.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+    const byTouched = by.some((attr) => hasValue(given(updatePayload, attr)))
+    const byCleared = by.some(
+      (attr) => Object.hasOwn(updatePayload, attr) && !hasValue(given(updatePayload, attr)),
+    )
     const byRemoved = removedSet !== undefined && by.some((attr) => removedSet.has(attr))
     // An empty PK half is a constant prefix, unless `by` makes its marker vary.
     const skipPk =
       (pkComposites.length > 0
         ? !pkHasRemoved && leavesHalf(pkComposites)
-        : by.length > 0 && by.some((attr) => !hasValue(keyRecord[attr]))) &&
+        : by.length > 0 && by.some((attr) => !hasValue(given(keyRecord, attr)))) &&
       !byTouched &&
       !byCleared &&
       !byRemoved
@@ -1938,7 +1980,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
         delete merged[k]
         continue
       }
-      merged[k] = v
+      setOwn(merged, k, v)
     }
     if (removedSet !== undefined) {
       for (const attr of removedSet) {
@@ -1974,7 +2016,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
       if (pkOutcome.kind === "drop") {
         removes.push(index.pk.field)
       } else if (pkOutcome.kind === "set") {
-        sets[index.pk.field] =
+        sets[keyAttribute(index, "pk")] =
           pkOutcome.length === pkComposites.length
             ? composePk(schema, entityType, index, merged)
             : composePkPrefixUpTo(schema, entityType, index, merged, pkOutcome.length)
@@ -1987,13 +2029,14 @@ export const composeGsiKeysForUpdatePolicyAware = (
       // field, so it is never truncated.
       const outcome = classifyZOrderHalf(skComposites, merged, policy.sk, skHasRemoved)
       if (outcome === "drop") removes.push(index.sk.field)
-      else if (outcome === "set") sets[index.sk.field] = composeZOrderSk(schema, index, merged)
+      else if (outcome === "set")
+        sets[keyAttribute(index, "sk")] = composeZOrderSk(schema, index, merged)
     } else if (!skipSk) {
       const skOutcome = classifyHalf(skComposites, merged, policy.sk, skHasRemoved)
       if (skOutcome.kind === "drop") {
         removes.push(index.sk.field)
       } else if (skOutcome.kind === "set") {
-        sets[index.sk.field] =
+        sets[keyAttribute(index, "sk")] =
           skOutcome.length === skComposites.length
             ? composeSk(schema, entityType, entityVersion, index, merged)
             : composeSkPrefixUpTo(
@@ -2088,7 +2131,7 @@ const availableSkCount = (index: IndexDefinition, record: Record<string, unknown
   assertStringHalf(index, "availableSkCount")
   let n = 0
   for (const attr of index.sk.composite) {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) break
     n++
   }
@@ -2504,7 +2547,7 @@ export const composeSortKeyPrefix = (
   const available: Array<string> = []
   const names: Array<string> = []
   for (const attr of index.sk.composite) {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) break
     available.push(keyValueText(schema, value, casing))
     names.push(attr)

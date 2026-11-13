@@ -29,7 +29,7 @@ export interface SearchConfig<A> {
      * the values `put` stores for its domain values (#111).
      */
     readonly _domainKeyForm: (record: Record<string, unknown>) => Record<string, unknown>
-  }
+  } & GivesValues
   readonly indexDef: KeyComposer.IndexDefinition
   readonly coordinates: (item: A) => Coordinates | undefined
   readonly fields: GeoFields
@@ -37,6 +37,50 @@ export interface SearchConfig<A> {
 }
 
 const H3_RESOLUTION_PRECISE = 15
+
+/** @internal What {@link givenValues} needs of an entity. */
+export type GivesValues = {
+  /**
+   * `Entity._givenValues`: a caller's record as a plain object, its own properties, and each of
+   * `names` they lack read by name where they lack one. Absent on a hand-made entity, whose records
+   * are read by their own properties alone.
+   */
+  readonly _givenValues?:
+    | ((record: object, names: ReadonlyArray<string>) => Record<string, unknown>)
+    | undefined
+}
+
+/**
+ * @internal What a caller's filter gives, as a plain object: a spread of it, as 1.40.0 copied it,
+ * and, only where that lacks one of `names` (the composites the search needs of it, where 1.40.0
+ * failed: "Missing composite attribute"), each it lacks read by name, from a getter, its prototype
+ * or a proxy (`Entity._givenValues`). A name whose read throws, from a getter the filter inherits,
+ * is a property of the copy that throws again when read: the search fails with a `ValidationError`
+ * naming it. So the copy is added to, never spread. Anything but an object is copied as a spread
+ * copies it.
+ */
+export const givenValues = (
+  entity: GivesValues,
+  record: object | undefined,
+  names: ReadonlyArray<string>,
+): Record<string, unknown> => {
+  if (record === undefined) return {}
+  return entity._givenValues === undefined ? { ...record } : entity._givenValues(record, names)
+}
+
+/** @internal Stores `value` under `name` as `record`'s own property, `__proto__` included. */
+export const setOwnValue = (
+  record: Record<string, unknown>,
+  name: string,
+  value: unknown,
+): void => {
+  Object.defineProperty(record, name, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  })
+}
 
 /**
  * Search for items near a geographic point within a given radius.
@@ -146,11 +190,18 @@ export const nearby = <A>(
             // a string on both sides, but a `timePartition: Schema.NumberFromString`
             // (a natural choice, since `computeTimePartition` returns a decimal
             // string) would compose an unpadded key the write never wrote (#111).
-            const pkCompositesKeyForm: Record<string, unknown> = entity._domainKeyForm({
-              ...pkFilter,
-              [fields.parentCell.field]: parentCell,
-              [fields.timePartition.field]: partition,
-            })
+            // The filter gives the composites the search doesn't compute: the parent cell and the
+            // time partition are set here, so the filter is never asked for them.
+            const pkComposites = givenValues(
+              entity,
+              pkFilter,
+              indexDef.pk.composite.filter(
+                (attr) => attr !== fields.parentCell.field && attr !== fields.timePartition.field,
+              ),
+            )
+            setOwnValue(pkComposites, fields.parentCell.field, parentCell)
+            setOwnValue(pkComposites, fields.timePartition.field, partition)
+            const pkCompositesKeyForm: Record<string, unknown> = entity._domainKeyForm(pkComposites)
 
             const pkValue = KeyComposer.composePk(
               entity._schema,

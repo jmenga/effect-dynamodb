@@ -21,6 +21,7 @@
 
 import { Data, DateTime, Predicate } from "effect"
 import type { DateTimeUnit, DimensionKind, DimensionSpec, LiteralValue } from "../ZOrder.js"
+import { given } from "./OwnNames.js"
 import { parseZonedIso } from "./ZonedIso.js"
 
 // ---------------------------------------------------------------------------
@@ -680,7 +681,7 @@ export const quantizeBounds = (
 ): Box | "empty" => {
   const box: Array<ReadonlyArray<Interval>> = []
   for (const dim of layout.dimensions) {
-    const bound = bounds[dim.field]
+    const bound = given(bounds, dim.field) as DimensionBound | undefined
     const top = dim.levels - 1n
     const ceiling = (1n << BigInt(dim.bits)) - 1n
     /** `[lo, hi]`, its top level widened to the ceiling. */

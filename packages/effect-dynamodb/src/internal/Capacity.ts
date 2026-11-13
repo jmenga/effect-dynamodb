@@ -21,6 +21,7 @@ import type {
 } from "@aws-sdk/client-dynamodb"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
+import { isUnreadableName } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import { Cause, Context, Effect, Exit, Stream, Tracer } from "effect"
@@ -524,11 +525,12 @@ const runIn = <A, E, R>(
 /**
  * A value the library refuses to compose into a key, thrown where there's no error channel to fail
  * into: no key text (`[EDD-9096]`), no Z-order level (`[EDD-9092]`), no shard source (`[EDD-9100]`).
+ * Or a caller's object that threw when a name it inherits was read from it (`UnreadableName`, #239).
  * A value DynamoDB can't store is `Marshaller.UnstorableValue`, which every path that marshals a
  * caller's value refuses itself, naming the field (`marshalOrFail`).
  */
 export const isRefusedValue = (u: unknown): boolean =>
-  isKeyValueError(u) || isZOrderValueError(u) || isShardSourceError(u)
+  isKeyValueError(u) || isZOrderValueError(u) || isShardSourceError(u) || isUnreadableName(u)
 
 /** The `ValidationError` for a {@link isRefusedValue} a cause dies of, if it dies of one. */
 const refusalOf = (

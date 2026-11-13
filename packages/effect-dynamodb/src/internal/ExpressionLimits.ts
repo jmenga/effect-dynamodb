@@ -18,6 +18,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { ownValue } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { attributeBytes, utf8Bytes } from "./ItemSize.js"
 
 /** DynamoDB's limit on one expression's length, in characters. */
@@ -152,12 +153,12 @@ export const asReadGuard = (
   const names: Record<string, string> = { "#gpk": pkField }
   const values: Record<string, AttributeValue> = {}
   let expression = "attribute_exists(#gpk)"
-  for (const [i, attr] of absent.filter((attr) => stored[attr] === undefined).entries()) {
+  for (const [i, attr] of absent.filter((attr) => ownValue(stored, attr) === undefined).entries()) {
     names[`#ga${i}`] = attr
     expression = `${expression} AND attribute_not_exists(#ga${i})`
   }
   const attrs = [...new Set([...prefer, ...Object.keys(stored).sort()])].filter(
-    (attr) => attr !== pkField && attr !== "sk" && stored[attr] !== undefined,
+    (attr) => attr !== pkField && attr !== "sk" && ownValue(stored, attr) !== undefined,
   )
   // Its substitutions stay far below EXPRESSION_MAX_SUBSTITUTION_BYTES: a row's names and values
   // are at most 400 KB, and an expression that fits names at most a few hundred placeholders.
@@ -165,7 +166,7 @@ export const asReadGuard = (
     const clause = `#g${i} = :g${i}`
     if (!expressionFits(`${expression} AND ${clause}`)) continue
     names[`#g${i}`] = attr
-    values[`:g${i}`] = stored[attr]!
+    values[`:g${i}`] = ownValue(stored, attr)!
     expression = `${expression} AND ${clause}`
   }
   return {
@@ -204,11 +205,12 @@ export const wholeRowGuard = (
   const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
   // `asReadGuard` leaves out what doesn't fit: whole, it named every attribute the read had.
   const named = Object.keys(names).filter((placeholder) => /^#g\d+$/.test(placeholder)).length
-  if (named !== [...held].filter((attr) => stored[attr] !== undefined).length) return undefined
+  if (named !== [...held].filter((attr) => ownValue(stored, attr) !== undefined).length)
+    return undefined
   const inGuard = new Set(Object.values(names))
   let expression = guard.ConditionExpression
   const missing = [...new Set(extra)].filter(
-    (attr) => keyed(attr) && stored[attr] === undefined && !inGuard.has(attr),
+    (attr) => keyed(attr) && ownValue(stored, attr) === undefined && !inGuard.has(attr),
   )
   for (const [i, attr] of missing.entries()) {
     names[`#gx${i}`] = attr
@@ -246,7 +248,10 @@ export const preferredGuard = (
   let expression = guard.ConditionExpression
   const missing = [...new Set(absent)].filter(
     (attr) =>
-      attr !== pkField && attr !== "sk" && stored[attr] === undefined && !prefer.includes(attr),
+      attr !== pkField &&
+      attr !== "sk" &&
+      ownValue(stored, attr) === undefined &&
+      !prefer.includes(attr),
   )
   for (const [i, attr] of missing.entries()) {
     const clause = `attribute_not_exists(#gx${i})`
