@@ -3670,7 +3670,8 @@ const makeImpl = <
    * would, or the field holds none.
    */
   const readBackIssue = (segments: ReadonlyArray<string | number>, encoded: unknown) => {
-    if (readBacks.size === 0 || !readBacks.has(String(segments[0]))) return undefined
+    // An untyped position is looked through where the operand is marshalled (`unstorableOperand`).
+    if (!customFields.has(String(segments[0]))) return undefined
     const issue = pathValues.validate(segments, asRead(encoded))
     return issue === undefined
       ? undefined
