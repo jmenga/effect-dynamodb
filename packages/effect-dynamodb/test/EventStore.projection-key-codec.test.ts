@@ -22,9 +22,15 @@ type Recording = ReturnType<typeof makeRecordingTable>
 const ZERO = { item: 0, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
 
 /** Rows in key order, with what a write stamps afresh (times, write tokens) masked. */
+/**
+ * Rows as compared: volatile values replaced, and no outbox item's read-model tag (`__edd_rm__`,
+ * #237), which a fresh item carries from 1.41.0 and one 1.39.0 wrote doesn't: `rekey` moves an
+ * item as it is.
+ */
 const comparable = (rows: Iterable<P.Row>) => {
   const keyOf = (row: P.Row) => `${row.pk?.S}|${row.sk?.S}`
   return [...rows]
+    .map(({ __edd_rm__: _tag, ...row }) => row as P.Row)
     .map(
       (row): P.Row => ({
         ...row,

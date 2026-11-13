@@ -608,6 +608,7 @@ describe.each([
           unregistered: 1,
           unrecognizedKey: 1,
           rootNotSeen: 0,
+          ambiguousOwner: 0,
         })
         expect(report.byMember.Meter?.conflicts).toBe(1)
       }),

@@ -603,6 +603,68 @@ describe("the bind check counts each attribute as its row holds it after the las
       primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
     } as any)
 
+  it.effect("an aggregate's index partition named `__edd_rm__`: no mark, as 1.40.0", () =>
+    Effect.gen(function* () {
+      // The outbox items are on the aggregate's table, which registers no member: the aggregate's
+      // rows are on it all the same, so its collection index's partition attribute, `__edd_rm__`,
+      // is a key attribute of the table. The outbox items carry no mark (`outboxMarkInUse`), and
+      // nothing of theirs is under that name, as on 1.40.0.
+      const schema = DynamoSchema.make({ name: "rmo", version: 1 })
+      const Tallies = tally()
+      const Target = Table.make({ schema, entities: {} })
+      const Events = outboxOf(schema, Tallies, { table: Target, pk: "pk", sk: "sk" })
+      const Source = Table.make({ schema, entities: { Tallies } })
+      const Orders = Aggregate.make(Schema.Struct({ id: Schema.String, out: Schema.Array(Line) }), {
+        table: Target,
+        schema,
+        pk: { field: "__edd_rm__", composite: ["id"] },
+        collection: { name: "tally", index: "gsi1", sk: { field: "gsi1sk", composite: [] } },
+        root: { entityType: "Order" },
+        ownsRows: true,
+        edges: { out: Aggregate.many({ entityType: "Tally#outbox", sk: { composite: ["lid"] } }) },
+      } as any)
+      expect(
+        yield* binds(
+          { entities: {}, aggregates: { Orders }, tables: { Source, Target } },
+          Layer.mergeAll(
+            Source.layer({ name: "source" }),
+            Target.layer({ name: "target" }),
+            Events.layer({ name: "events" }),
+          ),
+        ),
+      ).toBe("bound")
+    }),
+  )
+
+  it.effect("the partition key's attribute named `__edd_rm__`: no mark, as 1.40.0", () =>
+    Effect.gen(function* () {
+      // The table's partition attribute is `__edd_rm__`: its name is taken, so the outbox items
+      // carry no mark (`outboxMarkInUse`) and hold there what 1.40.0's did, the row's key.
+      const schema = DynamoSchema.make({ name: "rm", version: 1 })
+      const Tallies = Entity.make({
+        model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
+        entityType: "Tally",
+        primaryKey: {
+          pk: { field: "__edd_rm__", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as any)
+      const Events = outboxOf(schema, Tallies, {})
+      const Main = Table.make({ schema, entities: { Tallies } })
+      const Orders = owner(Main, schema, {
+        pkField: "__edd_rm__",
+        collection: "shared",
+        edgeType: "Tally#outbox",
+      })
+      expect(
+        yield* binds(
+          { entities: { Tallies }, aggregates: { Orders }, tables: { Main } },
+          Layer.merge(Main.layer({ name: "rm" }), Events.layer({ name: "events" })),
+        ),
+      ).toBe("bound")
+    }),
+  )
+
   it.effect("a projection outbox's index keys, which have no head, are any text", () =>
     Effect.gen(function* () {
       // The outbox index's partition is `Tally#outbox`, under `opk`: the aggregate's partition.

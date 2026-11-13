@@ -2151,25 +2151,34 @@ export const SORT_KEY_MAX = "\uFFFF"
 /**
  * @internal What a composite's values can be in a key, for {@link composeKeySpace}: `"open"`, any
  * text, the key delimiter included (the walk stops there); `"text"`, any text without the
- * delimiter; `"number"`, a number's or a bigint's key text; or exactly the key text of `values`
- * (a literal union, `true` and `false`).
+ * delimiter; `"number"`, a number's or a bigint's key text; `"date"`, an instant's ISO text (a
+ * date stored as a string: `DateTime.formatIso`, `Date.prototype.toISOString`); `"zonedDate"`, a
+ * zoned date's (`DateTime.formatIsoZoned`); or exactly the key text of `values` (a literal union,
+ * `true` and `false`).
  */
 export type CompositeValues =
   | "open"
   | "text"
   | "number"
+  | "date"
+  | "zonedDate"
   | { readonly values: ReadonlyArray<unknown> }
 
 /**
  * @internal A walked composite's value in a {@link KeySpace}: any text without the delimiter, the
- * empty text included (`text`); a number's or a bigint's key text under any setting (`number`:
+ * empty text included (`text`); any text at all, the delimiter included (`any`: a value walked past
+ * with `walkOpen`); a number's or a bigint's key text under any setting (`number`:
  * digits and `-+.:;)*`, never the delimiter, and of letters only `e` and those of `Infinity`, as
- * 1.36's text spells them, in any casing; it starts with a digit, `-`, `:` or `;`); or one of
- * `texts`.
+ * 1.36's text spells them, in any casing; it starts with a digit, `-`, `:` or `;`); a date's ISO
+ * text under any setting and casing (`date`: it starts with a digit, or the sign of a year past
+ * 9999 or before 0; an instant's goes on in digits and `-+:.TZ`, a zoned date's (`zoned`) in any
+ * text without the delimiter, its zone's name included); or one of `texts`.
  */
 export type KeyValueText =
   | { readonly kind: "text" }
+  | { readonly kind: "any" }
   | { readonly kind: "number" }
+  | { readonly kind: "date"; readonly zoned: boolean }
   | { readonly kind: "oneOf"; readonly texts: ReadonlyArray<string> }
 
 /**
@@ -2196,7 +2205,10 @@ export interface KeySpace {
  * escaped, so text after one can always match another key's. Without `valuesOf`, at the first
  * composite. A composite limited to `values` is their key text under the schema's setting, or
  * with `everyForm` under every setting a row can have been written under (`escapeKeys` on, off,
- * and the 1.37 numeric text): the fixed text is the same under all of them.
+ * and the 1.37 numeric text): the fixed text is the same under all of them. With `walkOpen` the
+ * walk goes on past a composite that can hold the delimiter too, its value any text (`any`), so
+ * the space is exactly the keys the composer writes for values of those kinds, to the end of the
+ * key.
  */
 export const composeKeySpace = (
   schema: DynamoSchema.DynamoSchema,
@@ -2204,7 +2216,9 @@ export const composeKeySpace = (
   entityVersion: number,
   index: IndexDefinition,
   valuesOf: (composite: string) => CompositeValues = () => "open",
-  options?: { readonly everyForm?: boolean | undefined } | undefined,
+  options?:
+    | { readonly everyForm?: boolean | undefined; readonly walkOpen?: boolean | undefined }
+    | undefined,
 ): { readonly pk: KeySpace; readonly sk: KeySpace } => {
   const casing = index.casing ?? schema.casing
   const forms: ReadonlyArray<DynamoSchema.DynamoSchema> =
@@ -2218,6 +2232,9 @@ export const composeKeySpace = (
   const valueText = (values: Exclude<CompositeValues, "open">): KeyValueText => {
     if (values === "text") return { kind: "text" }
     if (values === "number") return { kind: "number" }
+    if (values === "date" || values === "zonedDate") {
+      return { kind: "date", zoned: values === "zonedDate" }
+    }
     const texts = new Set<string>()
     for (const value of values.values) {
       for (const form of forms) {
@@ -2241,6 +2258,10 @@ export const composeKeySpace = (
     for (const name of composite) {
       walked.push(name)
       const of = valuesOf(name)
+      if (of === "open" && options?.walkOpen === true) {
+        values.push({ kind: "any" })
+        continue
+      }
       if (of === "open") {
         open = true
         break
@@ -2287,6 +2308,10 @@ const NOT_DELIMITER: CharClass = { chars: KEY_DELIMITER, negated: true }
 const NUMBER_FIRST: CharClass = { chars: "0123456789-:;", negated: false }
 /** Any other character of it: `NumericKey`'s, and 1.36's (`1e+21`, `Infinity`), in any casing. */
 const NUMBER_REST: CharClass = { chars: "0123456789-+.:;)*eEiInNfFtTyY", negated: false }
+/** The first character of a date's ISO text: its year's first digit, or the sign of a wide year. */
+const DATE_FIRST: CharClass = { chars: "0123456789+-", negated: false }
+/** Any other character of an instant's ISO text (`+275760-09-13T00:00:00.000Z`), in any casing. */
+const DATE_REST: CharClass = { chars: "0123456789-+:.TtZz", negated: false }
 
 /** Whether some character is in both. */
 const classesMeet = (a: CharClass, b: CharClass): boolean => {
@@ -2329,16 +2354,21 @@ const keyAutomaton = (
   space.after.forEach((text, i) => {
     const value = space.values?.[i] ?? { kind: "text" }
     const end = state()
-    if (value.kind === "text") {
+    if (value.kind === "text" || value.kind === "any") {
       const loop = state()
       empty[at]!.push(loop)
-      edges[loop]!.push([NOT_DELIMITER, loop])
+      edges[loop]!.push([value.kind === "any" ? ANY_CHARACTER : NOT_DELIMITER, loop])
       empty[loop]!.push(end)
     } else if (value.kind === "number") {
       const digits = state()
       edges[at]!.push([NUMBER_FIRST, digits])
       edges[digits]!.push([NUMBER_REST, digits])
       empty[digits]!.push(end)
+    } else if (value.kind === "date") {
+      const rest = state()
+      edges[at]!.push([DATE_FIRST, rest])
+      edges[rest]!.push([value.zoned ? NOT_DELIMITER : DATE_REST, rest])
+      empty[rest]!.push(end)
     } else {
       for (const option of value.texts) empty[spell(at, option)]!.push(end)
     }

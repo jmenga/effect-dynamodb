@@ -781,6 +781,7 @@ describeConnected("#171 rekey — connected", () => {
             unregistered: 1,
             unrecognizedKey: 0,
             rootNotSeen: 0,
+            ambiguousOwner: 0,
           })
           expect(dry.scanned).toBe(before.length)
           expect(dry.capacity.requests).toBeGreaterThan(0)

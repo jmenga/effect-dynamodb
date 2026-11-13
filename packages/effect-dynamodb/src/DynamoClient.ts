@@ -207,8 +207,10 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
+  type OutboxCandidate,
   physicalTableName,
   refuseSharedOutboxKeySpace,
+  rekeyOutboxMember,
   remoteOutboxesOf,
   sharedOutboxKeySpace,
 } from "./internal/ProjectionEngine.js"
@@ -3364,12 +3366,12 @@ const makeFromConfig = (config: {
               if (handler !== undefined) handlers.add(handler)
             }
             // The read models whose outboxes are on this table are checked before anything is
-            // sent: `rekey` reads an item's key back by its key space, so two whose keys could be
-            // read as each other's are refused here, where `DynamoClient.make` refuses only those
-            // whose items would overwrite each other in normal operation, and so is a member of
-            // this table that would read a read model's items as its own. Projections are defined
-            // when the program runs them, so one defined after the client was made has its outbox
-            // recorded only now. A run's refusal is the run's `ValidationError`.
+            // sent, as `DynamoClient.make` checks them: two whose items would overwrite each other
+            // in normal operation are refused, and so is a member of this table claiming a read
+            // model's items whose own would. Projections are defined when the program runs them,
+            // so one defined after the client was made has its outbox recorded only now. Whose an
+            // item is otherwise is decided item by item (`rekeyOutboxMember`). A run's refusal is
+            // the run's `ValidationError`.
             const shared = yield* sharedOutboxKeySpace("rekey", named, {
               key: tagKey,
               name: tableName,
@@ -3389,16 +3391,46 @@ const makeFromConfig = (config: {
                 cause: shared,
               })
             }
-            // The outboxes on this table of a read model on another (#171): every projection's, so
-            // a second projection of one read model doesn't hide the first's items, named by this
-            // table's service or by another handle on the same physical table. A read model's
-            // projections may have one each, on tables of their own.
-            const outboxOf = new Set<unknown>()
-            for (const entity of [...registered, ...visibleEntities]) {
-              if (outboxOf.has(entity)) continue
-              outboxOf.add(entity)
-              // Their key attributes, once each.
-              const layouts = new Map<string, { readonly pk: string; readonly sk: string }>()
+            // The outbox items on this table, by entity type, are judged by one member each, which
+            // asks every read model of that type that can have written them (#237): the table's
+            // members (their own projections' outbox items), then each read model whose
+            // projection's outbox is on this table (#171) — every projection's, so a second
+            // projection of one read model doesn't hide the first's items, named by this table's
+            // service or by another handle on the same physical table. A read model's projections
+            // may have one each, on tables of their own.
+            const outboxCandidates = new Map<
+              string,
+              Map<unknown, Array<{ readonly pk: string; readonly sk: string }>>
+            >()
+            const addCandidate = (
+              entity: unknown,
+              key: { readonly pk: string; readonly sk: string },
+            ) => {
+              const type = (entity as { readonly entityType: string }).entityType
+              const byEntity =
+                outboxCandidates.get(type) ??
+                new Map<unknown, Array<{ readonly pk: string; readonly sk: string }>>()
+              outboxCandidates.set(type, byEntity)
+              const keys = byEntity.get(entity) ?? []
+              byEntity.set(entity, keys)
+              if (!keys.some((k) => k.pk === key.pk && k.sk === key.sk)) keys.push(key)
+            }
+            for (const member of new Set(tableMembers)) {
+              const type = (member as { readonly entityType?: string }).entityType
+              const primary = (
+                member as { readonly indexes?: { readonly primary?: IndexDefinition } }
+              ).indexes?.primary
+              if (
+                type === undefined ||
+                primary === undefined ||
+                (member as { readonly _valuelessMove?: unknown })._valuelessMove === undefined ||
+                Rekey.handlerOf(member)?.types.includes(`${type}#outbox`) !== true
+              ) {
+                continue
+              }
+              addCandidate(member, { pk: primary.pk.field, sk: primary.sk.field })
+            }
+            for (const entity of new Set([...registered, ...visibleEntities])) {
               for (const outbox of remoteOutboxesOf(entity)) {
                 if (
                   outbox.table.Tag.key !== tagKey &&
@@ -3406,28 +3438,26 @@ const makeFromConfig = (config: {
                 ) {
                   continue
                 }
-                layouts.set(`${outbox.pk}\u0000${outbox.sk}`, { pk: outbox.pk, sk: outbox.sk })
+                addCandidate(entity, { pk: outbox.pk, sk: outbox.sk })
               }
-              if (layouts.size === 0) continue
-              const keys = [...layouts.values()]
-              const readModel = entity as unknown as Pick<
-                EntityType,
-                "entityType" | "_rekeyProjectionRow"
-              >
+            }
+            for (const [type, byEntity] of outboxCandidates) {
+              // A read model with one layout on this table names the table's key attributes.
+              const layout = [...byEntity.values()].find((keys) => keys.length === 1)?.[0]
               handlers.add({
-                name: readModel.entityType,
-                types: [`${readModel.entityType}#outbox`],
-                ...(keys.length === 1 && { key: keys[0] }),
-                // A table has one key schema, so its items are under the layout whose attributes
-                // they hold.
-                row: (row, ctx) =>
-                  readModel._rekeyProjectionRow(
-                    row,
-                    ctx,
-                    keys.find(
-                      (key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined,
-                    ) ?? keys[0]!,
-                  ),
+                ...rekeyOutboxMember(
+                  type,
+                  [...byEntity].map(([entity, keys]) => ({
+                    readModel: entity as OutboxCandidate["readModel"],
+                    // A table has one key schema, so its items are under the layout whose
+                    // attributes they hold.
+                    keys: (row) =>
+                      keys.find(
+                        (key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined,
+                      ) ?? keys[0]!,
+                  })),
+                ),
+                ...(layout !== undefined && { key: layout }),
               })
             }
             return yield* Rekey.run({ tableName, members: [...handlers], options })

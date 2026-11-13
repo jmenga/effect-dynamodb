@@ -1,0 +1,737 @@
+{
+ "version": "1.39.0",
+ "runs": {
+  "escapeKeys off": {
+   "ra": [
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north#branch_b1"
+     },
+     "idA": {
+      "S": "a1"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_a1"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north#branch_b1"
+     },
+     "idA": {
+      "S": "both"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     },
+     "__edd_removed__": {
+      "S": "2026-11-11T21:56:28.179Z"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_tomb"
+     },
+     "version": {
+      "N": "3"
+     },
+     "__edd_e__": {
+      "S": "Ledger#tombstone"
+     }
+    }
+   ],
+   "rb": [
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north"
+     },
+     "idA": {
+      "S": "b1"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_b1"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north"
+     },
+     "idA": {
+      "S": "both"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "o": [
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_a1"
+     },
+     "streamId": {
+      "S": "a1"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "a1"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_a1"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_b1"
+     },
+     "streamId": {
+      "S": "b1"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "b1"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_b1"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "streamId": {
+      "S": "both"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "both"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_gone"
+     },
+     "streamId": {
+      "S": "gone"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "gone"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_gone"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_tomb"
+     },
+     "streamId": {
+      "S": "tomb"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "tomb"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_tomb"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     }
+    }
+   ]
+  },
+  "escapeKeys on": {
+   "ra": [
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north#branch_b1"
+     },
+     "idA": {
+      "S": "a1"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_a1"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north#branch_b1"
+     },
+     "idA": {
+      "S": "both"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_removed__": {
+      "S": "2026-11-11T21:56:28.243Z"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Ledger#tombstone"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_tomb"
+     },
+     "version": {
+      "N": "3"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     }
+    }
+   ],
+   "rb": [
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north"
+     },
+     "idA": {
+      "S": "b1"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_b1"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "total": {
+      "N": "2"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "shop": {
+      "S": "north"
+     },
+     "idA": {
+      "S": "both"
+     },
+     "__edd_e__": {
+      "S": "Ledger"
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "branch": {
+      "S": "b1"
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "o": [
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_a1"
+     },
+     "streamId": {
+      "S": "a1"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "a1"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_a1"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_b1"
+     },
+     "streamId": {
+      "S": "b1"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "b1"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_b1"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "streamId": {
+      "S": "both"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "both"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north#branch_b1"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "streamId": {
+      "S": "both"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "both"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_both"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_gone"
+     },
+     "streamId": {
+      "S": "gone"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "gone"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_gone"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_row_pk__": {
+      "S": "$amb#v1#ledger#ida_tomb"
+     },
+     "streamId": {
+      "S": "tomb"
+     },
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "effect": {
+      "M": {
+       "account": {
+        "S": "tomb"
+       },
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "sk": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$amb#v1#ledger#ida_tomb"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "__edd_row_sk__": {
+      "S": "$amb#v1#ledger#shop_north%23branch_b1"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     }
+    }
+   ]
+  }
+ }
+}

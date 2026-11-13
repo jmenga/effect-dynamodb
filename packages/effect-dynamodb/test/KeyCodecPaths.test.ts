@@ -464,6 +464,7 @@ describe.each([
           unregistered: 0,
           unrecognizedKey: 0,
           rootNotSeen: 0,
+          ambiguousOwner: 0,
         })
 
         const fresh = makeRecordingTable({ indexes: Shapes.indexes })

@@ -1,0 +1,2356 @@
+{
+ "version": "1.40.0",
+ "scenarios": {
+  "single": {
+   "items": [
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.17g9pxh7hasei"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "5"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000002#0000"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000002#0000"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.17gkt10hg41ep"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000001#0000"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000001#0000"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "drainPending": {
+    "sent": [
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "IndexName": "outbox",
+       "KeyConditionExpression": "#p = :p",
+       "ExpressionAttributeNames": {
+        "#p": "obpk"
+       },
+       "ExpressionAttributeValues": {
+        ":p": {
+         "S": "Ledger#outbox"
+        }
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     }
+    ],
+    "delivered": [
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     }
+    ],
+    "result": {
+     "delivered": 2,
+     "undelivered": []
+    },
+    "left": []
+   },
+   "drain": {
+    "sent": [
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     }
+    ],
+    "delivered": [
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     }
+    ],
+    "result": {
+     "delivered": 2,
+     "undelivered": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    },
+    "left": []
+   }
+  },
+  "twoProjections": {
+   "items": [
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.17g9pxh7hasei"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "5"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000002#0000"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000002#0000"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.17gkt10hg41ep"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000001#0000"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000001#0000"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.3oz7pe0m4p75y"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "1005"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.3oz7pe0m4p75y"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.3oz7pe0m4p75y"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.3ozg0po2ls4f1"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "1002"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.3ozg0po2ls4f1"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.3ozg0po2ls4f1"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "drainPending": {
+    "sent": [
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "IndexName": "outbox",
+       "KeyConditionExpression": "#p = :p",
+       "ExpressionAttributeNames": {
+        "#p": "obpk"
+       },
+       "ExpressionAttributeValues": {
+        ":p": {
+         "S": "Ledger#outbox"
+        }
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.3ozg0po2ls4f1"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.3ozg0po2ls4f1"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.3oz7pe0m4p75y"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.3oz7pe0m4p75y"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     }
+    ],
+    "delivered": [
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 1002
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 1005
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     }
+    ],
+    "result": {
+     "delivered": 4,
+     "undelivered": []
+    },
+    "left": []
+   },
+   "drain": {
+    "sent": [
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.3ozg0po2ls4f1"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.3ozg0po2ls4f1"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.3oz7pe0m4p75y"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.3oz7pe0m4p75y"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     }
+    ],
+    "delivered": [
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 1002
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 1005
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     }
+    ],
+    "result": {
+     "delivered": 4,
+     "undelivered": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    },
+    "left": []
+   }
+  },
+  "rowLost": {
+   "items": [
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.17g9pxh7hasei"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "5"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000002#0000"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000002#0000"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.17gkt10hg41ep"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000001#0000"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000001#0000"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.2owsdqq0zv18q"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "5"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.2owsdqq0zv18q"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.2owsdqq0zv18q"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct2"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Ledger#outbox"
+     },
+     "__edd_rm__": {
+      "S": "1keqa9c.2ox0p2dhgxyht"
+     },
+     "__edd_row_pk__": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "__edd_row_sk__": {
+      "S": "$roll#v1#ledger"
+     },
+     "effect": {
+      "M": {
+       "total": {
+        "N": "2"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "obpk": {
+      "S": "Ledger#outbox"
+     },
+     "obsk": {
+      "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.2ox0p2dhgxyht"
+     },
+     "opk": {
+      "S": "$roll#v1#ledger#shop_north"
+     },
+     "osk": {
+      "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.2ox0p2dhgxyht"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "streamId": {
+      "S": "acct2"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "drainPending": {
+    "sent": [
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "IndexName": "outbox",
+       "KeyConditionExpression": "#p = :p",
+       "ExpressionAttributeNames": {
+        "#p": "obpk"
+       },
+       "ExpressionAttributeValues": {
+        ":p": {
+         "S": "Ledger#outbox"
+        }
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.2ox0p2dhgxyht"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.2ox0p2dhgxyht"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.2owsdqq0zv18q"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.2owsdqq0zv18q"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     }
+    ],
+    "delivered": [
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct2",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct2",
+       "version": 2,
+       "eventType": "Added"
+      }
+     }
+    ],
+    "result": {
+     "delivered": 4,
+     "undelivered": []
+    },
+    "left": []
+   },
+   "drain": {
+    "sent": [
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.2ox0p2dhgxyht"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000001#0000#1keqa9c.2ox0p2dhgxyht"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     },
+     {
+      "operation": "updateItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.2owsdqq0zv18q"
+        }
+       },
+       "UpdateExpression": "SET #c = :c, #u = :u",
+       "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+       "ExpressionAttributeNames": {
+        "#c": "__edd_claim__",
+        "#u": "__edd_claimed_until__",
+        "#pk": "opk"
+       },
+       "ExpressionAttributeValues": {
+        ":c": {
+         "volatile": true
+        },
+        ":u": {
+         "volatile": true
+        },
+        ":now": {
+         "volatile": true
+        }
+       }
+      }
+     },
+     {
+      "operation": "deleteItem",
+      "input": {
+       "TableName": "outbox",
+       "Key": {
+        "opk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        "osk": {
+         "S": "$roll#v1#ledger#outbox#000000000002#0000#1keqa9c.2owsdqq0zv18q"
+        }
+       },
+       "ConditionExpression": "attribute_exists(#pk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk"
+       }
+      }
+     },
+     {
+      "operation": "query",
+      "input": {
+       "TableName": "outbox",
+       "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+       "ExpressionAttributeNames": {
+        "#pk": "opk",
+        "#sk": "osk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$roll#v1#ledger#shop_north"
+        },
+        ":sk": {
+         "S": "$roll#v1#ledger#outbox#"
+        }
+       },
+       "ConsistentRead": true,
+       "Limit": 1
+      }
+     }
+    ],
+    "delivered": [
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 2
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct2",
+       "version": 1,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct",
+       "version": 2,
+       "eventType": "Added"
+      }
+     },
+     {
+      "effect": {
+       "total": 5
+      },
+      "meta": {
+       "source": "projection",
+       "streamId": "acct2",
+       "version": 2,
+       "eventType": "Added"
+      }
+     }
+    ],
+    "result": {
+     "delivered": 4,
+     "undelivered": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    },
+    "left": []
+   }
+  }
+ }
+}

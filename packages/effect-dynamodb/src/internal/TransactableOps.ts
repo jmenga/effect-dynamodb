@@ -16,7 +16,7 @@ import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
 import type { ConditionInput } from "../Expression.js"
 import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshaller.js"
-import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
+import { resolveTtlAttributeName, type TableConfig, tableKeyAttributes } from "../Table.js"
 import { isRefusedValue } from "./Capacity.js"
 import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
 import { encodeInput } from "./InputForm.js"
@@ -44,6 +44,19 @@ export interface ProjectionLayout {
   readonly roles: ReadonlyArray<readonly [field: string, role: ProjectionRole]>
   readonly removal: boolean
   readonly ttl: boolean
+}
+
+/**
+ * @internal A projection layout's tag: FNV-1a (32-bit, base 36) of its roles, `removal` and `ttl`,
+ * so every program defining the projection gives it the same tag.
+ */
+export const layoutTag = (layout: ProjectionLayout): string => {
+  let hash = 0x811c9dc5
+  for (const char of JSON.stringify([layout.roles, layout.removal, layout.ttl])) {
+    hash ^= char.charCodeAt(0)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(36)
 }
 
 /**
@@ -308,6 +321,61 @@ export const KEY_TEXT = "__edd_kt__"
 /** The read-model row an outbox item was written for: its key attributes' text. */
 export const OUTBOX_ROW_PK = "__edd_row_pk__"
 export const OUTBOX_ROW_SK = "__edd_row_sk__"
+
+/**
+ * The effect an outbox item holds, and the read model it was written for (#237):
+ * `<read model tag>.<effect tag>` (`ProjectionEngine.outboxMark`), the tag of the read model's key
+ * template (`ProjectionEngine.readModelTag`) then a hash of the projection and the event. Written
+ * from 1.41.0 where its name is free (`outboxMarkInUse`); part of no key. Read models of one entity
+ * type share the outbox index's partition, and a key alone can't always say whose an item is
+ * (`[shop]` with `north#branch_b1` beside `[shop, branch]`): `outboxOwnership` reads it first. An
+ * item's `Put` replaces only the item of the same effect (`ProjectionEngine.writeRow`).
+ */
+export const OUTBOX_READ_MODEL = "__edd_rm__"
+
+/**
+ * @internal The attributes a read model's projections' outbox items hold under names something
+ * else decides (#237): each outbox's key attributes and its index's, and every key attribute of
+ * the table it is on (`tableKeyAttributes`: any item holding one is in that index).
+ */
+const outboxItemNames = (entity: object): ReadonlySet<string> => {
+  const member = entity as {
+    readonly _tableTag?: unknown
+    readonly indexes?: { readonly primary?: { readonly pk: KeyPartLike; readonly sk: KeyPartLike } }
+    readonly _projectionOutboxes?: ReadonlyArray<{
+      readonly table: { readonly Tag: unknown } | undefined
+      readonly pk: string
+      readonly sk: string
+      readonly index: { readonly pk: string; readonly sk: string } | undefined
+    }>
+  }
+  const names = new Set<string>()
+  for (const outbox of member._projectionOutboxes ?? []) {
+    if (outbox.table === undefined) {
+      const primary = member.indexes?.primary
+      if (primary !== undefined) names.add(primary.pk.field).add(primary.sk.field)
+    } else names.add(outbox.pk).add(outbox.sk)
+    if (outbox.index !== undefined) names.add(outbox.index.pk).add(outbox.index.sk)
+    for (const name of tableKeyAttributes(outbox.table?.Tag ?? member._tableTag) ?? []) {
+      names.add(name)
+    }
+  }
+  return names
+}
+
+interface KeyPartLike {
+  readonly field: string
+}
+
+/**
+ * @internal Whether a read model's outbox items carry their mark (`OUTBOX_READ_MODEL`, #237): its
+ * name is free on them (`outboxItemNames`). The one decision, from the definitions: where an
+ * outbox's key or index attribute, or a key attribute of its table, is named `__edd_rm__`, the
+ * read model's items carry none, their `Put` no condition, and its drainers read no mark, as on
+ * 1.40.0.
+ */
+export const outboxMarkInUse = (entity: object): boolean =>
+  !outboxItemNames(entity).has(OUTBOX_READ_MODEL)
 
 /** A drainer's claim on an outbox item: its token, and the epoch millis it holds until. */
 export const OUTBOX_CLAIM = "__edd_claim__"

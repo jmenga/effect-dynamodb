@@ -1087,6 +1087,27 @@ export interface Entity<
     keys?: { readonly pk: string; readonly sk: string } | undefined,
   ) => Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig>
   /**
+   * @internal Where `rekey` moves a projection's outbox item of this read model, without moving it
+   * (`keys`: its table's key attributes): `"current"` at its key now, `to` with the read-model
+   * row's key now (`rowTo`) for one under other key text, `undefined` for a key this read model's
+   * reader doesn't read back.
+   */
+  readonly _valuelessMove: (
+    row: globalThis.Record<string, AttributeValue>,
+    keys: { readonly pk: string; readonly sk: string },
+  ) =>
+    | "current"
+    | {
+        readonly to: globalThis.Record<string, string>
+        readonly rowTo: { readonly pk: string; readonly sk: string }
+      }
+    | undefined
+  /**
+   * @internal Whether `row`, read from this entity's table, is one of its items stored where its
+   * own values put it under some key text: its key now or one `rekey` moves from.
+   */
+  readonly _ownsRow: (row: globalThis.Record<string, AttributeValue>) => boolean
+  /**
    * @internal The mark (`__edd_kt__`) a projection's row tombstone or outbox item takes for the
    * read-model row at `key` (a domain key record, `_domainKeyForm`): `KeyText136.markOf`.
    */
@@ -18021,7 +18042,8 @@ const makeImpl = <
    * that key is ({@link KeyText136.formOfMark}), and the key reads back to values when exactly one
    * set of them composes it there: `"current"` when they compose that key now, else the move to
    * the key they compose — an outbox item keeping its place after the row's sort key, the row it
-   * names and its sparse index sort key rewritten (`moved`). `undefined` for any other key.
+   * names and its sparse index sort key rewritten (`moved`), that row's key now (`rowTo`).
+   * `undefined` for any other key.
    */
   const valuelessMove = (
     row: StoredRow,
@@ -18031,6 +18053,8 @@ const makeImpl = <
         readonly kind: "tombstone" | "outbox"
         readonly from: StoredKey
         readonly to: StoredKey
+        /** The read-model row's key now: its partition and sort key's text. */
+        readonly rowTo: { readonly pk: string; readonly sk: string }
         /** The item at `to`: its keys, its mark, and an outbox item's text naming its row. */
         readonly moved: (read: StoredRow) => StoredRow
       }
@@ -18089,6 +18113,7 @@ const makeImpl = <
       kind,
       from: { [keys.pk]: storedPk, [keys.sk]: storedSk },
       to,
+      rowTo: { pk: newPk, sk: newRowSk },
       moved: (read) => {
         const item: StoredRow = { ...read, ...toAttributeMap(to) }
         const mark = KeyText136.markOf(schema, entityType, entityVersion, primary, readKeyForm)
@@ -18434,6 +18459,19 @@ const makeImpl = <
     _encodeKey: encodeKey,
     _liveRows: liveRows,
     _rekeyProjectionRow: rekeyProjectionRow,
+    _valuelessMove: (row: StoredRow, keys: { readonly pk: string; readonly sk: string }) => {
+      const move = valuelessMove(row, keys)
+      return typeof move === "object" ? { to: move.to, rowTo: move.rowTo } : move
+    },
+    _ownsRow: (row: StoredRow) => {
+      const places = rowPlaces(row)
+      return (
+        places !== undefined &&
+        !("uncomposable" in places) &&
+        places.kind === "item" &&
+        places.old !== undefined
+      )
+    },
     _keyTextMark: (key: globalThis.Record<string, unknown>) =>
       KeyText136.markOf(
         schema,
