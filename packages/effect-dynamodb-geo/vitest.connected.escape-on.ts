@@ -3,4 +3,8 @@ import { escapeKeysOnByDefault } from "../schema/test/helpers/escapeKeysOnByDefa
 import base from "./vitest.connected.js"
 
 /** The connected suite with `escapeKeys` on unless a schema says otherwise. */
-export default mergeConfig(base, { plugins: [escapeKeysOnByDefault()] })
+export default mergeConfig(base, {
+  plugins: [escapeKeysOnByDefault()],
+  // This pass runs against the tables the plain connected pass left behind.
+  test: { testTimeout: 120000 },
+})
