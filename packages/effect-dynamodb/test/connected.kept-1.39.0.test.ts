@@ -29,6 +29,7 @@ import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateListFiltersSuite } from "./helpers/AggregateListFilters.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { appendSparseMapsSuite } from "./helpers/AppendSparseMaps.js"
+import { clearBesideAbsentEntrySuite } from "./helpers/ClearBesideAbsentEntry.js"
 import {
   clearEveryOpSuite,
   clearWritesSuite,
@@ -259,6 +260,10 @@ describeConnected(
     unionMemberWritesSuite(openTable)
   },
 )
+
+describeConnected(".clearMap() beside a pathSubtract of an entry the row doesn't hold", () => {
+  clearBesideAbsentEntrySuite(openTable)
+})
 
 describeConnected("a renamed sparse map on an entity with a Z-order index", () => {
   renamedSparseMapZOrderSuite(openTable)

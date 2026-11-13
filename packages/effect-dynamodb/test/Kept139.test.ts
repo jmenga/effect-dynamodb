@@ -6,7 +6,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts`, `helpers/AppendSparseMaps.ts`, `helpers/UnionMemberWrites.ts` (the three against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts`, `helpers/AppendSparseMaps.ts`, `helpers/UnionMemberWrites.ts`, `helpers/ClearBesideAbsentEntry.ts` (the four against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -16,6 +16,7 @@ import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateListFiltersSuite } from "./helpers/AggregateListFilters.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { appendSparseMapsSuite } from "./helpers/AppendSparseMaps.js"
+import { clearBesideAbsentEntrySuite } from "./helpers/ClearBesideAbsentEntry.js"
 import {
   clearEveryOpSuite,
   clearWritesSuite,
@@ -175,6 +176,10 @@ describe("a time-series append whose appendInput holds a sparse map", () => {
 
 describe("a path write into a union whose members name it differently, or out of a member", () => {
   unionMemberWritesSuite(openRecordingTable)
+})
+
+describe(".clearMap() beside a pathSubtract of an entry the row doesn't hold", () => {
+  clearBesideAbsentEntrySuite(openRecordingTable)
 })
 
 describe("a renamed sparse map on an entity with a Z-order index", () => {

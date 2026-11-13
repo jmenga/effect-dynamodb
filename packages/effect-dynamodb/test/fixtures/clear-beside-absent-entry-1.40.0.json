@@ -1,0 +1,637 @@
+{
+  "generatedFrom": "effect-dynamodb@1.40.0 (published) on DynamoDB Local, captured once by a scratch script mirroring test/helpers/ClearBesideAbsentEntry.ts. Never regenerate: this is what 1.40.0 did.",
+  "cases": {
+    "an unrenamed map, standalone, escapeKeys false": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #psb0 = #psb0 - :psb1 REMOVE #sc0",
+            "ExpressionAttributeNames": {
+              "#psb0": "counts#missing",
+              "#sc0": "counts#a",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":psb1": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "counts#a": {
+            "N": "1"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    },
+    "an unrenamed map, in a transaction, escapeKeys false": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ca#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$ca#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #psb0 = #psb0 - :psb1 REMOVE #sc0",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#psb0": "counts#missing",
+                    "#sc0": "counts#a",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":psb1": {
+                      "N": "1"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "counts#a": {
+            "N": "1"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    },
+    "a renamed map, standalone, escapeKeys false": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #psb0 = #psb0 - :psb1",
+            "ExpressionAttributeNames": {
+              "#psb0": "counts#missing",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":psb1": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          },
+          "sr": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    },
+    "a renamed map, in a transaction, escapeKeys false": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ca#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$ca#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #psb0 = #psb0 - :psb1",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#psb0": "counts#missing",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":psb1": {
+                      "N": "1"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          },
+          "sr": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    },
+    "an unrenamed map, standalone, escapeKeys true": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #psb0 = #psb0 - :psb1 REMOVE #sc0",
+            "ExpressionAttributeNames": {
+              "#psb0": "counts#missing",
+              "#sc0": "counts#a",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":psb1": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "counts#a": {
+            "N": "1"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    },
+    "an unrenamed map, in a transaction, escapeKeys true": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ca#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$ca#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #psb0 = #psb0 - :psb1 REMOVE #sc0",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#psb0": "counts#missing",
+                    "#sc0": "counts#a",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":psb1": {
+                      "N": "1"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "counts#a": {
+            "N": "1"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    },
+    "a renamed map, standalone, escapeKeys true": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #psb0 = #psb0 - :psb1",
+            "ExpressionAttributeNames": {
+              "#psb0": "counts#missing",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":psb1": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          },
+          "sr": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    },
+    "a renamed map, in a transaction, escapeKeys true": {
+      "outcome": {
+        "fail": "DynamoValidationError"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ca#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$ca#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ca#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$ca#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #psb0 = #psb0 - :psb1",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#psb0": "counts#missing",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":psb1": {
+                      "N": "1"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ca#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$ca#v1#doc"
+          },
+          "sr": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "counts": {
+            "a": 1
+          }
+        }
+      }
+    }
+  }
+}
