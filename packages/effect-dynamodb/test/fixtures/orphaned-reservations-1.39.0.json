@@ -1,0 +1,231 @@
+{
+  "generatedWith": "effect-dynamodb@1.39.0",
+  "scenarios": [
+    {
+      "name": "deleted",
+      "writes": "Account a put with n = 5n, then deleted",
+      "results": [
+        "put a: ok",
+        "delete a: ok",
+        "put b, same n: failed UniqueConstraintViolation"
+      ]
+    },
+    {
+      "name": "changed",
+      "writes": "Account c put with n = 7n, then updated to n = 8n",
+      "results": [
+        "put c: ok",
+        "update c to 8n: ok"
+      ]
+    },
+    {
+      "name": "live",
+      "writes": "Account d put with n = 13n, and left",
+      "results": [
+        "put d: ok"
+      ]
+    },
+    {
+      "name": "large",
+      "writes": "Account e put with n = 2^60 + 1, then deleted",
+      "results": [
+        "put e: ok",
+        "delete e: ok"
+      ]
+    },
+    {
+      "name": "softDeleted",
+      "writes": "Member m put with n = 9n, then soft-deleted (no preserveUnique)",
+      "results": [
+        "put m: ok",
+        "delete m: ok"
+      ]
+    },
+    {
+      "name": "preserved",
+      "writes": "Holder h put with n = 11n, then soft-deleted under preserveUnique",
+      "results": [
+        "put h: ok",
+        "delete h: ok"
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "sk": {
+        "S": "$vu#v1#account"
+      },
+      "id": {
+        "S": "c"
+      },
+      "pk": {
+        "S": "$vu#v1#account#id_c"
+      },
+      "n": {
+        "N": "8"
+      },
+      "__edd_e__": {
+        "S": "Account"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#account"
+      },
+      "id": {
+        "S": "d"
+      },
+      "pk": {
+        "S": "$vu#v1#account#id_d"
+      },
+      "n": {
+        "N": "13"
+      },
+      "__edd_e__": {
+        "S": "Account"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#account.number"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#account"
+      },
+      "pk": {
+        "S": "$vu#v1#account.number#00000000000000000000000000000000000005"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#account#id_a"
+      },
+      "__edd_e__": {
+        "S": "Account._unique.number"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#account.number"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#account"
+      },
+      "pk": {
+        "S": "$vu#v1#account.number#00000000000000000000000000000000000007"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#account#id_c"
+      },
+      "__edd_e__": {
+        "S": "Account._unique.number"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#account.number"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#account"
+      },
+      "pk": {
+        "S": "$vu#v1#account.number#00000000000000000000000000000000000008"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#account#id_c"
+      },
+      "__edd_e__": {
+        "S": "Account._unique.number"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#account.number"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#account"
+      },
+      "pk": {
+        "S": "$vu#v1#account.number#00000000000000000000000000000000000013"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#account#id_d"
+      },
+      "__edd_e__": {
+        "S": "Account._unique.number"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#holder#deleted#2026-11-08T00:07:23.426Z"
+      },
+      "deletedAt": {
+        "S": "2026-11-08T00:07:23.426Z"
+      },
+      "id": {
+        "S": "h"
+      },
+      "pk": {
+        "S": "$vu#v1#holder#id_h"
+      },
+      "n": {
+        "N": "11"
+      },
+      "__edd_e__": {
+        "S": "Holder"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#holder.number"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#holder"
+      },
+      "pk": {
+        "S": "$vu#v1#holder.number#00000000000000000000000000000000000011"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#holder#id_h"
+      },
+      "__edd_e__": {
+        "S": "Holder._unique.number"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#member#deleted#2026-11-08T00:07:23.410Z"
+      },
+      "deletedAt": {
+        "S": "2026-11-08T00:07:23.410Z"
+      },
+      "id": {
+        "S": "m"
+      },
+      "pk": {
+        "S": "$vu#v1#member#id_m"
+      },
+      "n": {
+        "N": "9"
+      },
+      "__edd_e__": {
+        "S": "Member"
+      }
+    },
+    {
+      "sk": {
+        "S": "$vu#v1#member.number"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#member"
+      },
+      "pk": {
+        "S": "$vu#v1#member.number#00000000000000000000000000000000000009"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#member#id_m"
+      },
+      "__edd_e__": {
+        "S": "Member._unique.number"
+      }
+    }
+  ]
+}

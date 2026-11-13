@@ -224,6 +224,9 @@ export const chainScenarios: ReadonlyArray<ChainScenario> = [true, false].flatMa
         const { dry, real } = yield* dryThenReal(db, options)
         expect(real.conflicts).toEqual([])
         expect(real.sentinelsMoved).toBe(2)
+        // Both items' sentinels move, so neither item is left as it was, whichever pass moved
+        // which sentinel.
+        expect(real.unchanged).toBe(0)
         expect(decided(dry)).toEqual(decided(real))
         // Each value is taken under its current key, by its own row.
         const stored = yield* table.rows()

@@ -92,7 +92,15 @@ const byKey = (items: Iterable<Record<string, any>>) =>
         : 0,
   )
 
-const reportOf = (report: any) => ({
+/** The reports of the case running now, for {@link guardGapsOf}. Cases run one at a time. */
+const reports: Array<any> = []
+
+const reportOf = (report: any) => {
+  reports.push(report)
+  return reportShape(report)
+}
+
+const reportShape = (report: any) => ({
   moved: Object.fromEntries(
     Object.entries(report.moved ?? {}).filter(([, count]) => (count as number) > 0),
   ) as Record<string, number>,
@@ -482,3 +490,10 @@ export const capture = (api: Api, name: Case): Effect.Effect<Outcome> => {
   })()
   return Effect.map(run, (outcome) => plain(outcome) as Outcome) as Effect.Effect<Outcome>
 }
+
+/** Run one case and return the `guardGaps` of its last `rekey` report (since 1.41). */
+export const guardGapsOf = (api: Api, name: Case): Effect.Effect<unknown> =>
+  Effect.suspend(() => {
+    reports.length = 0
+    return Effect.map(capture(api, name), () => reports.at(-1)?.guardGaps)
+  })

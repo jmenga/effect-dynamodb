@@ -21,6 +21,7 @@ import * as Table from "../src/Table.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import * as RekeyChains from "./helpers/RekeyChains.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
+import { storedRows } from "./helpers/StoredRows.js"
 
 class Stop extends Schema.Class<Stop>("Stop")({
   label: Schema.String,
@@ -152,9 +153,12 @@ const on =
   <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.provide(layerOf(w, table))) as Effect.Effect<A, E>
 
-/** The stored rows, by key. */
+/** The stored rows' keys. */
 const keysOf = (table: ReturnType<typeof tableOf>) =>
   [...table.items.values()].map((row) => [row.pk?.S, row.sk?.S]).sort()
+
+/** The stored rows, every attribute's typed value included ({@link storedRows}). */
+const storedOf = (table: ReturnType<typeof tableOf>) => storedRows(table.items.values())
 
 /** Store a row as it is, in attribute form. */
 const store = (table: ReturnType<typeof tableOf>, row: Record<string, AttributeValue>) => {
@@ -190,25 +194,49 @@ const SETTINGS = [
 describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction, escapeKeys) => {
   const w = world(escapeKeys)
 
-  it.effect("a unique sentinel with no row behind it, on every run", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      const db = yield* w.client
-      yield* db.entities.Accounts.put({ id: "a", email: "x y" }).asEffect()
-      table.items.delete(
-        `${KeyComposer.composePk(w.schema, "Account", w.Accounts.indexes.primary, { id: "a" })}|${KeyComposer.composeSk(w.schema, "Account", 1, w.Accounts.indexes.primary, { id: "a" })}`,
-      )
-      const before = keysOf(table)
-      expect(before).toHaveLength(1)
-      const { dry, real } = yield* dryThenReal(db)
-      expect(real.skipped.unrecognizedKey).toBe(1)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect((yield* db.tables.MainTable.rekey()).skipped.unrecognizedKey).toBe(1)
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
+  it.effect(
+    "a unique sentinel with no row behind it is an orphaned reservation, on every run that judges reservations",
+    () => {
+      const table = tableOf()
+      return Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.Accounts.put({ id: "a", email: "x y" }).asEffect()
+        table.items.delete(
+          `${KeyComposer.composePk(w.schema, "Account", w.Accounts.indexes.primary, { id: "a" })}|${KeyComposer.composeSk(w.schema, "Account", 1, w.Accounts.indexes.primary, { id: "a" })}`,
+        )
+        const before = storedOf(table)
+        expect(before).toHaveLength(1)
+        // Without `reservations`, counted as 1.40.0 counted it.
+        const plain = yield* dryThenReal(db)
+        expect(plain.real.skipped.unrecognizedKey).toBe(1)
+        expect(plain.real.reservations).toMatchObject({
+          orphaned: 0,
+          released: 0,
+          skipped: 0,
+          raced: 0,
+          undecided: 0,
+        })
+        expect(rekeyOutcome(plain.dry)).toEqual(rekeyOutcome(plain.real))
+        const { dry, real } = yield* dryThenReal(db, { reservations: true })
+        expect(real.skipped.unrecognizedKey).toBe(0)
+        expect(real.reservations).toMatchObject({
+          orphaned: 1,
+          released: 0,
+          skipped: 0,
+          raced: 0,
+          undecided: 0,
+        })
+        expect(real.reservations.entries.map((entry) => entry.outcome)).toEqual(["orphaned"])
+        expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
+        expect(
+          (yield* db.tables.MainTable.rekey({ reservations: true })).reservations.orphaned,
+        ).toBe(1)
+        expect(storedOf(table)).toEqual(before)
+      }).pipe(on(w, table))
+    },
+  )
 
-  it.effect("a unique sentinel its row's values don't compose", () => {
+  it.effect("a unique sentinel its row's values don't compose is an orphaned reservation", () => {
     const table = tableOf()
     return Effect.gen(function* () {
       const db = yield* w.client
@@ -222,12 +250,20 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         _entity_sk: row.sk?.S,
         __edd_e__: "Account._unique.email",
       })
-      const before = keysOf(table)
-      const { dry, real } = yield* dryThenReal(db)
+      const before = storedOf(table)
+      expect((yield* dryThenReal(db)).real.skipped.unrecognizedKey).toBe(1)
+      const { dry, real } = yield* dryThenReal(db, { reservations: true })
       expect(real.conflicts).toEqual([])
-      expect(real.skipped.unrecognizedKey).toBe(1)
+      expect(real.skipped.unrecognizedKey).toBe(0)
+      expect(real.reservations).toMatchObject({
+        orphaned: 1,
+        released: 0,
+        skipped: 0,
+        raced: 0,
+        undecided: 0,
+      })
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(on(w, table))
   })
 
@@ -242,13 +278,13 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
       })
       const root = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
       table.items.delete(root[0])
-      const before = keysOf(table)
+      const before = storedOf(table)
       const { dry, real } = yield* dryThenReal(db)
       expect(real.skipped.unrecognizedKey).toBe(2)
       expect(real.moved.aggregate).toBe(0)
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
       expect((yield* db.tables.MainTable.rekey()).skipped.unrecognizedKey).toBe(2)
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(on(w, table))
   })
 
@@ -268,11 +304,11 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         name: "n",
         __edd_e__: "RouteItem",
       })
-      const before = keysOf(table)
+      const before = storedOf(table)
       const { dry, real } = yield* dryThenReal(db)
       expect(real.skipped.unrecognizedKey).toBe(1)
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(on(w, table))
   })
 
@@ -287,13 +323,13 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         sk: DynamoSchema.composeDeletedKey(w.schema, "Doc", "2026-01-02T03:04:05.000Z"),
         deletedAt: "2026-01-02T03:04:05.000Z",
       })
-      const before = keysOf(table)
+      const before = storedOf(table)
       const { dry, real } = yield* dryThenReal(db)
       expect(real.skipped.unrecognizedKey).toBe(2)
       expect(real.moved.snapshot + real.moved.tombstone).toBe(0)
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
       expect((yield* db.tables.MainTable.rekey()).skipped.unrecognizedKey).toBe(2)
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(on(w, table))
   })
 
@@ -304,12 +340,12 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
       const row = { sk: "e", version: 1, __edd_e__: w.Logs.eventMarker }
       seed(table, { ...row, pk: "$complete#v1#log#somewhere else", streamId: "s" })
       seed(table, { ...row, pk: "$complete#v1#log#no id" })
-      const before = keysOf(table)
+      const before = storedOf(table)
       const { dry, real } = yield* dryThenReal(db, { streams: [w.Logs] })
       expect(real.skipped.unrecognizedKey).toBe(2)
       expect(real.moved.stream).toBe(0)
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(on(w, table))
   })
 
@@ -348,12 +384,12 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         sk: KeyComposer.composeSk(otherText(escapeKeys), "Listing", 1, index, values),
         __edd_e__: "Listing",
       })
-      const before = keysOf(table)
+      const before = storedOf(table)
       const { dry, real } = yield* dryThenReal(db)
       expect(real.conflicts.map((conflict) => conflict.reason)).toEqual(["failed"])
       expect(real.moved.item).toBe(0)
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(on(w, table))
   })
 })
@@ -639,11 +675,11 @@ describe.each(SETTINGS)("an aggregate's move, %s", (_direction, escapeKeys) => {
       )!
       table.items.delete(entry[0])
       store(table, { ...entry[1], pk: { S: pkOf(w.schema) } })
-      const before = keysOf(table)
+      const before = storedOf(table)
       const { dry, real } = yield* dryThenReal(db)
       expect(real.skipped.unrecognizedKey).toBe(2)
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(on(w, table))
   })
 
@@ -913,7 +949,7 @@ describe("a failed aggregate's conflict says what went wrong", () => {
           { lid: "b", note: "same" },
         ],
       })
-      const before = keysOf(table)
+      const before = storedOf(table)
       const db = yield* DynamoClient.make({
         entities: {},
         aggregates: { Orders: orders("note") },
@@ -931,7 +967,7 @@ describe("a failed aggregate's conflict says what went wrong", () => {
           ],
         ])
       }
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(provide)
   })
 
@@ -957,7 +993,7 @@ describe("a failed aggregate's conflict says what went wrong", () => {
           { lid: "b", note: "same" },
         ],
       })
-      const before = keysOf(table)
+      const before = storedOf(table)
       const db = yield* DynamoClient.make({
         entities: {},
         aggregates: { Orders: orders("note") },
@@ -975,7 +1011,7 @@ describe("a failed aggregate's conflict says what went wrong", () => {
           ],
         ])
       }
-      expect(keysOf(table)).toEqual(before)
+      expect(storedOf(table)).toEqual(before)
     }).pipe(provide)
   })
 })

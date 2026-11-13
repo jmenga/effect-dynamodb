@@ -1,0 +1,87 @@
+{
+  "generatedWith": "effect-dynamodb@1.39.0",
+  "scenarios": [
+    {
+      "name": "live",
+      "writes": "Plan p1 put with length = Duration.seconds(5), and left",
+      "results": [
+        "put p1: ok"
+      ]
+    },
+    {
+      "name": "deleted",
+      "writes": "Plan p2 put with length = Duration.seconds(7), then deleted",
+      "results": [
+        "put p2: ok",
+        "delete p2: ok, its sentinel left behind"
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "pk": {
+        "S": "$vu#v1#plan#id_p1"
+      },
+      "sk": {
+        "S": "$vu#v1#plan"
+      },
+      "id": {
+        "S": "p1"
+      },
+      "length": {
+        "M": {
+          "~effect/Duration": {
+            "S": "~effect/Duration"
+          },
+          "value": {
+            "M": {
+              "millis": {
+                "N": "5000"
+              },
+              "_tag": {
+                "S": "Millis"
+              }
+            }
+          }
+        }
+      },
+      "__edd_e__": {
+        "S": "Plan"
+      }
+    },
+    {
+      "pk": {
+        "S": "$vu#v1#plan.length#5000 millis"
+      },
+      "sk": {
+        "S": "$vu#v1#plan.length"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#plan#id_p1"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#plan"
+      },
+      "__edd_e__": {
+        "S": "Plan._unique.length"
+      }
+    },
+    {
+      "pk": {
+        "S": "$vu#v1#plan.length#7000 millis"
+      },
+      "sk": {
+        "S": "$vu#v1#plan.length"
+      },
+      "_entity_pk": {
+        "S": "$vu#v1#plan#id_p2"
+      },
+      "_entity_sk": {
+        "S": "$vu#v1#plan"
+      },
+      "__edd_e__": {
+        "S": "Plan._unique.length"
+      }
+    }
+  ]
+}

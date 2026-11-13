@@ -539,6 +539,29 @@ const serializeWith = (
 }
 
 /**
+ * Whether `value` has key text of its own ({@link serializeValue}): a string, a number, a bigint, a
+ * boolean, a `DateTime` or a `Date`. Any other value's text is its `String` form, which says nothing
+ * exact about the value: a map read back from a row gives `[object Object]`, where the instance it
+ * was stored from gave its own `toString`. Two such texts compared say nothing either way. A map
+ * read back from a marshalled `DateTime` carries its type id but isn't one (#133): not exact.
+ */
+export const hasExactText = (value: unknown): boolean => {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "bigint" ||
+    typeof value === "boolean" ||
+    isStoredNaN(value) ||
+    value instanceof Date
+  ) {
+    return true
+  }
+  if (typeof value !== "object" || value === null || !DateTime.isDateTime(value)) return false
+  const proto = Object.getPrototypeOf(value)
+  return proto !== Object.prototype && proto !== null
+}
+
+/**
  * Serialize a value for a composite key under `escapeKeys: true`. {@link compositeText} is the
  * text under a schema's setting.
  *

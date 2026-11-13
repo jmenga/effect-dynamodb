@@ -920,7 +920,10 @@ export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
  *   or it is an outbox item on another table than its read model's, of a
  *   projection not defined where `rekey` runs
  * - `unrecognizedKey` — its member's, but stored neither under the key its
- *   values compose now nor under the one 1.36 composed for them. When several
+ *   values compose now nor under the one 1.36 composed for them. A unique
+ *   sentinel of a constraint the entity doesn't declare, or one not under the
+ *   schema's own key prefix, is counted here too (a sentinel of a declared
+ *   constraint that no row holds is in {@link RekeyReport.reservations}). When several
  *   members claim its `__edd_e__` (read models of one entity type in different
  *   schemas or primary collections, whose outboxes share a table), none of them
  *   reads its key back
@@ -939,7 +942,9 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" 
  * - `bothKeys` — the same row (the same item, version, event, …) is also
  *   under its current key — for an aggregate, any of its rows is, or which
  *   of them are where can't be told; both are left as they are
- * - `taken` — another row holds its current key
+ * - `taken` — another row holds its current key — for an aggregate, a row
+ *   that isn't one of its own holds one of its rows' current keys, and doesn't
+ *   move out of the way in this run
  * - `contended` — concurrent writes changed it on every attempt
  * - `failed` — it could not be moved as stored (its values no longer decode,
  *   a stream id reads as more than one id, or a write was refused);
@@ -983,7 +988,8 @@ export interface RekeyConflict {
  * - `ambiguous` — a `sparse` half with no key and two or more composites outside the primary key on
  *   the row. A writer naming only a later composite takes a row out of the index on purpose, and
  *   that leaves the same bytes, so these are never written
- * - `repaired` — keys written, or with `dryRun`, keys that would be
+ * - `repaired` — keys written: `missing`, `truncated` and `lagging`, less those a writer changed
+ *   first. A dry run writes none, so it counts none: what it finds is what a run would write
  * - `skipped` — keys a writer changed the row under, twice: the writer won
  */
 export interface RekeyIndexKeys {
@@ -995,6 +1001,127 @@ export interface RekeyIndexKeys {
   readonly skipped: number
 }
 
+/**
+ * Rows `rekey` moved under a guard that can miss a write landing between its read and the move,
+ * with writes to the table going on (counted only without {@link RekeyOptions.writesStopped}). The
+ * move puts the row back as it read it, so a write the guard doesn't see is lost (DESIGN.md §7,
+ * "What 'as read' proves"):
+ *
+ * - `stamp` — an entity's row too wide to guard whole, guarded on its `updatedAt` (held, or absent)
+ *   and what else fits: a write that leaves `updatedAt` as it was isn't seen when it changes an
+ *   attribute the guard leaves out. A library write within the stamp's resolution (the same
+ *   millisecond, or second for epoch seconds) is one: on an item, an update; on a tombstone, a soft
+ *   delete of the item put again; on a time-series event, an `append` made after its current item
+ *   was deleted. So is a `reembed`, which stamps nothing.
+ * - `sparse` — an entity's row with a sparse map (`storedAs: DynamoModel.SparseMap()`), guarded
+ *   whole: a write that only adds an entry adds an attribute no declaration names, so the guard
+ *   can't hold it absent. A library write stamps `updatedAt`, which the guard holds, so with
+ *   timestamps only one within the stamp's resolution goes unseen.
+ * - `strongest` — a row of an aggregate or stream already part-moved, too wide to guard whole and
+ *   finished under the strongest guard that fits: a write to an attribute it leaves out isn't seen.
+ *
+ * A row is counted only where a library write can be missed. A write from outside the library is
+ * seen only through the guard's terms, so these are never seen, on any row moved with writes going
+ * on, counted or not:
+ *
+ * - on a versioned item's row (live, snapshot or tombstone), one that leaves the version, the
+ *   incarnation token and the vector attributes as they were, whatever else it changes;
+ * - on a unique sentinel, one that leaves the row it names as it was;
+ * - on an entity's other rows and an aggregate's rows, one that only adds attributes the member
+ *   doesn't declare; on an event stream's row, one that only adds attributes; on a projection's row
+ *   tombstone or outbox item, one that only adds attributes other than a drainer's claim;
+ * - on a row counted here, what its count says.
+ *
+ * Stopping writes and running with `writesStopped: true` closes every one of these.
+ */
+export interface RekeyGuardGaps {
+  readonly stamp: number
+  readonly sparse: number
+  readonly strongest: number
+}
+
+/** A row counted in {@link RekeyGuardGaps}, named so it can be checked. */
+export interface RekeyGuardGapRow {
+  /** The entity type, aggregate or stream name. */
+  readonly member: string
+  readonly kind: RekeyRowKind
+  /** The count it's in. */
+  readonly gap: keyof RekeyGuardGaps
+  /** The row's primary key, as stored when the run read it. */
+  readonly key: Readonly<Record<string, unknown>>
+  /** Its current key: where the run moved it (a dry run: where it would). */
+  readonly target: Readonly<Record<string, unknown>>
+}
+
+/** {@link RekeyGuardGaps}, and the rows counted. */
+export interface RekeyGuardGapReport extends RekeyGuardGaps {
+  /**
+   * The rows counted, by member, kind and key: at most 100, the first in that order, so the list
+   * is the same whatever order the run met them in. The counts are exact.
+   */
+  readonly rows: ReadonlyArray<RekeyGuardGapRow>
+}
+
+/**
+ * What `rekey` did with a unique sentinel no row holds, or one it couldn't judge
+ * ({@link RekeyReservation}):
+ *
+ * - `orphaned` — no row holds it, and it was left: the run didn't ask for
+ *   {@link RekeyOptions.releaseOrphanedReservations}
+ * - `released` — deleted, or with `dryRun`, would be
+ * - `skipped` — left to a write that changed it or its row between the read and the release, twice
+ * - `raced` — no row held it when read, but a write got there before the release: it claimed the
+ *   sentinel, gave the row it names its value, or deleted it. Read again, it is held or gone, so it
+ *   was left, and it isn't counted `orphaned`
+ * - `undecided` — left, since nothing says whether a row holds it: it names no row, it names a row
+ *   of another type whose attributes don't compose its key (one whose do is taken to hold it, as
+ *   1.40.0 took it, and isn't counted), or that row's values compose no sentinel key
+ */
+export type RekeyReservationOutcome = "orphaned" | "released" | "skipped" | "raced" | "undecided"
+
+/**
+ * A unique sentinel of a known entity and constraint that no row holds, or that `rekey` couldn't
+ * judge. A sentinel is held by the row its back-pointer (`_entity_pk` / `_entity_sk`) names, when
+ * that row's values compose the sentinel's key under any key text. With `softDelete: {
+ * preserveUnique: true }` a tombstone of that row holds it the same way: the soft delete kept the
+ * reservation on purpose.
+ */
+export interface RekeyReservation {
+  /** The entity type. */
+  readonly member: string
+  /** The unique constraint's name. */
+  readonly constraint: string
+  /** The sentinel's primary key, as stored. */
+  readonly key: Readonly<Record<string, unknown>>
+  /** The key its back-pointer names, as stored: `undefined` when it names none. */
+  readonly owner: Readonly<Record<string, unknown>> | undefined
+  readonly outcome: RekeyReservationOutcome
+  readonly message: string
+}
+
+/**
+ * Unique sentinels no row holds, and ones `rekey` couldn't judge, counted only with
+ * {@link RekeyOptions.reservations} (or `releaseOrphanedReservations`): without, every count is 0,
+ * and such a sentinel is counted in `skipped.unrecognizedKey`, as 1.40.0 counted it. `released`,
+ * `skipped` and `raced` are counted only with {@link RekeyOptions.releaseOrphanedReservations}.
+ * `orphaned` counts every one found and still orphaned when released or left, so it includes those
+ * `released` and `skipped`, and not those `raced`. Each sentinel is judged once a run, however the
+ * run reaches it.
+ */
+export interface RekeyReservationCounts {
+  readonly orphaned: number
+  readonly released: number
+  readonly skipped: number
+  readonly raced: number
+  readonly undecided: number
+}
+
+/** {@link RekeyReservationCounts}, and each sentinel counted. */
+export interface RekeyReservations extends RekeyReservationCounts {
+  /** One per sentinel counted, by member and then key. */
+  readonly entries: ReadonlyArray<RekeyReservation>
+}
+
 /** One member's share of a {@link RekeyReport}. */
 export interface RekeyMemberReport {
   readonly unchanged: number
@@ -1003,20 +1130,30 @@ export interface RekeyMemberReport {
   readonly sentinelsMoved: number
   readonly conflicts: number
   readonly indexKeys: RekeyIndexKeys
+  readonly reservations: RekeyReservationCounts
+  readonly guardGaps: RekeyGuardGaps
 }
 
 /**
- * What a `rekey` run did — or, with `dryRun`, would do. Counts are of rows
- * acted on: a row the scan reads after the run moved it (at its current key)
- * is `unchanged`, so `scanned` is not the sum of the others. A row an
- * application write moved between the scan and the move is `unchanged` too:
- * `moved` counts the rows this run moved.
+ * What a `rekey` run did — or, with `dryRun`, would do. Each row is judged once a run, however
+ * many times the scan and the moves of other rows reach it, and the report and the rows left
+ * don't depend on the order the scan returns rows in, its segment count or its `concurrency`.
+ * Counts are of rows stored when the run met them, never of rows the run wrote: the scan passes
+ * a row the run moved there. A row an application write moved between the scan and the move is
+ * `unchanged`: `moved` counts the rows this run moved.
  */
 export interface RekeyReport {
   readonly dryRun: boolean
-  /** Rows the scan returned. */
+  /**
+   * Rows the table held that the run met: each once, when the scan returned it or when the run
+   * moved it out of another row's way first. Rows the run put aren't counted, nor is a row the
+   * scan returned from a page read before the run moved it.
+   */
   readonly scanned: number
-  /** Rows of a known member already under their current keys, with nothing to rewrite. */
+  /**
+   * Rows of a known member already under their current keys, with nothing to rewrite. A row the
+   * run moved isn't, whichever member meets it after.
+   */
   readonly unchanged: number
   /** Rows moved to their current keys (a dry run: rows that would move), by kind. */
   readonly moved: RekeyCounts
@@ -1029,6 +1166,10 @@ export interface RekeyReport {
   readonly sentinelsMoved: number
   /** Index keys that aren't what a `put` of their row's values writes: {@link RekeyIndexKeys}. */
   readonly indexKeys: RekeyIndexKeys
+  /** Unique sentinels no row holds, and ones that couldn't be judged: {@link RekeyReservations}. */
+  readonly reservations: RekeyReservations
+  /** Rows moved under a guard that can miss a write, and up to 100 of them: {@link RekeyGuardGapReport}. */
+  readonly guardGaps: RekeyGuardGapReport
   /** Rows left where they are — see {@link RekeyConflict}. */
   readonly conflicts: ReadonlyArray<RekeyConflict>
   /** Rows no member owns, by reason. */
@@ -1037,12 +1178,57 @@ export interface RekeyReport {
   readonly byMember: Readonly<Record<string, RekeyMemberReport>>
   /** What the run consumed — always measured, whatever `ConsumedCapacity` reporting is set to. */
   readonly capacity: CapacityTotals
+  /** What the run remembered, and whether it ran out of room: {@link RekeyJournal}. */
+  readonly journal: RekeyJournal
   /**
    * Where the scan stopped, when it stopped before the end of the table
    * (`maxPages`): pass it as {@link RekeyOptions.resume} to go on.
    * `None` when the run covered the whole table.
    */
   readonly resume: Option.Option<string>
+}
+
+/** The counts of a {@link RekeyReport}, by name. */
+export type RekeyCountName =
+  | "scanned"
+  | "unchanged"
+  | "moved"
+  | "indexKeysRewritten"
+  | "sentinelsMoved"
+  | "indexKeys"
+  | "reservations"
+  | "guardGaps"
+  | "conflicts"
+  | "skipped"
+
+/**
+ * What a `rekey` run remembers ({@link RekeyOptions.journalCapacity}): the keys it wrote to, the
+ * units it judged, and what it counted once, each a 128-bit digest with a few flags, never key
+ * text or a row. A row it doesn't move, write or report costs nothing; an aggregate's rows, which
+ * its root's move may take after the scan meets them, cost an entry each, moved or not. Moving a
+ * row costs about five entries. A real run keeps no row's image (only the last few it put); a dry
+ * run keeps each row it plans to put, which its reads see, and that row takes an entry for every
+ * 256 bytes of it.
+ *
+ * Under the capacity every count is exact, and the same whatever order the run meets the rows in.
+ * Once it's reached (`full`), the run carries on — its writes are guarded as ever, so no row is
+ * lost or overwritten — but what it forgets it can't pass or count once: `inexact` names the counts
+ * that may be off. A real run then meets a row it put as a row stored there (`scanned`, `unchanged`,
+ * `indexKeys` count it, as 1.40.0 counted every such row), judges a unit reached again once more
+ * (`unchanged`, `reservations`), may count a row stored under two old key texts as two moves
+ * (`moved`), may report a row in another's way that a run with room moves after it (`conflicts`; a
+ * rerun moves it), and doesn't report a row with no aggregate root found (`skipped`). A dry run's
+ * reads no longer see its whole plan, so any count may be off.
+ */
+export interface RekeyJournal {
+  /** {@link RekeyOptions.journalCapacity}, as used. */
+  readonly capacity: number
+  /** The entries the run kept: at most `capacity`. */
+  readonly used: number
+  /** Whether the run had more to keep than `capacity` entries. */
+  readonly full: boolean
+  /** The counts that may be off: none while the journal isn't full. */
+  readonly inexact: ReadonlyArray<RekeyCountName>
 }
 
 /** Options for `db.tables.<Table>.rekey()`. */
@@ -1061,6 +1247,31 @@ export interface RekeyOptions {
    */
   readonly repairIndexKeys?: boolean | undefined
   /**
+   * Judge the unique sentinels no row holds, and count them in {@link RekeyReport.reservations}.
+   * Default `false`: the run sends what 1.40.0 sent, and counts such a sentinel in
+   * `skipped.unrecognizedKey`, as 1.40.0 did. Judging reads more than that: under `preserveUnique`,
+   * a sentinel whose item is gone or holds another value costs a query for the item's tombstones,
+   * and one that looks orphaned is read again. It writes nothing.
+   */
+  readonly reservations?: boolean | undefined
+  /**
+   * Also delete the unique sentinels {@link RekeyReport.reservations} finds no row holding
+   * (`orphaned`), so their values can be taken again. Implies {@link reservations}. Default
+   * `false`: nothing is deleted. A maintenance step: it needs {@link writesStopped}, with every
+   * writer to the table stopped — another run releasing reservations counts as one — and fails
+   * with a `ValidationError` (`EDD-9098`) before anything is read without it. Each release is one
+   * transaction: the sentinel's `Delete`, conditioned on its back-pointer (and TTL, when it has
+   * one) as read, so another row's claim in between is never deleted, and a `ConditionCheck`
+   * that the row it names is still absent, or still holds the values read. These don't make it
+   * safe while the application writes, hence `writesStopped`: the row it names can take the value
+   * again in between, put again and soft-deleted under `preserveUnique`, leaving the sentinel as
+   * read and its tombstone holding the value, and the release deletes a reservation in use. On a
+   * failed condition the sentinel is read once and judged again. Only a sentinel of a known entity and constraint,
+   * under the schema's own key prefix, is ever judged. An orphaned sentinel holding the current
+   * key of another item's sentinel is judged, and released, before that sentinel moves there.
+   */
+  readonly releaseOrphanedReservations?: boolean | undefined
+  /**
    * Writes to the table are stopped for this run. A row `rekey` can't prove unchanged when it
    * moves (`unguarded`: too wide to guard whole, with no version or stamped `updatedAt` to stand in) then
    * moves under the strongest guard that fits, as on 1.39.0. Default `false`: such a row is
@@ -1075,6 +1286,15 @@ export interface RekeyOptions {
   readonly concurrency?: number | undefined
   /** The scan's page size (`Limit`). Default: DynamoDB's (1 MB pages). */
   readonly pageSize?: number | undefined
+  /**
+   * How many entries the run's journal holds at most ({@link RekeyJournal}): one for each key it
+   * writes to, unit it judges and row it counts once; a row it doesn't move, write or report costs
+   * none. Default 1,000,000: about 145 bytes an entry, so about 138 MiB when full, and exact counts
+   * for about 200,000 moved rows. Past it the run goes on, its counts named in
+   * {@link RekeyReport.journal} may be off, and a smaller run (`maxPages`, then `resume`) keeps
+   * them exact. A positive integer up to 16,000,000.
+   */
+  readonly journalCapacity?: number | undefined
   /**
    * Stop after this many scan pages (all segments together) and return a
    * {@link RekeyReport.resume} token: bound a run to a time slot and go on

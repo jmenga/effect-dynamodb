@@ -1,0 +1,2022 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0 (npm), effect@4.1.2, DynamoDB Local",
+ "note": "Generated once by running test/helpers/ReservationTable.ts against the published package: never regenerate or edit. Each setting's rows are what the table held (written by 1.40.0, or the rows 1.39.0 left); each run's requests are what 1.40.0's rekey sent over them, in order, the table named t; each run's report counts are 1.40.0's.",
+ "settings": {
+  "reused keys, escapeKeys off": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#a 1@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u 2"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#a 3@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u 2"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#a 2@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u 2"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#b@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u 3"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#seat.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#seat#seat_s 1"
+     },
+     "pk": {
+      "S": "$vu#v1#seat.number#00000000000000000000000000000000000041"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#seat#venue_v 1"
+     },
+     "__edd_e__": {
+      "S": "Seat._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder"
+     },
+     "id": {
+      "S": "h1"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "n": {
+      "N": "33"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder#deleted#2026-11-11T22:19:45.977Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:45.977Z"
+     },
+     "id": {
+      "S": "h1"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "n": {
+      "N": "31"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder#deleted#2026-11-11T22:19:45.988Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:45.988Z"
+     },
+     "id": {
+      "S": "h1"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "n": {
+      "N": "32"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "seat": {
+      "S": "s 1"
+     },
+     "venue": {
+      "S": "v 1"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.006Z"
+     },
+     "__edd_e__": {
+      "S": "Seat"
+     },
+     "sk": {
+      "S": "$vu#v1#seat#deleted#seat_s 1#2026-11-11T22:19:46.006Z"
+     },
+     "pk": {
+      "S": "$vu#v1#seat#venue_v 1"
+     },
+     "n": {
+      "N": "41"
+     }
+    },
+    {
+     "seat": {
+      "S": "s 1"
+     },
+     "sk": {
+      "S": "$vu#v1#seat#seat_s 1"
+     },
+     "venue": {
+      "S": "v 1"
+     },
+     "pk": {
+      "S": "$vu#v1#seat#venue_v 1"
+     },
+     "n": {
+      "N": "42"
+     },
+     "__edd_e__": {
+      "S": "Seat"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user"
+     },
+     "id": {
+      "S": "u 2"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u 2"
+     },
+     "email": {
+      "S": "a 3@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:45.936Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:45.936Z"
+     },
+     "id": {
+      "S": "u 2"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u 2"
+     },
+     "email": {
+      "S": "a 1@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:45.948Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:45.948Z"
+     },
+     "id": {
+      "S": "u 2"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u 2"
+     },
+     "email": {
+      "S": "a 2@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member"
+     },
+     "id": {
+      "S": "m1"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "n": {
+      "N": "23"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member#deleted#2026-11-11T22:19:46.024Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.024Z"
+     },
+     "id": {
+      "S": "m1"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "n": {
+      "N": "21"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member#deleted#2026-11-11T22:19:46.038Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.038Z"
+     },
+     "id": {
+      "S": "m1"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "n": {
+      "N": "22"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#seat.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#seat#seat_s 1"
+     },
+     "pk": {
+      "S": "$vu#v1#seat.number#00000000000000000000000000000000000042"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#seat#venue_v 1"
+     },
+     "__edd_e__": {
+      "S": "Seat._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000031"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000033"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000052"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_a1"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user"
+     },
+     "id": {
+      "S": "u1"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "email": {
+      "S": "new@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:45.918Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:45.918Z"
+     },
+     "id": {
+      "S": "u1"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "email": {
+      "S": "old@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#pass.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#pass"
+     },
+     "_ttl": {
+      "N": "1794439186"
+     },
+     "pk": {
+      "S": "$vu#v1#pass.number#00000000000000000000000000000000000062"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#pass#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Pass._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#pass"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$vu#v1#pass#id_p1"
+     },
+     "n": {
+      "N": "62"
+     },
+     "__edd_e__": {
+      "S": "Pass"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000032"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account"
+     },
+     "id": {
+      "S": "a1"
+     },
+     "pk": {
+      "S": "$vu#v1#account#id_a1"
+     },
+     "n": {
+      "N": "52"
+     },
+     "__edd_e__": {
+      "S": "Account"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#new@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#old@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#member"
+     },
+     "pk": {
+      "S": "$vu#v1#member.number#00000000000000000000000000000000000023"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "__edd_e__": {
+      "S": "Member._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:45.965Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:45.965Z"
+     },
+     "id": {
+      "S": "u 3"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u 3"
+     },
+     "email": {
+      "S": "b@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    }
+   ],
+   "runs": {
+    "run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 3\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#user#id_u 3\"},\":skPrefix\":{\"S\":\"$vu#v1#user#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000033\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000042\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 3@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%203@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000023\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000021\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000022\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a1\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#new@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass#id_p1\"},\"sk\":{\"S\":\"$vu#v1#pass\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass.number#00000000000000000000000000000000000062\"},\"sk\":{\"S\":\"$vu#v1#pass.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000052\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m1\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#b@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "dry run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 3\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#user#id_u 3\"},\":skPrefix\":{\"S\":\"$vu#v1#user#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000033\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000042\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 3@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%203@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000023\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000021\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000022\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a1\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#new@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass#id_p1\"},\"sk\":{\"S\":\"$vu#v1#pass\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass.number#00000000000000000000000000000000000062\"},\"sk\":{\"S\":\"$vu#v1#pass.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000052\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m1\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#b@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "repairIndexKeys run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 2\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u 3\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#user#id_u 3\"},\":skPrefix\":{\"S\":\"$vu#v1#user#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000033\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000042\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 3@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%203@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000023\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000021\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000022\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v 1\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s 1\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a1\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#new@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass#id_p1\"},\"sk\":{\"S\":\"$vu#v1#pass\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass.number#00000000000000000000000000000000000062\"},\"sk\":{\"S\":\"$vu#v1#pass.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000052\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m1\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#b@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ]
+   },
+   "reports": {
+    "run": {
+     "scanned": 30,
+     "unchanged": 16,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 6,
+      "rootNotSeen": 0
+     }
+    },
+    "dry run": {
+     "scanned": 30,
+     "unchanged": 16,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 6,
+      "rootNotSeen": 0
+     }
+    },
+    "repairIndexKeys run": {
+     "scanned": 30,
+     "unchanged": 16,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 6,
+      "rootNotSeen": 0
+     }
+    }
+   }
+  },
+  "1.39.0 orphans, escapeKeys off": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$vu#v1#holder#deleted#2026-11-08T00:07:23.426Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T00:07:23.426Z"
+     },
+     "id": {
+      "S": "h"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h"
+     },
+     "n": {
+      "N": "11"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000013"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_d"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#member"
+     },
+     "pk": {
+      "S": "$vu#v1#member.number#00000000000000000000000000000000000009"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#member#id_m"
+     },
+     "__edd_e__": {
+      "S": "Member._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000005"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_a"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member#deleted#2026-11-08T00:07:23.410Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T00:07:23.410Z"
+     },
+     "id": {
+      "S": "m"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m"
+     },
+     "n": {
+      "N": "9"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000008"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_c"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account"
+     },
+     "id": {
+      "S": "d"
+     },
+     "pk": {
+      "S": "$vu#v1#account#id_d"
+     },
+     "n": {
+      "N": "13"
+     },
+     "__edd_e__": {
+      "S": "Account"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000011"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000007"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_c"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account"
+     },
+     "id": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$vu#v1#account#id_c"
+     },
+     "n": {
+      "N": "8"
+     },
+     "__edd_e__": {
+      "S": "Account"
+     }
+    }
+   ],
+   "runs": {
+    "run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000011\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_d\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#member#id_m\"},\":skPrefix\":{\"S\":\"$vu#v1#member#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000005\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000009\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000013\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#holder#id_h\"},\":skPrefix\":{\"S\":\"$vu#v1#holder#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000007\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000008\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "dry run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000011\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_d\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#member#id_m\"},\":skPrefix\":{\"S\":\"$vu#v1#member#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000005\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000009\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000013\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#holder#id_h\"},\":skPrefix\":{\"S\":\"$vu#v1#holder#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000007\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000008\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "repairIndexKeys run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000011\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_d\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#member#id_m\"},\":skPrefix\":{\"S\":\"$vu#v1#member#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000005\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000009\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000013\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#holder#id_h\"},\":skPrefix\":{\"S\":\"$vu#v1#holder#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000007\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000008\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ]
+   },
+   "reports": {
+    "run": {
+     "scanned": 10,
+     "unchanged": 4,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 2,
+      "rootNotSeen": 0
+     }
+    },
+    "dry run": {
+     "scanned": 10,
+     "unchanged": 4,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 2,
+      "rootNotSeen": 0
+     }
+    },
+    "repairIndexKeys run": {
+     "scanned": 10,
+     "unchanged": 4,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 2,
+      "rootNotSeen": 0
+     }
+    }
+   }
+  },
+  "reused keys, escapeKeys on": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#b@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u%203"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#seat.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#seat#seat_s%201"
+     },
+     "pk": {
+      "S": "$vu#v1#seat.number#00000000000000000000000000000000000041"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#seat#venue_v%201"
+     },
+     "__edd_e__": {
+      "S": "Seat._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#a%201@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u%202"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#a%202@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u%202"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user"
+     },
+     "id": {
+      "S": "u 2"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u%202"
+     },
+     "email": {
+      "S": "a 3@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:46.466Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.466Z"
+     },
+     "id": {
+      "S": "u 2"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u%202"
+     },
+     "email": {
+      "S": "a 1@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:46.477Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.477Z"
+     },
+     "id": {
+      "S": "u 2"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u%202"
+     },
+     "email": {
+      "S": "a 2@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder"
+     },
+     "id": {
+      "S": "h1"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "n": {
+      "N": "33"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder#deleted#2026-11-11T22:19:46.501Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.501Z"
+     },
+     "id": {
+      "S": "h1"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "n": {
+      "N": "31"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder#deleted#2026-11-11T22:19:46.509Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.509Z"
+     },
+     "id": {
+      "S": "h1"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "n": {
+      "N": "32"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member"
+     },
+     "id": {
+      "S": "m1"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "n": {
+      "N": "23"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member#deleted#2026-11-11T22:19:46.540Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.540Z"
+     },
+     "id": {
+      "S": "m1"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "n": {
+      "N": "21"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member#deleted#2026-11-11T22:19:46.554Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.554Z"
+     },
+     "id": {
+      "S": "m1"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "n": {
+      "N": "22"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#seat.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#seat#seat_s%201"
+     },
+     "pk": {
+      "S": "$vu#v1#seat.number#00000000000000000000000000000000000042"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#seat#venue_v%201"
+     },
+     "__edd_e__": {
+      "S": "Seat._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#a%203@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u%202"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000031"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000033"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000052"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_a1"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:46.493Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.493Z"
+     },
+     "id": {
+      "S": "u 3"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u%203"
+     },
+     "email": {
+      "S": "b@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user"
+     },
+     "id": {
+      "S": "u1"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "email": {
+      "S": "new@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user#deleted#2026-11-11T22:19:46.450Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.450Z"
+     },
+     "id": {
+      "S": "u1"
+     },
+     "pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "email": {
+      "S": "old@x"
+     },
+     "__edd_e__": {
+      "S": "User"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#pass.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#pass"
+     },
+     "_ttl": {
+      "N": "1794439186"
+     },
+     "pk": {
+      "S": "$vu#v1#pass.number#00000000000000000000000000000000000062"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#pass#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Pass._unique.number"
+     }
+    },
+    {
+     "seat": {
+      "S": "s 1"
+     },
+     "venue": {
+      "S": "v 1"
+     },
+     "deletedAt": {
+      "S": "2026-11-11T22:19:46.524Z"
+     },
+     "__edd_e__": {
+      "S": "Seat"
+     },
+     "sk": {
+      "S": "$vu#v1#seat#deleted#seat_s%201#2026-11-11T22:19:46.524Z"
+     },
+     "pk": {
+      "S": "$vu#v1#seat#venue_v%201"
+     },
+     "n": {
+      "N": "41"
+     }
+    },
+    {
+     "seat": {
+      "S": "s 1"
+     },
+     "sk": {
+      "S": "$vu#v1#seat#seat_s%201"
+     },
+     "venue": {
+      "S": "v 1"
+     },
+     "pk": {
+      "S": "$vu#v1#seat#venue_v%201"
+     },
+     "n": {
+      "N": "42"
+     },
+     "__edd_e__": {
+      "S": "Seat"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#pass"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$vu#v1#pass#id_p1"
+     },
+     "n": {
+      "N": "62"
+     },
+     "__edd_e__": {
+      "S": "Pass"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000032"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h1"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account"
+     },
+     "id": {
+      "S": "a1"
+     },
+     "pk": {
+      "S": "$vu#v1#account#id_a1"
+     },
+     "n": {
+      "N": "52"
+     },
+     "__edd_e__": {
+      "S": "Account"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#new@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#user.email"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#user"
+     },
+     "pk": {
+      "S": "$vu#v1#user.email#old@x"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#user#id_u1"
+     },
+     "__edd_e__": {
+      "S": "User._unique.email"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#member"
+     },
+     "pk": {
+      "S": "$vu#v1#member.number#00000000000000000000000000000000000023"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#member#id_m1"
+     },
+     "__edd_e__": {
+      "S": "Member._unique.number"
+     }
+    }
+   ],
+   "runs": {
+    "run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%203\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#user#id_u%203\"},\":skPrefix\":{\"S\":\"$vu#v1#user#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%203@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 3@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000033\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000023\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000021\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000022\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a1\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#b@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#new@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass#id_p1\"},\"sk\":{\"S\":\"$vu#v1#pass\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000042\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass.number#00000000000000000000000000000000000062\"},\"sk\":{\"S\":\"$vu#v1#pass.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000052\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m1\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "dry run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%203\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#user#id_u%203\"},\":skPrefix\":{\"S\":\"$vu#v1#user#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%203@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 3@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000033\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000023\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000021\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000022\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a1\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#b@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#new@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass#id_p1\"},\"sk\":{\"S\":\"$vu#v1#pass\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000042\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass.number#00000000000000000000000000000000000062\"},\"sk\":{\"S\":\"$vu#v1#pass.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000052\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m1\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "repairIndexKeys run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%203\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#user#id_u%203\"},\":skPrefix\":{\"S\":\"$vu#v1#user#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%203@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 3@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%201@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 1@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a%202@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#a 2@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000033\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000023\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000021\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000022\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat#venue_v%201\"},\"sk\":{\"S\":\"$vu#v1#seat#seat_s%201\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u%202\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000031\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a1\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#b@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#new@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass#id_p1\"},\"sk\":{\"S\":\"$vu#v1#pass\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000041\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#seat.number#00000000000000000000000000000000000042\"},\"sk\":{\"S\":\"$vu#v1#seat.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#pass.number#00000000000000000000000000000000000062\"},\"sk\":{\"S\":\"$vu#v1#pass.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000032\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h1\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000052\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user.email#old@x\"},\"sk\":{\"S\":\"$vu#v1#user.email\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#user#id_u1\"},\"sk\":{\"S\":\"$vu#v1#user\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m1\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ]
+   },
+   "reports": {
+    "run": {
+     "scanned": 30,
+     "unchanged": 16,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 6,
+      "rootNotSeen": 0
+     }
+    },
+    "dry run": {
+     "scanned": 30,
+     "unchanged": 16,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 6,
+      "rootNotSeen": 0
+     }
+    },
+    "repairIndexKeys run": {
+     "scanned": 30,
+     "unchanged": 16,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 6,
+      "rootNotSeen": 0
+     }
+    }
+   }
+  },
+  "1.39.0 orphans, escapeKeys on": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$vu#v1#holder#deleted#2026-11-08T00:07:23.426Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T00:07:23.426Z"
+     },
+     "id": {
+      "S": "h"
+     },
+     "pk": {
+      "S": "$vu#v1#holder#id_h"
+     },
+     "n": {
+      "N": "11"
+     },
+     "__edd_e__": {
+      "S": "Holder"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000013"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_d"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#member"
+     },
+     "pk": {
+      "S": "$vu#v1#member.number#00000000000000000000000000000000000009"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#member#id_m"
+     },
+     "__edd_e__": {
+      "S": "Member._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000005"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_a"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#member#deleted#2026-11-08T00:07:23.410Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T00:07:23.410Z"
+     },
+     "id": {
+      "S": "m"
+     },
+     "pk": {
+      "S": "$vu#v1#member#id_m"
+     },
+     "n": {
+      "N": "9"
+     },
+     "__edd_e__": {
+      "S": "Member"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000008"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_c"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account"
+     },
+     "id": {
+      "S": "d"
+     },
+     "pk": {
+      "S": "$vu#v1#account#id_d"
+     },
+     "n": {
+      "N": "13"
+     },
+     "__edd_e__": {
+      "S": "Account"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#holder.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#holder"
+     },
+     "pk": {
+      "S": "$vu#v1#holder.number#00000000000000000000000000000000000011"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#holder#id_h"
+     },
+     "__edd_e__": {
+      "S": "Holder._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account.number"
+     },
+     "_entity_sk": {
+      "S": "$vu#v1#account"
+     },
+     "pk": {
+      "S": "$vu#v1#account.number#00000000000000000000000000000000000007"
+     },
+     "_entity_pk": {
+      "S": "$vu#v1#account#id_c"
+     },
+     "__edd_e__": {
+      "S": "Account._unique.number"
+     }
+    },
+    {
+     "sk": {
+      "S": "$vu#v1#account"
+     },
+     "id": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$vu#v1#account#id_c"
+     },
+     "n": {
+      "N": "8"
+     },
+     "__edd_e__": {
+      "S": "Account"
+     }
+    }
+   ],
+   "runs": {
+    "run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000011\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_d\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#member#id_m\"},\":skPrefix\":{\"S\":\"$vu#v1#member#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000005\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000009\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000013\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#holder#id_h\"},\":skPrefix\":{\"S\":\"$vu#v1#holder#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000007\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000008\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "dry run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000011\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_d\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#member#id_m\"},\":skPrefix\":{\"S\":\"$vu#v1#member#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000005\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000009\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000013\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#holder#id_h\"},\":skPrefix\":{\"S\":\"$vu#v1#holder#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000007\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000008\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ],
+    "repairIndexKeys run": [
+     "scan {\"TableName\":\"t\",\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder.number#00000000000000000000000000000000000011\"},\"sk\":{\"S\":\"$vu#v1#holder.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_d\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member#id_m\"},\"sk\":{\"S\":\"$vu#v1#member\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#member#id_m\"},\":skPrefix\":{\"S\":\"$vu#v1#member#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000005\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_a\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#account#id_a\"},\":skPrefix\":{\"S\":\"$vu#v1#account#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#member.number#00000000000000000000000000000000000009\"},\"sk\":{\"S\":\"$vu#v1#member.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000013\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#holder#id_h\"},\"sk\":{\"S\":\"$vu#v1#holder\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "query {\"TableName\":\"t\",\"KeyConditionExpression\":\"#pk = :pk AND begins_with(#sk, :skPrefix)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\",\"#sk\":\"sk\"},\"ExpressionAttributeValues\":{\":pk\":{\"S\":\"$vu#v1#holder#id_h\"},\":skPrefix\":{\"S\":\"$vu#v1#holder#deleted#\"}},\"ScanIndexForward\":false,\"Limit\":1,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000007\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account#id_c\"},\"sk\":{\"S\":\"$vu#v1#account\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}",
+     "getItem {\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$vu#v1#account.number#00000000000000000000000000000000000008\"},\"sk\":{\"S\":\"$vu#v1#account.number\"}},\"ConsistentRead\":true,\"ReturnConsumedCapacity\":\"TOTAL\"}"
+    ]
+   },
+   "reports": {
+    "run": {
+     "scanned": 10,
+     "unchanged": 4,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 2,
+      "rootNotSeen": 0
+     }
+    },
+    "dry run": {
+     "scanned": 10,
+     "unchanged": 4,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 2,
+      "rootNotSeen": 0
+     }
+    },
+    "repairIndexKeys run": {
+     "scanned": 10,
+     "unchanged": 4,
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 2,
+      "rootNotSeen": 0
+     }
+    }
+   }
+  }
+ }
+}
