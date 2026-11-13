@@ -7331,9 +7331,48 @@ const contextValuesOf = (
   return contextValues
 }
 
-/** A copy of a value of the caller's, keeping its class. */
-const copyHolding = (value: object): Record<string, unknown> =>
-  Object.assign(Object.create(Object.getPrototypeOf(value)), value)
+/**
+ * `value` with `changes` over its own properties, built as a read builds it (#241): a plain object
+ * copied, a `Schema.Class` instance made by its class's constructor (as decoding makes one), so its
+ * initializers and private fields are its own. `undefined` for any other object, or where the
+ * constructor refuses the fields or the instance it makes holds other properties than `value`: the
+ * caller keeps `value` as it was. Never a copy of an instance by its prototype, which a private
+ * field or a constructor's invariant can't survive.
+ */
+const rebuiltWith = (
+  value: object,
+  changes: Readonly<Record<string, unknown>>,
+): object | undefined => {
+  const proto: object | null = Object.getPrototypeOf(value)
+  if (proto === null || proto === Object.prototype) {
+    return Object.assign(Object.create(proto), value, changes)
+  }
+  const made = (proto as { readonly constructor?: unknown }).constructor
+  if (
+    typeof made !== "function" ||
+    made.prototype !== proto ||
+    !Schema.isSchema(made) ||
+    !("fields" in made)
+  ) {
+    return undefined
+  }
+  const fields: Record<string, unknown> = {}
+  for (const name of Object.keys((made as unknown as { readonly fields: object }).fields)) {
+    if (Object.hasOwn(changes, name)) fields[name] = changes[name]
+    else if (Object.hasOwn(value, name)) fields[name] = (value as Record<string, unknown>)[name]
+  }
+  let rebuilt: object
+  try {
+    rebuilt = new (made as unknown as new (fields: object) => object)(fields)
+  } catch {
+    return undefined
+  }
+  const own = Reflect.ownKeys(value)
+  return Reflect.ownKeys(rebuilt).length === own.length &&
+    own.every((key) => Object.hasOwn(rebuilt, key))
+    ? rebuilt
+    : undefined
+}
 
 /**
  * What the row of a member value holds once `update`'s write is done: the write sent it, holding
@@ -7352,7 +7391,8 @@ type RowNow = { readonly written: true } | { readonly row: Readonly<Record<strin
  * holds nothing or can't be made (a discriminator, a place the schema can't place exactly, a `many`
  * edge with a custom `decompose` or `assemble`, a value whose row can't be told), the value keeps
  * what the state held. Nothing is added or taken away, and a value no copy changes is the one the
- * mutation returned; a changed one is a copy of it, its class kept.
+ * mutation returned; a changed one is built as a read builds it ({@link rebuiltWith}), and where it
+ * can't be, the value is the mutation's, as on 1.40.0.
  */
 const contextCopiesAsStored = (
   root: ResolvedNode,
@@ -7414,15 +7454,16 @@ const contextCopiesAsStored = (
     if (names.length === 0) return value
     const now = rowAt(path)
     if (now === undefined) return value
-    let next: Record<string, unknown> | undefined
+    const changes: Record<string, unknown> = {}
+    let changed = false
     for (const name of names) {
       const read = readCopy(node, now, name)
       if (Option.isNone(read)) continue
       if (sameValue(read.value, (value as Record<string, unknown>)[name])) continue
-      next ??= copyHolding(value)
-      next[name] = read.value
+      changes[name] = read.value
+      changed = true
     }
-    return next ?? value
+    return changed ? (rebuiltWith(value, changes) ?? value) : value
   }
   const walk = (
     node: ResolvedNode,
@@ -7430,7 +7471,8 @@ const contextCopiesAsStored = (
     path: ReadonlyArray<string | number>,
   ): unknown => {
     if (value === null || typeof value !== "object") return value
-    let next: Record<string, unknown> | undefined
+    const changes: Record<string, unknown> = {}
+    let changed = false
     for (const child of node.children) {
       const name = child.fieldName!
       if (!Object.hasOwn(value, name)) continue
@@ -7448,10 +7490,10 @@ const contextCopiesAsStored = (
         now = child.children.length > 0 ? walk(child, held, at) : held
       }
       if (now === was) continue
-      next ??= copyHolding(value)
-      next[name] = now
+      changes[name] = now
+      changed = true
     }
-    return next ?? value
+    return changed ? (rebuiltWith(value, changes) ?? value) : value
   }
   return walk(root, decoded, [])
 }
