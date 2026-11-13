@@ -5082,7 +5082,12 @@ row holds after the write, read as a read reads it there; a copy equal to it
 (`sameValue`) is left as the value holds it. 1.40.0 returned the copy the state was
 read with, the old value after an update changing the root's. A copy is never
 added or removed, and a `many` edge with a custom `decompose` or `assemble` keeps
-1.40.0's copies (which row a value came from can't be told there). Pinned against
+1.40.0's copies (which row a value came from can't be told there). A value whose
+copy is corrected, and each value holding it, is built as a read builds it
+(`rebuiltWith`): a plain object copied, a `Schema.Class` instance by its class's
+constructor (its private fields and methods work); any other object, or one its
+constructor refuses, is 1.40.0's, unchanged. Never a copy by prototype
+(`AggregateUpdateInstances.test.ts`). Pinned against
 published 1.40.0 whole (`AggregateUpdateResult.test.ts`,
 `fixtures/aggregate-update-result-1.40.0.json`: class, order, own properties) and
 over every shape of the upgrade sweep. A `get` right after still reads otherwise

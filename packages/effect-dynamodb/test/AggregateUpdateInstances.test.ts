@@ -55,7 +55,7 @@ const run = <A>(
   escapeKeys: boolean,
   model: Schema.Top,
   edges: Record<string, unknown>,
-  body: (agg: any) => Effect.Effect<A, unknown>,
+  body: (agg: any) => Effect.Effect<A, unknown, unknown>,
 ): Promise<A> => {
   const schema = DynamoSchema.make({ name: "updinst", version: 1, escapeKeys })
   const Main = Table.make({ schema, entities: {} })
@@ -79,7 +79,7 @@ const run = <A>(
         aggregates: { Agg },
         tables: { Main },
       })
-      return yield* body(db.aggregates.Agg)
+      return yield* body(db.aggregates.Agg) as Effect.Effect<A, unknown, never>
     }).pipe(
       Effect.provide(Layer.merge(table.layer, Main.layer({ name: "updinst" }))),
     ) as Effect.Effect<A, never, never>,
