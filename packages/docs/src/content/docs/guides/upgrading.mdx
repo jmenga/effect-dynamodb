@@ -1,6 +1,6 @@
 ---
 title: "Upgrading"
-description: "Key text in 1.x: nothing to do from 1.36, rekey from 1.37.0 or 1.38.0, rekey for entities keyed by a codec in 1.40.0, and how to turn escapeKeys on over existing data with rekey."
+description: "Key text in 1.x: nothing to do from 1.36, rekey from 1.37.0 or 1.38.0, rekey for entities keyed by a codec in 1.40.0, and how to turn escapeKeys on over existing data with rekey. From 1.41, Effect 4.1.3 is required."
 ---
 
 import { Aside } from "@astrojs/starlight/components"
@@ -514,3 +514,28 @@ An update also refuses a `.remove()` of a primary key composite, as it refuses a
 `Schema.Duration`, `Schema.BigDecimal`, the time zones, `Schema.Cookie`, `Schema.UrlParams`, `Schema.SemVer` and the network types read back as real instances, where 1.39 handed back the map each is stored as. Nothing has to move: rows already stored read the same way. Code of yours that inspects one of these values on a read (a `.check()`, a transformation, a declaration holding it) now sees the instance, so a check written against the map's shape answers differently.
 
 Two things change for a cookie. A real `Cookie`'s expiry is now stored as ISO text wherever it's written, untyped fields included; 1.39 stored an empty map and lost it. And a condition on a cookie that has an expiry no longer matches a row 1.39 wrote for it, since that row's expiry was lost. A cookie 1.39 stored with an expiry still reads back as the map it's stored as, as in 1.39, and so does a value holding properties of its own inside a cookie or a jar, so writing what was read stores the row unchanged.
+
+## Effect 4.1.3 is required from 1.41
+
+**1.41 requires `effect@4.1.3`** (the peer range is `^4.1.3`). Upgrade `effect`, and the `@effect/*` packages you use, to 4.1.3 with it.
+
+**Under it, a field whose name is also an `Object.prototype` member (`toString`, `constructor`, `valueOf`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toLocaleString`, `__proto__` …) is read from a payload only when it is the payload's own property. Given through a prototype (`Object.create`), a class getter or a proxy without own-key traps, it is not seen: an optional field is left out, and a required one fails with `Missing key`. On Effect 4.1.2 it was read.**
+
+Effect's schema parser decides this, at any depth. The library hands it each payload as given, but where it adds to the payload first and hands it a copy made as 1.40 made it: a write filling a decoding default an index key needs, an aggregate's stamped dates, an aggregate's `create` fetching ids, and a `GeoIndex`'s `put` and `enrich`. Those copies take the payload's own properties alone, as in 1.40, so there a payload made by `Object.create`, from a class whose fields are getters, or as a proxy loses its fields whatever their names. If you build payloads with `Object.create`, from a class whose fields are getters, or as a proxy, and a model declares a field with one of these names, give that field as the payload's own property (spread it, or copy it in). Any other field is read however the payload gives it, as before.
+
+| A field named `toString`, given… | Effect 4.1.2 | Effect 4.1.3 |
+|---|---|---|
+| as the payload's own property | Read | Read |
+| by `Object.create`, a class getter or a proxy, the field optional | Read | Left out |
+| by `Object.create`, a class getter or a proxy, the field required | Read | `ValidationError`: `Missing key` |
+| left out of the payload, the field optional | `ValidationError`: the parser read `Object.prototype.toString` | Left out |
+
+A getter of the payload's own that throws while the parser reads a declared field is a defect, on either version.
+
+1.41 also fixes these names wherever the library looked them up itself, in a definition or in a row it read back: see the release notes (#239).
+
+Three of those fixes can leave something to do:
+
+- **A unique constraint on an optional field with one of these names.** Where a 1.40 write left the field out, 1.40 read it as the inherited function and reserved a sentinel keyed by the function's text (`function tostring() { [native code] }` under `toString`), so every other write leaving it out failed with `UniqueConstraintViolation`. 1.41 reserves nothing for a field a row doesn't hold, and never reads, moves or releases those sentinels. Delete each by its key: its `__edd_e__` is `<entityType>._unique.<constraint>`, and its key ends with the function's text.
+- **`__proto__` where every item written would hold it** (a required model field, a timestamp, the version, a key attribute, a projection's checkpoint or revision): the definition is now refused at `make` (`EDD-9152`, `EDD-9153` for an aggregate). No release stored such a value, as a JavaScript object can't hold that name by assignment. Rename it.
+- **An event holding a field named `constructor` whose value is an object with a `name` or an `identifier`** (`{ constructor: { name: "Acme Builders" } }`). 1.40 took that field for the event's class and stored its text as the event's `eventType`; 1.41 stores the event's class's type (a `Schema.Class` event's identifier, `"Object"` for a plain object), so such events written before and after the upgrade hold different `eventType` values. Both read back. If anything reads `eventType` (a GSI, a filter), account for both.

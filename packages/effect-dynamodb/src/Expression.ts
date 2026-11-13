@@ -11,8 +11,8 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { type ComparedOperand, ComparedOperandsKey } from "./internal/Expr.js"
-import { toAttributeValue } from "./Marshaller.js"
+import { type ComparedOperand, ComparedOperandsKey, markUnsent } from "./internal/Expr.js"
+import { toAttributeValue, type UnstorableValue } from "./Marshaller.js"
 
 // --- Output shape ---
 
@@ -44,19 +44,39 @@ const resetCounter = (): void => {
   _counter = 0
 }
 
+/**
+ * Marshals an operand. A map entry keyed `__proto__` within it (`EDD-9165`) is left out, as
+ * 1.40.0 left it out, and kept in `dropped` under the attribute's `name`: the result is then
+ * refused where it is sent ({@link finished}), not here. Anything else DynamoDB can't store
+ * throws, exactly as it did.
+ */
+const operandValue = (
+  value: unknown,
+  name: string,
+  dropped: Array<UnstorableValue>,
+): AttributeValue =>
+  toAttributeValue(value, undefined, (refusal) => dropped.push(refusal.at([name, ...refusal.path])))
+
+/** The result, recorded as compiled without a `__proto__` entry when one was dropped. */
+const finished = (result: ExpressionResult, dropped: ReadonlyArray<UnstorableValue>) => {
+  if (dropped.length > 0) markUnsent(result, dropped[0]!)
+  return result
+}
+
 const buildComparisonClauses = (
   op: string,
   attrs: Record<string, unknown>,
   names: Record<string, string>,
   values: Record<string, AttributeValue>,
   compared: Array<ComparedOperand>,
+  dropped: Array<UnstorableValue>,
 ): ReadonlyArray<string> => {
   const clauses: Array<string> = []
   for (const [attr, val] of Object.entries(attrs)) {
     const nameKey = `#${attr}`
     const valKey = `:${nextPlaceholder()}`
     names[nameKey] = attr
-    values[valKey] = toAttributeValue(val)
+    values[valKey] = operandValue(val, attr, dropped)
     compared.push({ placeholder: valKey, name: attr, value: val })
     clauses.push(`${nameKey} ${op} ${valKey}`)
   }
@@ -69,24 +89,25 @@ const buildFromInput = (input: ConditionInput): ExpressionResult => {
   const values: Record<string, AttributeValue> = {}
   const clauses: Array<string> = []
   const compared: Array<ComparedOperand> = []
+  const dropped: Array<UnstorableValue> = []
 
   if (input.eq) {
-    clauses.push(...buildComparisonClauses("=", input.eq, names, values, compared))
+    clauses.push(...buildComparisonClauses("=", input.eq, names, values, compared, dropped))
   }
   if (input.ne) {
-    clauses.push(...buildComparisonClauses("<>", input.ne, names, values, compared))
+    clauses.push(...buildComparisonClauses("<>", input.ne, names, values, compared, dropped))
   }
   if (input.lt) {
-    clauses.push(...buildComparisonClauses("<", input.lt, names, values, compared))
+    clauses.push(...buildComparisonClauses("<", input.lt, names, values, compared, dropped))
   }
   if (input.le) {
-    clauses.push(...buildComparisonClauses("<=", input.le, names, values, compared))
+    clauses.push(...buildComparisonClauses("<=", input.le, names, values, compared, dropped))
   }
   if (input.gt) {
-    clauses.push(...buildComparisonClauses(">", input.gt, names, values, compared))
+    clauses.push(...buildComparisonClauses(">", input.gt, names, values, compared, dropped))
   }
   if (input.ge) {
-    clauses.push(...buildComparisonClauses(">=", input.ge, names, values, compared))
+    clauses.push(...buildComparisonClauses(">=", input.ge, names, values, compared, dropped))
   }
 
   if (input.between) {
@@ -95,8 +116,8 @@ const buildFromInput = (input: ConditionInput): ExpressionResult => {
       const lowKey = `:${nextPlaceholder()}`
       const highKey = `:${nextPlaceholder()}`
       names[nameKey] = attr
-      values[lowKey] = toAttributeValue(low)
-      values[highKey] = toAttributeValue(high)
+      values[lowKey] = operandValue(low, attr, dropped)
+      values[highKey] = operandValue(high, attr, dropped)
       compared.push({ placeholder: lowKey, name: attr, value: low })
       compared.push({ placeholder: highKey, name: attr, value: high })
       clauses.push(`${nameKey} BETWEEN ${lowKey} AND ${highKey}`)
@@ -108,7 +129,7 @@ const buildFromInput = (input: ConditionInput): ExpressionResult => {
       const nameKey = `#${attr}`
       const valKey = `:${nextPlaceholder()}`
       names[nameKey] = attr
-      values[valKey] = toAttributeValue(prefix)
+      values[valKey] = operandValue(prefix, attr, dropped)
       clauses.push(`begins_with(${nameKey}, ${valKey})`)
     }
   }
@@ -137,12 +158,15 @@ const buildFromInput = (input: ConditionInput): ExpressionResult => {
 
   // The compared operands go on the result unseen (not enumerable): `Transaction.check` sends each
   // in the form its field stores it (#236); everything else reads the result as before.
-  return Object.defineProperty(
-    { expression: clauses.join(" AND "), names, values },
-    ComparedOperandsKey,
-    {
-      value: compared,
-    },
+  return finished(
+    Object.defineProperty(
+      { expression: clauses.join(" AND "), names, values },
+      ComparedOperandsKey,
+      {
+        value: compared,
+      },
+    ),
+    dropped,
   )
 }
 
@@ -175,6 +199,7 @@ export const update = (input: UpdateInput): ExpressionResult => {
   const names: Record<string, string> = {}
   const values: Record<string, AttributeValue> = {}
   const parts: Array<string> = []
+  const dropped: Array<UnstorableValue> = []
 
   if (input.set) {
     const setClauses: Array<string> = []
@@ -182,7 +207,7 @@ export const update = (input: UpdateInput): ExpressionResult => {
       const nameKey = `#${attr}`
       const valKey = `:${nextPlaceholder()}`
       names[nameKey] = attr
-      values[valKey] = toAttributeValue(val)
+      values[valKey] = operandValue(val, attr, dropped)
       setClauses.push(`${nameKey} = ${valKey}`)
     }
     if (setClauses.length > 0) {
@@ -205,7 +230,7 @@ export const update = (input: UpdateInput): ExpressionResult => {
       const nameKey = `#${attr}`
       const valKey = `:${nextPlaceholder()}`
       names[nameKey] = attr
-      values[valKey] = toAttributeValue(val)
+      values[valKey] = operandValue(val, attr, dropped)
       addClauses.push(`${nameKey} ${valKey}`)
     }
     if (addClauses.length > 0) {
@@ -219,7 +244,7 @@ export const update = (input: UpdateInput): ExpressionResult => {
       const nameKey = `#${attr}`
       const valKey = `:${nextPlaceholder()}`
       names[nameKey] = attr
-      values[valKey] = toAttributeValue(val)
+      values[valKey] = operandValue(val, attr, dropped)
       deleteClauses.push(`${nameKey} ${valKey}`)
     }
     if (deleteClauses.length > 0) {
@@ -227,9 +252,5 @@ export const update = (input: UpdateInput): ExpressionResult => {
     }
   }
 
-  return {
-    expression: parts.join(" "),
-    names,
-    values,
-  }
+  return finished({ expression: parts.join(" "), names, values }, dropped)
 }

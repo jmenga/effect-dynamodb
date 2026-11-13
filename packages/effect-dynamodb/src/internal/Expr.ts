@@ -7,7 +7,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { ConditionInput } from "../Expression.js"
-import { isEmptySet, toAttributeValue, unstorableIn } from "../Marshaller.js"
+import { isEmptySet, toAttributeValue, type UnstorableValue, unstorableIn } from "../Marshaller.js"
 import {
   compilePath,
   type PackedPath,
@@ -16,6 +16,27 @@ import {
   type SizeOperand,
   type StoredBelow,
 } from "./PathBuilder.js"
+
+// ---------------------------------------------------------------------------
+// An `Expression` builder's result compiled without a map entry keyed `__proto__`
+// ---------------------------------------------------------------------------
+
+/**
+ * Each result an `Expression` builder compiled from an operand holding a map entry keyed
+ * `__proto__` (`EDD-9165`), and the first such entry's refusal. The builder compiles it as
+ * 1.40.0 did, without that entry, and the library refuses the result where it would send it
+ * (`Transaction.check`'s condition in a transaction). Keyed by identity, so nothing a caller
+ * builds is taken for one.
+ */
+const unsent = new WeakMap<object, UnstorableValue>()
+
+/** Records that `result` was compiled without a map entry keyed `__proto__`. */
+export const markUnsent = (result: object, refusal: UnstorableValue): void => {
+  if (!unsent.has(result)) unsent.set(result, refusal)
+}
+
+/** The refusal recorded for this very `result` ({@link markUnsent}), or `undefined`. */
+export const unsentIn = (result: object): UnstorableValue | undefined => unsent.get(result)
 
 // ---------------------------------------------------------------------------
 // Operand — either a path reference, a literal value, or a size() function

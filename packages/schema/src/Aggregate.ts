@@ -26,6 +26,7 @@ import {
   manyEdgePaths,
   refuseAggregateKeyOverMovingValue,
   refuseAggregateKeysOverBothKinds,
+  refuseAggregateProtoName,
   refuseManySortKeysOverMovingValue,
   unwrapModel,
 } from "./internal/AggregateSchemas.js"
@@ -271,6 +272,9 @@ export function make<TSchema extends Schema.Top>(
   if (!("table" in config) || config.table === undefined) {
     return makeSubAggregate(schema, config as SubAggregateConfig)
   }
+  // A sub-aggregate's rows are written where an aggregate places it, so whether every write
+  // stores a name is decided there: the aggregate holding it walks into it (#239).
+  refuseAggregateProtoName(config.root.entityType, schema, config.edges)
   return makeAggregateDefinition(schema, config as AggregateConfig<TSchema>)
 }
 

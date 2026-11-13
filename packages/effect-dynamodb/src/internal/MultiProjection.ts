@@ -14,6 +14,7 @@ import type {
   StreamRecordIdentifierMissing,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { given, ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { Duration, Effect, Option, Pipeable, Result, type Schedule } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
@@ -455,7 +456,7 @@ export const multiProjection = <
   }
   if (config.checkpoints.field === undefined) {
     for (const name of names) {
-      if (mapped[name] === undefined) {
+      if (ownValue(mapped, name) === undefined) {
         throw new Error(
           `[EDD-9081] ${label}: source "${name}" has no checkpoint — declare \`checkpoints.field\` ` +
             "(a map for every source) or a field for it in `checkpoints.sources`.",
@@ -477,15 +478,15 @@ export const multiProjection = <
 
   const engineSources: Record<string, EngineSource> = {}
   for (const name of names) {
-    const src = sources[name]!
-    engineSources[name] = {
+    const src = ownValue(sources, name)!
+    setOwn(engineSources, name, {
       name,
       stream: src.stream as unknown as EngineSource["stream"],
       key: src.key as EngineSource["key"],
       evolve: src.evolve as EngineSource["evolve"],
       mode: src.mode,
       terminal: src.terminal as EngineSource["terminal"],
-    }
+    })
   }
   const engine = makeEngine({
     label,
@@ -709,16 +710,16 @@ export const multiProjection = <
     const map =
       config.checkpoints.field === undefined
         ? {}
-        : ((values[config.checkpoints.field] ?? {}) as Record<string, number>)
+        : ((ownValue(values, config.checkpoints.field) ?? {}) as Record<string, number>)
     for (const entry of Object.keys(map)) {
       const at = entry.indexOf("#")
       if (at > 0) known.push([entry.slice(0, at), entry.slice(at + 1)])
     }
     for (const [name, f] of Object.entries(mapped)) {
-      const owner = values[f.instanceField]
+      const owner = ownValue(values, f.instanceField)
       if (typeof owner === "string" && owner !== "") known.push([name, owner])
     }
-    return known.filter(([name]) => engineSources[name] !== undefined)
+    return known.filter(([name]) => ownValue(engineSources, name) !== undefined)
   }
 
   const catchUp = (key: K): Effect.Effect<Applied, Err, Req> =>
@@ -773,8 +774,7 @@ export const multiProjection = <
       const rowId = keyId(key)
       const work: Array<InstanceWork> = []
       for (const name of names) {
-        const ids = ((named as Record<string, ReadonlyArray<unknown>>)[name] ??
-          []) as ReadonlyArray<Record<string, string>>
+        const ids = (given(named as object, name) ?? []) as ReadonlyArray<Record<string, string>>
         const source = engineSources[name]!
         for (const streamId of ids) {
           const events = (yield* source.stream.read(streamId, { consistentRead: true })) as Array<

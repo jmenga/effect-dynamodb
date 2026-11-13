@@ -181,7 +181,7 @@ describe("key-form invariant — a caller's values compose the key put wrote", (
     expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBe(1)
     expect(src).not.toMatch(/toCompositeKeyRecord\(compositeKeyForm/)
     expect(src).not.toMatch(/mapBound\([^)]*compositeKeyForm\(/)
-    expect(src).toMatch(/toCompositeKeyRecord\(domainKeyForm, rawComposites\)/)
+    expect(src).toMatch(/toCompositeKeyRecord\(\s*domainKeyForm,\s*rawComposites,/)
   })
 
   it("geo search composes through the domain key form", () => {

@@ -33,6 +33,7 @@ import {
   unescapeKeyText,
 } from "../KeyComposer.js"
 import { decodeBigInt, decodeNumber } from "./NumericKey.js"
+import { hasOwnName, ownValue, setOwn } from "./OwnNames.js"
 
 /** The schema composing the key text 1.36 composed: what `escapeKeys` off composes. */
 export const schema136 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema => ({
@@ -255,8 +256,8 @@ export const readIndexKeys = (
     walk(parts[0]!.length, 1, new Map())
     return found
   }
-  const pk = stored[index.pk.field]
-  const sk = stored[index.sk.field]
+  const pk = ownValue(stored, index.pk.field)
+  const sk = ownValue(stored, index.sk.field)
   if (typeof pk !== "string" || typeof sk !== "string") return undefined
   const fits: Array<Record<string, unknown>> = []
   for (const fromPk of readings(pk, template[index.pk.field]!)) {
@@ -267,8 +268,10 @@ export const readIndexKeys = (
         for (const [slot, text] of halves) {
           const attr = attrs[slot]!
           const value = slotValue(under, text, attr)
-          if (value === undefined || (attr in record && record[attr] !== value)) consistent = false
-          record[attr] = value
+          if (value === undefined || (hasOwnName(record, attr) && record[attr] !== value)) {
+            consistent = false
+          }
+          setOwn(record, attr, value)
         }
       }
       read(fromPk, form.pk)

@@ -16,6 +16,7 @@
  */
 
 import { DateTime, Effect, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
+import { ownValue, setOwn } from "./internal/OwnNames.js"
 import {
   getSchemaFields,
   recordValueAst,
@@ -66,7 +67,7 @@ export const getIdentifierField = (
       if (attr.identifier) {
         const fields = getSchemaFields(configured.model)
         if (fields) {
-          const fieldSchema = fields[name]
+          const fieldSchema = ownValue(fields, name)
           if (fieldSchema) return { name, schema: fieldSchema }
         }
         // Fallback: return with a generic string schema
@@ -143,14 +144,14 @@ export const isRefField = (fieldName: string, model: Schema.Top): boolean => {
   // Check ConfiguredModel attributes
   if (isConfiguredModel(model)) {
     const configured = model as ConfiguredModel<Schema.Top>
-    if (configured.attributes[fieldName]?.ref) return true
+    if (ownValue(configured.attributes, fieldName)?.ref) return true
     // Fall through to check schema-level annotation on the inner model
     return isRefField(fieldName, configured.model)
   }
   // Check schema-level annotation
   const fields = getSchemaFields(model)
   if (fields) {
-    const fieldSchema = fields[fieldName]
+    const fieldSchema = ownValue(fields, fieldName)
     if (fieldSchema) return isRef(fieldSchema)
   }
   return false
@@ -733,7 +734,7 @@ export const getPackedFields = (
   const out: globalThis.Record<string, PackedConfig> = Object.create(null)
   if (!isConfiguredModel(model)) return out
   for (const [name, attr] of Object.entries(model.attributes)) {
-    if (attr.packed) out[name] = attr.packed
+    if (attr.packed) setOwn(out, name, attr.packed)
   }
   return out
 }
@@ -833,7 +834,7 @@ export const getSparseFields = (
   const out: globalThis.Record<string, SparseConfig> = Object.create(null)
   if (!isConfiguredModel(model)) return out
   for (const [name, attr] of Object.entries(model.attributes)) {
-    if (attr.sparse) out[name] = attr.sparse
+    if (attr.sparse) setOwn(out, name, attr.sparse)
   }
   return out
 }
@@ -1023,7 +1024,7 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
       }
       entry.encoding = encoding
     }
-    resolved[key] = entry
+    setOwn(resolved, key, entry)
   }
 
   // Validate: no field rename targets collide with existing model field names

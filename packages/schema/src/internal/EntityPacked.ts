@@ -27,6 +27,7 @@ import type { IndexDefinition } from "../KeyComposer.js"
 import type { VectorIndexConfig } from "../VectorIndex.js"
 import type { TimeSeriesConfig, UniqueConfig } from "./EntityConfig.js"
 import { resolveUniqueFields } from "./EntitySchemas.js"
+import { setOwn } from "./OwnNames.js"
 import { isDispatchEligible, packedShape } from "./PackedCodec.js"
 
 /** The storage plan of an entity's packed fields. */
@@ -59,7 +60,7 @@ export const packedIndexRefusal = (
   def: IndexDefinition,
 ): string | undefined => {
   for (const attr of [...def.pk.composite, ...def.sk.composite]) {
-    if (attr in packedFields) {
+    if (Object.hasOwn(packedFields, attr)) {
       return (
         `[EDD-9072] Entity "${entityType}": packed field "${attr}" cannot be a composite of ` +
         `${indexName === "primary" ? "the primary key" : `index "${indexName}"`}. A packed value ` +
@@ -89,7 +90,7 @@ export const resolvePackedPlan = (args: {
 }): PackedPlan => {
   const { entityType, packedFields, modelFields } = args
   for (const [field] of Object.entries(packedFields)) {
-    const schema = modelFields[field]
+    const schema = Object.hasOwn(modelFields, field) ? modelFields[field] : undefined
     if (schema === undefined) {
       throw refusal(
         "EDD-9073",
@@ -165,11 +166,11 @@ export const resolvePackedPlan = (args: {
 
   const packedAttributes: Record<string, PackedConfig> = {}
   for (const [field, config] of Object.entries(packedFields)) {
-    packedAttributes[args.resolveDbName(field)] = config
+    setOwn(packedAttributes, args.resolveDbName(field), config)
   }
   const dispatch = new Set<string>(Object.keys(packedAttributes))
   for (const [field, schema] of Object.entries(modelFields)) {
-    if (field in args.sparseFields) continue
+    if (Object.hasOwn(args.sparseFields, field)) continue
     if (isDispatchEligible(schema)) dispatch.add(args.resolveDbName(field))
   }
   return {

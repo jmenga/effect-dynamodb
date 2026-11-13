@@ -14,6 +14,7 @@ import type {
   ScanCommandOutput,
 } from "@aws-sdk/client-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import type { ReadFanOut, ReadPartitions } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Result, Stream } from "effect"
@@ -1382,8 +1383,8 @@ export const selectRenamed = <A>(
   return selectProjected(self, paths.map(storedOf), (raw) => {
     const item: Record<string, unknown> = {}
     for (const head of heads) {
-      const value = raw[resolveDbName(head)]
-      if (value !== undefined) item[head] = respelled(value, plans.get(head))
+      const value = ownValue(raw, resolveDbName(head))
+      if (value !== undefined) setOwn(item, head, respelled(value, plans.get(head)))
     }
     return item
   })
@@ -2411,9 +2412,9 @@ const keyOfItem = (
   if (!names || names.length === 0) return undefined
   const key: Record<string, AttributeValue> = {}
   for (const name of names) {
-    const value = item[name]
+    const value = ownValue(item, name)
     if (value === undefined) return undefined
-    key[name] = value
+    setOwn(key, name, value)
   }
   return key
 }

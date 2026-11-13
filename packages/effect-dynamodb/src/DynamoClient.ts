@@ -144,6 +144,7 @@ import type {
   IndexZOrderDimensions,
   IndexZOrderPrefix,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
+import { given, ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -516,13 +517,16 @@ const storedKeyForm = (
   const resolve = args.entityLike._resolveDbName ?? ((name: string) => name)
   const ref = args.entityLike._resolvedRefs?.find((r) => r.idFieldName === field)
   const attribute = resolve(ref?.fieldName ?? field)
-  const schema = getSchemaFields(args.encoderSource)?.[field]
+  const schema = ownValue(getSchemaFields(args.encoderSource), field)
   const wantsBigInt = schema !== undefined && SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
   const typeNumeric = compositeKeyFormKind(args.encoderSource, field) === "type-numeric"
   return {
     attribute,
     read: (row) => {
-      const value = ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.keyField]
+      const value =
+        ref === undefined
+          ? ownValue(row, attribute)
+          : ownValue(ownValue(row, attribute)?.M, ref.keyField)
       if (value === undefined) return undefined
       const stored = value.S ?? value.N
       if (ref !== undefined && stored !== undefined) {
@@ -609,7 +613,7 @@ const planCompositeWithin = <A>(args: {
   const { entityLike, accessor, indexDef, domainKeyForm, pinnedKeyForm } = args
   const sk = indexDef.sk.composite
   const n = sk.length
-  const p = sk.findIndex((attr) => pinnedKeyForm[attr] === undefined)
+  const p = sk.findIndex((attr) => given(pinnedKeyForm, attr) === undefined)
   const pinnedCount = p === -1 ? n : p
   const refuse = (why: string): never => {
     throw new Error(
@@ -626,7 +630,7 @@ const planCompositeWithin = <A>(args: {
     entityLike._resolvedRefs?.find((ref) => ref.idFieldName === field)
   /** The kind of value a composite's key form is, when its schema says (EDD-9093's type check). */
   const kindOf = (field: string): KeyFormValueKind | undefined => {
-    const schema = fields?.[field]
+    const schema = ownValue(fields, field)
     return schema === undefined ? undefined : keyFormValueKind(schema)
   }
 
@@ -1063,7 +1067,7 @@ const planZOrderWithin = <A>(args: {
   /** `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type. */
   const keyForm = (field: string, value: unknown): unknown => {
     const converted = domainKeyForm(field, value)
-    const schema = fields?.[field]
+    const schema = ownValue(fields, field)
     const expected = schema === undefined ? undefined : keyFormValueKind(schema)
     if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
       return refuse(
@@ -1443,6 +1447,7 @@ const planZOrderWithin = <A>(args: {
 const entityDomainKeyForm = (
   entityLike: { readonly model?: unknown; readonly schemas?: { readonly inputSchema?: unknown } },
   record: Record<string, unknown>,
+  needs: ReadonlyArray<string>,
 ): Record<string, unknown> => {
   const source = (entityLike.schemas?.inputSchema ?? entityLike.model) as Schema.Top | undefined
   if (source === undefined) return record
@@ -1453,7 +1458,7 @@ const entityDomainKeyForm = (
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
     )
   })
-  return toCompositeKeyRecord(form, record)
+  return toCompositeKeyRecord(form, record, needs)
 }
 
 /**
@@ -2640,7 +2645,7 @@ const makeFromConfig = (config: {
 
       // 1. All PK composites must be present
       for (const attr of pkAttrs) {
-        if (composites[attr] === undefined) {
+        if (given(composites, attr) === undefined) {
           throw new Error(
             `[EDD-9002] Missing required partition key attribute "${attr}" for index "${indexName}"`,
           )
@@ -2650,7 +2655,7 @@ const makeFromConfig = (config: {
       // 2. SK composites must follow prefix ordering
       let lastProvided = -1
       for (let i = 0; i < skAttrs.length; i++) {
-        if (composites[skAttrs[i]!] !== undefined) {
+        if (given(composites, skAttrs[i]!) !== undefined) {
           if (i !== lastProvided + 1) {
             const missing = skAttrs.slice(lastProvided + 1, i).join(", ")
             throw new Error(
@@ -2725,7 +2730,7 @@ const makeFromConfig = (config: {
       const accessor = (rawComposites: Record<string, unknown>) => {
         if (zorder) {
           const misplaced = indexDef.sk.composite.filter(
-            (attr) => rawComposites[attr] !== undefined,
+            (attr) => given(rawComposites, attr) !== undefined,
           )
           if (misplaced.length > 0) {
             throw new Error(
@@ -2737,7 +2742,12 @@ const makeFromConfig = (config: {
           }
         }
         validateQueryComposites(_indexName, accessorDef, rawComposites)
-        const compositesKeyForm = toCompositeKeyRecord(domainKeyForm, rawComposites)
+        const compositesKeyForm = toCompositeKeyRecord(
+          domainKeyForm,
+          rawComposites,
+          indexDef.pk.composite,
+          indexDef.sk.composite,
+        )
         // One partition, or a sharded index's several (#183).
         const read = KeyComposer.composeReadPartitions(
           entityLike._schema,
@@ -2782,7 +2792,7 @@ const makeFromConfig = (config: {
         // `name: "a"` also matches "ab".
         const hasSkComposites =
           !zorder &&
-          indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
+          indexDef.sk.composite.some((attr: string) => given(compositesKeyForm, attr) !== undefined)
         const pinnedQuery = hasSkComposites
           ? Query.whereUnderPins(
               query,
@@ -2828,7 +2838,7 @@ const makeFromConfig = (config: {
           // the index of the first composite still open to a condition.
           const pinnedCount = (() => {
             const i = skComposites.findIndex(
-              (attr: string) => compositesKeyForm[attr] === undefined,
+              (attr: string) => given(compositesKeyForm, attr) === undefined,
             )
             return i === -1 ? skComposites.length : i
           })()
@@ -2852,7 +2862,7 @@ const makeFromConfig = (config: {
           const rejectPinned = (attr: string): never => {
             throw new Error(
               `[EDD-9053] Sort key composite "${attr}" for index "${_indexName}" is already ` +
-                `pinned to ${JSON.stringify(String(compositesKeyForm[attr]))} by the accessor, ` +
+                `pinned to ${JSON.stringify(String(given(compositesKeyForm, attr)))} by the accessor, ` +
                 `so .where() cannot also constrain it: DynamoDB allows one sort key condition, ` +
                 `and this one would REPLACE the accessor's own prefix rather than narrow it — ` +
                 `returning rows outside the pinned value. Drop "${attr}" from the accessor call ` +
@@ -2883,7 +2893,7 @@ const makeFromConfig = (config: {
           // silently compare against the wrong prefix.
           const missing = skComposites
             .slice(0, targetIndex)
-            .filter((attr: string) => compositesKeyForm[attr] === undefined)
+            .filter((attr: string) => given(compositesKeyForm, attr) === undefined)
           if (missing.length > 0) {
             throw new Error(
               `[EDD-9004] Sort key condition on "${targetAttr}" for index "${_indexName}" ` +
@@ -2897,7 +2907,7 @@ const makeFromConfig = (config: {
           // follows them, so the shared delimiter rule always applies).
           const pinnedKeyForm: Record<string, unknown> = {}
           for (let i = 0; i < targetIndex; i++) {
-            pinnedKeyForm[skComposites[i]!] = compositesKeyForm[skComposites[i]!]
+            pinnedKeyForm[skComposites[i]!] = given(compositesKeyForm, skComposites[i]!)
           }
           const prefixText = KeyComposer.composeSortKeyBeginsWith(
             entityLike._schema,
@@ -3045,7 +3055,7 @@ const makeFromConfig = (config: {
       for (const [indexName, indexDef] of Object.entries(entityLike.indexes)) {
         if (!indexDef) continue
 
-        accessors[indexName] = buildEntityQueryAccessor(entityLike, indexName, indexDef)
+        setOwn(accessors, indexName, buildEntityQueryAccessor(entityLike, indexName, indexDef))
 
         // Track collection membership for auto-discovery
         if (indexDef.collection) {
@@ -3067,7 +3077,7 @@ const makeFromConfig = (config: {
         // named after an existing index accessor (or `scan` / `reembed`) would
         // silently replace it and take the other feature offline, so make the
         // collision a construction-time failure instead.
-        if (logicalName in accessors || RESERVED_ACCESSOR_NAMES.has(logicalName)) {
+        if (Object.hasOwn(accessors, logicalName) || RESERVED_ACCESSOR_NAMES.has(logicalName)) {
           throw new Error(
             `[EDD-9038] Entity "${key}": vector index "${logicalName}" collides with an existing ` +
               `accessor of the same name. Vector index names share a namespace with GSI query ` +
@@ -3075,7 +3085,8 @@ const makeFromConfig = (config: {
           )
         }
         const vqConfig: BoundVectorQueryConfig = {
-          keyForm: (record: Record<string, unknown>) => entityDomainKeyForm(entityLike, record),
+          keyForm: (record: Record<string, unknown>) =>
+            entityDomainKeyForm(entityLike, record, definition.partition ?? []),
           entityType: entityLike.entityType,
           logicalName,
           definition,
@@ -3191,7 +3202,7 @@ const makeFromConfig = (config: {
           firstMember.entityLike._schema,
           firstMember.entityLike.entityType,
           indexDef,
-          entityDomainKeyForm(firstMember.entityLike, composites),
+          entityDomainKeyForm(firstMember.entityLike, composites, indexDef.pk.composite),
           { prune: false },
         )
 

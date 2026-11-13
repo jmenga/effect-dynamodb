@@ -11,6 +11,7 @@ import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { given, ownValue } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, type Schema } from "effect"
@@ -939,10 +940,7 @@ export const rejectUnsupportedOp = (
   // stay missing and the primary key would compose around an `undefined`.
   if (opType === "put" && entity.generatedId != null) {
     const idField = (entity.generatedId as { readonly field: string }).field
-    const supplied =
-      typeof input === "object" &&
-      input !== null &&
-      (input as globalThis.Record<string, unknown>)[idField] != null
+    const supplied = typeof input === "object" && input !== null && given(input, idField) != null
     if (!supplied) {
       return Effect.fail(
         fail(
@@ -1156,17 +1154,17 @@ export const validateAndBuildPutItem = (
     // else generate a wire primitive directly. They are placed in the item
     // after the keys, where 1.39.0 placed them, so the request is the same.
     const sf = entity.systemFields
-    const createdAtSupplied = sf.createdAt !== null && item[sf.createdAt] !== undefined
+    const createdAtSupplied = sf.createdAt !== null && ownValue(item, sf.createdAt) !== undefined
     const stamps: Record<string, unknown> = {}
     if (sf.createdAt) {
       if (options?.createdAt !== undefined) {
         stamps[sf.createdAt] = generateTimestampPrimitive(options.createdAt, sf.createdAtEncoding)
-      } else if (item[sf.createdAt] === undefined) {
+      } else if (ownValue(item, sf.createdAt) === undefined) {
         stamps[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
       }
     }
     if (sf.updatedAt) {
-      if (item[sf.updatedAt] === undefined) {
+      if (ownValue(item, sf.updatedAt) === undefined) {
         stamps[sf.updatedAt] = generateTimestampPrimitive(now, sf.updatedAtEncoding)
       }
     }
@@ -1178,7 +1176,8 @@ export const validateAndBuildPutItem = (
     // accessor could read the transact-written one (#111).
     const composed = { ...(encoded as Record<string, unknown>) }
     for (const field of [sf.createdAt, sf.updatedAt, sf.version]) {
-      if (field) composed[field] = Object.hasOwn(stamps, field) ? stamps[field] : item[field]
+      if (field)
+        composed[field] = Object.hasOwn(stamps, field) ? stamps[field] : ownValue(item, field)
     }
     // The item is written whole: every key composed from it is its own, and an object composing
     // `[object Object]` into one is refused where it's composed (`EDD-9162`).
@@ -1202,7 +1201,7 @@ export const validateAndBuildPutItem = (
     yield* composeKeysOrFail(entity.entityType, operation, () => {
       for (const def of Object.values(entity.unique ?? {})) {
         for (const field of resolveUniqueFields(def as UniqueConstraintDef)) {
-          const value = (encoded as Record<string, unknown>)[field]
+          const value = ownValue(encoded as Record<string, unknown>, field)
           if (value !== undefined && value !== null) {
             KeyComposer.compositeText(entity._schema, value)
           }

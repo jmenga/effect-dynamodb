@@ -39,6 +39,7 @@ import type { CompressionRegistry } from "../Compression.js"
 import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
 import { type Lost, lostAs, lostRefusal } from "./LostValues.js"
+import { classOf } from "./OwnNames.js"
 import { storedFormOf, ZONE_MARKER, zoneEntriesWritten } from "./StoredForm.js"
 
 export { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./StoredForm.js"
@@ -205,11 +206,11 @@ const describe = (value: unknown): string => {
   if (typeof value === "number") return `the non-finite number ${String(value)}`
   if (value instanceof Date) return "a Date"
   if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
-    return `binary data (${(value as object).constructor?.name ?? "ArrayBuffer"})`
+    return `binary data (${classOf(value)?.name ?? "ArrayBuffer"})`
   }
   if (value instanceof Set) return "a Set"
   if (value instanceof Map) return "a Map"
-  const name = (value as object).constructor?.name
+  const name = classOf(value as object)?.name
   return name ? `an instance of ${name}` : "a non-plain object"
 }
 

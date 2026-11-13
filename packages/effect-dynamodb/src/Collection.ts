@@ -124,6 +124,7 @@ const keyFormSourceOf = (entity: unknown): Schema.Top => {
 const collectionKeyForm = (
   entity: unknown,
   record: Record<string, unknown>,
+  needs: ReadonlyArray<string>,
 ): Record<string, unknown> => {
   const e = entity as {
     readonly model?: unknown
@@ -140,7 +141,7 @@ const collectionKeyForm = (
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
     )
   })
-  return toCompositeKeyRecord(form, record)
+  return toCompositeKeyRecord(form, record, needs)
 }
 
 export const make = <
@@ -320,7 +321,11 @@ export const make = <
       sharedSchema!,
       firstEntity.entityType,
       firstEntity.indexes[sharedIndexName!]!,
-      collectionKeyForm(firstEntity, pkComposites),
+      collectionKeyForm(
+        firstEntity,
+        pkComposites,
+        firstEntity.indexes[sharedIndexName!]!.pk.composite,
+      ),
       { prune: false },
     )
   }
@@ -381,7 +386,7 @@ export const make = <
           sharedSchema!,
           entity.entityType,
           indexDef,
-          collectionKeyForm(entity, pkComposites),
+          collectionKeyForm(entity, pkComposites, indexDef.pk.composite),
           { prune: false },
         )
         const pkValue = read.partitions[0]!

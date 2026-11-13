@@ -1027,6 +1027,37 @@ describe("EventStore.projection — definition and binding", () => {
     ).toThrow(/\[EDD-9081\].*offset/)
   })
 
+  it("refuses a checkpoint or a revision named __proto__: every row written holds it (#239)", () => {
+    const named = Entity.make({
+      // `Object.fromEntries` defines `__proto__` as an own property, as a literal can't.
+      model: Schema.Struct(
+        Object.fromEntries([
+          ["orderId", Schema.String],
+          ["total", Schema.Number],
+          ["__proto__", Schema.optional(Schema.Number)],
+          ["rev", Schema.optional(Schema.Number)],
+        ]),
+      ),
+      entityType: "Named",
+      primaryKey: {
+        pk: { field: "pk", composite: ["orderId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const over = {
+      ...base,
+      readModel: named,
+      initial: (id: { readonly orderId: string }) => ({ orderId: id.orderId, total: 0 }),
+      evolve: (state: never) => Effect.succeed(state),
+    }
+    expect(() => EventStore.projection({ ...over, checkpoint: "__proto__" } as never)).toThrow(
+      /^\[EDD-9152\] EventStore\.projection\("Order" → "Named"\): a field the projection writes/,
+    )
+    expect(() =>
+      EventStore.projection({ ...over, checkpoint: "rev", revision: "__proto__" } as never),
+    ).toThrow(/^\[EDD-9152\] /)
+  })
+
   it("types the checkpoint as a numeric field and the requirements of each form", () => {
     // Type-checked only, never run.
     const _typesOnly = () => {

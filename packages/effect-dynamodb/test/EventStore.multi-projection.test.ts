@@ -656,4 +656,19 @@ describe("multiProjection", () => {
     ).toThrow(/\[EDD-9081\].*nope/)
     void Option
   })
+
+  it("refuses a checkpoint map or an instance field named __proto__ (#239)", () => {
+    expect(() =>
+      EventStore.multiProjection({ ...config, checkpoints: { field: "__proto__" } } as never),
+    ).toThrow(/^\[EDD-9152\] EventStore\.multiProjection\(.*\): a field the projection writes/)
+    expect(() =>
+      EventStore.multiProjection({
+        ...config,
+        checkpoints: {
+          field: "checkpoints",
+          sources: { inspection: { field: "inspectionVersion", instanceField: "__proto__" } },
+        },
+      } as never),
+    ).toThrow(/^\[EDD-9152\] /)
+  })
 })

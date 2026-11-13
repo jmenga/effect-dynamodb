@@ -14,6 +14,7 @@
  */
 
 import type * as DynamoSchema from "./DynamoSchema.js"
+import { given, ownValue, setOwn } from "./internal/OwnNames.js"
 
 // ---------------------------------------------------------------------------
 // Limits (DynamoDB service quotas)
@@ -291,8 +292,8 @@ export const deriveSourceText = (
 ): string | undefined => {
   const picked: Record<string, unknown> = {}
   for (const field of definition.sourceFields) {
-    const value = record[field]
-    if (value !== undefined && value !== null) picked[field] = value
+    const value = given(record, field)
+    if (value !== undefined && value !== null) setOwn(picked, field, value)
   }
   if (Object.keys(picked).length === 0) return undefined
   if (definition.compose) {
@@ -300,7 +301,7 @@ export const deriveSourceText = (
     return composed.length > 0 ? composed : undefined
   }
   const joined = definition.sourceFields
-    .map((field) => picked[field])
+    .map((field) => ownValue(picked, field))
     .filter((value): value is unknown => value !== undefined)
     .map((value) => String(value))
     .filter((value) => value.length > 0)
@@ -319,7 +320,7 @@ export const deriveSourceText = (
 export const touchesSource = (
   definition: VectorIndexDefinition,
   updatePayload: Record<string, unknown>,
-): boolean => definition.sourceFields.some((field) => field in updatePayload)
+): boolean => definition.sourceFields.some((field) => Object.hasOwn(updatePayload, field))
 
 // ---------------------------------------------------------------------------
 // Filters — equality-only (see DESIGN.md §14)

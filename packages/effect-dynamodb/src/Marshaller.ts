@@ -17,6 +17,7 @@ import {
   lostRefusal,
   readJudged,
 } from "@effect-dynamodb/schema/internal/LostValues.js"
+import { PROTO_ENTRY, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import {
   COOKIE_MARKER,
@@ -55,9 +56,9 @@ const renderPath = (
   )
 
 /**
- * A value DynamoDB can't store, and where it is (`EDD-9124`). Marshalling throws this, as
- * key composition throws `KeyValueError`; what reaches it is the caller's value, so a
- * write path turns it into a `ValidationError` (`marshalOrFail`).
+ * A value DynamoDB can't store, and where it is (`EDD-9124`), or a map entry keyed `__proto__`
+ * (`EDD-9165`). Marshalling throws this, as key composition throws `KeyValueError`; what reaches
+ * it is the caller's value, so a write path turns it into a `ValidationError` (`marshalOrFail`).
  */
 export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
   readonly path: ReadonlyArray<string | number>
@@ -67,6 +68,8 @@ export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
    * position no schema types returned it as the marshaller called it (`readJudged`).
    */
   readonly lost?: LostAt
+  /** The diagnostic code: `EDD-9124` when absent. */
+  readonly code?: "EDD-9165" | undefined
 }> {
   override get message(): string {
     return this.describe()
@@ -86,7 +89,17 @@ export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
     }
     const refused =
       this.path.length === 0 ? this.reason : `"${renderPath(this.path, fieldOf)}": ${this.reason}`
-    return `${refused.endsWith(".") ? refused : `${refused}.`} [EDD-9124]`
+    return `${refused.endsWith(".") ? refused : `${refused}.`} [${this.code ?? "EDD-9124"}]`
+  }
+
+  /** The same refusal at another path. */
+  at(path: ReadonlyArray<string | number>): UnstorableValue {
+    return new UnstorableValue({
+      path,
+      reason: this.reason,
+      ...(this.code === undefined ? {} : { code: this.code }),
+      ...(this.lost === undefined ? {} : { lost: { ...this.lost, path } }),
+    })
   }
 
   /**
@@ -117,6 +130,13 @@ const refuseLost = (lost: LostAt): never => {
  */
 const judgedAsRead = (item: Record<string, unknown>): Record<string, unknown> =>
   readJudged(item, [], refuseLost) as Record<string, unknown>
+
+/**
+ * The refusal of an attribute or a map entry named `__proto__` at `path`, the name last: the
+ * attribute's own name where the path is just that.
+ */
+export const protoEntryAt = (path: ReadonlyArray<string | number>): UnstorableValue =>
+  new UnstorableValue({ path, reason: PROTO_ENTRY, code: "EDD-9165" })
 
 export const isUnstorableValue = (value: unknown): value is UnstorableValue =>
   value instanceof UnstorableValue
@@ -352,10 +372,15 @@ const storedElements = (list: ReadonlyArray<unknown>): ReadonlyArray<unknown> | 
  * an own property, behind a getter or inside anything.
  *
  * Marshalling has already run, exactly as it always did, and nothing else it made is touched.
+ *
+ * The same walk refuses a map marshalling assigned an entry keyed `__proto__` to: that set the
+ * map's prototype, so the entry would not be sent ({@link protoEntryAt}, `EDD-9165`). Given
+ * `dropped`, it tells `dropped` instead and goes on, leaving the map as marshalled.
  */
 const finishingInstances = (
   marshalled: Record<string, AttributeValue>,
   source: unknown,
+  dropped?: (refusal: UnstorableValue) => void,
 ): Record<string, AttributeValue> => {
   const path: Array<string | number> = []
   const lists = new Map<object, ReadonlyArray<unknown> | undefined>()
@@ -412,6 +437,12 @@ const finishingInstances = (
   const visit = (attribute: AttributeValue): void => {
     const map = attribute.M
     if (map !== undefined) {
+      // Marshalling assigned an entry keyed `__proto__`: it is this map's prototype, not stored.
+      if (Object.getPrototypeOf(map) !== Object.prototype) {
+        const refusal = protoEntryAt([...path, "__proto__"])
+        if (dropped === undefined) throw refusal
+        dropped(refusal)
+      }
       if (Object.hasOwn(map, COOKIE_MARKER)) date(map)
       if (Object.hasOwn(map, ZONE_MARKER)) name(map)
       for (const key of Object.keys(map)) {
@@ -483,9 +514,13 @@ const NO_EMPTY_SET =
  * Whatever is still refused has no attribute to leave out, and throws
  * {@link UnstorableValue}, as does a value holding one it's inside ({@link cycleIn}), which
  * marshalling follows until the stack runs out. What marshalling makes of a cookie is then given the
- * cookie's expiry, and what it makes of a named zone the zone's name ({@link finishingInstances}).
+ * cookie's expiry, and what it makes of a named zone the zone's name ({@link finishingInstances}),
+ * and a map entry keyed `__proto__`, which marshalling drops, is refused (`EDD-9165`).
  */
-const marshallStorable = (given: Record<string, unknown>): Record<string, AttributeValue> => {
+const marshallStorable = (
+  given: Record<string, unknown>,
+  dropped?: (refusal: UnstorableValue) => void,
+): Record<string, AttributeValue> => {
   const item = judgedAsRead(given)
   let written: Record<string, unknown> = item
   let marshalled: Record<string, AttributeValue>
@@ -506,7 +541,7 @@ const marshallStorable = (given: Record<string, unknown>): Record<string, Attrib
       throw unstorableAt(written, [], cause instanceof Error ? cause.message : String(cause))
     }
   }
-  return finishingInstances(marshalled, written)
+  return finishingInstances(marshalled, written, dropped)
 }
 
 /**
@@ -528,35 +563,121 @@ export const unstorableIn = (attributes: Record<string, unknown>): UnstorableVal
 export const toAttributeMap = (item: Record<string, unknown>): Record<string, AttributeValue> =>
   marshallStorable(item)
 
-/** Unmarshall a DynamoDB attribute map to a JS object */
+/**
+ * Whether `map`, or a map or a list within it at any depth, holds an entry named `__proto__`. Read
+ * on every row, so written for speed: its own keys by `Object.keys` (an entry so named is an own
+ * enumerable one, as a response's JSON gives it), and indexed loops. A row holding none is walked
+ * once and handed to the unmarshaller as it is.
+ */
+const holdsProtoEntry = (map: Record<string, AttributeValue>): boolean => {
+  const keys = Object.keys(map)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]!
+    if (key === "__proto__") return true
+    const value = map[key]
+    if (value == null) continue
+    const nested = value.M
+    if (nested !== undefined) {
+      if (holdsProtoEntry(nested)) return true
+    } else {
+      const list = value.L
+      if (list !== undefined && listHoldsProtoEntry(list)) return true
+    }
+  }
+  return false
+}
+
+const listHoldsProtoEntry = (list: ReadonlyArray<AttributeValue>): boolean => {
+  for (let index = 0; index < list.length; index++) {
+    const value = list[index]
+    if (value == null) continue
+    const nested = value.M
+    if (nested !== undefined) {
+      if (holdsProtoEntry(nested)) return true
+    } else {
+      const inner = value.L
+      if (inner !== undefined && listHoldsProtoEntry(inner)) return true
+    }
+  }
+  return false
+}
+
+/** `map` without the entries named `__proto__` it, and every map within it, holds. */
+const withoutProtoEntries = (
+  map: Record<string, AttributeValue>,
+): Record<string, AttributeValue> => {
+  const kept: Record<string, AttributeValue> = {}
+  const keys = Object.keys(map)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]!
+    if (key !== "__proto__") kept[key] = withoutProtoEntry(map[key]!)
+  }
+  return kept
+}
+
+const withoutProtoEntry = (value: AttributeValue): AttributeValue =>
+  value == null
+    ? value
+    : value.M !== undefined
+      ? { M: withoutProtoEntries(value.M) }
+      : value.L !== undefined
+        ? { L: value.L.map((element) => withoutProtoEntry(element)) }
+        : value
+
+/**
+ * `item` for the AWS SDK's unmarshaller, which assigns each attribute and map entry to a plain
+ * object: one named `__proto__` would set that object's prototype instead, so a map stored there
+ * (by another writer: the library refuses to write one, `EDD-9165`) would give the object every
+ * entry of that map as an inherited property, read as its own fields. Such an entry is left out,
+ * whatever it holds. `item` itself where it holds none.
+ */
+const readable = (item: Record<string, AttributeValue>): Record<string, AttributeValue> =>
+  holdsProtoEntry(item) ? withoutProtoEntries(item) : item
+
+/**
+ * Unmarshall a DynamoDB attribute map to a JS object. An attribute or a map entry named
+ * `__proto__` is not read (`EDD-9165`).
+ */
 export const fromAttributeMap = (item: Record<string, AttributeValue>): Record<string, unknown> =>
-  unmarshall(item)
+  unmarshall(readable(item))
 
 /**
  * Marshall a single value to a DynamoDB attribute value. An empty set directly
  * here is refused, as marshalling refuses it: a caller holding a value to send has
  * no attribute to leave out, and has to decide what no value means. A refusal names
  * the value's `name`, when it has one.
+ *
+ * Given `dropped`, a map entry keyed `__proto__` (`EDD-9165`) is not refused here: the value is
+ * marshalled as 1.40.0 marshalled it, without that entry, and `dropped` is told where it was.
+ * `Expression`'s builders use it, so that what they return is refused where it is sent.
  */
-export const toAttributeValue = (value: unknown, name?: string): AttributeValue => {
+export const toAttributeValue = (
+  value: unknown,
+  name?: string,
+  dropped?: (refusal: UnstorableValue) => void,
+): AttributeValue => {
   const at = name === undefined ? [] : [name]
   if (isEmptySet(value))
     throw new UnstorableValue({ path: at, reason: "DynamoDB has no empty set." })
   try {
-    return marshallStorable({ v: value }).v!
+    return marshallStorable(
+      { v: value },
+      dropped === undefined
+        ? undefined
+        : (refusal) => dropped(refusal.at([...at, ...refusal.path.slice(1)])),
+    ).v!
   } catch (error) {
     if (!isUnstorableValue(error)) throw error
-    const path = [...at, ...error.path.slice(1)]
-    throw new UnstorableValue({
-      path,
-      reason: error.reason,
-      ...(error.lost !== undefined ? { lost: { ...error.lost, path } } : {}),
-    })
+    throw error.at([...at, ...error.path.slice(1)])
   }
 }
 
-/** Unmarshall a single DynamoDB attribute value */
-export const fromAttributeValue = (value: AttributeValue): unknown => unmarshall({ v: value }).v
+/**
+ * Unmarshall a single DynamoDB attribute value. A map entry named `__proto__` within it is not
+ * read (`EDD-9165`).
+ */
+export const fromAttributeValue = (value: AttributeValue): unknown =>
+  unmarshall(readable({ v: value })).v
 
 // ---------------------------------------------------------------------------
 // Sparse Map flatten / rebuild
@@ -579,7 +700,7 @@ export const encodeSparseFields = (
   sparseFields: Record<string, SparseConfig>,
 ): void => {
   for (const [fieldName, sparse] of Object.entries(sparseFields)) {
-    if (!(fieldName in item)) continue
+    if (!Object.hasOwn(item, fieldName)) continue
     const value = item[fieldName]
     if (value === undefined || value === null) {
       delete item[fieldName]
@@ -636,6 +757,6 @@ export const decodeSparseFields = (
   }
 
   for (const fieldName of fields) {
-    raw[fieldName] = buckets.get(fieldName)!
+    setOwn(raw, fieldName, buckets.get(fieldName)!)
   }
 }

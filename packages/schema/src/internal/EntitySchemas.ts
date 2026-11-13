@@ -14,6 +14,7 @@ import {
   SchemaAST,
   SchemaGetter,
   SchemaIssue,
+  SchemaTransformation,
 } from "effect"
 import {
   type ConfiguredModel,
@@ -33,6 +34,7 @@ import type {
   VersionedConfig,
 } from "./EntityConfig.js"
 import { readingInstances } from "./InstanceReads.js"
+import { hasOwnName, ownValue, PROTO_ENTRY, setOwn } from "./OwnNames.js"
 import { BETA_DATE_MARKER, DATE_MARKER } from "./PackedCodec.js"
 import {
   absentStored,
@@ -119,8 +121,11 @@ export const buildFieldEncodings = (
 ): globalThis.Record<string, DynamoEncoding> => {
   const encodings: globalThis.Record<string, DynamoEncoding> = {}
   for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    const encoding = resolveFieldEncoding(fieldSchema, configuredAttributes[fieldName]?.encoding)
-    if (encoding) encodings[fieldName] = encoding
+    const encoding = resolveFieldEncoding(
+      fieldSchema,
+      ownValue(configuredAttributes, fieldName)?.encoding,
+    )
+    if (encoding) setOwn(encodings, fieldName, encoding)
   }
   return encodings
 }
@@ -252,7 +257,7 @@ export const resolveSystemFields = (
   //       This preserves existing patterns where users declare `createdAt`
   //       as a plain string composite.
   let createdAtCollision = false
-  if (createdAt && createdAt in modelFields) {
+  if (createdAt && hasOwnName(modelFields, createdAt)) {
     const modelEncoding = resolveFieldEncoding(
       modelFields[createdAt]!,
       configuredAttributes[createdAt]?.encoding,
@@ -267,7 +272,7 @@ export const resolveSystemFields = (
     }
   }
   let updatedAtCollision = false
-  if (updatedAt && updatedAt in modelFields) {
+  if (updatedAt && hasOwnName(modelFields, updatedAt)) {
     const modelEncoding = resolveFieldEncoding(
       modelFields[updatedAt]!,
       configuredAttributes[updatedAt]?.encoding,
@@ -280,7 +285,7 @@ export const resolveSystemFields = (
       updatedAtEncoding = null
     }
   }
-  const versionCollision = !!(version && version in modelFields)
+  const versionCollision = !!(version && hasOwnName(modelFields, version))
 
   return {
     createdAt,
@@ -1774,6 +1779,92 @@ const absentAsDeclared = (schema: Schema.Top, withUndefined: boolean) => {
   )
 }
 
+/** `undefined`, or a set holding nothing once `undefined` is removed: no attribute is stored. */
+const storesNothing = (value: unknown): boolean =>
+  value === undefined ||
+  (value instanceof Set && [...value].every((element) => element === undefined))
+
+/**
+ * The annotation marking a field {@link protoAbsent} made: an annotation, not identity, since the
+ * modules reading it may be loaded twice (the package's source beside its build).
+ */
+const PROTO_ABSENT: unique symbol = Symbol.for("@effect-dynamodb/schema/ProtoAbsent")
+
+/** Whether `field` is one {@link protoAbsent} made. */
+export const isProtoAbsent = (field: unknown): boolean => {
+  const ast = (field as { readonly ast?: SchemaAST.AST } | null | undefined)?.ast
+  return (ast?.annotations as Record<symbol, unknown> | undefined)?.[PROTO_ABSENT] === true
+}
+
+/**
+ * A field named `__proto__`, stored under that name, of a struct the library builds over the
+ * model's (#239). 1.40.0 built each such struct by assignment, `fields[name] = schema`, and
+ * assigning `__proto__` set the map's prototype instead: the field wasn't in the struct. A payload
+ * leaving it out was taken, and one giving it lost the value, which the parser dropped. Here a
+ * payload leaving it out, or giving a value that stores nothing (`undefined`, a `None` encoded as
+ * `undefined`, a set holding nothing), is read as 1.40.0 read it: the field isn't in what the struct
+ * makes. A value that stores something is refused (`EDD-9165`), since no write can store it and no
+ * read can return it. What a value stores is what the field, as declared, makes of it on the way to
+ * storage: encoded, or as it is where it's already in its stored form.
+ */
+const protoAbsent = (field: Schema.Top): Schema.Top => {
+  const holder = Schema.Struct({ v: field } as Schema.Struct.Fields) as unknown as Schema.Codec<
+    { readonly v?: unknown },
+    { readonly v?: unknown }
+  >
+  const decode = Schema.decodeUnknownExit(holder)
+  const encode = Schema.encodeUnknownExit(holder)
+  /** The value as stored, `undefined` for none; the value as given where the field takes neither. */
+  const stored = (value: unknown, encoding: boolean): unknown => {
+    const asIs = () =>
+      Exit.isSuccess(decode({ v: value })) ? Exit.succeed({ v: value }) : undefined
+    const toStored = () => {
+      const encoded = encode({ v: value })
+      return Exit.isSuccess(encoded) ? encoded : undefined
+    }
+    for (const attempt of encoding ? [toStored, asIs] : [asIs, toStored]) {
+      const held = attempt()
+      if (held !== undefined && Exit.isSuccess(held)) {
+        return Object.hasOwn(held.value, "v") ? held.value.v : undefined
+      }
+    }
+    return value
+  }
+  const judge = (encoding: boolean) =>
+    SchemaGetter.transformOptionalEffect<unknown, unknown>((given) =>
+      Option.isNone(given) ||
+      storesNothing(given.value) ||
+      storesNothing(stored(given.value, encoding))
+        ? Effect.succeed(Option.none())
+        : Effect.fail(
+            new SchemaIssue.InvalidValue(
+              { message: `${PROTO_ENTRY} [EDD-9165]` },
+              Option.some(given.value),
+            ),
+          ),
+    )
+  return Schema.optionalKey(
+    Schema.Unknown.pipe(
+      Schema.decodeTo(
+        Schema.Unknown.annotate({ [PROTO_ABSENT]: true } as Schema.Annotations.Annotations),
+        new SchemaTransformation.Transformation(judge(false), judge(true)),
+      ),
+    ),
+  ) as unknown as Schema.Top
+}
+
+/**
+ * `field` under `name`: where that's `__proto__`, stored so, the field {@link protoAbsent} makes of
+ * the one the model `declared`, whose encoding is the stored form.
+ */
+const fieldNamed = (
+  name: string,
+  field: Schema.Top,
+  declared: Schema.Top,
+  storedAsProto = true,
+): Schema.Top =>
+  name === "__proto__" && storedAsProto && !isProtoAbsent(field) ? protoAbsent(declared) : field
+
 /**
  * The field, reading an absent attribute as the value it stands for (`absentStored`), which is what
  * its `declared` schema says, if the field is that schema read some other way.
@@ -2268,20 +2359,29 @@ export const substituteSchemaDeep = (
   // by the recursion (and class instance identity is preserved).
   const fields = schemaFieldsOf(schema)
   if (fields) {
+    // A field named `__proto__` is one 1.40.0's rebuilt struct didn't hold (`protoAbsent`).
     const subFields: SchemaFields = {}
     for (const [name, field] of Object.entries(fields)) {
       if (opts?.skipTopLevel?.has(name) === true) {
-        subFields[name] = field
+        setOwn(subFields, name, fieldNamed(name, field, field))
         continue
       }
       const refTarget = opts?.resolveRef?.(name, field)
       if (refTarget !== undefined) {
         const fieldOpt = optionalField(field)
         const sub = substituteSchemaDeep(refTarget, atField(deeper, opts, name))
-        subFields[name] = fieldOpt ? fieldOpt.rewrap(sub) : sub
+        setOwn(subFields, name, fieldNamed(name, fieldOpt ? fieldOpt.rewrap(sub) : sub, field))
       } else {
         const sub = substituteSchemaDeep(field, atField(deeper, opts, name))
-        subFields[name] = opts?.absentReads ? readingAbsent(sub) : sub
+        setOwn(
+          subFields,
+          name,
+          name === "__proto__"
+            ? fieldNamed(name, sub, field)
+            : opts?.absentReads
+              ? readingAbsent(sub)
+              : sub,
+        )
       }
     }
     const plainStruct = Schema.Struct(subFields as Schema.Struct.Fields) as unknown as Schema.Top
@@ -2597,9 +2697,16 @@ export const substituteSchemas = (
     readonly enforceChecks?: boolean | undefined
     /** Build READ schemas: see `DeepSubstitutionOptions.absentReads`. */
     readonly absentReads?: boolean | undefined
+    /**
+     * A field named `__proto__` is stored under another attribute (`DynamoModel.configure`'s
+     * `field`), so it's held as declared. Otherwise it's held as 1.40.0's map, built by
+     * assignment, held it: not at all (`protoAbsent`).
+     */
+    readonly protoRenamed?: boolean | undefined
   },
 ): SchemaFields => {
   const out: SchemaFields = {}
+  const storedAsProto = options?.protoRenamed !== true
   const deep: DeepSubstitutionOptions = {
     ...(options?.legacyReads ? { legacyReads: true } : {}),
     ...(options?.enforceChecks ? { enforceChecks: true } : {}),
@@ -2611,18 +2718,22 @@ export const substituteSchemas = (
     //    tolerant date transform so the encode pipeline produces the right
     //    wire primitive.
     if (isSelfDateSchema(schema)) {
-      const enc = fieldEncodings[name]
+      const enc = ownValue(fieldEncodings, name)
       if (enc) {
-        out[name] = buildDateTransform(enc)
+        setOwn(out, name, fieldNamed(name, buildDateTransform(enc), schema, storedAsProto))
         continue
       }
     }
     // …also beneath a decoding default, which is kept on top (#133).
     const defaulted = decodingDefaultField(schema)
     if (defaulted !== undefined && isSelfDateSchema(defaulted.inner)) {
-      const enc = fieldEncodings[name]
+      const enc = ownValue(fieldEncodings, name)
       if (enc) {
-        out[name] = defaulted.rewrap(buildDateTransform(enc))
+        setOwn(
+          out,
+          name,
+          fieldNamed(name, defaulted.rewrap(buildDateTransform(enc)), schema, storedAsProto),
+        )
         continue
       }
     }
@@ -2631,7 +2742,11 @@ export const substituteSchemas = (
     //    transform so the round-trip works for storage.
     const redactedInner = tryGetRedactedInner(schema)
     if (redactedInner !== undefined) {
-      out[name] = buildRedactedSubstitute(schema, redactedInner)
+      setOwn(
+        out,
+        name,
+        fieldNamed(name, buildRedactedSubstitute(schema, redactedInner), schema, storedAsProto),
+      )
       continue
     }
     // 3. Default: recurse for nested substitution. Pattern B transforms
@@ -2643,15 +2758,26 @@ export const substituteSchemas = (
     //    identity, and returns the schema unchanged when nothing nested needs it.
     //    A configured storage override on a UNION field (`NullOr(DateTimeUtc)`)
     //    is applied to the union's self-date member (#133).
-    const unionOverride = unionDateOverride(name, schema, fieldEncodings[name])
-    out[name] = substituteSchemaDeep(schema, {
-      ...deep,
-      path: [name],
-      ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
-    })
+    const unionOverride = unionDateOverride(name, schema, ownValue(fieldEncodings, name))
+    setOwn(
+      out,
+      name,
+      fieldNamed(
+        name,
+        substituteSchemaDeep(schema, {
+          ...deep,
+          path: [name],
+          ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
+        }),
+        schema,
+        storedAsProto,
+      ),
+    )
   }
   if (options?.absentReads) {
-    for (const [name, field] of Object.entries(out)) out[name] = readingAbsent(field)
+    for (const [name, field] of Object.entries(out)) {
+      if (!isProtoAbsent(field)) setOwn(out, name, readingAbsent(field))
+    }
   }
   return out
 }
@@ -2724,7 +2850,7 @@ export const validateNoTransformOverride = (
     if (!isDateTransform(schema)) continue
 
     // 1. ConfiguredModel.storedAs override?
-    const configOverride = configuredAttributes[name]?.encoding
+    const configOverride = ownValue(configuredAttributes, name)?.encoding
     if (configOverride !== undefined) {
       throw new Error(conflictMessage(name))
     }
@@ -2884,6 +3010,8 @@ export const buildDerivedSchemas = (
   timeSeries: TimeSeriesConfig<any> | undefined = undefined,
   fieldEncodings: globalThis.Record<string, DynamoEncoding> = {},
   generatedIdField: string | undefined = undefined,
+  /** The field `__proto__` is stored under another attribute: see `substituteSchemas`. */
+  protoRenamed = false,
 ): DerivedSchemas => {
   // --- Substitute model fields ---
   // Self date schemas (with effective encoding) are replaced with bidirectional
@@ -2893,7 +3021,10 @@ export const buildDerivedSchemas = (
   // transform IS the wire format and we never override it.
   // WRITE schemas (input / create / update / key) enforce the container checks
   // the substitution rebuilds; the READ schemas below do not (#133).
-  const fields = substituteSchemas(modelFields, fieldEncodings, { enforceChecks: true })
+  const fields = substituteSchemas(modelFields, fieldEncodings, {
+    enforceChecks: true,
+    protoRenamed,
+  })
   // READ schemas (model / record / item / deleted / history decode) also take
   // the domain-form values earlier releases left on transform fields (#133),
   // and read an absent attribute as the value it stands for (`absentStored`).
@@ -2902,6 +3033,7 @@ export const buildDerivedSchemas = (
   const readFields = substituteSchemas(modelFields, fieldEncodings, {
     legacyReads: true,
     absentReads: true,
+    protoRenamed,
   })
 
   // Ref fields carry the `DynamoModel.ref` annotation (an opaque Declaration that
@@ -2912,22 +3044,26 @@ export const buildDerivedSchemas = (
   // only model/record/item schemas — input/create/update replace refs with IDs.
   for (const ref of resolvedRefs) {
     const targetModel = ref.refEntity?.model
-    if (!targetModel || !(ref.fieldName in fields)) continue
+    if (!targetModel || !hasOwnName(fields, ref.fieldName)) continue
     const resolved = isConfiguredModel(targetModel)
       ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
       : targetModel
     // As optional as the model declares it (#241): a row an optional ref was left out of, or
     // removed from, reads without it. Up to 1.40.0 the target replaced the declaration whole.
-    const optional = optionalField(modelFields[ref.fieldName] as Schema.Top)
+    const optional = optionalField(ownValue(modelFields, ref.fieldName) as Schema.Top)
     const asDeclared = (target: Schema.Top) =>
       optional === undefined ? target : optional.rewrap(target)
     // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
-    fields[ref.fieldName] = asDeclared(refHeldSchema(resolved, { enforceChecks: true }))
-    readFields[ref.fieldName] = asDeclared(
-      refHeldSchema(resolved, {
-        legacyReads: true,
-        absentReads: true,
-      }),
+    setOwn(fields, ref.fieldName, asDeclared(refHeldSchema(resolved, { enforceChecks: true })))
+    setOwn(
+      readFields,
+      ref.fieldName,
+      asDeclared(
+        refHeldSchema(resolved, {
+          legacyReads: true,
+          absentReads: true,
+        }),
+      ),
     )
   }
 
@@ -2935,7 +3071,7 @@ export const buildDerivedSchemas = (
   // an `Option`, ...) reads back as a real instance, not the map DynamoDB hands back for it. A field
   // holding none is the same schema it was. Encoding through one is as it was.
   for (const [name, field] of Object.entries(readFields)) {
-    readFields[name] = readingInstances(field as Schema.Top)
+    if (!isProtoAbsent(field)) setOwn(readFields, name, readingInstances(field as Schema.Top))
   }
 
   // --- Model Schema: pure model fields (decode of stored items in "model" mode) ---
@@ -2948,20 +3084,30 @@ export const buildDerivedSchemas = (
   // already in `fields` and we don't add a system-schema entry.
   const systemSchemaFields: globalThis.Record<string, Schema.Top> = {}
   if (systemFields.createdAt && !systemFields.createdAtCollision) {
-    systemSchemaFields[systemFields.createdAt] = systemFields.createdAtEncoding
-      ? buildDateTransform(systemFields.createdAtEncoding)
-      : Schema.DateTimeUtcFromString
+    setOwn(
+      systemSchemaFields,
+      systemFields.createdAt,
+      systemFields.createdAtEncoding
+        ? buildDateTransform(systemFields.createdAtEncoding)
+        : Schema.DateTimeUtcFromString,
+    )
   }
   if (systemFields.updatedAt && !systemFields.updatedAtCollision) {
-    systemSchemaFields[systemFields.updatedAt] = systemFields.updatedAtEncoding
-      ? buildDateTransform(systemFields.updatedAtEncoding)
-      : Schema.DateTimeUtcFromString
+    setOwn(
+      systemSchemaFields,
+      systemFields.updatedAt,
+      systemFields.updatedAtEncoding
+        ? buildDateTransform(systemFields.updatedAtEncoding)
+        : Schema.DateTimeUtcFromString,
+    )
   }
   if (systemFields.version && !systemFields.versionCollision) {
     // An item written before the entity was `versioned` has no version: it
     // reads as version 0 — real versions start at 1 (#133).
-    systemSchemaFields[systemFields.version] = Schema.Number.pipe(
-      Schema.withDecodingDefaultKey(Effect.succeed(0)),
+    setOwn(
+      systemSchemaFields,
+      systemFields.version,
+      Schema.Number.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
     )
   }
   const recordSchema = Schema.Struct({
@@ -3019,10 +3165,10 @@ export const buildDerivedSchemas = (
     for (const [key, field] of Object.entries(fields)) {
       if (refFieldSet.has(key)) continue
       const adjusted = applySystemCollisionAdjustments(key, field, "input")
-      if (adjusted !== null) acc[key] = adjusted
+      if (adjusted !== null) setOwn(acc, key, adjusted)
     }
     for (const ref of resolvedRefs) {
-      acc[ref.idFieldName] = refIdInput(ref)
+      setOwn(acc, ref.idFieldName, refIdInput(ref))
     }
     return acc
   }
@@ -3036,12 +3182,12 @@ export const buildDerivedSchemas = (
     if (createOmitFields.has(key)) continue // skip identifier/PK composites (auto-generated)
     if (refFieldSet.has(key)) continue // skip ref fields (replaced by ID fields)
     const adjusted = applySystemCollisionAdjustments(key, field, "input")
-    if (adjusted !== null) createFieldsAcc[key] = adjusted
+    if (adjusted !== null) setOwn(createFieldsAcc, key, adjusted)
   }
   // Add ID fields for each ref (skip if the ref field is an omitted field)
   for (const ref of resolvedRefs) {
     if (createOmitFields.has(ref.fieldName)) continue
-    createFieldsAcc[ref.idFieldName] = refIdInput(ref)
+    setOwn(createFieldsAcc, ref.idFieldName, refIdInput(ref))
   }
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
@@ -3065,15 +3211,22 @@ export const buildDerivedSchemas = (
       if (immutableFields.has(key)) continue
       if (refFieldSet.has(key)) continue
       if (strippedFromUpdate.has(key)) continue
+      // A field 1.40.0's map didn't hold is one an update may leave out already (`protoAbsent`).
+      if (isProtoAbsent(field)) {
+        setOwn(acc, key, field)
+        continue
+      }
       const clearable = optionalOnCollide.has(key) || lackDecision(field as Schema.Top) !== "refuse"
-      acc[key] = clearable
-        ? Schema.optional(field as Schema.Top)
-        : Schema.optionalKey(field as Schema.Top)
+      setOwn(
+        acc,
+        key,
+        clearable ? Schema.optional(field as Schema.Top) : Schema.optionalKey(field as Schema.Top),
+      )
     }
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optionalKey(ref.keySchema as Schema.Top)
+      setOwn(acc, ref.idFieldName, Schema.optionalKey(ref.keySchema as Schema.Top))
     }
     return acc
   }
@@ -3083,8 +3236,8 @@ export const buildDerivedSchemas = (
   const keyCompositeNames = primaryKeyComposites(indexes)
   const keyFields: globalThis.Record<string, Schema.Top> = {}
   for (const name of keyCompositeNames) {
-    const field = fields[name]
-    if (field) keyFields[name] = field
+    const field = ownValue(fields, name)
+    if (field) setOwn(keyFields, name, field)
   }
   const keySchema = Schema.Struct(keyFields)
 
@@ -3102,9 +3255,11 @@ export const buildDerivedSchemas = (
   }
   const keyAttrFields: globalThis.Record<string, Schema.Top> = {}
   for (const fieldName of allKeyFieldNames(indexes)) {
-    keyAttrFields[fieldName] = primaryKeyFieldNames.has(fieldName)
-      ? Schema.String
-      : Schema.optional(Schema.String)
+    setOwn(
+      keyAttrFields,
+      fieldName,
+      primaryKeyFieldNames.has(fieldName) ? Schema.String : Schema.optional(Schema.String),
+    )
   }
   const itemSchema = Schema.Struct({
     ...readFields,
@@ -3159,7 +3314,10 @@ export const buildDerivedSchemas = (
         // Compute encodings for the appendInput fields (annotation +
         // inferred from typeConstructor for self schemas).
         const appendEncodings = buildFieldEncodings(userFields, {})
-        const subbedFields = substituteSchemas(userFields, appendEncodings, { enforceChecks: true })
+        const subbedFields = substituteSchemas(userFields, appendEncodings, {
+          enforceChecks: true,
+          protoRenamed,
+        })
         return Schema.Struct(subbedFields as Schema.Struct.Fields) as unknown as Schema.Top
       })()
     : null
@@ -3209,7 +3367,8 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   const inner = opt?.union ?? opt?.inner ?? schema
   const s = inner as unknown as globalThis.Record<string, unknown>
   const fields = schemaFieldsOf(inner)
-  if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
+  if (fields !== undefined)
+    return typeof segment === "string" ? ownValue(fields, segment) : undefined
   // An OPAQUE class — `X.check(…)`, `X.annotate(…)`, a `DynamoModel.ref` nested
   // in a ref target — is deliberately NOT followed. Its `.fields` are gone, so
   // the derived read schema keeps it unsubstituted and decodes its leaves
@@ -3242,7 +3401,7 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   if (SchemaAST.isObjects(inner.ast) && typeof segment === "string") {
     if (isSchemaLike(s.value) && isSchemaLike(s.key)) return s.value
     if (isSchemaLike(s.schema) && Array.isArray(s.records)) {
-      const declared = schemaFieldsOf(s.schema)?.[segment]
+      const declared = ownValue(schemaFieldsOf(s.schema), segment)
       if (declared !== undefined) return declared
       const record = s.records[0] as unknown as { readonly value?: Schema.Top } | undefined
       return record?.value
@@ -3280,7 +3439,10 @@ const sameValue = (a: unknown, b: unknown): boolean => {
   }
   if (isPlainObject(a) && isPlainObject(b)) {
     const keys = Object.keys(a)
-    return keys.length === Object.keys(b).length && keys.every((k) => sameValue(a[k], b[k]))
+    return (
+      keys.length === Object.keys(b).length &&
+      keys.every((k) => Object.hasOwn(b, k) && sameValue(a[k], b[k]))
+    )
   }
   return false
 }
@@ -3337,7 +3499,7 @@ const asStored = (value: unknown): unknown => {
   if (!isPlainObject(value)) return value
   const out: globalThis.Record<string, unknown> = {}
   for (const [key, entry] of Object.entries(value)) {
-    if (entry !== undefined) out[key] = asStored(entry)
+    if (entry !== undefined) setOwn(out, key, asStored(entry))
   }
   return out
 }
@@ -3741,7 +3903,7 @@ export const makePathValueEncoder = (
     const out: globalThis.Record<string, unknown> = {}
     for (const [key, entry] of Object.entries(value)) {
       const child = childAtSegment(schema, key)
-      out[key] = child === undefined ? entry : partEncoder(child)(entry)
+      setOwn(out, key, child === undefined ? entry : partEncoder(child)(entry))
     }
     return out
   }
@@ -3752,7 +3914,7 @@ export const makePathValueEncoder = (
   const originalAt = (segments: ReadonlyArray<string | number>) => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return undefined
-    let current: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    let current: Schema.Top | undefined = ownValue(refTargets, head) ?? ownValue(modelFields, head)
     let asDeclared = false
     for (const segment of rest) {
       if (current === undefined) return undefined
@@ -3771,7 +3933,7 @@ export const makePathValueEncoder = (
     const head = segments[0] as string
     const stored =
       segments.length === 1
-        ? recordFields[head]
+        ? ownValue(recordFields, head)
         : at.asDeclared
           ? original
           : substituteSchemaDeep(original, { enforceChecks: true })

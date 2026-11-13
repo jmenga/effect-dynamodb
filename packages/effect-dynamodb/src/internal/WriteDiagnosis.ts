@@ -47,6 +47,7 @@ import {
   TRANSACT_WRITE_ITEMS_LIMIT,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { toHex } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import {
   MAX_DIMENSIONS,
@@ -612,7 +613,7 @@ const writtenAttributes = (item: TransactWriteItem): Record<string, AttributeVal
     for (const match of setClause.matchAll(/(#[\w]+)\s*=\s*(:[\w]+)\s*(?=,|$)/g)) {
       const name = names[match[1]!]
       const value = values[match[2]!]
-      if (name !== undefined && value !== undefined) written[name] = value
+      if (name !== undefined && value !== undefined) setOwn(written, name, value)
     }
   }
   return written

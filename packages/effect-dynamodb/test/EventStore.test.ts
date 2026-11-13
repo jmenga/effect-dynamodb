@@ -560,6 +560,60 @@ describe("EventStore", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
+    it.effect(
+      "an event's type is its class's where a field named constructor stands for it (#239)",
+      () =>
+        Effect.gen(function* () {
+          // A struct event has no class of its own: its type is that of the object given. A field
+          // named `constructor` (given by `Object.create`, or by a getter of a class) isn't the class,
+          // where 1.40.0 stored no type. The event is read as 1.40.0 read it (`_tag`, then
+          // `constructor`), so a strict proxy refusing `_tag` dies as it did. Effect 4.1.3's parser
+          // reads a field named like an `Object.prototype` member only as an own property, so the
+          // inherited `constructor` is left out of the stored event.
+          const Noted = EventStore.makeStream({
+            table: EventsTable,
+            streamName: "Noted",
+            events: [
+              Schema.Struct({ kind: Schema.String, constructor: Schema.optional(Schema.String) }),
+            ],
+            streamId: { composite: ["matchId"] },
+          })
+          class Getters {}
+          Object.defineProperty(Getters.prototype, "constructor", { get: () => "c" })
+          Object.defineProperty(Getters.prototype, "kind", { get: () => "g" })
+          const strict = new Proxy(
+            { kind: "s" },
+            {
+              get: (target, name) => {
+                if (typeof name === "string" && !(name in target)) throw new Error(`no "${name}"`)
+                return Reflect.get(target, name)
+              },
+            },
+          )
+          const given = [
+            { kind: "p", constructor: "c" },
+            Object.create({ kind: "o", constructor: "c" }),
+            new Getters(),
+          ]
+          for (const [index, event] of given.entries()) {
+            yield* Noted.append({ matchId: `m-${index}` }, [event], 0)
+          }
+          const stored = putItemsOf("event").map((input) => fromAttributeMap(input.Item))
+          expect(stored.map((item) => [item.eventType, item.data])).toEqual([
+            ["Object", { _tag: "Object", kind: "p", constructor: "c" }],
+            ["Object", { _tag: "Object", kind: "o" }],
+            ["Object", { _tag: "Object", kind: "g" }],
+          ])
+          const refused = yield* Effect.exit(
+            Noted.append({ matchId: "m-strict" }, [strict as never], 0),
+          )
+          expect(Exit.isFailure(refused) && Cause.hasDies(refused.cause)).toBe(true)
+          expect(String(Cause.squash((refused as Exit.Failure<never, never>).cause))).toContain(
+            'no "_tag"',
+          )
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
     it.effect("appends multiple events atomically", () =>
       Effect.gen(function* () {
         mockTransactWriteItems.mockResolvedValue({})

@@ -1,6 +1,6 @@
 # CLAUDE.md — Effect DynamoDB ORM
 
-> **Version:** This project targets **Effect v4** (`effect@^4.1.0`, published from the main [Effect-TS/effect](https://github.com/Effect-TS/effect) repo). The former `effect/unstable/*` modules now live at top-level paths (`effect/http`, `effect/http-api`, …); modules still tagged `@stability unstable` may change in minor releases. Toolchain: TypeScript 6, pnpm 12 (pinned via `packageManager`), vitest 5. The v3 codebase is preserved at git tag `effect-dynamodb-v3`.
+> **Version:** This project targets **Effect v4** (`effect@^4.1.3`, published from the main [Effect-TS/effect](https://github.com/Effect-TS/effect) repo). The former `effect/unstable/*` modules now live at top-level paths (`effect/http`, `effect/http-api`, …); modules still tagged `@stability unstable` may change in minor releases. Toolchain: TypeScript 6, pnpm 12 (pinned via `packageManager`), vitest 5. The v3 codebase is preserved at git tag `effect-dynamodb-v3`.
 
 ## Project Overview
 
@@ -86,7 +86,7 @@ packages/effect-dynamodb/src/
 ├── VectorSearchEmulation.ts # Scan + brute-force stand-in for SearchVectors (DDB Local has none)
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── ConsumedCapacity.ts # Opt-in consumed-capacity reporting (#174): layer / layerEffect / disabled, observer reports, withOperation(Stream), span Attributes, detachContext
-├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb; a value with no DynamoDB form throws the tagged UnstorableValue (EDD-9124)
+├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb; a value with no DynamoDB form throws the tagged UnstorableValue (EDD-9124), an attribute or a map entry named `__proto__` too (EDD-9165), which a read leaves out
 ├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value, valueBytes (stored size), each with a *Sync twin; limits
 ├── compression/zlib.ts # Subpath `effect-dynamodb/compression/zlib` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ValidationError, TransactionCancelled, UniqueConstraintViolation)
