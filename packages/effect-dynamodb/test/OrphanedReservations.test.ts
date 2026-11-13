@@ -7,7 +7,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Effect, Layer } from "effect"
 import * as OrphanedReservations from "./helpers/OrphanedReservations.js"
-import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { keyText, makeRecordingTable } from "./helpers/RecordingTable.js"
 import * as RekeyRepair from "./helpers/RekeyRepair.js"
 
 const harness = RekeyRepair.harnessOn(() => {
@@ -15,16 +15,40 @@ const harness = RekeyRepair.harnessOn(() => {
   return { tableName: "t", client: table.layer, acquire: Effect.void, release: Effect.void }
 })
 
-for (const [name, scenarios] of [
-  ["the rows 1.39.0 left", OrphanedReservations.fixtureScenarios],
-  ["reservations a row holds", OrphanedReservations.heldScenarios],
-  ["a writer in between", OrphanedReservations.racingScenarios],
-  ["what isn't judged", OrphanedReservations.untouchedScenarios],
-  ["what DynamoDB can't store", OrphanedReservations.recordingOnlyScenarios],
+/**
+ * {@link harness}, its rows seeded as given rather than put: the recording table refuses what
+ * DynamoDB refuses, and these scenarios seed a row DynamoDB can't store.
+ */
+const storedAsGiven: RekeyRepair.Harness = {
+  on: (world, body) => {
+    const table = makeRecordingTable()
+    return RekeyRepair.harnessOn(() => ({
+      tableName: "t",
+      client: table.layer,
+      acquire: Effect.void,
+      release: Effect.void,
+    })).on(world, (repair) =>
+      body({
+        ...repair,
+        seed: (row) =>
+          Effect.sync(() => {
+            table.items.set(keyText(row.pk!.S!, row.sk!.S!), row)
+          }),
+      }),
+    )
+  },
+}
+
+for (const [name, scenarios, on] of [
+  ["the rows 1.39.0 left", OrphanedReservations.fixtureScenarios, harness],
+  ["reservations a row holds", OrphanedReservations.heldScenarios, harness],
+  ["a writer in between", OrphanedReservations.racingScenarios, harness],
+  ["what isn't judged", OrphanedReservations.untouchedScenarios, harness],
+  ["what DynamoDB can't store", OrphanedReservations.recordingOnlyScenarios, storedAsGiven],
 ] as const) {
   describe(name, () => {
     for (const scenario of scenarios) {
-      it.live(scenario.name, () => scenario.run(harness))
+      it.live(scenario.name, () => scenario.run(on))
     }
   })
 }
