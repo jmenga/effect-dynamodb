@@ -46,6 +46,7 @@ import {
   isSetDeclaration,
   keyRenamesOf,
   lackDecision,
+  membersNamedExactly,
   numericTypeWithStringEncoding,
   ReadsAbsentAs,
   rowCanLack,
@@ -4106,6 +4107,9 @@ export const makePathValueEncoder = (
       asDeclared || (first !== undefined && !first.has(member))
     const reads = (member: Schema.Top) => memberReads(member, further, declaredFor(member), strict)
     if (members.length === 1) return reads(members[0]!)
+    // Members that don't name every segment alike are written as 1.40.0 wrote them, by the names
+    // given ({@link membersNamedExactly}): what they leave isn't judged.
+    if (!membersNamedExactly(members)) return !strict
     if (!strict) return members.some(reads)
     return (
       members.every(reads) ||
@@ -4160,6 +4164,7 @@ export const makePathValueEncoder = (
     const opt = optionalField(schema)
     const members = membersOf(opt?.union ?? opt?.inner ?? schema)
     const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
+    if (members.length > 1 && !membersNamedExactly(members)) return false
     return members.some((member) => {
       const declared = asDeclared || (first !== undefined && !first.has(member))
       return (

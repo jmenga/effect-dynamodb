@@ -58,6 +58,7 @@ import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { sparseEntryValuesSuite } from "./helpers/SparseEntryValues.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
+import { unionMemberWritesSuite } from "./helpers/UnionMemberWrites.js"
 import { unionPathWritesPassedSuite, unionPathWritesSuite } from "./helpers/UnionPathWrites.js"
 import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
 
@@ -251,6 +252,13 @@ describeConnected("a sparse map entry on every terminal that takes a path callba
 describeConnected("a time-series append whose appendInput holds a sparse map", () => {
   appendSparseMapsSuite(openTable)
 })
+
+describeConnected(
+  "a path write into a union whose members name it differently, or out of a member",
+  () => {
+    unionMemberWritesSuite(openTable)
+  },
+)
 
 describeConnected("a renamed sparse map on an entity with a Z-order index", () => {
   renamedSparseMapZOrderSuite(openTable)

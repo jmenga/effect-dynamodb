@@ -6,7 +6,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts`, `helpers/AppendSparseMaps.ts` (both against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/RenamedSparseMapPaths.ts`, `helpers/NestedKeyEncodings.ts` (the last seven against 1.40.0), `helpers/EntryInQueries.ts`, `helpers/EntryOnEveryTerminal.ts`, `helpers/AppendSparseMaps.ts`, `helpers/UnionMemberWrites.ts` (the three against 1.40.0), `helpers/RenamedSparseMapZOrder.ts`, `helpers/RenamedSparseMapRaces.ts`, `helpers/RenamedSparseMapVerdictTable.ts` (against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -45,6 +45,7 @@ import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { sparseEntryValuesSuite } from "./helpers/SparseEntryValues.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
+import { unionMemberWritesSuite } from "./helpers/UnionMemberWrites.js"
 import { unionPathWritesPassedSuite, unionPathWritesSuite } from "./helpers/UnionPathWrites.js"
 import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
 
@@ -170,6 +171,10 @@ describe("a sparse map entry on every terminal that takes a path callback", () =
 
 describe("a time-series append whose appendInput holds a sparse map", () => {
   appendSparseMapsSuite(openRecordingTable)
+})
+
+describe("a path write into a union whose members name it differently, or out of a member", () => {
+  unionMemberWritesSuite(openRecordingTable)
 })
 
 describe("a renamed sparse map on an entity with a Z-order index", () => {

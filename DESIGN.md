@@ -4026,9 +4026,10 @@ and union wrappers. It knows a struct's stored names only where `Schema.encodeKe
 built them, by their shape (one transformation to a bare struct whose `i`-th
 property is the encoded form of the struct's `i`-th, as the removal guard below
 reads it), and never runs the model's functions to find out. Where it can't tell what a node stores (a node it doesn't
-model, or a union whose members name the segment differently, such as a struct
-encoding `amount` as `am` beside one holding `amount`), the rest of the path is
-sent as written. A union member that holds nothing at the segment (a scalar, a
+model, or a union whose members don't name every segment alike, such as a struct
+encoding `amount` as `am` beside one holding `amount`, or two renaming `x` and `y`
+crosswise: `unionNamedExactly`), the rest of the path is sent as written, from the
+union on. A union member that holds nothing at the segment (a scalar, a
 struct without the property) has no say. In a collection each member's rows are
 named by its own walk, joined by `__edd_e__` where the members differ. Through
 1.40.0 a path named the property as written below its first segment: a domain
@@ -4342,7 +4343,23 @@ no read took them. That write is one 1.40.0 never made, so it's judged by the
 first question too, each such member read as the struct it renames (`readAs`),
 and refused with nothing sent where it fails: `renamed.kind = "b"` alone, or
 `pathRemove(["renamed", "x"])` where a member requires `x`, would leave a row no
-read takes.
+read takes. That holds only where the members name every segment alike
+(`unionNamedExactly` in `internal/SchemaAccessors.ts`): each name any member
+takes is stored under one name by every member taking it, and each stored name
+is reached by the same names in every member storing it. Where they don't (one
+member storing `x` as `y` and the other `y` as `x`, a discriminator stored as
+`ka` in one and `kb` in the other, a property stored under a name another
+member stores a different property under), no one name is right for every row:
+from that union on the path is written as given, as 1.40.0 wrote it, and isn't
+judged (a value only another member takes stays refused as on 1.40.0). Two such
+writes are left as 1.40.0 behaves, and named: with the discriminator stored
+under different names, `kind = "b"` beside `y = 2` writes the given names, and
+the row reads as the member it held; and a discriminator set alone to another
+member's tag (`kind = "a"` on a row holding `b`, in a field or a sparse map's
+entry) is sent as 1.40.0 sent it, leaving a row no read takes. A path through a
+recursive union (`Schema.suspend`) is written as 1.40.0 wrote it
+(`helpers/UnionMemberWrites.ts`, `fixtures/union-member-writes-1.40.0.json`:
+standalone, transaction, retained and unique, both `escapeKeys`).
 
 So `tag.kind = "b"` beside `tag.y = 2` is sent, and reads as `b` on a row of
 either member; `tag.kind = "b"` alone, or beside `pathRemove(["tag", "y"])`

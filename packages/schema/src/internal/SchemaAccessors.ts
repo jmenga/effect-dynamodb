@@ -1463,6 +1463,76 @@ const namingStep = (node: SchemaAST.AST, segment: string | number): NameStep => 
   return SCALARS.has(node._tag) || node._tag === "Never" ? NEUTRAL : UNKNOWN
 }
 
+/** The struct a node is stored as, where it renames its keys: a struct's own, a `Schema.Class`'s. */
+const renamingStruct = (node: SchemaAST.AST): boolean => {
+  if (SchemaAST.isDeclaration(node)) {
+    const to = node.encoding?.[0]?.to
+    return to !== undefined && renamingStruct(to)
+  }
+  return SchemaAST.isObjects(node) && node.encoding !== undefined
+}
+
+/** Every name a node takes a path segment by: its properties' own names and the names they're stored under. */
+const namesTaken = (node: SchemaAST.AST): ReadonlyArray<string> => {
+  if (SchemaAST.isDeclaration(node)) {
+    const to = node.encoding?.[0]?.to
+    return to === undefined ? [] : namesTaken(to)
+  }
+  if (!SchemaAST.isObjects(node)) return []
+  const own = node.propertySignatures.flatMap((property) =>
+    typeof property.name === "string" ? [property.name] : [],
+  )
+  const renames = node.encoding === undefined ? undefined : keyRenamesOf(node)
+  return renames === undefined ? own : [...own, ...renames.holding.keys()]
+}
+
+/**
+ * Whether the nodes a value at one place may be read by (a union's members) name every path
+ * segment alike (#238): each name any of them takes is stored under one name by every one that
+ * takes it, and each stored name is reached by the same names in every one that stores it. Where
+ * none renames its keys, they do. Where they don't (members storing one property under different
+ * names, or one name holding a different property in each), no one name is right for every row,
+ * so a path through them is named as written, as 1.40.0 named it.
+ *
+ * @internal
+ */
+export const unionNamedExactly = (nodes: ReadonlyArray<SchemaAST.AST>): boolean => {
+  if (nodes.length < 2 || !nodes.some(renamingStruct)) return true
+  const names = new Set(nodes.flatMap(namesTaken))
+  const reaching = nodes.map(() => new Map<string | number, Array<string>>())
+  for (const name of names) {
+    let stored: string | number | undefined
+    for (const [i, node] of nodes.entries()) {
+      const step = namingStep(node, name)
+      if (step._tag === "Unknown") return false
+      if (step._tag === "Neutral") continue
+      if (stored !== undefined && stored !== step.stored) return false
+      stored = step.stored
+      const by = reaching[i]!.get(step.stored)
+      if (by === undefined) reaching[i]!.set(step.stored, [name])
+      else by.push(name)
+    }
+  }
+  const reachedBy = new Map<string | number, string>()
+  for (const reached of reaching) {
+    for (const [stored, by] of reached) {
+      const key = JSON.stringify(by)
+      const seen = reachedBy.get(stored)
+      if (seen !== undefined && seen !== key) return false
+      reachedBy.set(stored, key)
+    }
+  }
+  return true
+}
+
+/** {@link unionNamedExactly} for a union's members as schemas: each read by its own members, in turn. */
+export const membersNamedExactly = (members: ReadonlyArray<{ readonly ast: SchemaAST.AST }>) => {
+  const nodes: Array<SchemaAST.AST> = []
+  const seen = new Set<SchemaAST.AST>()
+  for (const member of members) namingNodes(member.ast, nodes, seen)
+  return unionNamedExactly(nodes)
+}
+
 /**
  * The path below a field as it's stored (#238): each segment that is a property's own name, in a
  * struct that renames its keys as it's stored (`Schema.encodeKeys`), becomes the name it's stored
@@ -1477,8 +1547,9 @@ const namingStep = (node: SchemaAST.AST, segment: string | number): NameStep => 
  *
  * The walk follows unions (every member that holds the segment must name it alike), suspensions,
  * `Schema.Class` structs, records and lists. From a node it doesn't know the stored names of (any
- * other transformation, a declaration, `Schema.Unknown`), and where a union's members disagree,
- * the rest of the path is kept as it is, as it was before.
+ * other transformation, a declaration, `Schema.Unknown`), and from a union whose members don't
+ * name every segment alike ({@link unionNamedExactly}), the rest of the path is kept as it is, as
+ * it was before.
  */
 export const storedSegments = (
   field: Schema.Top,
@@ -1490,6 +1561,7 @@ export const storedSegments = (
     const nodes: Array<SchemaAST.AST> = []
     const seen = new Set<SchemaAST.AST>()
     for (const way of ways) namingNodes(way, nodes, seen)
+    if (!unionNamedExactly(nodes)) return [...out, ...segments.slice(i)]
     let stored: string | number | undefined
     const next: Array<SchemaAST.AST> = []
     for (const node of nodes) {
