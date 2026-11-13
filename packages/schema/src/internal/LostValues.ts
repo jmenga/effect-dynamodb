@@ -386,6 +386,13 @@ const holdersIn = (value: unknown, holders: Set<object>, seen: Set<object>): boo
 }
 
 /**
+ * Whether a value is or holds a part {@link lostIn} marked ({@link holdsGetters}), read from
+ * descriptors: one whose getters the marshaller calls through {@link readJudged}.
+ */
+export const holdsMarked = (value: unknown): boolean =>
+  marking && holdersIn(value, new Set(), new Set())
+
+/**
  * The value as the marshaller is to read it. Where it holds a part {@link lostIn} marked
  * ({@link holdsGetters}), a view whose getters, each called as the marshaller calls it and once for
  * each time it does, have what they return judged by {@link lostIn} where it's stored. A lost part
