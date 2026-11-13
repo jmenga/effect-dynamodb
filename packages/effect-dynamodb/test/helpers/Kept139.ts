@@ -14,6 +14,7 @@ import { Cause, DateTime, Duration, Effect, Exit, Layer } from "effect"
 import { TestClock } from "effect/testing"
 import { DynamoClient, type DynamoClientService } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
+import { indexesOf } from "./DynamoExpressions.js"
 import { makeRecordingTable } from "./RecordingTable.js"
 
 export type Row = Record<string, AttributeValue>
@@ -53,16 +54,7 @@ export type OpenTable = (MainTable: Table.Table) => Effect.Effect<ScenarioTable>
 /** A recording table with `MainTable`'s secondary indexes. */
 export const openRecordingTable: OpenTable = (MainTable) =>
   Effect.sync(() => {
-    const indexes = Object.fromEntries(
-      (Table.definition(MainTable).GlobalSecondaryIndexes ?? []).map((index) => [
-        index.IndexName!,
-        {
-          pk: index.KeySchema!.find((key) => key.KeyType === "HASH")!.AttributeName!,
-          sk: index.KeySchema!.find((key) => key.KeyType === "RANGE")!.AttributeName!,
-        },
-      ]),
-    )
-    const table = makeRecordingTable({ indexes, refuseInvalidUpdates: true })
+    const table = makeRecordingTable({ indexes: indexesOf(Table.definition(MainTable)) })
     return {
       name: "t",
       layer: table.layer,

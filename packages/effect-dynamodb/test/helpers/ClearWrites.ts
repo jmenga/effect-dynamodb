@@ -32,8 +32,8 @@ import * as Entity from "../../src/Entity.js"
 import { createPathBuilder } from "../../src/internal/PathBuilder.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
+import { readExpressions } from "./DynamoExpressions.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
-import { overlappingUpdatePaths, unusedPlaceholders } from "./MockDynamoClient.js"
 import { outcomeOf, rowsOf } from "./RenamedSparseMap.js"
 import { wholeOf } from "./RenamedSparseMapWrites.js"
 import { comparedCases } from "./WholeDiff.js"
@@ -189,6 +189,16 @@ const updatesOf = (sent: ReadonlyArray<any>): ReadonlyArray<any> =>
     return []
   })
 
+/** DynamoDB Local's refusal of an update's expressions before it reads the item, or "" if none. */
+const refusalOf = (update: any): string => {
+  try {
+    readExpressions(update, "UpdateItem")
+    return ""
+  } catch (error) {
+    return (error as Error).message
+  }
+}
+
 export const clearWritesSuite = (open: OpenTable) => {
   for (const entity of [
     "Plain",
@@ -259,7 +269,7 @@ export const clearWritesSuite = (open: OpenTable) => {
                 const { captured } = got
                 // Never one request naming a path twice.
                 for (const update of updatesOf(captured.sent)) {
-                  expect(overlappingUpdatePaths(update)).toBeUndefined()
+                  expect(refusalOf(update)).not.toContain("Two document paths")
                 }
                 if (same && (row === "entries" || row === "unrenamed")) {
                   expect(captured).toEqual(was)
@@ -689,8 +699,8 @@ export const clearEveryOpSuite = (open: OpenTable) => {
                 const commands = (sent: ReadonlyArray<any>) =>
                   sent.map((request) => Object.keys(request)[0])
                 for (const update of updatesOf(captured.sent)) {
-                  expect(overlappingUpdatePaths(update)).toBeUndefined()
-                  expect(unusedPlaceholders(update)).toBeUndefined()
+                  expect(refusalOf(update)).not.toContain("Two document paths")
+                  expect(refusalOf(update)).not.toContain("unused in expressions")
                 }
                 if (refused) {
                   expect(captured.outcome.fail).toBe("ValidationError")
