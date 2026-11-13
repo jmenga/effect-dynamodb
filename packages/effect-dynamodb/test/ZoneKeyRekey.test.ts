@@ -291,20 +291,35 @@ describe("rows published 1.40.0 keyed by a zone's given name on Effect 4.1.3", (
             report.conflicts
               .filter((conflict) => conflict.member === "Unique")
               .map(({ kind, reason }) => [kind, reason])
-          // Every run reports `u1` taken, its sentinel left where it is: both items hold the value.
+          const u1 = () =>
+            rowsOf(table).find((row) => row.__edd_e__?.S === "Unique" && row.id?.S === "u1")
+          const read = structuredClone(u1())
+          // Every run reports `u1` taken, and leaves all of it as it was, its zones' text and its
+          // sentinels alike: the zones and what's keyed by them move together or not at all, so the
+          // next run finds it as this one did. A dry run says the same.
+          const dry = yield* db.tables.Main.rekey({ repairIndexKeys: true, dryRun: true })
           const first = yield* db.tables.Main.rekey({ repairIndexKeys: true })
+          expect(contested(dry)).toEqual([["item", "taken"]])
           expect(contested(first)).toEqual([["item", "taken"]])
+          expect(first.skipped).toEqual(dry.skipped)
+          expect(u1()).toEqual(read)
           const again = yield* db.tables.Main.rekey({ repairIndexKeys: true })
           expect(contested(again)).toEqual([["item", "taken"]])
           expect(again.sentinelsMoved).toBe(0)
+          expect(u1()).toEqual(read)
           const keys = keysOf(rowsOf(table)).join("\n")
           expect(keys).toContain("$zones#v1#unique.bytz#asia/kolkata|")
           expect(keys).toContain("$zones#v1#unique.bytz#asia/calcutta|")
-          // Once `u9` lets go of it, the next run moves `u1`'s sentinel, which then holds it.
+          // Once `u9` lets go of it, the next run moves both of `u1`'s sentinels in one step: no
+          // key is left under the given name, and nothing is unrecognised.
           yield* db.entities.Unique.delete({ id: "u9" }).asEffect()
           const after = yield* db.tables.Main.rekey({ repairIndexKeys: true })
           expect(contested(after)).toEqual([])
-          expect(after.sentinelsMoved).toBe(1)
+          expect(after.sentinelsMoved).toBe(2)
+          expect(keysOf(rowsOf(table)).join("\n")).not.toContain("kolkata")
+          const settled = yield* db.tables.Main.rekey({ repairIndexKeys: true })
+          expect(settled.skipped?.unrecognizedKey ?? 0).toBe(0)
+          expect(settled.sentinelsMoved).toBe(0)
           const held = yield* Effect.exit(
             db.entities.Unique.put({
               id: "u8",

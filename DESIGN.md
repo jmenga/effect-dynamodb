@@ -5472,7 +5472,13 @@ would rewrite. A row holding none sends no request (`ZoneValuesRekey.test.ts`, o
 published 1.40.0 wrote on 4.1.3 and on 4.1.2: `zone-values-1.40.0-effect-4.1.{3,2}.json`).
 An aggregate's rows under their current keys and an event stream's events are not
 rewritten: an aggregate's rows `rekey` moves are rebuilt as any aggregate write builds
-them, and the rest keep their form until they're next written.
+them, and the rest keep their form until they're next written. An item under its current
+key is one step, all or nothing: where its zones or index keys are due a rewrite, its
+unique sentinels move first, planned from the row as read (`rekeySentinels`), and a
+sentinel that can't move (`taken`, `bothKeys`, `uncomposable`, `contended`) leaves all of
+it as it was, reported; a dry run judges the same (`ZoneUniqueRekey.test.ts`). Only then
+are its zones and index keys rewritten: a zone rewritten first lost its given name, and with
+it the key of the sentinel still under it.
 
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values

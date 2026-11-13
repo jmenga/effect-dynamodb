@@ -15412,6 +15412,12 @@ const makeImpl = <
    * names, and the zones {@link staleZoneSets} names, in place — one `UpdateItem` conditioned
    * on each still holding what was read and the composites they are composed from unchanged —
    * and move its unique sentinels whose text changed.
+   *
+   * The item is one step, all or nothing (#242): where its zones or index keys are due a
+   * rewrite, its sentinels move first, planned from the row as read ({@link rekeySentinels}), and
+   * a sentinel that can't move (`taken`, `bothKeys`, `uncomposable`, `contended`) leaves all of
+   * the item as it is, reported, so the next run finds it as this one did; a dry run judges the
+   * same. Rewritten first, a zone's given name was gone, and with it the sentinel's old key.
    */
   const rekeyCurrentItem = (
     ctx: Rekey.RekeyRowContext,
@@ -15426,6 +15432,26 @@ const makeImpl = <
       let uncomposable: ReadonlyArray<string> = []
       // What the text rewrite leaves on the row, for judging what's left of its index keys.
       let left = scanned
+      const owns = (key: StoredKey) => sameStoredKey(key, at)
+      const due = staleIndexKeys(scanned)
+      const dueZones = yield* staleZoneSets(scanned)
+      const first =
+        Object.keys(due.sets).length > 0 || Object.keys(dueZones.sets).length > 0
+          ? yield* rekeySentinels(
+              ctx,
+              "item",
+              scanned,
+              owns,
+              at,
+              false,
+              undefined,
+              undefined,
+              "held",
+            )
+          : undefined
+      if (first !== undefined && (first.conflicts ?? []).length > 0) {
+        return Rekey.mergeTallies(first, heldBackIndexKeys(at, due.uncomposable))
+      }
       for (let attempt = 0; ; attempt++) {
         const stale = staleIndexKeys(row)
         const zones = yield* staleZoneSets(row)
@@ -15505,17 +15531,9 @@ const makeImpl = <
         row = fresh
       }
       const repair = yield* repairIndexKeys(ctx, left, at)
-      const sentinels = yield* rekeySentinels(
-        ctx,
-        "item",
-        row,
-        (key) => sameStoredKey(key, at),
-        at,
-        false,
-        undefined,
-        undefined,
-        "held",
-      )
+      const sentinels =
+        first ??
+        (yield* rekeySentinels(ctx, "item", row, owns, at, false, undefined, undefined, "held"))
       const refused = heldBackIndexKeys(at, uncomposable)
       return Rekey.mergeTallies(
         rewritten ||
