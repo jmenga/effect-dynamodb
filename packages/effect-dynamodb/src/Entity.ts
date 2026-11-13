@@ -2467,26 +2467,25 @@ const makeImpl = <
     return { encoded, issue: pathValues.validateElements(segments, encoded) }
   }
   /**
-   * DynamoDB's refusal of an update expression reading an attribute (`#f - :v`,
-   * `list_append(#f, :v)`, `ADD`, `DELETE`) on a row without it, or holding a value of a kind the
-   * expression doesn't take (`fits`): what an update that applies the record operation to the row
-   * it read (a retained entity's, one changing a unique field, one computing an index composite)
-   * answers where the same operation sent as an expression would be refused. Its message is the
-   * library's, in DynamoDB Local's wording (the service's may differ, and nothing depends on it),
-   * named `TransactWriteItems`, the request a retained update sends. `undefined` when the
+   * DynamoDB's refusal of an update expression (`#f - :v`, `list_append(#f, :v)`, `ADD`, `DELETE`)
+   * on a row holding a value of a kind the expression doesn't take (`fits`): what an update that
+   * applies the record operation to the row it read (a retained entity's, one changing a unique
+   * field, one computing an index composite) answers where the same operation sent as an
+   * expression would be refused. A row without the attribute, or holding `NULL` there, isn't
+   * refused here: such an update starts it from nothing (`0`, `[]`, the operand), as 1.40.0 did,
+   * where DynamoDB refuses `#f - :v` and `list_append(#f, :v)` on a missing attribute and every
+   * expression on `NULL` (DESIGN.md names the difference). Its message is
+   * the library's, in DynamoDB Local's wording (the service's may differ, and nothing depends on
+   * it), named `TransactWriteItems`, the request a retained update sends. `undefined` when the
    * expression applies.
    */
-  const expressionRefusal = (before: unknown, fits: boolean): DynamoValidationError | undefined =>
+  const expressionRefusal = (fits: boolean): DynamoValidationError | undefined =>
     fits
       ? undefined
       : new DynamoValidationError({
           operation: "TransactWriteItems",
           cause: Object.assign(
-            new Error(
-              before === undefined
-                ? "The provided expression refers to an attribute that does not exist in the item"
-                : "An operand in the update expression has an incorrect data type",
-            ),
+            new Error("An operand in the update expression has an incorrect data type"),
             { name: "ValidationException" },
           ),
         })
@@ -8224,8 +8223,11 @@ const makeImpl = <
           newItem[entry.field] = map
           return [map, entry.key]
         }
+        // What a record operation starts from. A `NULL` the row holds is taken as nothing, as
+        // 1.40.0 took it (`.add(2)` stores `2`, `.append` the operand alone), where DynamoDB
+        // refuses the expression on `NULL`: named in DESIGN.md, not changed (#236).
         const held = (holder: globalThis.Record<string, unknown>, key: string): unknown =>
-          Object.hasOwn(holder, key) ? holder[key] : undefined
+          Object.hasOwn(holder, key) ? (holder[key] ?? undefined) : undefined
         const hold = (
           holder: globalThis.Record<string, unknown>,
           key: string,
@@ -8249,7 +8251,6 @@ const makeImpl = <
             const [holder, key] = slot(attr)
             const before = held(holder, key)
             const refused = expressionRefusal(
-              before,
               before === undefined ||
                 (isNumeric(val) ? isNumeric(before) : sameSetKind(before, val)),
             )
@@ -8266,27 +8267,34 @@ const makeImpl = <
           }
         }
         // `.subtract()` and `.append()` are `SET #f = #f - :v` and `SET #f = list_append(#f, :v)`
-        // when sent: DynamoDB refuses either on a row without the attribute, or holding a value
-        // of another kind, and writes nothing. Applied here, they're refused the same way, so a
-        // retained entity's update ends as any other entity's (#236). It used to store `-v` or
-        // the operand alone, and append to a string its characters.
+        // when sent: DynamoDB refuses either on a value of another kind and writes nothing.
+        // Applied here, they're refused the same way (#236); it used to append to a string its
+        // characters, and die on the `NaN` a string less a number is. A row without the
+        // attribute, or holding `NULL` there, starts from `0` or `[]`, as on 1.40.0, where
+        // DynamoDB refuses the expression (named in DESIGN.md, not changed).
         if (uState.subtract) {
           for (const [attr, val] of Object.entries(uState.subtract)) {
             const [holder, key] = slot(attr)
             const before = held(holder, key)
-            const refused = expressionRefusal(before, isNumeric(before) && isNumeric(val))
+            const refused = expressionRefusal(
+              (before === undefined || isNumeric(before)) && isNumeric(val),
+            )
             if (refused !== undefined) return yield* refused
-            hold(holder, key, numberSum(before as number | bigint, val as number | bigint, true))
+            hold(
+              holder,
+              key,
+              numberSum((before ?? 0) as number | bigint, val as number | bigint, true),
+            )
           }
         }
         if (uState.append) {
           for (const attr of Object.keys(uState.append)) {
             const [holder, key] = slot(attr)
             const before = held(holder, key)
-            const refused = expressionRefusal(before, Array.isArray(before))
+            const refused = expressionRefusal(before === undefined || Array.isArray(before))
             if (refused !== undefined) return yield* refused
             hold(holder, key, [
-              ...(before as Array<unknown>),
+              ...((before ?? []) as Array<unknown>),
               ...(operands.append[attr] as ReadonlyArray<unknown>),
             ])
           }
@@ -8298,10 +8306,7 @@ const makeImpl = <
             const before = held(holder, key)
             // DynamoDB's DELETE: nothing on a row without the attribute, and refused on a value
             // that isn't a set of the operand's kind (#236).
-            const refused = expressionRefusal(
-              before,
-              before === undefined || sameSetKind(before, val),
-            )
+            const refused = expressionRefusal(before === undefined || sameSetKind(before, val))
             if (refused !== undefined) return yield* refused
             if (before instanceof Set && val instanceof Set) {
               hold(holder, key, setDifference(before, val))

@@ -458,6 +458,8 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 | Delete from set | `Entity.deleteFromSet({ f: set })` | `Entity.pathDelete(...)` | `DELETE #f :v` |
 | Copy attribute | — | `Entity.pathSet({ isPath: true })` | `SET #a = #b` |
 
+On an attribute or a sparse map's entry the row doesn't hold, `subtract` and `append` end differently depending on the update, and so does any record operation on an attribute holding `null`. A plain update sends `#f - :v` or `list_append(#f, :v)`, which DynamoDB refuses (`DynamoValidationError`, nothing written). An update that reads the row first (a `versioned: { retain: true }` entity's, one changing a unique field, or one computing an index composite) starts the attribute from nothing, storing `-v`, `v` or the operand alone.
+
 #### Values are encoded through the schema at the path
 
 `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and the record-based `append` encode their value through the model schema at the path they address, the same way `set` does:

@@ -3,10 +3,12 @@
  * retained entity's, one changing a unique field, one computing an index composite) against
  * DynamoDB Local, beside the same update of an entity without the configuration (#236). The first
  * applies `.subtract()`, `.append()`, `.add()` and `.deleteFromSet()` to the row it read; the
- * other sends them as an expression. Both now end the same way: where DynamoDB refuses the
- * expression, both fail with `DynamoValidationError` and neither row changes; where it applies it,
- * both rows read back the same. The refusal's message is not compared: the update that reads first
- * gives DynamoDB Local's wording, which the service's need not match.
+ * other sends them as an expression. Both now end the same way on a value the row holds: where
+ * DynamoDB refuses the expression, both fail with `DynamoValidationError` and neither row changes;
+ * where it applies it, both rows read back the same. The refusal's message is not compared: the
+ * update that reads first gives DynamoDB Local's wording, which the service's need not match. On
+ * an attribute the row lacks, or holds as `NULL`, the two still differ, as on 1.40.0
+ * (`connected.missing-operand-paths.test.ts`).
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -123,10 +125,6 @@ const entity = (config: ReadFirstUpdate | undefined) =>
   } as never) as any
 
 const cases: ReadonlyArray<readonly [name: string, apply: (u: any) => any]> = [
-  ["subtract from an attribute the row lacks", (u) => u.subtract({ m: 2 })],
-  ["append to an attribute the row lacks", (u) => u.append({ notes: ["x"] })],
-  ["subtract from a sparse map's entry the row lacks", (u) => u.subtract({ "data#x": 2 })],
-  ["append to a sparse map's entry the row lacks", (u) => u.append({ "lists#x": ["x"] })],
   ["append to a string", (u) => u.append({ name: ["x"] })],
   ["subtract from a string", (u) => u.subtract({ name: 2 })],
   ["add a number to a string", (u) => u.add({ name: 2 })],
@@ -140,11 +138,6 @@ const cases: ReadonlyArray<readonly [name: string, apply: (u: any) => any]> = [
     (u) => u.deleteFromSet({ labels: new Set([2]) }),
   ],
   ["delete a set of strings from a set of numbers", (u) => u.deleteFromSet({ ns: new Set(["1"]) })],
-  ["add a number to NULL", (u) => u.add({ nul: 2 })],
-  ["subtract from NULL", (u) => u.subtract({ nul: 2 })],
-  ["append to NULL", (u) => u.append({ nlist: ["x"] })],
-  ["add a set to NULL", (u) => u.add({ nset: new Set(["x"]) })],
-  ["delete from NULL", (u) => u.deleteFromSet({ nset: new Set(["x"]) })],
   [
     "operations on values the row holds",
     (u) =>

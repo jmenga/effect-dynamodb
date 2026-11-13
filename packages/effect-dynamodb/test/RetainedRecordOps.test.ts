@@ -2,13 +2,14 @@
  * A retained entity's update, one changing a unique field and one computing an index composite
  * (`helpers/ReadFirstUpdates.ts`) apply `.subtract()`, `.append()`, `.add()` and
  * `.deleteFromSet()` to the row they read, where any other update sends them as an expression for
- * DynamoDB to apply (#236). Where DynamoDB refuses the expression (an attribute the row doesn't
- * hold for `#f - :v` and `list_append`, a value of another kind for any of them) the update that
- * reads first is refused the same way, after its read and with nothing written. Its message is the
- * library's, in DynamoDB Local's wording (`ABSENT`, `KIND`): what this test checks is the library's
- * text, never that the service words it so. It used to store `-v` or the operand alone, append a string's characters, add a number
- * to a string, and die on the `NaN` a string less a number is.
- * `connected.retained-record-ops.test.ts` holds the two paths side by side on DynamoDB Local.
+ * DynamoDB to apply (#236). Where DynamoDB refuses the expression on a value of another kind, the
+ * update that reads first is refused the same way, after its read and with nothing written. Its
+ * message is the library's, in DynamoDB Local's wording (`KIND`): what this test checks is the
+ * library's text, never that the service words it so. It used to append a string's characters,
+ * add a number to a string, and die on the `NaN` a string less a number is.
+ * `connected.retained-record-ops.test.ts` holds the two paths side by side on DynamoDB Local. On an
+ * attribute the row lacks, or holds as `NULL`, the two still differ, as on 1.40.0: the update that
+ * reads first starts it from nothing (`connected.missing-operand-paths.test.ts`).
  */
 
 import { it } from "@effect/vitest"
@@ -58,7 +59,6 @@ const definitions = (config: ReadFirstUpdate) => {
   return { E, Main }
 }
 
-const ABSENT = "The provided expression refers to an attribute that does not exist in the item"
 const KIND = "An operand in the update expression has an incorrect data type"
 
 /**
@@ -68,25 +68,6 @@ const KIND = "An operand in the update expression has an incorrect data type"
 const refused: ReadonlyArray<
   readonly [name: string, says: string, apply: (u: any) => any, on140: string]
 > = [
-  ["subtract from an attribute the row lacks", ABSENT, (u) => u.subtract({ m: 2 }), "stored -2"],
-  [
-    "append to an attribute the row lacks",
-    ABSENT,
-    (u) => u.append({ notes: ["x"] }),
-    "stored the operand alone",
-  ],
-  [
-    "subtract from a sparse map's entry the row lacks",
-    ABSENT,
-    (u) => u.subtract({ "data#x": 2 }),
-    "stored -2",
-  ],
-  [
-    "append to a sparse map's entry the row lacks",
-    ABSENT,
-    (u) => u.append({ "lists#x": ["x"] }),
-    "stored the operand alone",
-  ],
   [
     "append to a string",
     KIND,
@@ -140,16 +121,6 @@ const refused: ReadonlyArray<
     "delete a set of strings from a set of numbers",
     KIND,
     (u) => u.deleteFromSet({ ns: new Set(["1"]) }),
-    "wrote the row unchanged",
-  ],
-  ["add a number to NULL", KIND, (u) => u.add({ nul: 2 }), "stored 2"],
-  ["subtract from NULL", KIND, (u) => u.subtract({ nul: 2 }), "stored -2"],
-  ["append to NULL", KIND, (u) => u.append({ nlist: ["x"] }), "stored the operand alone"],
-  ["add a set to NULL", KIND, (u) => u.add({ nset: new Set(["x"]) }), "stored the set"],
-  [
-    "delete from NULL",
-    KIND,
-    (u) => u.deleteFromSet({ nset: new Set(["x"]) }),
     "wrote the row unchanged",
   ],
 ]

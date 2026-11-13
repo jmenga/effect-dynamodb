@@ -3479,15 +3479,19 @@ by construction, never emulated — and a rejected expression writes no snapshot
 The record operations (`.subtract()`, `.append()`, `.add()`, `.deleteFromSet()`)
 are applied to the row read, here and in the other updates that read the row
 first (one changing a unique field, one computing an index composite), as
-DynamoDB applies their expressions: where it refuses one (`#f - :v` or
-`list_append` on an attribute the row lacks, or any of them on a value of
-another kind: a string, a set of the other kind, `NULL`), the update fails with
-`DynamoValidationError` (`operation` `TransactWriteItems`, its message the
-library's in DynamoDB Local's wording, which the service's may not match)
-and writes nothing (`expressionRefusal`, #236), as the same update of an entity
-without the configuration fails. It used to
-store `-v` or the operand alone, append a string's characters (a row that no
-longer read), add a number to a string, and die on `NaN`. Where DynamoDB applies
+DynamoDB applies their expressions: where it refuses one on a value of another
+kind (a string, a number for `DELETE`, a set of the other kind), the update
+fails with `DynamoValidationError` (`operation` `TransactWriteItems`, its
+message the library's in DynamoDB Local's wording, which the service's may not
+match) and writes nothing (`expressionRefusal`, #236), as the same update of an
+entity without the configuration fails. It used to append a string's characters
+(a row that no longer read), add a number to a string, and die on `NaN`. On an
+attribute or a sparse map's entry the row lacks, and on one it holds as `NULL`,
+the two still differ, as on 1.40.0: an update sent as an expression is refused
+by DynamoDB (`#f - :v` and `list_append(#f, :v)` on a missing attribute, every
+one of them on `NULL`), while one that reads the row first starts the attribute
+from nothing and stores `-v`, `v` or the operand alone (a `DELETE` leaves it as
+it was) (`connected.missing-operand-paths.test.ts` pins both). Where DynamoDB applies
 one, the result is DynamoDB's (`internal/DynamoArithmetic.ts`): a sum or
 difference is taken exactly on the two numbers' decimal text and given back as a
 read gives the stored result (a `number`, or a `bigint` past
