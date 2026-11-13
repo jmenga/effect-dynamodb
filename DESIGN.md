@@ -5476,12 +5476,14 @@ A sparse map's entries, an aggregate's rows under their current keys and an even
 stream's events are not rewritten (left as 1.40.0, named: `ZoneValuesRekey.test.ts` pins a
 sparse entry and an aggregate's root row): an aggregate's rows `rekey` moves are rebuilt
 as any aggregate write builds them, and the rest keep their form until they're next
-written. An item under its current key is one step, all or nothing: where its zones or
+written. An item under its current key is rewritten all or nothing: where its zones or
 index keys are due a rewrite, its unique sentinels move first, planned from the row as
 read (`rekeySentinels`), and a sentinel that can't move (`taken`, `bothKeys`,
-`uncomposable`, `contended`) leaves all of it as it was, reported; a dry run judges the
-same (`ZoneUniqueRekey.test.ts`). Only then are its zones and index keys rewritten: a zone
+`uncomposable`, `contended`) leaves the row as it was, reported; a dry run judges the same
+(`ZoneUniqueRekey.test.ts`). Only then are its zones and index keys rewritten: a zone
 rewritten first lost its given name, and with it the key of the sentinel still under it.
+Each sentinel under other key text is a unit of its own, so another of the item's that can
+move does (`ZoneKeyRekey.test.ts`).
 
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
