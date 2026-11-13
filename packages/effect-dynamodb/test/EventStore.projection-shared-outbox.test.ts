@@ -14,7 +14,7 @@ import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
+import { InMemoryClient, resetStore, store, tableIndexes } from "./helpers/InMemoryTables.js"
 import { markOf, tagOf } from "./helpers/OutboxMarks.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { makeRoutedTables } from "./helpers/RoutedTables.js"
@@ -44,6 +44,8 @@ const OutboxTable = Table.make({
   entities: {},
 })
 const index = { name: "outbox", pk: "obpk", sk: "obsk" } as const
+// The in-memory tables read a query of an index they declare.
+tableIndexes.set("outbox", { outbox: { pk: index.pk, sk: index.sk } })
 
 /**
  * A `Ledger` read model in schema `schemaName` (in primary collection `collection`, when given),
