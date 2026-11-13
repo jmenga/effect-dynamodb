@@ -40,7 +40,7 @@ import {
   written,
 } from "./helpers/LookalikeKeys.js"
 import { isInstanceOf, lookalikes } from "./helpers/Lookalikes.js"
-import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { keyText, makeRecordingTable } from "./helpers/RecordingTable.js"
 
 /** A table holding `seed`, and a typed client of the fixture's definitions on it. */
 const on = <A>(
@@ -51,7 +51,7 @@ const on = <A>(
   const { Soft, Unique, Indexed, Retained, Roots, Base, Main } = definitionsOf(field)
   const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
   for (const row of seed)
-    table.items.set(`${row.pk!.S}|${row.sk!.S}`, structuredClone(row) as never)
+    table.items.set(keyText(row.pk!.S!, row.sk!.S!), structuredClone(row) as never)
   const rows = () => [...table.items.values()] as unknown as ReadonlyArray<Row>
   return Effect.gen(function* () {
     const db = yield* DynamoClient.make({
@@ -283,7 +283,7 @@ describe("rekey over 1.39.0's restore of an item with a unique constraint and an
       })
       const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
       for (const row of restored) {
-        table.items.set(`${row.pk!.S}|${row.sk!.S}`, structuredClone(row) as never)
+        table.items.set(keyText(row.pk!.S!, row.sk!.S!), structuredClone(row) as never)
       }
       const rows = () => [...table.items.values()] as unknown as ReadonlyArray<Row>
       return Effect.gen(function* () {
