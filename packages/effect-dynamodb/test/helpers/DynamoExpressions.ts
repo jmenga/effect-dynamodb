@@ -17,7 +17,7 @@
  *   that isn't a reserved word).
  * - Update expressions: `SET` (`+`, `-`, `if_not_exists`, `list_append`), `REMOVE`, `ADD` and
  *   `DELETE`, sections in any order and keywords in any case, whitespace optional.
- * - Projection expressions of attribute and map-key paths.
+ * - Projection expressions of attribute, map-key and list-element paths.
  * - Reads: `GetItem`, `Query` of the table or a declared index (local or global, its projection,
  *   `Select`, `ConsistentRead`, `Limit` counting rows examined, `ExclusiveStartKey` /
  *   `LastEvaluatedKey`), `Scan`, `BatchGetItem`, `TransactGetItems`.
@@ -101,7 +101,7 @@
  * - Several problems of one kind in one request (two index keys of the wrong type, …), as which
  *   DynamoDB Local reports first is unmeasured.
  * - A key condition naming several index keys through nested paths.
- * - A projection of a list element; an `attribute_type` whose type is a path or a `size`.
+ * - An `attribute_type` whose type is a path or a `size`.
  * - A `Select` DynamoDB Local refuses in words unmeasured, and each check marked "unmeasured"
  *   below.
  *
@@ -2286,27 +2286,62 @@ export const updatedItem = (item: Item, input: ExpressionInput): Item =>
 // Projections
 // ---------------------------------------------------------------------------
 
-/** The parts of `item` a projection names, placed at their paths. */
-const project = (item: Item, paths: ReadonlyArray<Path>): Item => {
-  const out: Item = {}
-  for (const path of paths) {
-    if (path.some((segment) => typeof segment === "number")) {
-      unreadable("the ProjectionExpression", pathText(path), "a list element")
+/** What a projection names below one point of an item: all of it, or attributes and list positions. */
+interface Selection {
+  whole: boolean
+  readonly attributes: Map<string, Selection>
+  readonly positions: Map<number, Selection>
+}
+const selection = (): Selection => ({ whole: false, attributes: new Map(), positions: new Map() })
+
+/**
+ * The part of `value` that `at` names, or `undefined` where it holds nothing named: a map keeps
+ * the attributes named, and a list the positions named, in position order, whatever order the
+ * projection names them in (`l[2], l[0]` returns `[l[0], l[2]]`); a position past the list's end,
+ * and a step of the other kind (a position in a map, an attribute of a list), name nothing.
+ */
+const selected = (value: AttributeValue | undefined, at: Selection): AttributeValue | undefined => {
+  if (value === undefined) return undefined
+  if (at.whole) return clone(value)
+  if (value.M !== undefined && at.attributes.size > 0) {
+    const out: Record<string, AttributeValue> = {}
+    for (const [name, below] of at.attributes) {
+      const held = selected(own(value.M, name), below)
+      if (held !== undefined) setOwn(out, name, held)
     }
-    const value = readPath(item, path)
-    if (value === undefined) continue
-    let target: Record<string, AttributeValue> = out
-    for (const segment of path.slice(0, -1) as ReadonlyArray<string>) {
-      let inner = own(target, segment)
-      if (inner === undefined) {
-        inner = { M: {} }
-        setOwn(target, segment, inner)
-      }
-      target = inner.M!
-    }
-    setOwn(target, path[path.length - 1] as string, clone(value))
+    return Object.keys(out).length === 0 ? undefined : { M: out }
   }
-  return out
+  if (value.L !== undefined && at.positions.size > 0) {
+    const list = value.L
+    const kept = [...at.positions]
+      .sort(([a], [b]) => a - b)
+      .flatMap(([position, below]) => {
+        const held = position < list.length ? selected(list[position], below) : undefined
+        return held === undefined ? [] : [held]
+      })
+    return kept.length === 0 ? undefined : { L: kept }
+  }
+  return undefined
+}
+
+/** The parts of `item` a projection names, placed at their paths (list positions: {@link selected}). */
+const project = (item: Item, paths: ReadonlyArray<Path>): Item => {
+  const root = selection()
+  for (const path of paths) {
+    let at = root
+    for (const segment of path) {
+      const below: Map<string | number, Selection> =
+        typeof segment === "number" ? at.positions : at.attributes
+      let next = below.get(segment)
+      if (next === undefined) {
+        next = selection()
+        below.set(segment, next)
+      }
+      at = next
+    }
+    at.whole = true
+  }
+  return selected({ M: item }, root)?.M ?? {}
 }
 
 // ---------------------------------------------------------------------------

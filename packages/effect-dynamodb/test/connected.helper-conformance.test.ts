@@ -2293,6 +2293,28 @@ const REQUESTS: ReadonlyArray<FullBrief> = [
       ExpressionAttributeNames: { "#n": "n", "#x": "x" },
     },
   ],
+  ...(
+    [
+      ["one list element", "#l[1]"],
+      ["list elements named out of order", "#l[2], #l[0]"],
+      ["an attribute of a list element, and a nested list's element", "#l[2].#a, #m.#l[1]"],
+      ["a list element past the end, beside an attribute", "#l[5], #n"],
+      ["an attribute of a list element that isn't a map", "#l[0].#a"],
+      ["a position in a map, and an attribute of a list", "#m[0], #l.#a"],
+      ["only list elements past the end", "#l[3], #m.#l[2]"],
+    ] as const
+  ).map(
+    ([label, expression]): FullBrief => [
+      `get: projection of ${label}`,
+      "GetItem",
+      {
+        TableName: "$T",
+        Key: KEY,
+        ProjectionExpression: expression,
+        ExpressionAttributeNames: namesIn(expression),
+      },
+    ],
+  ),
   [
     "query: unused value",
     "Query",
