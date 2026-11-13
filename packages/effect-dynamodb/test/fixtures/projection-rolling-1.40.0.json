@@ -1,0 +1,726 @@
+{
+  "version": "1.40.0",
+  "runs": {
+    "a0 a1": [
+      {
+        "step": "A0",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "id": {
+                  "S": "x"
+                },
+                "total": {
+                  "N": "1"
+                },
+                "a": {
+                  "N": "1"
+                },
+                "ra": {
+                  "N": "1"
+                },
+                "__edd_e__": {
+                  "S": "Row"
+                },
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+              "ExpressionAttributeNames": {
+                "#e0": "pk",
+                "#e1": "sk"
+              }
+            }
+          }
+        ],
+        "item": {
+          "id": {
+            "S": "x"
+          },
+          "total": {
+            "N": "1"
+          },
+          "a": {
+            "N": "1"
+          },
+          "ra": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Row"
+          },
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          }
+        }
+      },
+      {
+        "step": "A1",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "id": {
+                  "S": "x"
+                },
+                "total": {
+                  "N": "3"
+                },
+                "a": {
+                  "N": "2"
+                },
+                "ra": {
+                  "N": "2"
+                },
+                "__edd_e__": {
+                  "S": "Row"
+                },
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConditionExpression": "#e0 = :e1",
+              "ExpressionAttributeNames": {
+                "#e0": "ra"
+              },
+              "ExpressionAttributeValues": {
+                ":e1": {
+                  "N": "1"
+                }
+              }
+            }
+          }
+        ],
+        "item": {
+          "id": {
+            "S": "x"
+          },
+          "total": {
+            "N": "3"
+          },
+          "a": {
+            "N": "2"
+          },
+          "ra": {
+            "N": "2"
+          },
+          "__edd_e__": {
+            "S": "Row"
+          },
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          }
+        }
+      }
+    ],
+    "a0 b0 b1": [
+      {
+        "step": "A0",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "id": {
+                  "S": "x"
+                },
+                "total": {
+                  "N": "1"
+                },
+                "a": {
+                  "N": "1"
+                },
+                "ra": {
+                  "N": "1"
+                },
+                "__edd_e__": {
+                  "S": "Row"
+                },
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+              "ExpressionAttributeNames": {
+                "#e0": "pk",
+                "#e1": "sk"
+              }
+            }
+          }
+        ],
+        "item": {
+          "id": {
+            "S": "x"
+          },
+          "total": {
+            "N": "1"
+          },
+          "a": {
+            "N": "1"
+          },
+          "ra": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Row"
+          },
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          }
+        }
+      },
+      {
+        "step": "B0",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "id": {
+                  "S": "x"
+                },
+                "total": {
+                  "N": "6"
+                },
+                "a": {
+                  "N": "1"
+                },
+                "ra": {
+                  "N": "1"
+                },
+                "b": {
+                  "N": "1"
+                },
+                "rb": {
+                  "N": "1"
+                },
+                "__edd_e__": {
+                  "S": "Row"
+                },
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConditionExpression": "attribute_not_exists(#e0)",
+              "ExpressionAttributeNames": {
+                "#e0": "rb"
+              }
+            }
+          }
+        ],
+        "item": {
+          "id": {
+            "S": "x"
+          },
+          "total": {
+            "N": "6"
+          },
+          "a": {
+            "N": "1"
+          },
+          "ra": {
+            "N": "1"
+          },
+          "b": {
+            "N": "1"
+          },
+          "rb": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Row"
+          },
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          }
+        }
+      },
+      {
+        "step": "B1",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "id": {
+                  "S": "x"
+                },
+                "total": {
+                  "N": "13"
+                },
+                "a": {
+                  "N": "1"
+                },
+                "ra": {
+                  "N": "1"
+                },
+                "b": {
+                  "N": "2"
+                },
+                "rb": {
+                  "N": "2"
+                },
+                "__edd_e__": {
+                  "S": "Row"
+                },
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConditionExpression": "#e0 = :e1",
+              "ExpressionAttributeNames": {
+                "#e0": "rb"
+              },
+              "ExpressionAttributeValues": {
+                ":e1": {
+                  "N": "1"
+                }
+              }
+            }
+          }
+        ],
+        "item": {
+          "id": {
+            "S": "x"
+          },
+          "total": {
+            "N": "13"
+          },
+          "a": {
+            "N": "1"
+          },
+          "ra": {
+            "N": "1"
+          },
+          "b": {
+            "N": "2"
+          },
+          "rb": {
+            "N": "2"
+          },
+          "__edd_e__": {
+            "S": "Row"
+          },
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          }
+        }
+      }
+    ],
+    "removal: a0 a1 a2 a3": [
+      {
+        "step": "A0",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "id": {
+                  "S": "x"
+                },
+                "total": {
+                  "N": "1"
+                },
+                "a": {
+                  "N": "1"
+                },
+                "__edd_e__": {
+                  "S": "Row"
+                },
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+              "ExpressionAttributeNames": {
+                "#e0": "pk",
+                "#e1": "sk"
+              }
+            }
+          }
+        ],
+        "item": {
+          "id": {
+            "S": "x"
+          },
+          "total": {
+            "N": "1"
+          },
+          "a": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Row"
+          },
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          }
+        }
+      },
+      {
+        "step": "A1",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                },
+                "__edd_e__": {
+                  "S": "Row#tombstone"
+                },
+                "__edd_removed__": {
+                  "S": "1970-01-01T00:00:00.000Z"
+                },
+                "a": {
+                  "N": "2"
+                }
+              },
+              "ConditionExpression": "#g = :g",
+              "ExpressionAttributeNames": {
+                "#g": "a"
+              },
+              "ExpressionAttributeValues": {
+                ":g": {
+                  "N": "1"
+                }
+              }
+            }
+          }
+        ],
+        "item": {
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          },
+          "__edd_e__": {
+            "S": "Row#tombstone"
+          },
+          "__edd_removed__": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "a": {
+            "N": "2"
+          }
+        }
+      },
+      {
+        "step": "A2",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "id": {
+                  "S": "x"
+                },
+                "total": {
+                  "N": "4"
+                },
+                "a": {
+                  "N": "3"
+                },
+                "__edd_e__": {
+                  "S": "Row"
+                },
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConditionExpression": "#e0 = :e1",
+              "ExpressionAttributeNames": {
+                "#e0": "a"
+              },
+              "ExpressionAttributeValues": {
+                ":e1": {
+                  "N": "2"
+                }
+              }
+            }
+          }
+        ],
+        "item": {
+          "id": {
+            "S": "x"
+          },
+          "total": {
+            "N": "4"
+          },
+          "a": {
+            "N": "3"
+          },
+          "__edd_e__": {
+            "S": "Row"
+          },
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          }
+        }
+      },
+      {
+        "step": "A3",
+        "requests": [
+          {
+            "command": "GetItem",
+            "input": {
+              "TableName": "read",
+              "Key": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                }
+              },
+              "ConsistentRead": true
+            }
+          },
+          {
+            "command": "PutItem",
+            "input": {
+              "TableName": "read",
+              "Item": {
+                "pk": {
+                  "S": "$token#v1#row#id_x"
+                },
+                "sk": {
+                  "S": "$token#v1#row"
+                },
+                "__edd_e__": {
+                  "S": "Row#tombstone"
+                },
+                "__edd_removed__": {
+                  "S": "1970-01-01T00:00:00.000Z"
+                },
+                "a": {
+                  "N": "4"
+                }
+              },
+              "ConditionExpression": "#g = :g",
+              "ExpressionAttributeNames": {
+                "#g": "a"
+              },
+              "ExpressionAttributeValues": {
+                ":g": {
+                  "N": "3"
+                }
+              }
+            }
+          }
+        ],
+        "item": {
+          "pk": {
+            "S": "$token#v1#row#id_x"
+          },
+          "sk": {
+            "S": "$token#v1#row"
+          },
+          "__edd_e__": {
+            "S": "Row#tombstone"
+          },
+          "__edd_removed__": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "a": {
+            "N": "4"
+          }
+        }
+      }
+    ]
+  }
+}

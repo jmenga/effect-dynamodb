@@ -665,6 +665,53 @@ describe("the bind check counts each attribute as its row holds it after the las
     }),
   )
 
+  it.effect("the partition key's attribute named `__edd_rt__`: no row token, as 1.40.0", () =>
+    Effect.gen(function* () {
+      // The table's partition attribute is `__edd_rt__`: its name is taken (`rowTokenInUse`), so
+      // the rows of a read model two projections write carry no token (#237), and nothing writes
+      // it but the key, as on 1.40.0.
+      const schema = DynamoSchema.make({ name: "rk", version: 1 })
+      const Tallies = Entity.make({
+        model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
+        entityType: "Tally",
+        primaryKey: {
+          pk: { field: "__edd_rt__", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as any)
+      class Added extends Schema.TaggedClass<Added>()("Added", {}) {}
+      const Events = Table.make({ schema, entities: {} })
+      const Main = Table.make({ schema, entities: { Tallies } })
+      const Orders = owner(Main, schema, {
+        pkField: "__edd_rt__",
+        collection: "shared",
+        edgeType: "Tally",
+      })
+      const bind = binds(
+        { entities: { Tallies }, aggregates: { Orders }, tables: { Main } },
+        Layer.merge(Main.layer({ name: "rk" }), Events.layer({ name: "events" })),
+      )
+      const define = (streamName: string, checkpoint: string) =>
+        EventStore.projection({
+          stream: EventStore.makeStream({
+            table: Events,
+            streamName,
+            events: [Added],
+            streamId: { composite: ["id"] },
+          }),
+          readModel: Tallies,
+          key: (id: { readonly id: string }) => id,
+          initial: (id: { readonly id: string }) => ({ ...id, version: 0, rev: 0 }),
+          evolve: (state: any) => Effect.succeed(state),
+          checkpoint,
+        } as any)
+      define("First", "version")
+      expect(yield* bind).toBe("bound")
+      define("Second", "rev")
+      expect(yield* bind).toBe("bound")
+    }),
+  )
+
   it.effect("a projection outbox's index keys, which have no head, are any text", () =>
     Effect.gen(function* () {
       // The outbox index's partition is `Tally#outbox`, under `opk`: the aggregate's partition.

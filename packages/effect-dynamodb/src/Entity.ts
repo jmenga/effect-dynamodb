@@ -193,6 +193,7 @@ import {
   readBackRefusal,
 } from "./internal/RoundTrip.js"
 import {
+  andRaw,
   composeKeysOrFail,
   freshIncarnationToken,
   generateTimestampPrimitive,
@@ -206,6 +207,7 @@ import {
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
   overTombstone,
+  type RawCondition,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
@@ -1121,7 +1123,11 @@ export interface Entity<
    */
   readonly _overTombstone: (
     item: globalThis.Record<string, unknown>,
-  ) => Effect.Effect<Option.Option<ConditionInput>, DynamoClientError, DynamoClient | TableConfig>
+  ) => Effect.Effect<
+    Option.Option<{ readonly guard: ConditionInput; readonly term: RawCondition | undefined }>,
+    DynamoClientError | ValidationError,
+    DynamoClient | TableConfig
+  >
 
   /**
    * @internal Configure the entity with table schema and tag.
@@ -8128,6 +8134,9 @@ const makeImpl = <
           // renames and sparse flattening, before marshalling, so every size
           // measured from here on is the stored size.
           yield* packFields(item, operation)
+          // A projection's write (#237): its library attributes (the row token), as stored.
+          const projected = opts.projectionWrite
+          if (projected !== undefined) Object.assign(item, projected.attributes)
 
           // The caller's condition, ANDed onto `create`'s not-exists guard —
           // a guard no `.condition()` can replace (#133). `upsert`'s create
@@ -8136,20 +8145,30 @@ const makeImpl = <
             opts.putKind === "create" && operation !== "upsert" ? createGuard(self) : undefined,
             opts.condition,
           )
-          let userCondition = condition
-            ? compileCondition(condition, resolveDbName, storedFormAt)
-            : undefined
+          let userCondition = andRaw(
+            condition ? compileCondition(condition, resolveDbName, storedFormAt) : undefined,
+            projected?.condition,
+          )
 
           // `create` over a projection tombstone (#154): the row takes the
           // tombstone's place, its checkpoints and revision carried over, on
-          // the condition that tombstone is still there.
-          if (opts.putKind === "create" && operation !== "upsert" && !guarded) {
+          // the condition that tombstone is still there. Not for a projection
+          // that read no row: it never takes the place of one written since.
+          if (
+            opts.putKind === "create" &&
+            operation !== "upsert" &&
+            !guarded &&
+            projected?.expectAbsent !== true
+          ) {
             const over = yield* overTombstone(self, client, tc, item)
             if (Option.isSome(over)) {
-              userCondition = compileCondition(
-                withGuard(over.value, opts.condition) as Expr | ConditionInput,
-                resolveDbName,
-                storedFormAt,
+              userCondition = andRaw(
+                compileCondition(
+                  withGuard(over.value.guard, opts.condition) as Expr | ConditionInput,
+                  resolveDbName,
+                  storedFormAt,
+                ),
+                over.value.term,
               )
             }
           }
@@ -8185,6 +8204,7 @@ const makeImpl = <
               ConditionExpression?: string
               ExpressionAttributeNames?: globalThis.Record<string, string>
               ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+              ReturnValuesOnConditionCheckFailure?: "ALL_OLD"
             } = {
               TableName: tableName,
               Item: marshalledItem,
@@ -8195,6 +8215,9 @@ const makeImpl = <
               if (Object.keys(userCondition.values).length > 0) {
                 putInput.ExpressionAttributeValues = userCondition.values
               }
+              if (projected?.returnOld === true) {
+                putInput.ReturnValuesOnConditionCheckFailure = "ALL_OLD"
+              }
             }
             yield* client.putItem(putInput).pipe(
               Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
@@ -8202,6 +8225,11 @@ const makeImpl = <
                   return new ConditionalCheckFailed({
                     entityType,
                     key: encoded as globalThis.Record<string, unknown>,
+                    ...(projected?.returnOld === true && {
+                      current: Option.fromNullishOr(
+                        (err.cause as { readonly Item?: unknown }).Item,
+                      ),
+                    }),
                   })
                 }
                 return err

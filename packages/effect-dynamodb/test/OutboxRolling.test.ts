@@ -6,7 +6,7 @@
  * - Where `__edd_rm__` is a key attribute where a read model's outbox items are written, its items
  *   carry no mark (`outboxMarkInUse`): this release sends, stores and delivers exactly what 1.40.0
  *   did (`fixtures/outbox-mark-names-1.40.0.json`), with one projection and two, `escapeKeys` off
- *   and on.
+ *   and on. With two, the rows carry a row token (#237), taken out to compare (`RowTokens.ts`).
  * - Rolling deployment: 1.40.0's `drainPending` and `drain` were given the items this release
  *   writes (marks, items written beside another's at its key followed by their mark) and
  *   delivered every one, in order, leaving none, with the requests this release's drainer sends
@@ -33,6 +33,7 @@ import {
   type Sent,
 } from "./helpers/OutboxScenarios.js"
 import { makeRoutedTables } from "./helpers/RoutedTables.js"
+import { namesRowToken, withoutRowToken } from "./helpers/RowTokens.js"
 
 const lib = { DynamoSchema, Table, Entity, EventStore, DynamoClient }
 const tables = { events: "events", read: "read", outbox: "outbox" } as const
@@ -89,7 +90,11 @@ describe("a read model whose mark's name is a key attribute: 1.40.0's requests",
             // Decided from the definitions: no mark.
             expect(outboxMarkInUse(scenario.Ledgers)).toBe(false)
             const fixture = namesFixture[at]!
-            expect(ranOf(ran)).toEqual(
+            // Two projections write the rows: each carries a row token (#237), its name free. With
+            // it taken out, the requests are 1.40.0's (`withoutRowToken`).
+            const tokened = projections === 2
+            expect(namesRowToken(ran.sent)).toBe(tokened)
+            expect(ranOf(tokened ? withoutRowToken(ran) : ran)).toEqual(
               asJson({ sent: fixture.sent, delivered: fixture.delivered, result: fixture.result }),
             )
             // What's stored: the row, and no outbox item left.
@@ -97,7 +102,9 @@ describe("a read model whose mark's name is a key attribute: 1.40.0's requests",
               const ledger = [...routed.table(name).items.values()].filter((item) =>
                 String(item.__edd_e__?.S).startsWith("Ledger"),
               )
-              expect(sorted(ledger as Iterable<Stored>)).toEqual(fixture.items[name])
+              const stored = sorted(ledger as Iterable<Stored>)
+              expect(sorted(withoutRowToken(stored))).toEqual(fixture.items[name])
+              if (name === "read") expect(namesRowToken(stored)).toBe(tokened)
             }
           })
         })

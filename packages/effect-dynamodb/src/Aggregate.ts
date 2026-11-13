@@ -142,6 +142,9 @@ import {
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
   outboxMarkInUse,
+  ROW_TOKEN,
+  rowTokened,
+  rowTokenInUse,
 } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
@@ -7937,6 +7940,18 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
           [tombstone],
           table,
           (field) => `its projection tombstones' "${field}"`,
+        )
+      }
+      // The row token (#237), on the rows and tombstones of a read model several projections write,
+      // where its name is free (`rowTokenInUse`). The table's TTL attribute isn't known here: a
+      // read model whose TTL attribute alone is named `__edd_rt__` is counted as writing it, which
+      // only adds a writer of an attribute no key is made of.
+      if (rowTokened(e) && rowTokenInUse(e, undefined)) {
+        anyText(
+          [ROW_TOKEN],
+          tombstone === undefined ? [own] : [own, tombstone],
+          table,
+          (field) => `its projection rows' "${field}"`,
         )
       }
       for (const constraint of Object.keys(e.unique ?? {})) {

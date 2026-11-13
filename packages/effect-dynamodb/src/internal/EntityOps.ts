@@ -13,6 +13,7 @@ import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
+import type { RawCondition } from "./TransactableOps.js"
 
 // ---------------------------------------------------------------------------
 // TypeId symbols
@@ -444,6 +445,25 @@ export interface EntityPutOpts {
    * now — an EventStore projection rewriting a row it read keeps the row's.
    */
   readonly createdAt?: DateTime.Utc | undefined
+  /**
+   * @internal An EventStore projection's write (#237): `attributes` set on the stored item
+   * (stored names, stored values: the row token; another projection's bookkeeping is carried in
+   * the value written, so the entity stores it as any value of its field), `condition` ANDed with
+   * the op's (the row token as read, or that the row is still the tombstone read), and
+   * `expectAbsent` when the projection read no row on a read model one of whose projections has
+   * `removal` (its rows may be tombstones), so `create` never takes the place of a tombstone
+   * written since. With `returnOld`, a failed condition asks for the item as stored
+   * (`ReturnValuesOnConditionCheckFailure: "ALL_OLD"`), carried as the failure's `current`, so
+   * the projection names the attribute that changed.
+   */
+  readonly projectionWrite?:
+    | {
+        readonly attributes: Readonly<Record<string, unknown>>
+        readonly condition?: RawCondition | undefined
+        readonly expectAbsent?: boolean | undefined
+        readonly returnOld?: boolean | undefined
+      }
+    | undefined
 }
 
 /**

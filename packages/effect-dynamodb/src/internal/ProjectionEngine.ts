@@ -52,6 +52,7 @@ import {
   Duration as Dur,
   type Duration,
   Effect,
+  Equal,
   Option,
   Random,
   Result,
@@ -64,6 +65,7 @@ import type { StreamEvent } from "../EventStore.js"
 import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
 import type * as Query from "../Query.js"
 import { type RekeyAmbiguity, resolveTtlAttributeName, type TableConfig } from "../Table.js"
+import { attributeValueEquals } from "./AttributeValueEquals.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
@@ -71,19 +73,31 @@ import { handlerOf, type RekeyMember, type RekeyTally } from "./Rekey.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
   addProjectionLayout,
+  andRaw,
+  asReadTerm,
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
+  freshRowToken,
+  hasProjectionTombstones,
   KEY_TEXT,
   layoutTag,
   marshalOrFail,
   OUTBOX_READ_MODEL,
   outboxMarkInUse,
+  type ProjectionLayout,
   type ProjectionRole,
+  projectionLayoutsOf,
   projectionTtlChecked,
   projectionTtlConflict,
+  type RawCondition,
   OUTBOX_ROW_PK as ROW_PK,
   OUTBOX_ROW_SK as ROW_SK,
+  ROW_TOKEN,
+  rowTokened,
+  rowTokenInUse,
+  rowTokenTerm,
+  rowWriters,
   serializeSparseOrFail,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
@@ -145,6 +159,16 @@ export const outboxMarker = (entityType: string): string => `${entityType}#outbo
 
 /** Attribute names the engine owns on tombstones and outbox items. */
 export const REMOVED_AT = "__edd_removed__"
+
+/**
+ * The term a projection keeping no revision adds to a write over a tombstone it read: the row is
+ * still a tombstone (#237).
+ */
+const tombstoneTerm: RawCondition = {
+  expression: "attribute_exists(#eddRm)",
+  names: { "#eddRm": REMOVED_AT },
+  values: {},
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -317,7 +341,11 @@ export interface RowResult {
 
 /** The engine's own lost-race signal. */
 class LostRace {
-  constructor(readonly key: unknown) {}
+  /** `attributes`: the attributes whose change failed the write's condition (#237). */
+  constructor(
+    readonly key: unknown,
+    readonly attributes: ReadonlyArray<string>,
+  ) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +385,45 @@ interface Row {
   readonly values: Record<string, unknown>
   readonly tombstone: boolean
   readonly createdAt: unknown
+  /** The item as read: another projection's bookkeeping as stored (#237). */
+  readonly item: Record<string, AttributeValue>
+  /**
+   * The row token as read (#237): `undefined` when the row holds none, or where the token's name
+   * isn't free on the read model's rows (`rowTokenInUse`), where an attribute of that name is the
+   * user's.
+   */
+  readonly token: AttributeValue | undefined
+}
+
+/**
+ * Two decoded values alike: primitives by `Object.is`, arrays and plain records entry by entry,
+ * anything else by `Equal.equals`.
+ */
+const sameValue = (a: unknown, b: unknown): boolean => {
+  if (Object.is(a, b)) return true
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return (
+      Array.isArray(a) &&
+      Array.isArray(b) &&
+      a.length === b.length &&
+      a.every((v, i) => sameValue(v, b[i]))
+    )
+  }
+  const plain = (v: object) => {
+    const proto = Object.getPrototypeOf(v)
+    return proto === Object.prototype || proto === null
+  }
+  if (plain(a) && plain(b)) {
+    const x = a as Record<string, unknown>
+    const y = b as Record<string, unknown>
+    const keys = Object.keys(x)
+    return (
+      keys.length === Object.keys(y).length &&
+      keys.every((k) => Object.hasOwn(y, k) && sameValue(x[k], y[k]))
+    )
+  }
+  return Equal.equals(a, b)
 }
 
 /** A table's service, as an entity or an outbox names it. */
@@ -1083,15 +1150,24 @@ export const makeEngine = (config: EngineConfig) => {
   // `removal`, for the checks of `[EDD-9133]`. Rows may be tombstones (#154) when one has
   // `removal`: the entity's `create` takes one's place, keeping the checkpoints of the projection
   // with `removal` that wrote it, with its revision one higher (`overTombstone`).
-  const ownLayout = {
+  const ownLayout: ProjectionLayout = {
     label: config.label,
     roles,
     removal: config.removal !== undefined,
     ttl: config.removal?.ttl !== undefined,
   }
   addProjectionLayout(readModel, ownLayout)
-  /** This projection's tag (`layoutTag`), in its outbox items' marks (`outboxMark`). */
+  /**
+   * This projection's tag (`layoutTag`), in its outbox items' marks (`outboxMark`) and in a row
+   * token.
+   */
   const ownTag = layoutTag(ownLayout)
+  /** This projection's roles, by stored name. */
+  const ownRoles = new Map<string, Set<ProjectionRole>>()
+  for (const [field, role] of roles) {
+    const name = dbName(field)
+    ownRoles.set(name, (ownRoles.get(name) ?? new Set()).add(role))
+  }
 
   // Every projection's outbox, kept on the read model, one entry per distinct layout, the one defined
   // last at the end: a second projection doesn't hide the first's, which stays callable, and one
@@ -1136,17 +1212,29 @@ export const makeEngine = (config: EngineConfig) => {
     Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => tc.name),
   )
 
+  /**
+   * Whether the read model's rows may carry the row token (`rowTokenInUse`, #237): decided from
+   * the definitions and the table's TTL attribute, never from a stored row.
+   */
+  const tokenInUse = Effect.suspend(() =>
+    Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) =>
+      rowTokenInUse(readModel, resolveTtlAttributeName(tc)),
+    ),
+  )
+
   /** The row, read strongly consistent — raw, so a tombstone reads as one. */
   const readRow = (key: unknown): Effect.Effect<Option.Option<Row>, any, any> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
+      const inUse = yield* tokenInUse
       const { Item: item } = yield* client.getItem({
         TableName,
         Key: toAttributeMap(composePrimaryKey(readModel as any, key as Record<string, unknown>)),
         ConsistentRead: true,
       })
       if (item === undefined) return Option.none<Row>()
+      const token = inUse && Object.hasOwn(item, ROW_TOKEN) ? item[ROW_TOKEN] : undefined
       if (item.__edd_e__?.S === tombstoneMarker(entityType)) {
         const raw = fromAttributeMap(item) as Record<string, unknown>
         const values: Record<string, unknown> = {}
@@ -1154,7 +1242,7 @@ export const makeEngine = (config: EngineConfig) => {
           const v = raw[dbName(f)]
           if (v !== undefined) values[f] = v
         }
-        return Option.some<Row>({ values, tombstone: true, createdAt: undefined })
+        return Option.some<Row>({ values, tombstone: true, createdAt: undefined, item, token })
       }
       const decoded = (yield* decodeMarshalledItem(readModel as any, item)) as Record<
         string,
@@ -1169,6 +1257,8 @@ export const makeEngine = (config: EngineConfig) => {
         values: readModel._attachPrototype?.(values) ?? values,
         tombstone: false,
         createdAt: createdAtField === null ? undefined : decoded[createdAtField],
+        item,
+        token,
       })
     })
 
@@ -1467,6 +1557,76 @@ export const makeEngine = (config: EngineConfig) => {
       }),
     )
 
+  /** The guard's attribute, as a lost race has named it since 1.39.0: the field, by its name. */
+  const guardLabel = config.revision?.field ?? (config.checkpoints as { field: string }).field
+
+  /**
+   * The item as stored when the row's write failed its condition, from a write that asked for it
+   * (`ReturnValuesOnConditionCheckFailure: "ALL_OLD"`): none when the row is gone.
+   */
+  const storedOf = (error: unknown, transaction: boolean): Option.Option<unknown> => {
+    const cause = (error as { readonly cause?: any })?.cause
+    return Option.fromNullishOr(
+      transaction ? cause?.CancellationReasons?.[0]?.Item : (cause as { Item?: unknown })?.Item,
+    )
+  }
+
+  /**
+   * The attributes whose change failed a write's condition (#237): the guard (the revision or
+   * checkpoint read, named by its field), the row token read, that the row is still the tombstone
+   * read. Told apart
+   * from `current`, the item as stored when it failed (none: the row is gone); without it (a
+   * write that didn't ask, sending what 1.40.0 did), every part that could have failed.
+   */
+  const changedOf = (
+    guardRaw: RawCondition,
+    token: AttributeValue | undefined,
+    tokenTerm: RawCondition | undefined,
+    held: ReadonlyArray<readonly [field: string, stored: string]>,
+    readItem: Record<string, AttributeValue> | undefined,
+    overRead: RawCondition | undefined,
+    current: Option.Option<unknown> | undefined,
+  ): ReadonlyArray<string> => {
+    const name = guardRaw.names["#g"]!
+    const parts: Array<
+      readonly [string, (item: Record<string, AttributeValue> | undefined) => boolean]
+    > = [
+      [
+        guardLabel,
+        (item) =>
+          guardRaw.values[":g"] === undefined
+            ? item?.[name] === undefined
+            : item?.[name] !== undefined &&
+              attributeValueEquals(item[name], guardRaw.values[":g"]!),
+      ],
+    ]
+    if (tokenTerm !== undefined) {
+      parts.push([
+        ROW_TOKEN,
+        (item) =>
+          token === undefined
+            ? item?.[ROW_TOKEN] === undefined
+            : item?.[ROW_TOKEN] !== undefined && attributeValueEquals(item[ROW_TOKEN], token),
+      ])
+    }
+    for (const [field, stored] of held) {
+      const was =
+        readItem !== undefined && Object.hasOwn(readItem, stored) ? readItem[stored] : undefined
+      parts.push([
+        field,
+        (item) =>
+          was === undefined
+            ? item?.[stored] === undefined
+            : item?.[stored] !== undefined && attributeValueEquals(item[stored], was),
+      ])
+    }
+    if (overRead !== undefined) parts.push([REMOVED_AT, (item) => item?.[REMOVED_AT] !== undefined])
+    if (current === undefined) return parts.map(([part]) => part)
+    const item = Option.getOrUndefined(current) as Record<string, AttributeValue> | undefined
+    const changed = parts.filter(([, holds]) => !holds(item)).map(([part]) => part)
+    return changed.length > 0 ? changed : parts.map(([part]) => part)
+  }
+
   /** A lost race, from a single write's failure: the row's Put cancelled. */
   const lostRaceOf = (error: unknown): boolean =>
     isAwsConditionalCheckFailed((error as { readonly cause?: unknown })?.cause)
@@ -1507,6 +1667,51 @@ export const makeEngine = (config: EngineConfig) => {
     }
   }
 
+  /**
+   * The projections a row token records after a write storing `written` (domain fields) over a
+   * row whose token was `read` (#237): this one, each other that had written it and whose
+   * bookkeeping the write still holds, and those this program doesn't define, kept as they are. A
+   * write that drops a projection's bookkeeping (a rebuild, a write that drops another's data)
+   * drops its tag, so the token describes the row as it is.
+   */
+  const writersAfter = (
+    read: AttributeValue | undefined,
+    written: Record<string, unknown>,
+  ): ReadonlyArray<string> => {
+    const known = new Map<string, ProjectionLayout>()
+    for (const layout of projectionLayoutsOf(readModel) ?? []) known.set(layoutTag(layout), layout)
+    const out = [ownTag]
+    for (const tag of rowWriters(read)) {
+      if (tag === ownTag) continue
+      const layout = known.get(tag)
+      if (layout === undefined || layout.roles.some(([field]) => written[field] !== undefined)) {
+        out.push(tag)
+      }
+    }
+    return out
+  }
+
+  /**
+   * Every projection's bookkeeping attribute on the read model (each field and its stored name,
+   * once), but the one `guardRaw` already names: what proves a row read without a row token is
+   * as read (`asReadTerm`, #237).
+   */
+  const heldBookkeeping = (
+    guardRaw: RawCondition,
+  ): ReadonlyArray<readonly [field: string, stored: string]> => {
+    const seen = new Set<string>([guardRaw.names["#g"]!])
+    const out: Array<readonly [string, string]> = []
+    for (const layout of projectionLayoutsOf(readModel) ?? []) {
+      for (const [field] of layout.roles) {
+        const stored = dbName(field)
+        if (seen.has(stored)) continue
+        seen.add(stored)
+        out.push([field, stored])
+      }
+    }
+    return out
+  }
+
   /** The row (or tombstone) and any outbox items, written as one conditional unit. */
   const writeRow = (
     key: unknown,
@@ -1515,12 +1720,70 @@ export const makeEngine = (config: EngineConfig) => {
     row: Option.Option<Row>,
     enqueued: ReadonlyArray<Enqueued>,
     revision: number | undefined,
+    carried: Record<string, unknown> = {},
   ): Effect.Effect<Option.Option<unknown>, any, any> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
       const rowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
       const condition = guard(row)
+      // On a read model whose rows carry the row token (#237), or on a row that holds one (a
+      // program defining only this projection writes it too, so it never replaces another's write
+      // landed since its read), a fresh one recording the projections whose bookkeeping the row
+      // holds after this write (`writersAfter`), and the term naming the one read. Where the
+      // token's name is taken (`rowTokenInUse`), none: the write sends what 1.40.0 did.
+      const read = Option.isSome(row) ? row.value.token : undefined
+      const tokened = (yield* tokenInUse) && (rowTokened(readModel) || read !== undefined)
+      const token = tokened
+        ? yield* freshRowToken(
+            writersAfter(read, Option.isSome(target) ? target.value : { ...kept, ...carried }),
+          )
+        : undefined
+      // A row read without a token, where rows carry one, was last written by a process still on
+      // 1.40.0 (which writes none) or before the token: the term names every projection's
+      // bookkeeping as read too (`asReadTerm`), which each of their writes changes, so this write
+      // never replaces one landed since its read, whichever library made it (#237).
+      const held: ReadonlyArray<readonly [string, string]> =
+        tokened && read === undefined && Option.isSome(row) ? heldBookkeeping(condition.raw) : []
+      const tokenTerm = !tokened
+        ? undefined
+        : Option.isSome(row)
+          ? asReadTerm(
+              readModel,
+              row.value.item,
+              held.map(([, stored]) => stored),
+              true,
+            )
+          : rowTokenTerm(undefined)
+      // A row read without a token, a tombstone, names it: `create` over it keeps the checkpoints,
+      // which alone would let this write replace the row the `create` wrote (#237). With one
+      // projection keeping a revision, `create` changes it, and the write sends what 1.40.0 did.
+      const overRead =
+        Option.isSome(row) &&
+        row.value.tombstone &&
+        read === undefined &&
+        (tokened || config.revision === undefined)
+          ? tombstoneTerm
+          : undefined
+      const term = andRaw(tokenTerm, overRead)
+      // A write naming the row token asks for the item as stored when its condition fails
+      // (`returnOld`), so the failure names what changed; a write without one sends what 1.40.0
+      // did (#237).
+      const returnOld = tokenTerm !== undefined
+      const failed = (current: Option.Option<unknown> | undefined) =>
+        changedOf(
+          condition.raw,
+          read,
+          tokenTerm,
+          held,
+          Option.isSome(row) ? row.value.item : undefined,
+          overRead,
+          current,
+        )
+      // A write for a row read absent, on a read model whose rows may be tombstones, proves the
+      // key still holds nothing, as the transaction's put does: `create` never takes the place
+      // of a tombstone written since, which 1.39.0 and 1.40.0 replaced, the removal lost (#237).
+      const absent = Option.isNone(row) && hasProjectionTombstones(readModel)
       const createdAt = Option.isSome(row) ? row.value.createdAt : undefined
       // A tombstone or outbox item holds no values, so its key alone says which text it is for
       // `rekey` (`KEY_TEXT`): one under the text of `escapeKeys: true`, where that isn't off's, is
@@ -1548,6 +1811,10 @@ export const makeEngine = (config: EngineConfig) => {
         // A sparse-map key is refused as the row's own write refuses it. The check flattens a
         // copy: what's stored is the tombstone as 1.39.0 stored it, an empty map whole.
         yield* serializeSparseOrFail(readModel, { ...tomb }, `${config.label}.write`)
+        // The other projections' bookkeeping, stored as the tombstone stores its own (natively,
+        // a map whole), where `readRow` reads it.
+        for (const [f, v] of Object.entries(carried)) tomb[dbName(f)] = v
+        if (token !== undefined) tomb[ROW_TOKEN] = token
         rowItem = yield* marshalOrFail(entityType, `${config.label}.write`, () =>
           toAttributeMap(tomb),
         )
@@ -1558,6 +1825,7 @@ export const makeEngine = (config: EngineConfig) => {
           `${config.label}.write`,
           { createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined },
         )
+        if (token !== undefined) built.item[ROW_TOKEN] = token
         rowItem = toAttributeMap(built.item)
       }
 
@@ -1572,32 +1840,56 @@ export const makeEngine = (config: EngineConfig) => {
                 readModel.put(value),
                 condition.input as never,
               ) as unknown as EntityPutImpl<any, any, any, any>)
+        // With a row token the entity writes it, and adds the token's term (without one, the
+        // tombstone's); a `create` for a row read absent never takes a tombstone's place.
         const run =
-          condition.input === undefined
+          condition.input === undefined && token === undefined && overRead === undefined && !absent
             ? (op.asEffect() as Effect.Effect<unknown, any, any>)
             : (op as EntityPutImpl<any, any, any, any>)._builder("model", {
                 condition: (op as EntityPutImpl<any, any, any, any>)._condition,
                 withVectors: (op as EntityPutImpl<any, any, any, any>)._withVectors,
                 putKind: (op as EntityPutImpl<any, any, any, any>)._putKind,
                 createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined,
+                ...((token !== undefined || overRead !== undefined || absent) && {
+                  projectionWrite: {
+                    attributes: token === undefined ? {} : { [ROW_TOKEN]: token },
+                    condition: Option.isSome(row) ? term : undefined,
+                    expectAbsent: Option.isNone(row),
+                    returnOld: returnOld && Option.isSome(row),
+                  },
+                }),
               })
         const written = yield* (run as Effect.Effect<unknown, any, any>).pipe(
-          Effect.catchTag("ConditionalCheckFailed", () => Effect.fail(new LostRace(key))),
+          Effect.catchTag("ConditionalCheckFailed", (error: { readonly current?: unknown }) =>
+            Effect.fail(
+              new LostRace(
+                key,
+                // A `create` for a row read absent: the condition is that it still is.
+                Option.isNone(row)
+                  ? [guardLabel]
+                  : failed(error.current as Option.Option<unknown> | undefined),
+              ),
+            ),
+          ),
         )
         return Option.some(written)
       }
 
       const lostRace = (error: unknown) =>
-        Effect.fail(lostRaceOf(error) ? new LostRace(key) : error)
+        Effect.fail(
+          lostRaceOf(error)
+            ? new LostRace(key, failed(returnOld ? storedOf(error, false) : undefined))
+            : error,
+        )
+      const raw = andRaw(condition.raw, term)!
       const rowPut = {
         Put: {
           TableName,
           Item: rowItem,
-          ConditionExpression: condition.raw.expression,
-          ExpressionAttributeNames: condition.raw.names,
-          ...(Object.keys(condition.raw.values).length > 0
-            ? { ExpressionAttributeValues: condition.raw.values }
-            : {}),
+          ConditionExpression: raw.expression,
+          ExpressionAttributeNames: raw.names,
+          ...(Object.keys(raw.values).length > 0 ? { ExpressionAttributeValues: raw.values } : {}),
+          ...(returnOld && { ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const }),
         },
       } satisfies TransactWriteItem
       if (enqueued.length === 0) {
@@ -1643,9 +1935,13 @@ export const makeEngine = (config: EngineConfig) => {
         const cause = (sent.failure as { readonly cause?: unknown })?.cause
         if (!isAwsTransactionCancelled(cause)) return yield* Effect.fail(sent.failure)
         const reasons = cause.CancellationReasons ?? []
-        const failed = (i: number) => reasons[i]?.Code === "ConditionalCheckFailed"
-        if (failed(0)) return yield* Effect.fail(new LostRace(key))
-        const held = items.flatMap((_, i) => (failed(i + 1) && stageOf(i) !== "none" ? [i] : []))
+        const cancelled = (i: number) => reasons[i]?.Code === "ConditionalCheckFailed"
+        if (cancelled(0)) {
+          return yield* Effect.fail(
+            new LostRace(key, failed(returnOld ? storedOf(sent.failure, true) : undefined)),
+          )
+        }
+        const held = items.flatMap((_, i) => (cancelled(i + 1) && stageOf(i) !== "none" ? [i] : []))
         if (held.length === 0) return yield* Effect.fail(sent.failure)
         const again = held.find((i) => stageOf(i) === "beside")
         if (again !== undefined) {
@@ -1744,9 +2040,7 @@ export const makeEngine = (config: EngineConfig) => {
           ? new ConcurrentModification({
               entityType,
               key: error.key as Record<string, unknown>,
-              attributes: [
-                config.revision?.field ?? (config.checkpoints as { field: string }).field,
-              ],
+              attributes: error.attributes,
               current: Option.none(),
             })
           : error,
@@ -1819,6 +2113,13 @@ export const makeEngine = (config: EngineConfig) => {
     const fromScratch = options?.fromScratch === true
     const attempt = Effect.gen(function* () {
       const row = yield* readRow(key)
+      // An attribute this projection keeps that another, which has written the row, keeps in
+      // another role, present on the row, would be read in the wrong one (`[EDD-9144]`). A
+      // rebuild reads none of its old values from the row, so it misreads nothing.
+      const misread = fromScratch ? undefined : sharedMeaning(row)
+      if (misread !== undefined) {
+        return yield* new ValidationError({ entityType, operation: config.label, cause: misread })
+      }
       type Plan = {
         readonly work: InstanceWork
         readonly slot: Slot
@@ -2093,8 +2394,17 @@ export const makeEngine = (config: EngineConfig) => {
         config.revision === undefined ? undefined : (target[config.revision.field] as number)
       let written: Option.Option<unknown>
       if (Option.isNone(state)) {
-        // A tombstone keeps exactly the layout's fields.
-        written = yield* writeRow(key, Option.none(), pick(target), row, enqueued, nextRevision)
+        // A tombstone keeps the layout's fields, and the bookkeeping of the other projections that
+        // have written the row (`carriedOf`), so they still recognise what they applied.
+        written = yield* writeRow(
+          key,
+          Option.none(),
+          pick(target),
+          row,
+          enqueued,
+          nextRevision,
+          carriedOf(row),
+        )
       } else {
         const mapped =
           config.toItem === undefined
@@ -2105,7 +2415,36 @@ export const makeEngine = (config: EngineConfig) => {
                 )),
                 ...pick(target),
               }
-        written = yield* writeRow(key, Option.some(mapped), {}, row, enqueued, nextRevision)
+        // The bookkeeping of the other projections that have written the row (`carriedOf`), each
+        // value as the entity stores it on a row. Over a tombstone it replaces what `initial` gave
+        // it. Over a live row a change to it is refused (`[EDD-9144]`), and it fills what the write
+        // left out only when the write, with it, stores every attribute the row holds under the
+        // name the row holds it by (`keepsData`): one that drops one drops the others'
+        // checkpoints with it, as 1.40.0 did, so they fold their streams again and put their data
+        // back. A rebuild over a live row carries none: it drops the other projections'
+        // contributions to the state, so they lose their checkpoints too and apply again.
+        let item: Record<string, unknown> = mapped
+        if (Option.isSome(row) && row.value.tombstone) {
+          item = { ...mapped, ...onRow(carriedOf(row)) }
+        } else if (Option.isSome(row) && !fromScratch) {
+          const changed = sharedMeaning(row, mapped)
+          if (changed !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: config.label,
+              cause: changed,
+            })
+          }
+          const carried = onRow(carriedOf(row))
+          if (Object.keys(carried).length > 0) {
+            const candidate: Record<string, unknown> = { ...mapped }
+            for (const [field, value] of Object.entries(carried)) {
+              if (candidate[field] === undefined) candidate[field] = value
+            }
+            if (yield* keepsData(row.value, candidate)) item = candidate
+          }
+        }
+        written = yield* writeRow(key, Option.some(item), {}, row, enqueued, nextRevision)
       }
       const versions = new Map(
         advanced.map((a) => [`${a.source}\u0000${a.streamIdStr}`, a.version]),
@@ -2126,6 +2465,160 @@ export const makeEngine = (config: EngineConfig) => {
     })
     return Effect.andThen(preflight("apply"), withRetry(attempt))
   }
+
+  /**
+   * The bookkeeping of the read model's other projections that have written `row`, as its row
+   * token records them (`rowWriters`, #237), each value present on the row as it reads it: a live
+   * row's decoded, a tombstone's as stored (a tombstone keeps every value natively). None for a
+   * row without a token (written before, or by a program that defines only this projection) or of
+   * a projection this program doesn't define: its names can't be told from another's data. A
+   * writer whose attributes the row no longer holds has nothing here.
+   */
+  const writtenBy = (
+    row: Option.Option<Row>,
+  ): ReadonlyArray<{
+    readonly layout: ProjectionLayout
+    readonly field: string
+    readonly role: ProjectionRole
+    readonly stored: string
+    readonly value: unknown
+  }> => {
+    if (Option.isNone(row)) return []
+    const writers = new Set(rowWriters(row.value.token))
+    writers.delete(ownTag)
+    if (writers.size === 0) return []
+    const values = row.value.tombstone
+      ? (fromAttributeMap(row.value.item) as Record<string, unknown>)
+      : row.value.values
+    const out: Array<{
+      readonly layout: ProjectionLayout
+      readonly field: string
+      readonly role: ProjectionRole
+      readonly stored: string
+      readonly value: unknown
+    }> = []
+    for (const layout of projectionLayoutsOf(readModel) ?? []) {
+      if (!writers.has(layoutTag(layout))) continue
+      for (const [field, role] of layout.roles) {
+        const stored = dbName(field)
+        const at = row.value.tombstone ? stored : field
+        const value = Object.hasOwn(values, at) ? values[at] : undefined
+        if (value !== undefined) out.push({ layout, field, role, stored, value })
+      }
+    }
+    return out
+  }
+
+  /**
+   * `[EDD-9144]` (#237): an attribute holding two meanings on `row`. Another projection that has
+   * written the row (`writtenBy`) keeps it as bookkeeping, and it's on the row, and this
+   * projection keeps it in another role, so each would read the other's value as its own; or,
+   * given `item` (what a write over the live row stores), this write gives it another value than
+   * the row holds without keeping it in that role. The problem, or `undefined`. On rows only one
+   * of them writes nothing is refused: projections writing disjoint rows may give one name
+   * different meanings.
+   */
+  const sharedMeaning = (
+    row: Option.Option<Row>,
+    item?: Record<string, unknown>,
+  ): string | undefined => {
+    for (const { layout, field, role, stored, value: held } of writtenBy(row)) {
+      const mine = ownRoles.get(stored)
+      if (mine?.has(role)) continue
+      if (mine !== undefined) {
+        return (
+          `[EDD-9144] ${config.label}: on read model "${entityType}", "${field}" is ` +
+          `${layout.label}'s ${role} on a row ${layout.label} has written, and this ` +
+          `projection's ${[...mine].join(" and ")}. An attribute holds one meaning on a row two ` +
+          "projections write: give each meaning its own field."
+        )
+      }
+      if (item === undefined || Option.isNone(row) || row.value.tombstone) continue
+      const value = item[field]
+      if (value === undefined || sameValue(value, held)) continue
+      return (
+        `[EDD-9144] ${config.label}: on read model "${entityType}", this write changes ` +
+        `"${field}", which is ${layout.label}'s ${role}, on a row ${layout.label} has written. ` +
+        "An attribute holds one meaning on a row two projections write: give each meaning its " +
+        "own field."
+      )
+    }
+    return undefined
+  }
+
+  /**
+   * The bookkeeping a write over `row` carries for the other projections that have written it
+   * (`writtenBy`), by field: each attribute once, none this projection keeps, each value as the
+   * row reads it. The one function every site carries through: a tombstone stores it as it stores
+   * its own (`writeRow`), natively; a row as the entity stores any value of the field (`onRow`),
+   * renamed, packed or as sparse entries; and each reads back what it wrote.
+   */
+  const carriedOf = (row: Option.Option<Row>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    const seen = new Set<string>()
+    for (const { field, stored, value } of writtenBy(row)) {
+      if (ownRoles.has(stored) || seen.has(stored)) continue
+      seen.add(stored)
+      out[field] = value
+    }
+    return out
+  }
+
+  /**
+   * Carried bookkeeping as a row can hold it: a sparse map without the entries whose keys sparse
+   * storage can't hold (a 1.39.0 tombstone's map holding a key with `#`), which are left off.
+   */
+  const onRow = (carried: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    const holds = (name: string, value: unknown) => {
+      try {
+        readModel._serializeSparseFields({ [name]: value })
+        return true
+      } catch {
+        return false
+      }
+    }
+    for (const [field, value] of Object.entries(carried)) {
+      const name = dbName(field)
+      if (holds(name, value)) {
+        out[field] = value
+        continue
+      }
+      if (typeof value !== "object" || value === null) continue
+      const entries: Record<string, unknown> = {}
+      for (const [entry, v] of Object.entries(value)) {
+        if (holds(name, { [entry]: v })) entries[entry] = v
+      }
+      out[field] = entries
+    }
+    return out
+  }
+
+  /**
+   * Whether a write over the live `row` storing `item` keeps every attribute the row holds (#237),
+   * judged on two stored things alone: the row's attribute map as read, and the attribute map the
+   * write's request carries (`validateAndBuildPutItem`, the transaction's own: encoded, renamed, as
+   * sparse entries, packed, then marshalled). Every attribute of the row but its row token must be
+   * there under the same name; its value, and its type, may change. No definition says which
+   * attributes are data: a field another program renames, stores in a sparse map under another
+   * prefix, or doesn't define, is an attribute the write drops. `item` carries the other
+   * projections' bookkeeping (`carriedOf`), so theirs counts as kept only where it lands under the
+   * name the row holds it by. A value that stores nothing drops its attributes, whatever drops it:
+   * an `Option.none()`, an emptied sparse map, an empty set (the marshaller stores none). An item
+   * the entity or the marshaller refuses keeps nothing: the write then fails as it would have. A
+   * projection's row write is always a whole `Put`: nothing is left in place or removed by name.
+   */
+  const keepsData = (row: Row, item: Record<string, unknown>): Effect.Effect<boolean, never, any> =>
+    Effect.gen(function* () {
+      const built = yield* Effect.option(
+        validateAndBuildPutItem(readModel as any, item, `${config.label}.write`),
+      )
+      if (Option.isNone(built)) return false
+      const written = built.value.marshalled
+      return Object.keys(row.item).every(
+        (name) => Object.hasOwn(written, name) || (name === ROW_TOKEN && row.token !== undefined),
+      )
+    })
 
   /** The fields the library owns, re-applied after `toItem`. */
   const pick = (target: Record<string, unknown>): Record<string, unknown> => {
@@ -2350,13 +2843,6 @@ export interface DrainResult<E> {
   readonly delivered: number
   /** The effect `deliver` failed on — it stays pending, at the head. */
   readonly undelivered: Option.Option<{ readonly meta: OutboxMeta; readonly error: E }>
-}
-
-/** A raw condition for a `Put` the engine writes itself. */
-interface RawCondition {
-  readonly expression: string
-  readonly names: Record<string, string>
-  readonly values: Record<string, AttributeValue>
 }
 
 /**
