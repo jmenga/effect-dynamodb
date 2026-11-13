@@ -23,6 +23,13 @@ jobs:
         image: amazon/dynamodb-local:latest
         ports:
           - 8000:8000
+      # A second instance for the escaped connected pass. Run against the instance
+      # the plain pass has filled, that pass is several times slower and its
+      # larger tests time out.
+      dynamodb-local-escaped:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8001:8000
     steps:
       - uses: actions/checkout@v6
         with:
@@ -92,7 +99,7 @@ jobs:
 
       - name: Integration tests (connected, escapeKeys on)
         env:
-          DYNAMODB_ENDPOINT: http://localhost:8000
+          DYNAMODB_ENDPOINT: http://localhost:8001
           AWS_REGION: us-east-1
           AWS_ACCESS_KEY_ID: dummy
           AWS_SECRET_ACCESS_KEY: dummy
