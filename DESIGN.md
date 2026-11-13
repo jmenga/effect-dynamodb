@@ -7260,6 +7260,16 @@ yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source:
   on redelivery gives at least once (duplicates on every reordering).
 - **`catchUp(streamId)`** brings the row of the stream's latest event to the head.
   **`rebuild(streamId)`** re-derives every row from version 1 and returns no events;
+  it never replays side effects, the outbox included (#237): single- or
+  multi-source, it writes the row with its checkpoints and revision and no outbox
+  item, whatever the row's state (`applyRow`'s `fromScratch` enqueues nothing;
+  `effects` still runs in the fold, so the row is the one the live path derives),
+  so the row goes alone through `writeRow`'s write-alone path (the entity's
+  conditioned `put`, or `create` for a row read absent; a tombstone, its `Put`).
+  Pending items are untouched. Events a row behind its stream hadn't applied go
+  without their effects (`catchUp` first, where they matter). Another
+  projection of the read model whose checkpoint a rebuild drops with its data
+  folds its stream again and enqueues those effects again, as on 1.40.0;
   live delivery for the instance must be paused while it runs (a row already at the
   head keeps its checkpoint, so a concurrent applier's condition still holds). Neither
   reads the stream's snapshot, because it is decider state.

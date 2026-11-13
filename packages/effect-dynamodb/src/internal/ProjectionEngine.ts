@@ -2345,7 +2345,12 @@ export const makeEngine = (config: EngineConfig) => {
       }
       // Every instance failed: the row fails, with the first failure.
       if (active.length === 0 && failed.length > 0) return yield* Effect.fail(failed[0]!.error)
-      const { state, removed, enqueued, results } = folded
+      const { state, removed, results } = folded
+      // A rebuild enqueues nothing (#237): it re-derives the row, and never replays side effects.
+      // `effects` still runs in its fold, so the row comes out as the fold that applied the events
+      // made it; what it returns is not written. Without effects the row is written alone, as any
+      // write that enqueues nothing is (`writeRow`).
+      const enqueued = fromScratch ? [] : folded.enqueued
 
       const instances = (version: (i: number) => number): Array<InstanceResult> =>
         active.map((plan, i) => ({
