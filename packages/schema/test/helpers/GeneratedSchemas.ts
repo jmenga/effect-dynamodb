@@ -20,9 +20,9 @@ export const generator = (seed: number) => {
 
 export type Built = { readonly schema: Schema.Top; readonly label: string }
 export type Random = () => number
-type Child = () => Built
+export type Child = () => Built
 
-const S = Schema.String
+export const S = Schema.String
 
 export const LEAVES: ReadonlyArray<Built> = [
   { schema: S, label: "string" },
@@ -45,7 +45,7 @@ export const range = (random: Random, low: number, high: number): ReadonlyArray<
   Array.from({ length: low + Math.floor(random() * (high - low + 1)) }, (_, i) => i)
 
 /** A struct's property: as it is, optional, an optional key, or a key with a decoding default. */
-const property = (child: Child, random: Random): Built => {
+export const property = (child: Child, random: Random): Built => {
   const built = child()
   const roll = random()
   if (roll < 0.2) return { schema: Schema.optional(built.schema), label: `${built.label}?` }
@@ -63,7 +63,7 @@ const property = (child: Child, random: Random): Built => {
   return built
 }
 
-const fieldsOf = (child: Child, random: Random, low: number, high: number) => {
+export const fieldsOf = (child: Child, random: Random, low: number, high: number) => {
   const built = range(random, low, high).map((i) => [`p${i}`, property(child, random)] as const)
   return {
     fields: Object.fromEntries(built.map(([name, field]) => [name, field.schema])),
@@ -71,7 +71,7 @@ const fieldsOf = (child: Child, random: Random, low: number, high: number) => {
   }
 }
 
-const tupleOf = (child: Child, random: Random, optional: boolean) => {
+export const tupleOf = (child: Child, random: Random, optional: boolean) => {
   const required = range(random, 0, 2).map(() => child())
   const optionals = optional ? range(random, 0, 2).map(() => child()) : []
   return {
@@ -87,7 +87,10 @@ const tupleOf = (child: Child, random: Random, optional: boolean) => {
 
 let classes = 0
 
-export const WRAPPERS: ReadonlyArray<(child: Child, random: Random) => Built> = [
+/** A wrapper: a schema nesting the ones `child` builds. */
+export type Wrapper = (child: Child, random: Random) => Built
+
+export const WRAPPERS: ReadonlyArray<Wrapper> = [
   // A struct.
   (child, random) => {
     const { fields, label } = fieldsOf(child, random, 1, 3)
@@ -241,12 +244,21 @@ export const WRAPPERS: ReadonlyArray<(child: Child, random: Random) => Built> = 
   },
 ]
 
-export const build = (random: Random, depth: number): Built => {
-  if (depth === 0 || random() < 0.15) return pick(random, LEAVES)
-  const wrapper = pick(random, WRAPPERS)
+/** What {@link build} picks from: the leaves, and the wrappers nesting what it builds. */
+export type Kinds = {
+  readonly leaves: ReadonlyArray<Built>
+  readonly wrappers: ReadonlyArray<Wrapper>
+}
+
+/** The leaves and wrappers both property tests build from. */
+export const KINDS: Kinds = { leaves: LEAVES, wrappers: WRAPPERS }
+
+export const build = (random: Random, depth: number, kinds: Kinds = KINDS): Built => {
+  if (depth === 0 || random() < 0.15) return pick(random, kinds.leaves)
+  const wrapper = pick(random, kinds.wrappers)
   const built: Array<Built> = []
   const child = () => {
-    const inner = build(random, depth - 1)
+    const inner = build(random, depth - 1, kinds)
     built.push(inner)
     return inner
   }
@@ -254,7 +266,7 @@ export const build = (random: Random, depth: number): Built => {
     return wrapper(child, random)
   } catch {
     // A wrapper Effect refuses for this child (a check on a suspension): the child as it is.
-    return built[0] ?? pick(random, LEAVES)
+    return built[0] ?? pick(random, kinds.leaves)
   }
 }
 

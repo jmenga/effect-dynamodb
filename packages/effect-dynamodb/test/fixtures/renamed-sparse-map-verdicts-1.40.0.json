@@ -1,0 +1,1212 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Entities Plain and Versioned (versioned: true) over { id, note?: string, counts: Record<string, number> }, counts configured { storedAs: SparseMap(), field: 'sr' }, on DynamoSchema.make({ name: 'sr', version: 1 }). Each case starts from a row put { id: 'a', counts: { a: 1 } } created (the map whole, as sr) and sends one update writing an entry (set({ counts: { b: 2 } })), with a condition the row meets or doesn't, or an expectedVersion that is or isn't the stored one. Recorded: its outcome (a result, or a failure's tag and the first line of its message), every request it sent, whole and in order, every row of the table after it, and what get read back. The table's name is replaced by <table>, UUIDs by <token> and timestamps by <time>. Never regenerate it: it is the record of what 1.40.0 did.",
+ "cases": {
+  "Plain, a row put created: set({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: set({ counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#e0": "note",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       }
+      },
+      "ConditionExpression": "(attribute_not_exists(#e0)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: set({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#e0": "note",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       }
+      },
+      "ConditionExpression": "(attribute_exists(#e0)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: set({ counts: { b: 2 } }) condition counts.entry('a') = 1, which holds": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#e0": "counts#a",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":e1": {
+        "N": "1"
+       }
+      },
+      "ConditionExpression": "(#e0 = :e1) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: set({ counts: { b: 2 } }) condition counts.entry('a') = 9, which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#e0": "counts#a",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":e1": {
+        "N": "9"
+       }
+      },
+      "ConditionExpression": "(#e0 = :e1) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: set({ counts: { b: 2 } }) condition between(counts.entry('a'), 0, 2) or exists(t.note), which holds": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#e0": "counts#a",
+       "#e3": "note",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":e1": {
+        "N": "0"
+       },
+       ":e2": {
+        "N": "2"
+       }
+      },
+      "ConditionExpression": "((#e0 BETWEEN :e1 AND :e2) OR (attribute_exists(#e3))) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       }
+      },
+      "ConditionExpression": "(attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#e0": "note",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       }
+      },
+      "ConditionExpression": "(attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND (attribute_not_exists(#e0)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#e0": "note",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       }
+      },
+      "ConditionExpression": "(attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND (attribute_exists(#e0)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) condition counts.entry('a') = 1, which holds": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#e0": "counts#a",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       },
+       ":e1": {
+        "N": "1"
+       }
+      },
+      "ConditionExpression": "(attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND (#e0 = :e1) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) condition counts.entry('a') = 9, which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#e0": "counts#a",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       },
+       ":e1": {
+        "N": "9"
+       }
+      },
+      "ConditionExpression": "(attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND (#e0 = :e1) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) condition between(counts.entry('a'), 0, 2) or exists(t.note), which holds": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#e0": "counts#a",
+       "#e3": "note",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       },
+       ":e1": {
+        "N": "0"
+       },
+       ":e2": {
+        "N": "2"
+       }
+      },
+      "ConditionExpression": "(attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND ((#e0 BETWEEN :e1 AND :e2) OR (attribute_exists(#e3))) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) expectedVersion(1), the stored version": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#condVer": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       },
+       ":expectedVer": {
+        "N": "1"
+       }
+      },
+      "ConditionExpression": "#condVer = :expectedVer AND (attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) expectedVersion(5), a stale version": {
+   "outcome": {
+    "fail": "OptimisticLockError",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#condVer": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       },
+       ":expectedVer": {
+        "N": "5"
+       }
+      },
+      "ConditionExpression": "#condVer = :expectedVer AND (attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Versioned, a row put created: set({ counts: { b: 2 } }) expectedVersion(5) condition notExists(t.note)": {
+   "outcome": {
+    "fail": "OptimisticLockError",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#versioned#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#versioned"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc",
+      "ExpressionAttributeNames": {
+       "#u0": "counts#b",
+       "#u1": "version",
+       "#condVer": "version",
+       "#intVer": "version",
+       "#intInc": "__edd_i__",
+       "#e0": "note",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "N": "2"
+       },
+       ":vzero": {
+        "N": "0"
+       },
+       ":vinc": {
+        "N": "1"
+       },
+       ":expectedVer": {
+        "N": "5"
+       }
+      },
+      "ConditionExpression": "#condVer = :expectedVer AND (attribute_exists(#intVer) OR attribute_not_exists(#intInc)) AND (attribute_not_exists(#e0)) AND attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Versioned"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#versioned#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#versioned"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  }
+ }
+}

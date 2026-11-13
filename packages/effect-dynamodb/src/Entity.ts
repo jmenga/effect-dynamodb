@@ -20,7 +20,6 @@ import {
   type ExtractIdentifier,
   type ExtractPackedFields,
   type ExtractUnremovableFields,
-  getSparseFields,
   isConfiguredModel,
   isRefField,
 } from "@effect-dynamodb/schema/DynamoModel.js"
@@ -82,6 +81,7 @@ import {
   pathIsRequired,
   readersAt,
   rowOmits,
+  storedBelowFields,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { CANT_SAY } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
@@ -131,6 +131,7 @@ import {
   BoundQueryImpl,
   entityNaming,
   type RawSortKeyCondition,
+  wholeRowsOf,
 } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import {
@@ -151,6 +152,7 @@ import {
   parseShorthand,
   parseSimpleShorthand,
   type StoredFormAt,
+  splitByForms,
   toExpr,
 } from "./internal/Expr.js"
 import {
@@ -161,6 +163,7 @@ import {
   type UnprovableRow,
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
+import { formGuard, formGuardName, rejectedBy } from "./internal/FormGuard.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import { encodeInput } from "./internal/InputForm.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
@@ -179,9 +182,12 @@ import {
 } from "./internal/Packed.js"
 import {
   compilePath,
-  createPathBuilder,
+  entryOfPath,
   type PathModel,
+  pathBuilderOf,
+  type StoredBelow,
   storedPath,
+  withEntry,
 } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
@@ -355,9 +361,11 @@ import {
   getSchemaFields,
   inferDefaultEncoding,
   makePathValueEncoder,
+  type PathSetValue,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveUniqueFields,
+  type UnionClause,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import type {
   AppendInputType,
@@ -647,6 +655,101 @@ class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
 export { countOperators }
 
 /**
+ * An update's clauses against the entries its `.clearMap()` removes, the one place that decides
+ * what any other write to a cleared map does (#238). `cleared`: the attributes the clear's read
+ * found of the map, which it removes; `inside`: the entries a renamed map's attribute held whole
+ * (`counts#a` for `sr.a`), which it removes with that attribute. The clear comes first, so an
+ * entry either held is gone when the rest of the update runs, and the request names no path twice:
+ *
+ * - a `SET` of its whole value replaces it (the clear doesn't remove it); one to
+ *   `if_not_exists(entry, v)` finds nothing, and is sent as `SET entry = v`;
+ * - an `ADD` to it starts from nothing, sent as that `SET` where the clear removes the attribute;
+ * - a `REMOVE` of it is the clear's own, and a `REMOVE` below it or a `DELETE` from it is left out:
+ *   nothing is left to remove;
+ * - anything else reads its value or writes below it (`.subtract()`, `.append()`, a `SET` or
+ *   `ADD` below it, a `DELETE` below it), and there's nothing left for it: the update is refused
+ *   (the reason returned), before anything is sent. 1.40.0 sent each, and DynamoDB refused it
+ *   (two paths overlapping, or an operand or a path naming nothing).
+ *
+ * An entry neither held, and a copy reading an entry into another (whose operand, like every
+ * operand in the request, reads the row as it was), are sent as they are. Updates the clause
+ * lists, `cleared`, and the names and values a clause left out no longer uses, in place.
+ */
+const clearedOverlap = (
+  cleared: Set<string>,
+  inside: ReadonlySet<string>,
+  names: globalThis.Record<string, string>,
+  values: globalThis.Record<string, AttributeValue>,
+  setClauses: Array<string>,
+  addClauses: Array<string>,
+  deleteClauses: Array<string>,
+  removeClauses: Array<string>,
+): string | undefined => {
+  if (cleared.size === 0) return undefined
+  const named = (token: string) =>
+    token.startsWith("#") && Object.hasOwn(names, token) ? names[token]! : token
+  const headOf = (path: string) => named(path.split(/[.[]/)[0]!)
+  const whole = (path: string) => !/[.[]/.test(path)
+  const held = (head: string) => cleared.has(head) || inside.has(head)
+  const mentions = (text: string, attribute: string) =>
+    (text.match(/#[A-Za-z0-9_]+/g) ?? []).some((token) => named(token) === attribute)
+  const refusal = (attribute: string) =>
+    `.clearMap() removes "${attribute}", which this update also reads or writes below ` +
+    `(.subtract(), .append(), a path operation): after the clear there's nothing there for it. ` +
+    `Write the entry's new value with .set(), or update without clearing. Nothing was written. ` +
+    `[EDD-9151]`
+  const replaced = new Set<string>()
+  const leftOut: Array<string> = []
+  for (const [i, clause] of setClauses.entries()) {
+    const at = clause.indexOf(" = ")
+    const path = clause.slice(0, at).trim()
+    const head = headOf(path)
+    if (!held(head)) continue
+    const value = clause.slice(at + 3).trim()
+    const found = value.startsWith(`if_not_exists(${path}, `) && value.endsWith(")")
+    const otherwise = found ? value.slice(`if_not_exists(${path}, `.length, -1).trim() : undefined
+    if (whole(path) && otherwise !== undefined && !mentions(otherwise, head)) {
+      setClauses[i] = `${path} = ${otherwise}`
+    } else if (!whole(path) || mentions(value, head)) {
+      return refusal(head)
+    }
+    replaced.add(head)
+  }
+  for (const [i, clause] of [...addClauses.entries()].reverse()) {
+    const [path, value] = clause.trim().split(/\s+/) as [string, string]
+    const head = headOf(path)
+    if (!held(head)) continue
+    if (!whole(path)) return refusal(head)
+    if (!cleared.has(head)) continue
+    addClauses.splice(i, 1)
+    setClauses.push(`${path} = ${value}`)
+    replaced.add(head)
+  }
+  for (const [i, clause] of [...deleteClauses.entries()].reverse()) {
+    const path = clause.trim().split(/\s+/)[0]!
+    const head = headOf(path)
+    if (!held(head)) continue
+    if (!whole(path)) return refusal(head)
+    leftOut.push(...deleteClauses.splice(i, 1))
+  }
+  for (const [i, path] of [...removeClauses.entries()].reverse()) {
+    const head = headOf(path.trim())
+    if (!held(head)) continue
+    if (whole(path.trim())) replaced.add(head)
+    else leftOut.push(...removeClauses.splice(i, 1))
+  }
+  for (const head of replaced) cleared.delete(head)
+  // DynamoDB refuses a name or a value no expression uses.
+  const kept = [...setClauses, ...addClauses, ...deleteClauses, ...removeClauses].join(" ")
+  for (const token of new Set(leftOut.join(" ").match(/[#:][A-Za-z0-9_]+/g) ?? [])) {
+    if (new RegExp(`${token}(?![A-Za-z0-9_])`).test(kept)) continue
+    if (token.startsWith("#")) delete names[token]
+    else delete values[token]
+  }
+  return undefined
+}
+
+/**
  * The top-level attributes an UpdateExpression writes (SET / REMOVE / ADD /
  * DELETE targets), resolved through its attribute names.
  */
@@ -859,6 +962,46 @@ export interface Entity<
    * is put in this form (`operandsAsStored`).
    */
   readonly _storedFormAt: StoredFormAt
+
+  /**
+   * @internal The fields stored as sparse maps, one attribute per entry: a `.select()` naming one
+   * reads whole rows, since no projection can name them (#238).
+   */
+  readonly _sparseFieldNames: ReadonlyArray<string>
+
+  /**
+   * @internal A stored row as every read sees it, as a copy: its sparse maps rebuilt, then each
+   * renamed field under its domain name (`toDomainView`).
+   */
+  readonly _toDomainView: (
+    raw: globalThis.Record<string, unknown>,
+  ) => globalThis.Record<string, unknown>
+
+  /**
+   * @internal The sparse map field a read takes a stored attribute for: an entry's attribute
+   * (`<prefix>#<key>`), or the attribute a `field:` rename stores a map under whole.
+   */
+  readonly _sparseMapOf: (attribute: string) => string | undefined
+
+  /** @internal The attribute entry `key` of sparse map `field` is stored under (`<prefix>#<key>`, #238). */
+  readonly _sparseEntryAttribute: (field: string, key: string) => string
+  /**
+   * @internal The attribute a `field:` rename stores sparse map `field` under whole, as `put`
+   * stores it, if it's renamed (#238): a read takes it in place of the entries when a row holds it.
+   */
+  readonly _sparseWholeAttribute: (field: string) => string | undefined
+
+  /**
+   * @internal A condition or filter (domain-named) whose conditions on an entry of a sparse map a
+   * `field:` rename stores whole ask the row where it holds the map (#238); any other as given.
+   */
+  readonly _entryForms: (expr: Expr) => Expr
+
+  /**
+   * @internal The segments below a path's first as they're stored, given the path as written: a
+   * property of a struct that renames its keys as it's stored, by its stored name (#238).
+   */
+  readonly _storedBelow: StoredBelow
 
   /** @internal Entity schema version baked into composed keys. */
   readonly _entityVersion: number
@@ -2166,6 +2309,7 @@ const compileCondition = (
   cond: Expr | ConditionInput | undefined,
   resolveDbNameFn: (name: string) => string,
   storedFormAt: StoredFormAt,
+  below?: StoredBelow,
 ):
   | {
       expression: string
@@ -2175,7 +2319,7 @@ const compileCondition = (
   | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond)
-  return compileExpr(operandsAsStored(expr, storedFormAt), resolveDbNameFn)
+  return compileExpr(operandsAsStored(expr, storedFormAt), resolveDbNameFn, below)
 }
 
 /** Name a get- or delete-shaped op for consumed-capacity reports (its builder carries it). */
@@ -2192,6 +2336,19 @@ const GUARDED_PUT_ATTEMPTS = 3
  * nothing asserted about it: read again, never reported (#133).
  */
 class DeletedConcurrently extends Data.TaggedError("DeletedConcurrently")<{}> {}
+
+/**
+ * @internal A write made from a read of the row was refused by its form guard alone: the row's
+ * renamed sparse map `field` changed form since the read (#238, `internal/FormGuard.ts`). Read
+ * again and written again; never reported — once attempts run out, the race is reported naming
+ * `field` ({@link formKeptMoving}).
+ */
+class FormMoved extends Data.TaggedError("FormMoved")<{
+  readonly field: string
+  /** The key, through `encodeKey`, as the error reporting the race names it. */
+  readonly key: globalThis.Record<string, unknown>
+  readonly stored: globalThis.Record<string, AttributeValue>
+}> {}
 
 /**
  * The `ConcurrentModification`s that report a sentinel release whose
@@ -2612,6 +2769,139 @@ const makeImpl = <
   } = data
   /** Which stored attributes are this entity's sparse map entries, as a row's reader takes them. */
   const sparseEntries = sparseReader(sparseFields)
+  /** The attributes `field:` renames store sparse maps under whole, by attribute. */
+  const sparseRenames = new Map(
+    Object.keys(sparseFields).flatMap((field) =>
+      Object.hasOwn(data.fieldRenames, field) ? [[data.fieldRenames[field]!, field] as const] : [],
+    ),
+  )
+  /** The sparse map a read takes a stored attribute for: an entry's, or one stored whole. */
+  const sparseMapOf = (attribute: string): string | undefined =>
+    sparseRenames.get(attribute) ?? sparseEntries.entryOf(attribute)?.field
+  /**
+   * The attribute a `field:` rename stores sparse map `field` under whole, or `undefined` for a map
+   * stored only as one attribute per entry (#238). A row holds such a map whole where `put` wrote
+   * it, and as entries where an update or a plain entity's `upsert` did; a read takes the whole map
+   * whenever the row holds it.
+   */
+  const renamedMapAttribute = (field: string): string | undefined =>
+    Object.hasOwn(sparseFields, field) && Object.hasOwn(data.fieldRenames, field)
+      ? data.fieldRenames[field]
+      : undefined
+  /**
+   * The entry of a sparse map a `field:` rename stores whole that a path names, with the segments
+   * below it (#238): one `.entry()` built, an entry's attribute (`counts#a`) where no model field is
+   * named so, or the map's field with a key below it (`t.counts.a`). The one place that says which
+   * paths such an entry is named by, for an update's writes and for conditions and filters.
+   */
+  const renamedEntryAt = (
+    segments: ReadonlyArray<string | number>,
+  ):
+    | {
+        readonly field: string
+        readonly key: string
+        readonly rest: ReadonlyArray<string | number>
+      }
+    | undefined => {
+    if (sparseRenames.size === 0) return undefined
+    const built = entryOfPath(segments)
+    const head = segments[0]
+    if (built !== undefined) {
+      return renamedMapAttribute(built.field) === undefined
+        ? undefined
+        : { field: built.field, key: built.key, rest: segments.slice(1) }
+    }
+    if (typeof head !== "string") return undefined
+    if (renamedMapAttribute(head) !== undefined) {
+      const key = segments[1]
+      return typeof key === "string" ? { field: head, key, rest: segments.slice(2) } : undefined
+    }
+    if (Object.hasOwn(modelFieldSchemas, head)) return undefined
+    const entry = sparseEntries.entryOf(head)
+    return entry === undefined || renamedMapAttribute(entry.field) === undefined
+      ? undefined
+      : { field: entry.field, key: entry.key, rest: segments.slice(1) }
+  }
+  /**
+   * The entry of a sparse map a path names by the entry's own attribute (#238): one `.entry()`
+   * built, or an entry's attribute (`counts#a`) where no model field is named so. A path through
+   * the map's field (`["counts", "a"]`) is a path of the model already. The one place such a path is
+   * told from a field's, for the names below the entry ({@link storedBelow}) and the schema a value
+   * written there is checked against ({@link modelPathOf}).
+   */
+  const sparseEntryNamedBy = (
+    segments: ReadonlyArray<string | number>,
+  ): { readonly field: string; readonly key: string } | undefined => {
+    const head = segments[0]
+    if (typeof head !== "string") return undefined
+    return entryOfPath(segments) ?? (isModelField(head) ? undefined : sparseEntries.entryOf(head))
+  }
+  /**
+   * A path as the model holds it (#238): below an entry a sparse map's attribute names, the map's
+   * field, the entry's key and the rest; any other path as it is. A value written into an entry is
+   * checked against the map's value schema there, as one written into a field is against the
+   * field's.
+   */
+  const modelPathOf = (
+    segments: ReadonlyArray<string | number>,
+  ): ReadonlyArray<string | number> => {
+    const entry = sparseEntryNamedBy(segments)
+    return entry === undefined ? segments : [entry.field, entry.key, ...segments.slice(1)]
+  }
+  /** The attribute entry `key` of sparse map `field` is stored under (`_sparseEntryAttribute`). */
+  const sparseEntryAttribute = (field: string, key: string): string =>
+    `${sparseFields[field]!.prefix}#${key}`
+  /**
+   * A condition or filter whose conditions on an entry of a sparse map a `field:` rename stores
+   * whole ask the row where it holds the map (#238): inside the map's attribute when the row holds
+   * it, as the entry's own attribute when it doesn't (`splitByForms`). Any other is returned as it
+   * is, so an entity without such a map sends what it always sent.
+   */
+  const entryForms = (expr: Expr): Expr =>
+    sparseRenames.size === 0
+      ? expr
+      : splitByForms(expr, (segments) => {
+          const entry = renamedEntryAt(segments)
+          if (entry === undefined) return undefined
+          const prefix = sparseFields[entry.field]!.prefix
+          return {
+            holder: [entry.field],
+            whole: [entry.field, entry.key, ...entry.rest],
+            entries: withEntry([`${prefix}#${entry.key}`, ...entry.rest], {
+              field: entry.field,
+              key: entry.key,
+            }),
+          }
+        })
+  /**
+   * Why an update or an upsert that wrote the entries of renamed sparse map `field` as their own
+   * attributes, without reading the row, was refused: the row holds the map whole, where `put`
+   * stores it, and a read takes that in their place (#238).
+   */
+  const renamedMapRefusal = (field: string, write: "update" | "upsert"): string => {
+    const attribute = renamedMapAttribute(field)!
+    return (
+      `Sparse map "${field}" is stored whole under "${attribute}" on this row, as put stores ` +
+      `it, and this ${write} writes its entries as attributes of their own without reading the ` +
+      `row: a read would take "${attribute}" in their place. Nothing was written. ` +
+      (write === "update"
+        ? `Send the update in a transaction (Transaction.transactWrite), which reads the row and ` +
+          `writes the entries inside "${attribute}", or put the item whole. [EDD-9150]`
+        : `Write the entries with an update in a transaction (Transaction.transactWrite), which ` +
+          `reads the row and writes them inside "${attribute}", or put the item whole. [EDD-9150]`)
+    )
+  }
+  /**
+   * {@link compileCondition}, its operands in the form the attribute holds (#242), asking an entry
+   * of a renamed sparse map where the row holds it.
+   */
+  const compileOwnCondition = (cond: Expr | ConditionInput | undefined) =>
+    compileCondition(
+      cond === undefined ? undefined : entryForms(operandsAsStored(toExpr(cond), storedFormAt)),
+      resolveDbName,
+      storedFormAt,
+      storedBelow,
+    )
   // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
   // record-based `append`, which bypass the update schema (#133).
   const pathValues = makePathValueEncoder(
@@ -2641,22 +2931,31 @@ const makeImpl = <
     ),
     // An operand DynamoDB can't store in its stored form is sent as given (`operand`).
     (encoded) => unstorableIn({ stored: encoded }) === undefined,
+    (schemas.modelSchema as unknown as { readonly fields: globalThis.Record<string, Schema.Top> })
+      .fields,
   )
   /**
    * Encode a path-addressed update value and check it against the write schema
-   * at its path — container checks included (#133). `undefined` issue = valid.
+   * at its path — container checks included (#133). `undefined` issue = valid. A
+   * value written into a sparse map's entry is checked against the map's value
+   * schema, by the path the model holds it at ({@link modelPathOf}, #238), where
+   * that schema checks it exactly, and written as given, as
+   * through 1.40.0, elsewhere in an entry or where a read takes it as given
+   * ({@link entryAsGiven}).
    */
   const encodePathValue = (
     segments: ReadonlyArray<string | number>,
     value: unknown,
     kind: "value" | "elements",
   ): { readonly encoded: unknown; readonly issue: unknown } => {
+    const path = modelPathOf(segments)
+    if (entryAsGiven(segments, value, kind)) return { encoded: value, issue: undefined }
     if (kind === "value") {
-      const encoded = pathValues.value(segments, value)
-      return { encoded, issue: pathValues.validate(segments, encoded) }
+      const encoded = pathValues.value(path, value)
+      return { encoded, issue: pathValues.validate(path, encoded) }
     }
-    const encoded = pathValues.elements(segments, value)
-    return { encoded, issue: pathValues.validateElements(segments, encoded) }
+    const encoded = pathValues.elements(path, value)
+    return { encoded, issue: pathValues.validateElements(path, encoded) }
   }
   /**
    * DynamoDB's refusal of an update expression (`#f - :v`, `list_append(#f, :v)`, `ADD`, `DELETE`)
@@ -2696,6 +2995,34 @@ const makeImpl = <
     return was === undefined || now === undefined || was === now
   }
 
+  /**
+   * A `pathSet` value as it's written ({@link PathSetValue}): by the schema at its path (an
+   * entry's, the map's value schema: {@link modelPathOf}), or, where that refuses it, by another
+   * member of a union on the way that takes it (#238), which {@link unionRefusal} judges with the
+   * update's other clauses.
+   */
+  const encodePathSet = (segments: ReadonlyArray<string | number>, value: unknown): PathSetValue =>
+    entryAsGiven(segments, value, "value")
+      ? { encoded: value, issue: undefined, otherWay: false, check: () => undefined }
+      : pathValues.pathSet(modelPathOf(segments), value)
+  /**
+   * Whether a value a path operation writes into a sparse map's entry, by a path the entry's
+   * attribute names, is written as given, as through 1.40.0 (#238): where the map's value schema
+   * doesn't check it exactly (`checks`: below an opaque class, or a list's elements where the list
+   * checks or transforms itself), or where a read takes it as given (`readsAsGiven`: a number on a
+   * field stored as text, which a read takes as earlier releases left it). Anywhere else it's
+   * checked and encoded as a value written into a field is, and refused where the schema refuses
+   * it. A path of the model is never written as given.
+   */
+  const entryAsGiven = (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "elements",
+  ): boolean => {
+    if (sparseEntryNamedBy(segments) === undefined) return false
+    const path = modelPathOf(segments)
+    return !pathValues.checks(path, kind) || pathValues.readsAsGiven(path, value, kind)
+  }
   /**
    * A `pathSet` or `pathSubtract` that names another attribute in place of a value: it has no
    * operand of its own. The other path operations always write their `value`, whatever else the
@@ -2830,7 +3157,8 @@ const makeImpl = <
       segments: ReadonlyArray<string | number>,
     ): { readonly field: string; readonly reason: string } | "free" | "refused" => {
       const first = segments[0]
-      if (typeof first !== "string") return "free"
+      // A sparse map's entry `.entry()` built names no field, whatever field its attribute spells.
+      if (typeof first !== "string" || entryOfPath(segments) !== undefined) return "free"
       const head: string = first
       const reason = derivedFrom(head)
       if (reason === undefined) return "free"
@@ -3002,6 +3330,22 @@ const makeImpl = <
 
   const modelFieldSchemas = data.modelFields as globalThis.Record<string, Schema.Top>
   const isModelField = (name: string): boolean => Object.hasOwn(modelFieldSchemas, name)
+  const modelBelow = storedBelowFields(modelFieldSchemas)
+  /**
+   * The segments below a path's first as they're stored (#238), given the path as written: each
+   * named through the model's schema below its field ({@link storedBelowFields}), so a property of
+   * a struct that renames its keys as it's stored is named as stored. Below a sparse map's entry
+   * (one `.entry()` built, or an entry's attribute no field is named as), through the map's own
+   * schema from the entry's key. The one place a path below its field is named, for an update's
+   * path operations, a condition, a filter and a projection alike; anything else as written.
+   */
+  const storedBelow: StoredBelow = (segments) => {
+    const rest = segments.slice(1)
+    if (rest.length === 0 || typeof segments[0] !== "string") return rest
+    const entry = sparseEntryNamedBy(segments)
+    if (entry !== undefined) return modelBelow([entry.field, entry.key, ...rest]).slice(1)
+    return modelBelow(segments)
+  }
   const modelFieldStoredIn = (attribute: string): string | undefined =>
     Object.keys(modelFieldSchemas).find((field) => resolveDbName(field) === attribute)
   const fieldOfAttribute = (attribute: string): string => modelFieldStoredIn(attribute) ?? attribute
@@ -3203,9 +3547,13 @@ const makeImpl = <
 
   /** An update naming, in any operation, a top-level attribute it can't address. */
   const refusedAttributeNames = (uState: UpdateState, ttlAttribute: string): string | undefined => {
+    // An entry `.entry()` built is addressed as an entry, never as a field it spells (#238).
     const heads = (
       ops: ReadonlyArray<{ readonly segments: ReadonlyArray<string | number> }> = [],
-    ) => ops.flatMap(({ segments }) => (typeof segments[0] === "string" ? [segments[0]] : []))
+    ) =>
+      ops.flatMap(({ segments }) =>
+        typeof segments[0] === "string" && entryOfPath(segments) === undefined ? [segments[0]] : [],
+      )
     const named: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
       [".remove()", uState.remove ?? []],
       [".add()", Object.keys(uState.add ?? {})],
@@ -3230,20 +3578,28 @@ const makeImpl = <
     // A sparse map's entries have an operation of their own to clear them. The other
     // path operations address an entry by its stored name, which is how a counter
     // entry is added to, so that name stays open to them.
-    const clearedEntries: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
-      [".remove()", uState.remove ?? []],
+    const clearedEntries: ReadonlyArray<
+      readonly [string, ReadonlyArray<ReadonlyArray<string | number>>]
+    > = [
+      [".remove()", (uState.remove ?? []).map((name) => [name])],
       [
         "pathRemove",
-        (uState.pathRemoves ?? []).flatMap((segments) =>
-          segments.length === 1 && typeof segments[0] === "string" ? [segments[0]] : [],
+        (uState.pathRemoves ?? []).filter(
+          (segments) => segments.length === 1 && typeof segments[0] === "string",
         ),
       ],
     ]
-    for (const [op, names] of clearedEntries) {
-      for (const name of names) {
-        // The attribute the operation removes decides: `.remove()` names a field, removed where
-        // it's stored, and a path's segment holding `#` is the attribute's own name.
-        const entry = sparseEntries.entryOf(op === ".remove()" ? resolveDbName(name) : name)
+    for (const [op, paths] of clearedEntries) {
+      for (const path of paths) {
+        const name = String(path[0])
+        // The attribute the operation removes decides: each names a field, removed where it's
+        // stored (`compilePath`), and an entry's attribute names no field, so it is its own. An
+        // entry `.entry()` built is that entry, whatever field its attribute spells (#238).
+        const built = entryOfPath(path)
+        const entry =
+          built !== undefined && Object.hasOwn(sparseFields, built.field)
+            ? built
+            : sparseEntries.entryOf(resolveDbName(name))
         if (entry === undefined) continue
         return (
           `${op} of "${name}": "${name}" is an entry of the sparse map "${entry.field}". ` +
@@ -3752,14 +4108,27 @@ const makeImpl = <
         // A copy writes another attribute's value: it holds no value of its own to read back.
         if (op === "pathSet of" && isCopy(operand)) continue
         const { segments, value } = operand
-        // An untyped position is looked through where the operand is marshalled (`unstorableOperand`).
-        if (!customFields.has(String(segments[0]))) continue
-        const { encoded } = encodePathValue(segments, value, kind)
+        // An untyped position is looked through where the operand is marshalled (`unstorableOperand`),
+        // and an entry of a sparse map is read back as the map's value schema reads it (#238).
+        const path = modelPathOf(segments)
+        if (!customFields.has(String(path[0])) || entryAsGiven(segments, value, kind)) continue
+        // A value its schema refuses is refused as an operand is (`refusedOperand`), naming what
+        // the schema refuses: not as a declaration's value no read takes.
+        if (op === "pathSet of") {
+          // Read back by the way the value is written by (#238).
+          const written = encodePathSet(segments, value)
+          if (written.issue !== undefined) continue
+          const issue = written.check(asRead(written.encoded))
+          if (issue !== undefined) return notReadBack(`${op} "${segments.join(".")}"`, issue)
+          continue
+        }
+        const { encoded, issue: refused } = encodePathValue(segments, value, kind)
+        if (refused !== undefined) continue
         const read = asRead(encoded)
         const issue =
           kind === "value"
-            ? pathValues.validate(segments, read)
-            : pathValues.validateElements(segments, read)
+            ? pathValues.validate(path, read)
+            : pathValues.validateElements(path, read)
         if (issue !== undefined) return notReadBack(`${op} "${segments.join(".")}"`, issue)
       }
     }
@@ -3855,7 +4224,9 @@ const makeImpl = <
         const value =
           kind === undefined
             ? operand.value
-            : encodePathValue(operand.segments, operand.value, kind).encoded
+            : op === "pathSet of"
+              ? encodePathSet(operand.segments, operand.value).encoded
+              : encodePathValue(operand.segments, operand.value, kind).encoded
         if (kind !== undefined) {
           const lost = lostOperand(op, operand.segments, value)
           if (lost !== undefined) return lost
@@ -4016,6 +4387,11 @@ const makeImpl = <
       if (read.issue !== undefined) return { operation: "update.append", issue: read.issue }
       append[field] = read.encoded
     }
+    // The first `pathSet` the schema at its path refuses and another member of a union on the way
+    // takes (#238): how 1.40.0 refused the update, which stands where the union can't take it.
+    let refusedBefore: RefusedOperand | undefined
+    // The `pathSet`s, by index, so taken.
+    const otherWays = new Set<number>()
     const each = (
       operation: string,
       ops:
@@ -4031,16 +4407,25 @@ const makeImpl = <
       copies = false,
     ): ReadonlyArray<unknown> | RefusedOperand => {
       const values: Array<unknown> = []
-      for (const op of ops ?? []) {
+      for (const [index, op] of (ops ?? []).entries()) {
         // A copy writes another attribute's value: there's nothing to encode.
         if (copies && isCopy(op)) {
           values.push(undefined)
           continue
         }
-        const { encoded, issue } = encodePathValue(op.segments, op.value, kind)
-        if (issue !== undefined) return { operation, issue }
-        const read = operandAsRead(op.segments, "path", kind, op.value, encoded)
-        if (read.issue !== undefined) return { operation, issue: read.issue }
+        const written: {
+          readonly encoded: unknown
+          readonly issue: unknown
+        } & Partial<PathSetValue> = copies
+          ? encodePathSet(op.segments, op.value)
+          : encodePathValue(op.segments, op.value, kind)
+        if (written.issue !== undefined) return refusedBefore ?? { operation, issue: written.issue }
+        if (written.otherWay === true) {
+          refusedBefore ??= { operation, issue: written.refusedBefore }
+          otherWays.add(index)
+        }
+        const read = operandAsRead(op.segments, "path", kind, op.value, written.encoded)
+        if (read.issue !== undefined) return refusedBefore ?? { operation, issue: read.issue }
         values.push(read.encoded)
       }
       return values
@@ -4072,6 +4457,8 @@ const makeImpl = <
         })
       }
     }
+    const refused = unionRefusal(uState, pathSets, otherWays, refusedBefore)
+    if (refused !== undefined) return refused
     const byField = (record: globalThis.Record<string, unknown> | undefined) => {
       const out: globalThis.Record<string, unknown> = Object.create(null)
       for (const [field, value] of Object.entries(record ?? {})) {
@@ -4109,8 +4496,10 @@ const makeImpl = <
     row: globalThis.Record<string, AttributeValue>,
     segments: ReadonlyArray<string | number>,
   ): boolean => {
-    const [head, ...below] = storedPath(segments, (name) =>
-      name.includes("#") ? name : resolveDbName(name),
+    const [head, ...below] = storedPath(
+      segments,
+      (name) => (name.includes("#") ? name : resolveDbName(name)),
+      storedBelow,
     )
     if (typeof head !== "string" || !Object.hasOwn(row, head)) return false
     let at: AttributeValue | undefined = row[head]
@@ -4150,14 +4539,217 @@ const makeImpl = <
   }
 
   /**
+   * A path write into a union's member, judged with every other clause of the update in the same
+   * field, or the same entry of a sparse map (#238), by one judgement (`reads`) for every path
+   * operation: a `pathSet` or a removal where the schema says what each member reads after it, and
+   * anything else — an increment, an append, a `pathIfNotExists`, a copy, a write of all of the
+   * field or the entry — as a clause the schema can't judge. An entry is judged by the path the
+   * model holds it at ({@link modelPathOf}), however the path names it, against the map's value
+   * schema: each entry is an attribute of its own, as each field is.
+   *
+   * Where a value is taken only by another member than the schema at its path (`refusedBefore`,
+   * which 1.40.0 refused), it's sent only where what the update leaves is read whatever the row
+   * held, at EVERY union the field's clauses pass, passed through or ended at, at any depth: every
+   * member reads it there, or the update writes every property of one member that does (a struct
+   * property set whole or every property of it written, in turn). A path write reads nothing of
+   * the row, and on a row holding another member 1.40.0's refusal kept it readable. Anywhere else
+   * it stays refused as 1.40.0 refused it.
+   *
+   * Beside values the first member takes, as 1.40.0 checked them, the update is sent as 1.40.0
+   * sent it unless no row can read what it leaves: one member at each union, the same for every
+   * clause under it, must read every clause, a clause the schema can't judge taken as read.
+   */
+  const unionRefusal = (
+    uState: UpdateState,
+    pathSets: ReadonlyArray<unknown>,
+    otherWays: ReadonlySet<number>,
+    refusedBefore: RefusedOperand | undefined,
+  ): RefusedOperand | undefined => {
+    const sets = uState.pathSets ?? []
+    /**
+     * Where a path writes, as the model holds it: its model path and the part of it judged as one
+     * (a field, or a sparse map's field and an entry's key).
+     */
+    const unitOf = (segments: ReadonlyArray<string | number>) => {
+      const path = modelPathOf(segments)
+      const head = path[0]
+      const depth = typeof head === "string" && Object.hasOwn(sparseFields, head) ? 2 : 1
+      return { path, root: path.slice(0, depth), key: JSON.stringify(path.slice(0, depth)) }
+    }
+    const judgedPath = (segments: ReadonlyArray<string | number>) => {
+      const { path, root } = unitOf(segments)
+      return path.length > root.length
+    }
+    const passes = (segments: ReadonlyArray<string | number>) =>
+      judgedPath(segments) && pathValues.passesUnion(modelPathOf(segments))
+    // A path through a union written by other names than its own: the names a member that renames
+    // its keys stores them under. 1.40.0 wrote the names given, beside what the row held, where no
+    // read took them; the write is one it never made, judged as a value only another member takes.
+    const renamed = (segments: ReadonlyArray<string | number>) =>
+      passes(segments) && storedBelow(segments).some((segment, i) => segment !== segments[i + 1])
+    const everyPath: ReadonlyArray<readonly [string, ReadonlyArray<string | number>]> = [
+      ...sets.map((op) => ["pathSet", op.segments] as const),
+      ...(uState.pathRemoves ?? []).map((segments) => ["pathRemove", segments] as const),
+      ...(
+        [
+          ["pathAdd", uState.pathAdds],
+          ["pathSubtract", uState.pathSubtracts],
+          ["pathAppend", uState.pathAppends],
+          ["pathPrepend", uState.pathPrepends],
+          ["pathIfNotExists", uState.pathIfNotExists],
+          ["pathDelete", uState.pathDeletes],
+        ] as const
+      ).flatMap(([name, ops]) => (ops ?? []).map((op) => [name, op.segments] as const)),
+    ]
+    // Each unit so written, by the first operation that does.
+    const renamedUnits = new Map<string, string>()
+    for (const [name, segments] of everyPath) {
+      const { key } = unitOf(segments)
+      if (renamed(segments) && !renamedUnits.has(key)) renamedUnits.set(key, name)
+    }
+    // Each unit judged, by its key: its root.
+    const units = new Map<string, ReadonlyArray<string | number>>()
+    for (const [, segments] of everyPath) {
+      const { key, root } = unitOf(segments)
+      if (renamedUnits.has(key)) units.set(key, root)
+    }
+    for (const op of sets) {
+      if (isCopy(op) || !passes(op.segments)) continue
+      const { key, root } = unitOf(op.segments)
+      units.set(key, root)
+    }
+    if (units.size === 0) return undefined
+    // Every record operation (a write of all of a field or an entry, an increment, …), by the part
+    // of the model it writes all of: a field, a sparse map's entry, or every entry of a map. A
+    // renamed map's attribute beside the entries a `.set()` of it names is those entries.
+    const recordRoots = clausesOf(uState).flatMap(
+      (clause): ReadonlyArray<ReadonlyArray<string>> => {
+        if (clause.record !== true) return []
+        const colon = clause.at.indexOf(":")
+        const kind = clause.at.slice(0, colon)
+        const name = clause.at.slice(colon + 1)
+        if (kind === "map") return [[name]]
+        if (kind === "field") return Object.hasOwn(sparseFields, name) ? [] : [[name]]
+        const entry = sparseEntries.entryOf(name)
+        return entry === undefined ? [[name]] : [[entry.field, entry.key]]
+      },
+    )
+    let refusal: RefusedOperand | undefined
+    for (const [unit, root] of units) {
+      const inUnit = (segments: ReadonlyArray<string | number>) => unitOf(segments).key === unit
+      const judged: Array<UnionClause> = []
+      let otherWay = false
+      for (const [index, op] of sets.entries()) {
+        if (!inUnit(op.segments)) continue
+        if (otherWays.has(index)) otherWay = true
+        const path = modelPathOf(op.segments)
+        judged.push(
+          isCopy(op) || !judgedPath(op.segments)
+            ? { _tag: "Other", segments: path }
+            : { _tag: "Value", segments: path, encoded: pathSets[index] },
+        )
+      }
+      for (const segments of uState.pathRemoves ?? []) {
+        if (!inUnit(segments)) continue
+        judged.push({
+          _tag: judgedPath(segments) ? "Removal" : "Other",
+          segments: modelPathOf(segments),
+        })
+      }
+      // Every other path operation in the unit, where it writes.
+      for (const ops of [
+        uState.pathAdds,
+        uState.pathSubtracts,
+        uState.pathAppends,
+        uState.pathPrepends,
+        uState.pathIfNotExists,
+        uState.pathDeletes,
+      ]) {
+        for (const { segments } of ops ?? []) {
+          if (!inUnit(segments)) continue
+          judged.push({
+            _tag: "Other",
+            segments: judgedPath(segments) ? modelPathOf(segments) : root,
+          })
+        }
+      }
+      for (const written of recordRoots) {
+        if (written.length <= root.length && written.every((segment, i) => segment === root[i])) {
+          judged.push({ _tag: "Other", segments: root })
+        }
+      }
+      const strict = otherWay || renamedUnits.has(unit)
+      if (pathValues.reads(judged, strict)) continue
+      // A value only another member takes, where what the update leaves isn't read whatever the
+      // row held: refused as 1.40.0 refused the update.
+      if (otherWay) return refusedBefore
+      const name =
+        root.length === 1 ? `"${root[0]}"` : `entry "${root[1]}" of the sparse map "${root[0]}"`
+      refusal ??= {
+        operation: `update.${renamedUnits.get(unit) ?? "pathSet"}`,
+        issue: strict
+          ? `the path operations on ${name} write into its union's members by the names they ` +
+            "store their keys under, and leave a value not every member reads: write every " +
+            `property of one member, or all of ${name}. Nothing was sent.`
+          : `the path operations on ${name} leave a value no member of its union reads: what ` +
+            "one of them needs a member to hold, another removes or refuses. Nothing was sent.",
+      }
+    }
+    return refusal
+  }
+
+  /**
    * A `pathRemove` of a field no row can be without, or of a property below a field
    * whose schema requires it. Primary-key composites, and paths below a field that
    * feeds a key or a sentinel, get their refusal from `normalizeDerivedPathOps`.
    */
   const refusedPathRemove = (uState: UpdateState, lacks: Lacks): string | undefined => {
-    for (const segments of uState.pathRemoves ?? []) {
+    const required = (segments: ReadonlyArray<string | number>) =>
+      `pathRemove on "${segments.map((s) => String(s)).join(".")}": the model requires it, so a ` +
+      "row without it could not be read. Make it optional in the model, or write a new value " +
+      "with .pathSet(). Nothing was sent."
+    // Read only where a removal is judged, so an update without one reads its payload as before.
+    let clauses: ReturnType<typeof clausesOf> | undefined
+    const clausesOnce = () => {
+      if (clauses === undefined) clauses = clausesOf(uState)
+      return clauses
+    }
+    // What the update's other clauses write or remove where the removal at `index` is: in the
+    // attribute it names, or in all of a sparse map whose entry that is (#238).
+    const besideOf = (index: number, at: string, map?: string) =>
+      clausesOnce().flatMap((clause) =>
+        clause.removal === index
+          ? []
+          : clause.at === at
+            ? [clause.path]
+            : map !== undefined && clause.at === `map:${map}`
+              ? [[]]
+              : [],
+      )
+    for (const [index, segments] of (uState.pathRemoves ?? []).entries()) {
       const head = segments[0]
-      if (typeof head !== "string" || !isModelField(head)) continue
+      if (typeof head !== "string") continue
+      const built = entryOfPath(segments)
+      if (built !== undefined || !isModelField(head)) {
+        // Below a sparse map's entry (`m#k`, then `x`), judged as a read rebuilds the map: the
+        // entry's key, then the rest, against the map's own schema (#238). One `.entry()` built
+        // is that entry, whatever field its attribute spells.
+        const entry = segments.length > 1 ? readEntryOf(head, built) : undefined
+        if (entry === undefined) continue
+        const beside = besideOf(index, clauseAt(segments), entry.field).map((path) => [
+          entry.key,
+          ...path,
+        ])
+        if (
+          pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...storedBelow(segments)], {
+            beside,
+            judgedBefore: false,
+          })
+        ) {
+          return required(segments)
+        }
+        continue
+      }
       if (segments.length === 1) {
         if (isPrimaryComposite(head)) continue
         const refused = clearRefusal("pathRemove", head, lacks)
@@ -4165,16 +4757,127 @@ const makeImpl = <
         continue
       }
       if (derivedFrom(head) !== undefined) continue
-      if (pathIsRequired(modelFieldSchemas[head]!, segments.slice(1))) {
-        const path = segments.map((s) => String(s)).join(".")
-        return (
-          `pathRemove on "${path}": the model requires it, so a row without it could not be ` +
-          "read. Make it optional in the model, or write a new value with .pathSet(). " +
-          "Nothing was sent."
-        )
+      // Judged by the names the request removes it by (#238).
+      const beside = besideOf(index, clauseAt(segments))
+      if (pathIsRequired(modelFieldSchemas[head]!, storedBelow(segments), { beside })) {
+        return required(segments)
       }
     }
     return undefined
+  }
+
+  /**
+   * Where a path operation writes or removes: `field:<name>` for a model field, by its domain
+   * name, or `attribute:<name>` for an attribute no field is named as (a sparse map's entry,
+   * `m#k`). An entry `.entry()` built is that entry's attribute, whatever field it spells.
+   */
+  const clauseAt = (segments: ReadonlyArray<string | number>): string => {
+    const built = entryOfPath(segments)
+    if (built !== undefined && Object.hasOwn(sparseFields, built.field)) {
+      return `attribute:${sparseFields[built.field]!.prefix}#${built.key}`
+    }
+    const head = String(segments[0])
+    return isModelField(head) ? `field:${head}` : `attribute:${head}`
+  }
+
+  /**
+   * Where a record operation (`.set()`, `.remove()`, `.add()`, …) of `name` writes or removes,
+   * all of it: a field ({@link clauseAt}), a ref's id the ref's field, each entry a sparse map's
+   * value names (and, for a map a `field:` rename stores whole, the field), or every entry of the
+   * map (`map:<name>`) where the value names none.
+   */
+  const recordClausesAt = (name: string, value: unknown): ReadonlyArray<string> => {
+    const ref = resolvedRefs.find((r) => r.idFieldName === name)
+    if (ref !== undefined) return [`field:${ref.fieldName}`]
+    if (Object.hasOwn(sparseFields, name)) {
+      if (value === null || typeof value !== "object") return [`map:${name}`]
+      const { prefix } = sparseFields[name]!
+      return [
+        ...Object.keys(value).map((key) => `attribute:${prefix}#${key}`),
+        ...(Object.hasOwn(data.fieldRenames, name) ? [`field:${name}`] : []),
+      ]
+    }
+    return [isModelField(name) ? `field:${name}` : `attribute:${name}`]
+  }
+
+  /**
+   * Every clause of an update: where it writes or removes ({@link clauseAt},
+   * {@link recordClausesAt}), and the path inside there (`[]` for all of it), by the names it's
+   * sent with ({@link storedBelow}). A `pathRemove` carries its index, so a removal's judgement
+   * leaves itself out, and a record operation's clause says it's one.
+   */
+  const clausesOf = (
+    uState: UpdateState,
+  ): ReadonlyArray<{
+    readonly at: string
+    readonly path: ReadonlyArray<string | number>
+    readonly removal?: number
+    readonly record?: true
+  }> => {
+    const out: Array<{
+      readonly at: string
+      readonly path: ReadonlyArray<string | number>
+      readonly removal?: number
+      readonly record?: true
+    }> = []
+    const record = (entries: ReadonlyArray<readonly [string, unknown]>) => {
+      for (const [name, value] of entries) {
+        for (const at of recordClausesAt(name, value)) out.push({ at, path: [], record: true })
+      }
+    }
+    const updates = uState.updates
+    if (updates !== null && typeof updates === "object") {
+      record(Object.entries(updates as globalThis.Record<string, unknown>))
+    }
+    record((uState.remove ?? []).map((name) => [name, undefined] as const))
+    record(Object.entries(uState.add ?? {}))
+    record(Object.entries(uState.subtract ?? {}))
+    record(Object.entries(uState.append ?? {}))
+    record(Object.entries(uState.deleteFromSet ?? {}))
+    for (const ops of [
+      uState.pathSets,
+      uState.pathAdds,
+      uState.pathSubtracts,
+      uState.pathAppends,
+      uState.pathPrepends,
+      uState.pathIfNotExists,
+      uState.pathDeletes,
+    ]) {
+      for (const { segments } of ops ?? []) {
+        out.push({ at: clauseAt(segments), path: storedBelow(segments) })
+      }
+    }
+    for (const [removal, segments] of (uState.pathRemoves ?? []).entries()) {
+      out.push({ at: clauseAt(segments), path: storedBelow(segments), removal })
+    }
+    for (const { field, keys } of uState.sparseRemoveEntries ?? []) {
+      const prefix = Object.hasOwn(sparseFields, field) ? sparseFields[field]!.prefix : field
+      for (const key of keys) {
+        out.push({ at: `attribute:${prefix}#${key}`, path: [], record: true })
+      }
+    }
+    for (const field of uState.sparseClearFields ?? []) {
+      out.push({ at: `map:${field}`, path: [], record: true })
+    }
+    return out
+  }
+
+  /**
+   * The sparse map entry a read takes a stored attribute as: one of a map stored under its own
+   * name. A map a `field:` rename stores whole (`put`) has its attribute read in place of its
+   * entries whenever a row holds it, so its entries may not be what a read sees.
+   */
+  const readEntryOf = (
+    attribute: string,
+    built?: { readonly field: string; readonly key: string },
+  ) => {
+    const entry =
+      built !== undefined
+        ? Object.hasOwn(sparseFields, built.field)
+          ? built
+          : undefined
+        : sparseEntries.entryOf(attribute)
+    return entry === undefined || Object.hasOwn(data.fieldRenames, entry.field) ? undefined : entry
   }
 
   /**
@@ -4518,7 +5221,8 @@ const makeImpl = <
     for (const [op, ops] of pathOps) {
       for (const { segments } of ops) {
         const head = segments[0]
-        if (typeof head === "string" && head in packedFields) return refuse(op, head)
+        if (typeof head !== "string" || entryOfPath(segments) !== undefined) continue
+        if (head in packedFields) return refuse(op, head)
       }
     }
     for (const { field } of uState.sparseRemoveEntries ?? []) {
@@ -5975,12 +6679,12 @@ const makeImpl = <
     for (const ops of pathOps) {
       for (const op of ops) {
         const root = op.segments[0]
-        if (typeof root === "string") touched.add(root)
+        if (typeof root === "string" && entryOfPath(op.segments) === undefined) touched.add(root)
       }
     }
     for (const segments of uState.pathRemoves ?? []) {
       const root = segments[0]
-      if (typeof root === "string") touched.add(root)
+      if (typeof root === "string" && entryOfPath(segments) === undefined) touched.add(root)
     }
     return touched
   }
@@ -6265,6 +6969,31 @@ const makeImpl = <
       })
     }
     return new ConditionalCheckFailed({ entityType, key })
+  }
+
+  /**
+   * A write made from a read whose renamed sparse map changed form before every attempt landed
+   * (#238): the race, reported as a lost race is, naming the map — `OptimisticLockError` (its
+   * version didn't move) or `ConcurrentModification` (its `current` filled by the caller).
+   */
+  const formKeptMoving = (moved: FormMoved): OptimisticLockError | ConcurrentModification => {
+    const key = moved.key
+    if (systemFields.version) {
+      const version = storedVersionOf(moved.stored) ?? 0
+      return new OptimisticLockError({
+        entityType,
+        key,
+        expectedVersion: version,
+        actualVersion: version,
+        attributes: [moved.field],
+      })
+    }
+    return new ConcurrentModification({
+      entityType,
+      key,
+      attributes: [moved.field],
+      current: Option.none(),
+    })
   }
 
   /** The domain field a stored attribute holds (`storedAs` renames reversed). */
@@ -8146,7 +8875,7 @@ const makeImpl = <
             opts.condition,
           )
           let userCondition = andRaw(
-            condition ? compileCondition(condition, resolveDbName, storedFormAt) : undefined,
+            condition ? compileOwnCondition(condition) : undefined,
             projected?.condition,
           )
 
@@ -8163,10 +8892,8 @@ const makeImpl = <
             const over = yield* overTombstone(self, client, tc, item)
             if (Option.isSome(over)) {
               userCondition = andRaw(
-                compileCondition(
+                compileOwnCondition(
                   withGuard(over.value.guard, opts.condition) as Expr | ConditionInput,
-                  resolveDbName,
-                  storedFormAt,
                 ),
                 over.value.term,
               )
@@ -8809,8 +9536,10 @@ const makeImpl = <
     prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
     mode: DecodeMode,
     /**
-     * The item as already read — consistently — by the caller (`upsert`).
-     * Used instead of reading it again: the write is guarded on it either way.
+     * The item as already read — consistently — by the caller (`upsert`, a transaction's plan).
+     * Used instead of reading it again: the write is guarded on it either way. An update that
+     * reads no row is handed it only to write a renamed sparse map's entries where it holds the
+     * map (#238).
      */
     preRead?: globalThis.Record<string, AttributeValue>,
   ) =>
@@ -8907,6 +9636,17 @@ const makeImpl = <
           ...uState.upsertOver?.fill,
           ...currentDomainItem,
         }
+        // Sparse-map clear: blow away the entire bucket Record, before anything
+        // the update writes into it, as the expression an update sends clears
+        // first (#238). The retain path always reads-then-writes the full item,
+        // so the version CAS already gives clearMap atomic semantics for free —
+        // no per-bucket GET dance needed here.
+        if (uState.sparseClearFields) {
+          for (const field of uState.sparseClearFields) {
+            if (!hasSparseFields || !(field in sparseFields)) continue
+            newItem[field] = {}
+          }
+        }
         // Apply user updates. For sparse fields, merge bucket-by-bucket
         // rather than whole-field replace — concurrent writers to disjoint
         // buckets must coexist (the version CAS protects against same-bucket
@@ -8941,23 +9681,20 @@ const makeImpl = <
             delete newItem[attr]
           }
         }
-        // Sparse-map removes: drop named entries from the in-memory Record.
+        // Sparse-map removes: drop named entries from a copy of the in-memory Record. The map a
+        // row holds whole (a `field:` rename's attribute) is the read row's own object, which the
+        // version snapshot is written from: removed in place, the snapshot lost the entries too.
         if (uState.sparseRemoveEntries) {
           for (const op of uState.sparseRemoveEntries) {
             if (!hasSparseFields || !(op.field in sparseFields)) continue
             const bucket = newItem[op.field] as globalThis.Record<string, unknown> | undefined
             if (!bucket) continue
-            for (const k of op.keys) delete bucket[k]
-          }
-        }
-        // Sparse-map clear: blow away the entire bucket Record. The retain
-        // path always reads-then-writes the full item, so the version CAS
-        // already gives clearMap atomic semantics for free — no per-bucket
-        // GET dance needed here.
-        if (uState.sparseClearFields) {
-          for (const field of uState.sparseClearFields) {
-            if (!hasSparseFields || !(field in sparseFields)) continue
-            newItem[field] = {}
+            const kept: globalThis.Record<string, unknown> = Object.assign(
+              Object.create(null),
+              bucket,
+            )
+            for (const k of op.keys) delete kept[k]
+            newItem[op.field] = kept
           }
         }
         // Where a record operation's attribute is in the row as read: an operation naming a
@@ -9409,7 +10146,7 @@ const makeImpl = <
             }
           }
         }
-        const uc = userCond ? compileCondition(userCond, resolveDbName, storedFormAt) : undefined
+        const uc = userCond ? compileOwnCondition(userCond) : undefined
         if (uc) {
           condParts.push(`(${uc.expression})`)
           Object.assign(writeNames, uc.names)
@@ -9868,6 +10605,7 @@ const makeImpl = <
       // it, or fail — without sending a write that needs the item: an op that
       // read its row missing writes nothing that requires it, which is what
       // `transactWrite`'s planner relies on.
+      let packedRead: globalThis.Record<string, AttributeValue> | undefined
       if (plainWrite && immutables.some((asserted) => asserted.packed)) {
         const stored = yield* readCurrent(tableName, marshalledKey)
         if (stored.Item === undefined) {
@@ -9885,6 +10623,139 @@ const makeImpl = <
         }
         const fallback = fallbackRefusal(operands.fallbacks, stored.Item, evExpected)
         if (fallback !== undefined) return yield* fallback
+        packedRead = stored.Item
+      }
+      // `.removeEntries()` and `.clearMap()` name sparse maps, and `.removeEntries()` the keys a
+      // read reads as their entries: refused before anything is read.
+      for (const op of uState.sparseRemoveEntries ?? []) {
+        if (!hasSparseFields || !(op.field in sparseFields)) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.removeEntries",
+            cause: `field "${op.field}" is not configured as a sparse map`,
+          })
+        }
+        const sparse = sparseFields[op.field]!
+        for (const k of op.keys) {
+          // An entry the reader reads under `k`: never `<prefix>#` itself.
+          if (
+            typeof k !== "string" ||
+            sparseEntries.entryOf(`${sparse.prefix}#${k}`)?.field !== op.field
+          ) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.removeEntries",
+              cause:
+                `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}: no stored ` +
+                "attribute is read as its entry under it",
+            })
+          }
+        }
+      }
+      for (const field of uState.sparseClearFields ?? []) {
+        if (!hasSparseFields || !(field in sparseFields)) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.clearMap",
+            cause: `field "${field}" is not configured as a sparse map`,
+          })
+        }
+      }
+      // Sparse-map .clearMap — Get-then-Update helper. Reads the current
+      // item with a consistent read to discover which `<prefix>#*` attrs
+      // exist, then folds the resulting REMOVEs into this same UpdateItem
+      // (below). On a versioned entity the update is conditioned on the version that
+      // read found (`casRead`), so a writer adding a bucket in between makes
+      // it fail rather than survive the clear; a stale `expectedVersion` is
+      // refused before anything is sent. Non-versioned entities are
+      // best-effort (a concurrent writer can add a new bucket between the read
+      // and the update — that bucket survives).
+      let clearRead: globalThis.Record<string, AttributeValue> | undefined
+      if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
+        // Read once for all clearMap fields combined.
+        const clearGetResult = yield* client.getItem({
+          TableName: tableName,
+          Key: marshalledKey,
+          ConsistentRead: true,
+        })
+        clearRead = clearGetResult.Item
+        if (clearGetResult.Item) {
+          if (systemFields.version && casRead === undefined && retainSnapshot === undefined) {
+            yield* checkVersion(clearGetResult.Item, "update")
+            const clearedRaw = fromAttributeMap(clearGetResult.Item) as globalThis.Record<
+              string,
+              unknown
+            >
+            const version = (clearedRaw[systemFields.version] as number | undefined) ?? 0
+            if (evExpected !== undefined && version !== evExpected) {
+              return yield* new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: evExpected,
+                actualVersion: version,
+              })
+            }
+            casRead = { raw: clearGetResult.Item, version }
+          }
+          const fallback = fallbackRefusal(operands.fallbacks, clearGetResult.Item)
+          if (fallback !== undefined) return yield* fallback
+        }
+        // If the item doesn't exist, clearMap is a no-op — and the
+        // subsequent UpdateItem's existence condition reports it.
+      }
+      // The row as this update holds it: read above (a retained or versioned read, a packed
+      // immutable's, `clearMap`'s), or handed to it (a transaction's plan). An entry of a sparse map
+      // a `field:` rename stores whole is written where that row holds the map (#238).
+      const held = preRead ?? retainSnapshot?.raw ?? casRead?.raw ?? packedRead ?? clearRead
+      /**
+       * Where this update writes the entries of sparse map `field` (#238): `undefined` for a map
+       * stored only as entries, written as they always were; for one a `field:` rename stores whole,
+       * `"whole"` (inside its attribute) when the row this update holds holds the attribute, else
+       * `"entries"` (each entry its own attribute). Each map written either way is guarded on the
+       * row holding it so ({@link formGuards}), so the entry lands only where a read takes it. A map
+       * this update clears is written as entries, unguarded: the clear removes what its read found
+       * of the map, the attribute it's stored whole under included, so the row ends holding the map
+       * as entries whatever it held.
+       */
+      const formGuards = new Map<string, "whole" | "entries">()
+      const formConditions: Array<string> = []
+      const entryForm = (field: string): "whole" | "entries" | undefined => {
+        const attribute = renamedMapAttribute(field)
+        if (attribute === undefined) return undefined
+        if (uState.sparseClearFields?.includes(field) === true) return "entries"
+        const form = held !== undefined && Object.hasOwn(held, attribute) ? "whole" : "entries"
+        formGuards.set(field, form)
+        return form
+      }
+      const mapCounter = { value: 0 }
+      /** The path of an entry held inside its map's attribute, with the segments below it. */
+      const wholeEntryPath = (field: string, key: string, rest: ReadonlyArray<string | number>) =>
+        compilePath([renamedMapAttribute(field)!, key, ...rest], names, "m", mapCounter)
+      /**
+       * Whether an operation writing a value into an entry of a renamed map writes it as 1.40.0
+       * wrote it, as the path names it, unguarded (#238): where no schema checks the value
+       * (`checks`: below an opaque class, say), so a row holding the map whole never gets a value
+       * inside it that no read may take, and the write lands, or DynamoDB refuses it, as through
+       * 1.40.0. A value a schema checks, and every other operation, goes where the row holds the
+       * map.
+       */
+      const asNamed = (
+        segments: ReadonlyArray<string | number>,
+        written: "value" | "elements" | undefined,
+      ): boolean => written !== undefined && !pathValues.checks(modelPathOf(segments), written)
+      /**
+       * The expression path of an attribute a record operation names (`.add({ "counts#a": 1 })`):
+       * inside its map's attribute for an entry of a renamed map the row holds whole, else
+       * `undefined` (the attribute, as before). `written`: the kind of value it writes there.
+       */
+      const recordEntryPath = (
+        attr: string,
+        written?: "value" | "elements",
+      ): string | undefined => {
+        const entry = renamedEntryAt([attr])
+        if (entry === undefined || asNamed([attr], written)) return undefined
+        if (entryForm(entry.field) !== "whole") return undefined
+        return wholeEntryPath(entry.field, entry.key, entry.rest)
       }
       // Build UpdateExpression
       const setClauses: Array<string> = []
@@ -9932,13 +10803,27 @@ const makeImpl = <
         if (hasSparseFields && attr in sparseFields) {
           if (typeof val !== "object") continue
           const sparse = sparseFields[attr]!
-          for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
+          const entries = Object.entries(val as globalThis.Record<string, unknown>)
+          const form = entries.length > 0 ? entryForm(attr) : undefined
+          for (const [k, v] of entries) {
             if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
               return yield* new ValidationError({
                 entityType,
                 operation: "update.sparse",
                 cause: `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
               })
+            }
+            if (form === "whole") {
+              const path = wholeEntryPath(attr, k, [])
+              if (hasNoStoredForm(v)) {
+                entryClears.push(path)
+                continue
+              }
+              const valKey = `:u${counter}`
+              values[valKey] = toAttributeValue(v)
+              setClauses.push(`${path} = ${valKey}`)
+              counter++
+              continue
             }
             const nameKey = `#u${counter}`
             names[nameKey] = `${sparse.prefix}#${k}`
@@ -10005,9 +10890,10 @@ const makeImpl = <
         for (const [attr, val] of Object.entries(uState.subtract)) {
           const nameKey = `#u${counter}`
           const valKey = `:u${counter}`
-          names[nameKey] = resolveDbName(attr)
+          const path = recordEntryPath(attr) ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(val)
-          setClauses.push(`${nameKey} = ${nameKey} - ${valKey}`)
+          setClauses.push(`${path} = ${path} - ${valKey}`)
           counter++
         }
       }
@@ -10017,9 +10903,10 @@ const makeImpl = <
         for (const attr of Object.keys(uState.append)) {
           const nameKey = `#u${counter}`
           const valKey = `:u${counter}`
-          names[nameKey] = resolveDbName(attr)
+          const path = recordEntryPath(attr, "elements") ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(operands.append[attr])
-          setClauses.push(`${nameKey} = list_append(${nameKey}, ${valKey})`)
+          setClauses.push(`${path} = list_append(${path}, ${valKey})`)
           counter++
         }
       }
@@ -10136,9 +11023,12 @@ const makeImpl = <
         for (const attr of Object.keys(uState.add)) {
           const nameKey = `#a${addClauses.length}`
           const valKey = `:a${addClauses.length}`
-          names[nameKey] = resolveDbName(attr)
+          // An entry held inside its map's attribute is added to there: DynamoDB's ADD takes a
+          // document path, and starts an absent entry from nothing, as it does an attribute.
+          const path = recordEntryPath(attr) ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(operands.add[attr])
-          addClauses.push(`${nameKey} ${valKey}`)
+          addClauses.push(`${path} ${valKey}`)
         }
       }
 
@@ -10147,21 +11037,81 @@ const makeImpl = <
         for (const attr of Object.keys(uState.deleteFromSet)) {
           const nameKey = `#d${deleteClauses.length}`
           const valKey = `:d${deleteClauses.length}`
-          names[nameKey] = resolveDbName(attr)
+          const path = recordEntryPath(attr) ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(operands.deleteFromSet[attr])
-          deleteClauses.push(`${nameKey} ${valKey}`)
+          deleteClauses.push(`${path} ${valKey}`)
         }
       }
 
       // Path-based operations (from typed callback API)
       const pathCounter = { value: 0 }
+      /**
+       * A path operation's path, compiled. An entry of a sparse map a `field:` rename stores whole
+       * is where the row this update holds holds the map ({@link entryForm}): inside its attribute,
+       * or as the entry's own (#238). Any other path as before.
+       */
+      const pathOf = (
+        segments: ReadonlyArray<string | number>,
+        prefix: string,
+        written?: "value" | "elements",
+      ): string => {
+        const entry = renamedEntryAt(segments)
+        if (entry === undefined || asNamed(segments, written)) {
+          return compilePath(segments, names, prefix, pathCounter, resolveDbName, storedBelow)
+        }
+        return entryPath(entry, entryForm(entry.field)!, prefix)
+      }
+      /** An entry's path in one stored form, with the segments below it named as stored. */
+      const entryPath = (
+        entry: {
+          readonly field: string
+          readonly key: string
+          readonly rest: ReadonlyArray<string | number>
+        },
+        form: "whole" | "entries",
+        prefix: string,
+      ): string => {
+        const rest = storedBelow([entry.field, entry.key, ...entry.rest]).slice(1)
+        return form === "whole"
+          ? compilePath(
+              [renamedMapAttribute(entry.field)!, entry.key, ...rest],
+              names,
+              prefix,
+              pathCounter,
+            )
+          : compilePath(
+              [`${sparseFields[entry.field]!.prefix}#${entry.key}`, ...rest],
+              names,
+              prefix,
+              pathCounter,
+            )
+      }
+      /**
+       * A copy's source (`pathSet` / `pathSubtract` with `isPath`). It writes nothing, so it carries
+       * no form guard (#238). An entry of a renamed map spelled through the map (`.entry("a")`, or
+       * `["counts", "a"]`) reads where a read takes it, inside the map's attribute or as the entry's
+       * own, when this update holds the row; without the row it's named as 1.40.0 named it, as is a
+       * source spelled as the entry's attribute (`["counts#a"]`), which names that attribute.
+       */
+      const sourceOf = (segments: ReadonlyArray<string | number>, prefix: string): string => {
+        const entry = renamedEntryAt(segments)
+        const throughMap =
+          entry !== undefined &&
+          (entryOfPath(segments) !== undefined || segments[0] === entry.field)
+        if (!throughMap || held === undefined) {
+          return compilePath(segments, names, prefix, pathCounter, resolveDbName, storedBelow)
+        }
+        const whole = Object.hasOwn(held, renamedMapAttribute(entry.field)!)
+        return entryPath(entry, whole ? "whole" : "entries", prefix)
+      }
 
       // Path SET operations
       if (uState.pathSets) {
         for (const [i, op] of uState.pathSets.entries()) {
-          const pathExpr = compilePath(op.segments, names, "ps", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "ps", isCopy(op) ? undefined : "value")
           if (op.isPath && op.valueSegments) {
-            const srcExpr = compilePath(op.valueSegments, names, "ps", pathCounter, resolveDbName)
+            const srcExpr = sourceOf(op.valueSegments, "ps")
             setClauses.push(`${pathExpr} = ${srcExpr}`)
           } else {
             const valKey = `:ps${pathCounter.value++}`
@@ -10174,9 +11124,9 @@ const makeImpl = <
       // Path SUBTRACT operations
       if (uState.pathSubtracts) {
         for (const op of uState.pathSubtracts) {
-          const pathExpr = compilePath(op.segments, names, "psb", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "psb")
           if (op.isPath && op.valueSegments) {
-            const srcExpr = compilePath(op.valueSegments, names, "psb", pathCounter, resolveDbName)
+            const srcExpr = sourceOf(op.valueSegments, "psb")
             setClauses.push(`${pathExpr} = ${pathExpr} - ${srcExpr}`)
           } else {
             const valKey = `:psb${pathCounter.value++}`
@@ -10189,7 +11139,7 @@ const makeImpl = <
       // Path APPEND operations
       if (uState.pathAppends) {
         for (const [i, op] of uState.pathAppends.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pa", "elements")
           const valKey = `:pa${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathAppends[i])
           setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
@@ -10199,7 +11149,7 @@ const makeImpl = <
       // Path PREPEND operations
       if (uState.pathPrepends) {
         for (const [i, op] of uState.pathPrepends.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pp", "elements")
           const valKey = `:pp${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathPrepends[i])
           setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
@@ -10209,7 +11159,7 @@ const makeImpl = <
       // Path if_not_exists operations
       if (uState.pathIfNotExists) {
         for (const [i, op] of uState.pathIfNotExists.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pi", "value")
           const valKey = `:pi${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathIfNotExists[i])
           setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
@@ -10219,7 +11169,7 @@ const makeImpl = <
       // Path REMOVE operations
       if (uState.pathRemoves) {
         for (const segments of uState.pathRemoves) {
-          const pathExpr = compilePath(segments, names, "pr", pathCounter, resolveDbName)
+          const pathExpr = pathOf(segments, "pr")
           removeClauses.push(pathExpr)
         }
       }
@@ -10227,7 +11177,7 @@ const makeImpl = <
       // Path ADD operations
       if (uState.pathAdds) {
         for (const [index, op] of uState.pathAdds.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pad", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pad")
           const valKey = `:pad${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathAdds[index])
           addClauses.push(`${pathExpr} ${valKey}`)
@@ -10237,106 +11187,83 @@ const makeImpl = <
       // Path DELETE operations
       if (uState.pathDeletes) {
         for (const [index, op] of uState.pathDeletes.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pd", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pd")
           const valKey = `:pd${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathDeletes[index])
           deleteClauses.push(`${pathExpr} ${valKey}`)
         }
       }
 
-      // Sparse-map .removeEntries — explicit REMOVE on `<prefix>#<key>`.
-      // Each key emits one REMOVE clause through ExpressionAttributeNames
-      // (the literal "#" survives via compilePath's raw-segment escape).
-      if (uState.sparseRemoveEntries) {
-        for (const op of uState.sparseRemoveEntries) {
-          if (!hasSparseFields || !(op.field in sparseFields)) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.removeEntries",
-              cause: `field "${op.field}" is not configured as a sparse map`,
-            })
+      // Sparse-map .removeEntries — explicit REMOVE on `<prefix>#<key>`, its
+      // map and keys refused above. Each key emits one REMOVE clause through
+      // ExpressionAttributeNames (the literal "#" survives via compilePath's
+      // raw-segment escape); an entry of a renamed map the row holds whole is
+      // removed from inside it (#238).
+      for (const op of uState.sparseRemoveEntries ?? []) {
+        const sparse = sparseFields[op.field]!
+        const form = op.keys.length > 0 ? entryForm(op.field) : undefined
+        for (const k of op.keys) {
+          if (form === "whole") {
+            removeClauses.push(wholeEntryPath(op.field, k, []))
+            continue
           }
-          const sparse = sparseFields[op.field]!
-          for (const k of op.keys) {
-            // An entry the reader reads under `k`: never `<prefix>#` itself.
-            if (
-              typeof k !== "string" ||
-              sparseEntries.entryOf(`${sparse.prefix}#${k}`)?.field !== op.field
-            ) {
-              return yield* new ValidationError({
-                entityType,
-                operation: "update.removeEntries",
-                cause:
-                  `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}: no stored ` +
-                  "attribute is read as its entry under it",
-              })
-            }
-            const nameKey = `#sr${removeClauses.length}`
-            names[nameKey] = `${sparse.prefix}#${k}`
-            removeClauses.push(nameKey)
-          }
+          const nameKey = `#sr${removeClauses.length}`
+          names[nameKey] = `${sparse.prefix}#${k}`
+          removeClauses.push(nameKey)
         }
       }
 
-      // Sparse-map .clearMap — Get-then-Update helper. Reads the current
-      // item with a consistent read to discover which `<prefix>#*` attrs
-      // exist, then folds the resulting REMOVEs into this same UpdateItem.
-      // On a versioned entity the update is conditioned on the version that
-      // read found (`casRead`), so a writer adding a bucket in between makes
-      // it fail rather than survive the clear; a stale `expectedVersion` is
-      // refused before anything is sent. Non-versioned entities are
-      // best-effort (a concurrent writer can add a new bucket between the read
-      // and the update — that bucket survives).
-      if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
-        for (const field of uState.sparseClearFields) {
-          if (!hasSparseFields || !(field in sparseFields)) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.clearMap",
-              cause: `field "${field}" is not configured as a sparse map`,
-            })
+      // Sparse-map .clearMap: REMOVE exactly the attributes the read above
+      // found the reader takes as the map's entries — and, for a map a
+      // `field:` rename stores whole, the attribute it holds it in (#238).
+      if (clearRead !== undefined) {
+        const cleared = new Set<string>()
+        // The entries a renamed map's attribute holds whole, which the clear removes with it.
+        const inside = new Set<string>()
+        for (const field of uState.sparseClearFields ?? []) {
+          for (const attrName of Object.keys(clearRead)) {
+            if (sparseMapOf(attrName) === field) cleared.add(attrName)
+          }
+          const attribute = renamedMapAttribute(field)
+          const map =
+            attribute !== undefined && Object.hasOwn(clearRead, attribute)
+              ? clearRead[attribute]!.M
+              : undefined
+          for (const key of Object.keys(map ?? {})) {
+            inside.add(`${sparseFields[field]!.prefix}#${key}`)
           }
         }
-        // Read once for all clearMap fields combined.
-        const clearGetResult = yield* client.getItem({
-          TableName: tableName,
-          Key: marshalledKey,
-          ConsistentRead: true,
-        })
-        if (clearGetResult.Item) {
-          if (systemFields.version && casRead === undefined && retainSnapshot === undefined) {
-            yield* checkVersion(clearGetResult.Item, "update")
-            const clearedRaw = fromAttributeMap(clearGetResult.Item) as globalThis.Record<
-              string,
-              unknown
-            >
-            const version = (clearedRaw[systemFields.version] as number | undefined) ?? 0
-            if (evExpected !== undefined && version !== evExpected) {
-              return yield* new OptimisticLockError({
-                entityType,
-                key: encodedKey,
-                expectedVersion: evExpected,
-                actualVersion: version,
-              })
-            }
-            casRead = { raw: clearGetResult.Item, version }
-          }
-          const fallback = fallbackRefusal(operands.fallbacks, clearGetResult.Item)
-          if (fallback !== undefined) return yield* fallback
-          const clearItemKeys = Object.keys(clearGetResult.Item)
-          for (const field of uState.sparseClearFields) {
-            // Exactly the attributes the reader takes as the map's entries.
-            for (const attrName of clearItemKeys) {
-              if (sparseEntries.entryOf(attrName)?.field === field) {
-                const nameKey = `#sc${removeClauses.length}`
-                names[nameKey] = attrName
-                removeClauses.push(nameKey)
-              }
-            }
-          }
+        // The clear comes first, and one request never names a path twice (#238).
+        const overlap = clearedOverlap(
+          cleared,
+          inside,
+          names,
+          values,
+          setClauses,
+          addClauses,
+          deleteClauses,
+          removeClauses,
+        )
+        if (overlap !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.clearMap",
+            cause: overlap,
+          })
         }
-        // If the item doesn't exist, clearMap is a no-op — and the
-        // subsequent UpdateItem's existence condition reports it.
+        for (const attrName of cleared) {
+          const nameKey = `#sc${removeClauses.length}`
+          names[nameKey] = attrName
+          removeClauses.push(nameKey)
+        }
+      }
+
+      // Each renamed map whose entries this update writes, guarded on the row holding it the way
+      // they were written (#238): a write made without reading the row is refused, and one made
+      // from a read is refused if the row changed form since.
+      for (const [i, [field, form]] of [...formGuards].entries()) {
+        names[formGuardName(i)] = renamedMapAttribute(field)!
+        formConditions.push(formGuard(i, form))
       }
 
       // A legacy retain item gets its incarnation token with this write.
@@ -10386,7 +11313,7 @@ const makeImpl = <
       // A plain write already requires the item (`attribute_exists(#exists)`
       // below), so `patch`'s own exists guard would only repeat it.
       const sentCond = plainWrite ? uState.condition : userCond
-      const uc = sentCond ? compileCondition(sentCond, resolveDbName, storedFormAt) : undefined
+      const uc = sentCond ? compileOwnCondition(sentCond) : undefined
       if (uc) {
         condParts.push(`(${uc.expression})`)
         Object.assign(names, uc.names)
@@ -10408,10 +11335,11 @@ const makeImpl = <
         const fallbackCounter = { value: 0 }
         for (const fallback of operands.fallbacks) {
           condParts.push(
-            `attribute_exists(${compilePath(fallback.segments, names, "fb", fallbackCounter, resolveDbName)})`,
+            `attribute_exists(${compilePath(fallback.segments, names, "fb", fallbackCounter, resolveDbName, storedBelow)})`,
           )
         }
       }
+      condParts.push(...formConditions)
       if (casRead !== undefined && systemFields.version) {
         condParts.push(versionIs(casRead.version, names, values, "#casVer", ":casVer"))
         const incarnation = incarnationGuard(casRead.raw, names, values)
@@ -10420,6 +11348,34 @@ const makeImpl = <
       // Sent as built: a condition over DynamoDB's expression limits is
       // DynamoDB's to reject, and is diagnosed naming the caller's part (#144).
       const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
+      /**
+       * A refusal of `expression` by its form guard (`internal/FormGuard.ts`), judged on the row it
+       * returned (#238). Written without reading the row, the map is stored whole there: `EDD-9150`
+       * where the rest of the condition is known to hold, else the rest's verdict, as before (a
+       * caller's condition the evaluator can't tell is answered as the caller's). Written from a
+       * read, the row changed form since: read again and written again ({@link FormMoved}), which
+       * lets DynamoDB judge a condition the evaluator can't. `undefined`: the rest of the condition
+       * refused it, answered as before.
+       */
+      const formRefusal = (
+        expression: string | undefined,
+        stored: Readonly<globalThis.Record<string, unknown>> | undefined,
+      ): ValidationError | FormMoved | undefined => {
+        const rejection = rejectedBy({ expression, names, values }, stored)
+        if (rejection._tag === "Rest" || (held === undefined && !rejection.known)) return undefined
+        const field = sparseRenames.get(rejection.attribute)!
+        return held === undefined
+          ? new ValidationError({
+              entityType,
+              operation: "update",
+              cause: renamedMapRefusal(field, "update"),
+            })
+          : new FormMoved({
+              field,
+              key: encodedKey as globalThis.Record<string, unknown>,
+              stored: stored as globalThis.Record<string, AttributeValue>,
+            })
+      }
 
       // The top-level attributes this update writes — what `updatedOld` /
       // `updatedNew` return.
@@ -10475,12 +11431,14 @@ const makeImpl = <
               | DynamoClientError
               | OptimisticLockError
               | ConditionalCheckFailed
-              | ValidationError => {
+              | ValidationError
+              | FormMoved => {
               // The update is guarded by the snapshot version AND any user
               // condition; the stored item (ALL_OLD) says which rejected it.
               const rejection = (
                 stored: Readonly<globalThis.Record<string, unknown>> | undefined,
               ) =>
+                formRefusal(guardParts.join(" AND "), stored) ??
                 conditionRejection(
                   encodedKey as globalThis.Record<string, unknown>,
                   stored,
@@ -10563,7 +11521,8 @@ const makeImpl = <
             | ConditionalCheckFailed
             | ItemNotFound
             | MissingForCreate
-            | ValidationError => {
+            | ValidationError
+            | FormMoved => {
             // The stored item (ALL_OLD) says what rejected the update: no
             // item (it must exist), a restated immutable value, the
             // version CAS, or the user's condition.
@@ -10594,6 +11553,11 @@ const makeImpl = <
                   )
                 : undefined
               if (fallback !== undefined) return fallback
+              // The form guard is answered only where the rest of the condition is known to hold
+              // on the row returned: the caller's condition and the version keep their own
+              // verdicts (#238).
+              const form = formRefusal(conditionExpression, stored)
+              if (form !== undefined) return form
               return conditionRejection(
                 encodedKey as globalThis.Record<string, unknown>,
                 stored,
@@ -10652,11 +11616,28 @@ const makeImpl = <
     requested: UpdateState,
     /** What {@link prepareUpdate} decided of `requested`, when the caller already ran it. */
     prepared?: Effect.Success<ReturnType<typeof prepareUpdate>>,
+    /** The row as the caller read it, consistently (a transaction's plan): see {@link runPreparedUpdate}. */
+    held?: globalThis.Record<string, AttributeValue>,
   ) => {
-    const run = () =>
+    const once = () =>
       prepared === undefined
-        ? runUpdate(key, mode, requested)
-        : runPreparedUpdate(key, prepared, mode)
+        ? runUpdate(key, mode, requested, held)
+        : runPreparedUpdate(key, prepared, mode, held)
+    // A form race (#238): the row's renamed sparse map changed form between the update's read and
+    // its write. Read again and written again, as a guarded put is; once every attempt raced, the
+    // race is reported naming the map. A row handed in (a transaction's plan) is never re-read here:
+    // its writes are recorded, not sent, so they're never refused.
+    const run = () =>
+      once().pipe(
+        Effect.retry({
+          times: held === undefined ? GUARDED_PUT_ATTEMPTS - 1 : 0,
+          while: (e) => e instanceof FormMoved,
+        }),
+        Effect.catchIf(
+          (e): e is FormMoved => e instanceof FormMoved,
+          (moved) => withCurrentItem(Effect.fail(formKeptMoving(moved)), () => moved.stored),
+        ),
+      )
     return run().pipe(
       Effect.catchIf(
         (e): e is MissingForCreate => e instanceof MissingForCreate,
@@ -10729,8 +11710,11 @@ const makeImpl = <
     operation: string,
     /** The key, through `encodeKey`. */
     encodedKey: globalThis.Record<string, unknown>,
-    /** The op itself — a factory, because a missing row means running it again. */
-    op: () => Effect.Effect<unknown, E, R>,
+    /**
+     * The op itself — a factory, because a missing row means running it again. Handed the row
+     * when this reads it for the op: see below.
+     */
+    op: (held?: globalThis.Record<string, AttributeValue>) => Effect.Effect<unknown, E, R>,
     request: {
       readonly payload: globalThis.Record<string, unknown>
       /** Values `.add()` / `.subtract()` change by, for the reported reservation. */
@@ -10750,8 +11734,10 @@ const makeImpl = <
     Effect.gen(function* () {
       const primaryKey = composePrimaryKey(encodedKey)
       const ownKey = toAttributeMap(primaryKey)
-      const plan = (rowMissing?: { readonly rowMissing: true }) =>
-        planWrite(operation, op(), ownKey, rowMissing)
+      const plan = (
+        rowMissing?: { readonly rowMissing: true },
+        held?: globalThis.Record<string, AttributeValue>,
+      ) => planWrite(operation, op(held), ownKey, rowMissing)
       const recorded = yield* plan()
       let { items, ownRow } = recorded
       // An op that wrote without reading its row relies on its write's own
@@ -10788,6 +11774,12 @@ const makeImpl = <
           }
           const refused = request.refuse?.(read.Item)
           if (refused !== undefined) return yield* refused
+          // An entry of a sparse map a `field:` rename stores whole is written, and a copy reads
+          // one spelled through its map, where the row holds the map, so the op is planned again
+          // holding the row: the op made no read, so this one sends nothing (#238).
+          if (sparseRenames.size > 0) {
+            ;({ items } = yield* plan(undefined, read.Item))
+          }
         }
       }
       const pkField = config.indexes.primary.pk.field
@@ -10876,13 +11868,16 @@ const makeImpl = <
       // Otherwise: every attribute the main item's condition names — the
       // op's own guard inputs are all among them, so if none changed the
       // guard held, and only the caller's condition can have rejected it.
+      // A renamed sparse map's form guard is judged first, by the function
+      // every write carrying it asks (`internal/FormGuard.ts`, #238); its
+      // attribute is no input of the rest.
       const mainItem = items[roles.findIndex((role) => role._tag === "main")]
       const guarded = mainItem?.Update ?? mainItem?.Put ?? mainItem?.Delete
       const conditionAttrs = [
         ...new Set(
           (guarded?.ConditionExpression?.match(/#[A-Za-z0-9_]+/g) ?? []).flatMap((token) => {
             const attr = guarded?.ExpressionAttributeNames?.[token]
-            return attr === undefined ? [] : [attr]
+            return attr === undefined || /^#fm\d+$/.test(token) ? [] : [attr]
           }),
         ),
       ]
@@ -10956,6 +11951,30 @@ const makeImpl = <
           }
           if (main === undefined) return sideFailed ? lostRace(undefined) : undefined
           if (main === "absent") return lostRace(undefined)
+          // Refused by the form guard: the row's map changed form since the plan's read. Planned
+          // again — which lets DynamoDB judge a caller's condition the evaluator can't — and
+          // reported naming the map once every attempt raced.
+          const form = rejectedBy(
+            {
+              expression: guarded?.ConditionExpression,
+              names: guarded?.ExpressionAttributeNames,
+              values: guarded?.ExpressionAttributeValues,
+            },
+            main,
+          )
+          if (form._tag === "Form") {
+            return {
+              _tag: "Retry",
+              stored: main,
+              error: formKeptMoving(
+                new FormMoved({
+                  field: sparseRenames.get(form.attribute)!,
+                  key: encodedKey,
+                  stored: main,
+                }),
+              ),
+            }
+          }
           if (raced(main) || !request.callerCondition) return lostRace(main)
           return { _tag: "Condition" }
         },
@@ -10971,7 +11990,7 @@ const makeImpl = <
     planned(
       "transactWrite.update",
       prepared.encodedKey,
-      () => updateOrCreate(key, "native", uState, prepared),
+      (held) => updateOrCreate(key, "native", uState, prepared, held),
       {
         payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
         deltas: {
@@ -11042,9 +12061,7 @@ const makeImpl = <
             opts.condition,
           )
           const userCondition =
-            condition && !existenceOnly
-              ? compileCondition(condition, resolveDbName, storedFormAt)
-              : undefined
+            condition && !existenceOnly ? compileOwnCondition(condition) : undefined
           /**
            * What the delete returns: with `returnValues("allOld")`, the item it
            * removed — the one read (every read-first delete is guarded on it) or
@@ -11878,6 +12895,9 @@ const makeImpl = <
           let counter = 0
           // Each written value's placeholders, for the key guards below.
           const placeholders = new Map<string, readonly [string, string]>()
+          // The sparse maps a `field:` rename stores whole whose entries this upsert writes as
+          // attributes of their own: guarded on the row not holding the map whole (#238).
+          const entriesWritten = new Set<string>()
 
           // The physical key attributes (`pk` / `sk`) live in `Key` and cannot
           // appear in an UpdateExpression. The COMPOSITE SOURCE fields are
@@ -11936,6 +12956,7 @@ const makeImpl = <
                 }
                 const nameKey = `#u${counter}`
                 names[nameKey] = `${sparse.prefix}#${k}`
+                if (renamedMapAttribute(attr) !== undefined) entriesWritten.add(attr)
                 if (hasNoStoredForm(v)) {
                   upsertRemoveClauses.push(nameKey)
                   counter++
@@ -12082,9 +13103,7 @@ const makeImpl = <
             names["#intInc"] = INCARNATION_TOKEN
             condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
           }
-          const uc = opts.condition
-            ? compileCondition(opts.condition, resolveDbName, storedFormAt)
-            : undefined
+          const uc = opts.condition ? compileOwnCondition(opts.condition) : undefined
           if (uc) {
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
@@ -12111,6 +13130,14 @@ const makeImpl = <
             keyGuards.push(`(attribute_not_exists(#kpk) OR (${stays.join(" AND ")}))`)
           }
           condParts.push(...keyGuards)
+          // An entry written as its own attribute is lost on a row holding its map whole, where a
+          // read takes the map in its place: such a row refuses the upsert (#238). The guard costs
+          // no request, and an entity without such a map sends what it always sent.
+          const formGuards = [...entriesWritten].map((field, i) => {
+            names[formGuardName(i)] = renamedMapAttribute(field)!
+            return formGuard(i, "entries")
+          })
+          condParts.push(...formGuards)
 
           const upsertInput: UpdateItemCommandInput = {
             TableName: tableName,
@@ -12119,8 +13146,9 @@ const makeImpl = <
             ExpressionAttributeNames: names,
             ExpressionAttributeValues: values,
             ConditionExpression: condParts.length > 0 ? condParts.join(" AND ") : undefined,
-            // The corruption guard needs the stored item, and so does a rejected key guard.
-            ...((systemFields.version || keyGuards.length > 0) && {
+            // The corruption guard needs the stored item, and so do a rejected key guard and a
+            // rejected form guard.
+            ...((systemFields.version || keyGuards.length > 0 || formGuards.length > 0) && {
               ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
             }),
             ReturnValues: "ALL_NEW",
@@ -12133,6 +13161,20 @@ const makeImpl = <
             if (isAwsConditionalCheckFailed(err.cause)) {
               const corrupt = versionCorruption(err.cause.Item, "upsert")
               if (corrupt !== undefined) return corrupt
+              // The form guard is answered only where the rest of the condition is known to hold
+              // on the row returned: the caller's condition and the key guards keep their own
+              // verdicts (#238, `internal/FormGuard.ts`).
+              const rejection = rejectedBy(
+                { expression: upsertInput.ConditionExpression, names, values },
+                err.cause.Item,
+              )
+              if (rejection._tag === "Form" && rejection.known) {
+                return new ValidationError({
+                  entityType,
+                  operation: "upsert",
+                  cause: renamedMapRefusal(sparseRenames.get(rejection.attribute)!, "upsert"),
+                })
+              }
               if (keyGuards.length > 0 && err.cause.Item !== undefined) {
                 rejected.row = err.cause.Item as globalThis.Record<string, AttributeValue>
               }
@@ -12421,6 +13463,29 @@ const makeImpl = <
         }
       }
 
+      // A sparse map without a `field:` rename has no whole form: a read rebuilds it from its
+      // entries (`<prefix>#<key>`), and the append's SET writes the field whole, under its own
+      // name, which no read takes. Through 1.40.0 the entries were lost to every read, and the
+      // stored ones read in their place, so a map with entries is refused, as `.remove()` of
+      // it is. An empty one writes nothing a read sees, as it did; a renamed map's whole
+      // attribute is the form a read takes first, so it's written as it was (#238).
+      if (hasSparseFields) {
+        for (const field of Object.keys(sparseFields)) {
+          const value = encoded[field]
+          if (resolveDbName(field) !== field || value === null || typeof value !== "object")
+            continue
+          if (Object.keys(value).length === 0) continue
+          return yield* new ValidationError({
+            entityType,
+            operation: "append",
+            cause:
+              `"${field}" is a sparse map, stored as one attribute per entry, which an append ` +
+              `doesn't write. Write its entries with .update(key).set({ ${field}: ... }). ` +
+              `Nothing was sent.`,
+          })
+        }
+      }
+
       // A value with no stored form is an absent attribute, on the current item as on
       // the event item, so it's a `.remove()` of that field. A field left unset (an
       // optional `undefined`) isn't: it leaves the current item's attribute alone.
@@ -12653,10 +13718,7 @@ const makeImpl = <
       const newObValue = serialisedInput[orderByField]
       // The user's condition is ANDed after the CAS, its names and values
       // after the CAS's, as 1.36 sent them.
-      const uc =
-        userCondition !== undefined
-          ? compileCondition(userCondition, resolveDbName, storedFormAt)
-          : undefined
+      const uc = userCondition !== undefined ? compileOwnCondition(userCondition) : undefined
       const expressionOf = (clauses: ReadonlyArray<string>) =>
         [
           ...(clauses.length > 0 ? [`SET ${clauses.join(", ")}`] : []),
@@ -18341,10 +19403,13 @@ const makeImpl = <
   // Expression combinators: condition, filter, select
   // ---------------------------------------------------------------------------
 
-  // Sparse-field map used by createPathBuilder to wire `.entry(key)` accessors.
-  const sparseFieldsForPath = hasSparseFields ? sparseFields : undefined
-  const entityPathBuilder = createPathBuilder<any>([], resolveDbName, sparseFieldsForPath)
+  // The path builder of the entity's own conditions, filters and selects (`pathBuilderOf`), and
+  // the naming its filters and selects get, as a bound query's do (`entityNaming`): a write names
+  // a condition's stored attributes itself.
+  const entityPathBuilder = pathBuilderOf<any>([config.model])
   const entityConditionOps = createConditionOps<any>()
+  const ownNaming = () =>
+    entityNaming(resolveDbName, storedFormAt, wholeRowsOf(entity), storedBelow)
 
   /**
    * Build a condition expression combinator from callback or shorthand.
@@ -18374,9 +19439,12 @@ const makeImpl = <
         : parseSimpleShorthand(cbOrShorthand)
     refusePackedExpr(expr, "filter")
     // Each operand that is one of Effect's instances or a `Date` in the form this entity's
-    // attribute holds it (#242), whichever query it's added to.
-    const stored = operandsAsStored(expr, storedFormAt)
-    return <A>(q: Query.Query<A>): Query.Query<A> => filterExprStored(q, stored)
+    // attribute holds it (#242), whichever query it's added to, and its paths named as the entity
+    // stores them (#238).
+    return <A>(q: Query.Query<A>): Query.Query<A> => {
+      const { renameExpr } = ownNaming()
+      return filterExprStored(q, renameExpr === undefined ? expr : renameExpr(expr))
+    }
   }
 
   /**
@@ -18395,12 +19463,22 @@ const makeImpl = <
       const paths = cbOrAttrs(entityPathBuilder)
       const segments = paths.map((p: { segments: ReadonlyArray<string | number> }) => p.segments)
       refuse(segments)
-      return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
-        selectPaths(q, segments)
+      return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> => {
+        const { selectAs } = ownNaming()
+        return selectAs === undefined ? selectPaths(q, segments) : selectAs(q, segments, "paths")
+      }
     }
     refuse(cbOrAttrs.map((attribute) => [attribute]))
-    return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> =>
-      Query.select(q, cbOrAttrs)
+    return <A>(q: Query.Query<A>): Query.Query<globalThis.Record<string, unknown>> => {
+      const { selectAs } = ownNaming()
+      return selectAs === undefined
+        ? Query.select(q, cbOrAttrs)
+        : selectAs(
+            q,
+            cbOrAttrs.map((attribute) => [attribute]),
+            "attributes",
+          )
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -18443,6 +19521,13 @@ const makeImpl = <
     /** @internal Domain field name → stored attribute name (`storedAs` renames). */
     _resolveDbName: resolveDbName,
     _storedFormAt: storedFormAt,
+    _sparseFieldNames: Object.keys(sparseFields),
+    _toDomainView: toDomainView,
+    _sparseMapOf: sparseMapOf,
+    _sparseEntryAttribute: sparseEntryAttribute,
+    _sparseWholeAttribute: renamedMapAttribute,
+    _entryForms: entryForms,
+    _storedBelow: storedBelow,
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
@@ -18697,17 +19782,14 @@ export const bind = <
       TGeneratedId
     >
 
-    // Sparse-field map (if any) — extracted from the Entity's configured model
-    // so the PathBuilder used by `.condition((t, ops) => ...)` exposes
-    // `.entry(key)` accessors on sparse-map fields.
-    const boundSparseFields = getSparseFields(entity.model as Schema.Top)
-    const boundSparseFieldsForPath =
-      Object.keys(boundSparseFields).length > 0 ? boundSparseFields : undefined
+    // The path builder every callback of the binding gets (`pathBuilderOf`), so `.entry(key)`
+    // resolves on the entity's sparse maps in a condition as in a query.
+    const boundPathBuilder = () => pathBuilderOf([entity.model])
 
     // Shared config for the bound-CRUD builders — pre-resolved services plus
     // a typed PathBuilder/ConditionOps so `.condition((t, ops) => ...)` works.
     const boundCrudConfig: import("./internal/BoundCrud.js").BoundCrudConfig<unknown> = {
-      pathBuilder: createPathBuilder(undefined, undefined, boundSparseFieldsForPath),
+      pathBuilder: boundPathBuilder(),
       conditionOps: createConditionOps(),
       provide,
     }
@@ -18725,10 +19807,15 @@ export const bind = <
     // .filter() ergonomics they get from index accessors and `.scan()`.
     const wrapAsBoundQuery = <A>(q: Query.Query<A>, operation: string) => {
       const bqConfig: BoundQueryConfig<unknown> = {
-        pathBuilder: createPathBuilder(),
+        pathBuilder: boundPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
-        ...entityNaming(entity._resolveDbName, entity._storedFormAt),
+        ...entityNaming(
+          entity._resolveDbName,
+          entity._storedFormAt,
+          wholeRowsOf(entity),
+          entity._storedBelow,
+        ),
         operation: { name: operation, target: entity.entityType },
       }
       return new BoundQueryImpl(
@@ -18976,7 +20063,7 @@ export const bind = <
       },
       history: (key: Key) => {
         const q = (entity.history as any as (k: Key) => Query.Query<any>)(key)
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = boundPathBuilder()
         const conditionOps = createConditionOps()
         const ts = (entity as unknown as { readonly timeSeries?: TimeSeriesConfig<any> }).timeSeries
         const orderBy = ts?.orderBy
@@ -19099,7 +20186,12 @@ export const bind = <
           provide,
           skFields: orderBy ? [orderBy] : [],
           composeSkCondition,
-          ...entityNaming(entity._resolveDbName, entity._storedFormAt),
+          ...entityNaming(
+            entity._resolveDbName,
+            entity._storedFormAt,
+            wholeRowsOf(entity),
+            entity._storedBelow,
+          ),
           operation: { name: "Entity.history", target: entity.entityType },
         }
         return new BoundQueryImpl(q, bqConfig)

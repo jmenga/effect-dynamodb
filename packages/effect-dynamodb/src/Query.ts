@@ -35,7 +35,7 @@ import {
   packedExprRefusal,
   packedProjectionRefusal,
 } from "./internal/Packed.js"
-import { compilePath, storedPath } from "./internal/PathBuilder.js"
+import { compilePath, type StoredBelow, storedPath } from "./internal/PathBuilder.js"
 import {
   canonicalJson,
   compositePlanner,
@@ -253,6 +253,12 @@ interface QueryState {
   readonly isScan: boolean
   readonly projection: ReadonlyArray<string> | undefined
   readonly projectionPaths: ReadonlyArray<ReadonlyArray<string | number>> | undefined
+  /**
+   * @internal A select read from whole rows ({@link selectWhole}): no projection is sent, and the
+   * decoder trims each row to the paths selected. Set so {@link filterBy} refuses it as it refuses
+   * any select (EDD-9054).
+   */
+  readonly selectsWholeRows?: boolean | undefined
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>
   /**
    * How a raw row ({@link select} / {@link selectPaths}) is handed back: the
@@ -1139,29 +1145,248 @@ export const selectProjected = <A>(
 }
 
 /**
+ * @internal A select no `ProjectionExpression` can express (#238): a sparse map is stored one
+ * attribute per entry (`<prefix>#<key>`), and a projection can't name attributes by prefix. The
+ * rows are read whole. Each row is first cut to what a projection of `storedPaths` would return
+ * ({@link projectRow}: the other selected paths, under their stored names), and that goes through
+ * exactly what a projected row goes through: the raw-row hook, given what it reads to dispatch
+ * (taken back off after it ran, as off a projected row), and only where a projection of
+ * `storedPaths` would run it. Nothing the select doesn't name is unpacked, decompressed or
+ * checked. `decode` gets that, and the whole row, from which it takes the sparse maps selected.
+ */
+export const selectWhole = <A>(
+  self: Query<A>,
+  storedPaths: ReadonlyArray<ReadonlyArray<string | number>>,
+  decode: (projected: Record<string, unknown>, raw: Record<string, unknown>) => unknown,
+): Query<Record<string, unknown>> => {
+  if (self._state.predicates.length > 0) {
+    throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
+  }
+  refusePackedProjection(self._state, storedPaths)
+  const hook = projectedRawRow(self._state.rawRow, storedPaths)
+  const reads = hook?.reads ?? []
+  return new QueryImpl<Record<string, unknown>>({
+    ...self._state,
+    projection: undefined,
+    projectionPaths: undefined,
+    selectsWholeRows: true,
+    decoder: (raw) => {
+      const projected = projectRow(raw, storedPaths)
+      if (hook === undefined)
+        return Effect.succeed(decode(projected, raw) as Record<string, unknown>)
+      const borrowed = reads.filter(
+        (attribute) => !Object.hasOwn(projected, attribute) && Object.hasOwn(raw, attribute),
+      )
+      for (const attribute of borrowed) projected[attribute] = raw[attribute]
+      return Effect.map(hook(projected), (row) => {
+        const hooked = row as Record<string, unknown>
+        for (const attribute of borrowed) delete hooked[attribute]
+        return decode(hooked, raw) as Record<string, unknown>
+      })
+    },
+  })
+}
+
+/** Whether a value is a map a path's name segment can step into: a plain object. */
+const isPlainMap = (value: unknown): value is Record<string, unknown> => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+/** A map or list being built by {@link projectRow}: its selected members, by name or position. */
+type Projected = {
+  readonly list: boolean
+  readonly members: Map<string | number, Projected | { readonly value: unknown }>
+}
+
+/** Put `value` at `path` in `root`, unless a value selected whole above it holds it already. */
+const place = (root: Projected, path: ReadonlyArray<string | number>, value: unknown): void => {
+  let at = root
+  for (let i = 0; i < path.length - 1; i++) {
+    const member = at.members.get(path[i]!)
+    if (member !== undefined && !("members" in member)) return
+    const next = member ?? { list: typeof path[i + 1] === "number", members: new Map() }
+    at.members.set(path[i]!, next)
+    at = next
+  }
+  at.members.set(path[path.length - 1]!, { value })
+}
+
+/**
+ * @internal What a `ProjectionExpression` of `paths` returns of `row`, worked out on the row
+ * itself (#238): each path's value, under the maps and lists that hold it, a list keeping the
+ * positions selected in position order; nothing for a path the row doesn't hold (a name on
+ * anything but a map, a position on anything but a list, or past its end). A path inside one
+ * selected whole is held by it.
+ */
+export const projectRow = (
+  row: Record<string, unknown>,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): Record<string, unknown> => {
+  const root: Projected = { list: false, members: new Map() }
+  for (const path of paths) {
+    let value: unknown = row
+    let held = path.length > 0
+    for (const segment of path) {
+      if (typeof segment === "number") {
+        held = Array.isArray(value) && segment >= 0 && segment < value.length
+        if (held) value = (value as ReadonlyArray<unknown>)[segment]
+      } else {
+        held = isPlainMap(value) && Object.hasOwn(value, segment)
+        if (held) value = (value as Record<string, unknown>)[segment]
+      }
+      if (!held) break
+    }
+    if (held) place(root, path, value)
+  }
+  const built = (node: Projected): unknown => {
+    const valueOf = (member: Projected | { readonly value: unknown }) =>
+      "members" in member ? built(member) : member.value
+    if (node.list) {
+      return [...node.members.entries()]
+        .sort(([a], [b]) => (a as number) - (b as number))
+        .map(([, member]) => valueOf(member))
+    }
+    const map: Record<string, unknown> = {}
+    for (const [name, member] of node.members) {
+      Object.defineProperty(map, name, {
+        value: valueOf(member),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      })
+    }
+    return map
+  }
+  return built(root) as Record<string, unknown>
+}
+
+/**
+ * How a projected value's names are handed back by {@link respelled}: under each name a selected
+ * path was projected by, the name it was written with and what's below it; a list's elements by
+ * one plan, whatever their positions (a projection closes a list up).
+ */
+type Respelling = {
+  readonly names: Map<string, { written: string; readonly below: Respelling }>
+  element?: Respelling
+}
+
+/**
+ * @internal How the values a select of `paths` projects are handed back by the names each was
+ * selected by (#238): a path whose segments below its field a struct stores under other names
+ * (`Schema.encodeKeys`) is projected by those ({@link storedPath}), and its value is handed back
+ * under the names written. Each of `paths` as written, beside it as stored, below the field. A name
+ * two paths wrote differently is handed back as stored. `undefined` when nothing is renamed: the
+ * values are handed back as they come.
+ */
+export const respelling = (
+  paths: ReadonlyArray<{
+    readonly written: ReadonlyArray<string | number>
+    readonly stored: ReadonlyArray<string | number>
+  }>,
+): Respelling | undefined => {
+  const root: Respelling = { names: new Map() }
+  let renamed = false
+  for (const { written, stored } of paths) {
+    let node = root
+    for (const [i, segment] of stored.entries()) {
+      if (typeof segment === "number") {
+        node.element ??= { names: new Map() }
+        node = node.element
+        continue
+      }
+      const spelled = written[i]
+      const name = typeof spelled === "string" ? spelled : segment
+      if (name !== segment) renamed = true
+      const step = node.names.get(segment)
+      if (step === undefined) {
+        const below: Respelling = { names: new Map() }
+        node.names.set(segment, { written: name, below })
+        node = below
+      } else {
+        if (step.written !== name) step.written = segment
+        node = step.below
+      }
+    }
+  }
+  return renamed ? root : undefined
+}
+
+/** @internal `value`, projected by stored names, handed back as {@link respelling} says. */
+export const respelled = (value: unknown, plan: Respelling | undefined): unknown => {
+  if (plan === undefined) return value
+  if (Array.isArray(value)) {
+    const element = plan.element
+    return element === undefined ? value : value.map((held) => respelled(held, element))
+  }
+  if (!isPlainMap(value) || plan.names.size === 0) return value
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(value)) {
+    const step = plan.names.get(key)
+    Object.defineProperty(out, step?.written ?? key, {
+      value: step === undefined ? value[key] : respelled(value[key], step.below),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+  }
+  return out
+}
+
+/**
+ * @internal Each head's {@link respelling}, for the paths `paths` selected, each stored as
+ * `storedOf` names it.
+ */
+export const respellings = (
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  storedOf: (path: ReadonlyArray<string | number>) => ReadonlyArray<string | number>,
+): ReadonlyMap<string, Respelling> => {
+  const byHead = new Map<
+    string,
+    Array<{
+      readonly written: ReadonlyArray<string | number>
+      readonly stored: ReadonlyArray<string | number>
+    }>
+  >()
+  for (const path of paths) {
+    const head = String(path[0])
+    const held = byHead.get(head) ?? []
+    held.push({ written: path.slice(1), stored: storedOf(path).slice(1) })
+    byHead.set(head, held)
+  }
+  const out = new Map<string, Respelling>()
+  for (const [head, held] of byHead) {
+    const plan = respelling(held)
+    if (plan !== undefined) out.set(head, plan)
+  }
+  return out
+}
+
+/**
  * @internal `select` / `selectPaths` of DOMAIN field names on an entity that
- * stores some under other names (`DynamoModel.configure(..., { field })`): the
- * projection names the stored attributes, and each item is handed back keyed
- * by the domain names asked for (#133).
+ * stores some under other names (`DynamoModel.configure(..., { field })`, or a
+ * struct's `Schema.encodeKeys` below one, #238): the projection names the
+ * stored attributes, and each item is handed back keyed by the domain names
+ * asked for (#133).
  */
 export const selectRenamed = <A>(
   self: Query<A>,
   paths: ReadonlyArray<ReadonlyArray<string | number>>,
   resolveDbName: (domainName: string) => string,
+  below?: StoredBelow,
 ): Query<Record<string, unknown>> => {
   const heads = [...new Set(paths.map((path) => String(path[0])))]
-  return selectProjected(
-    self,
-    paths.map((path) => storedPath(path, resolveDbName)),
-    (raw) => {
-      const item: Record<string, unknown> = {}
-      for (const head of heads) {
-        const value = raw[resolveDbName(head)]
-        if (value !== undefined) item[head] = value
-      }
-      return item
-    },
-  )
+  const storedOf = (path: ReadonlyArray<string | number>) => storedPath(path, resolveDbName, below)
+  const plans = respellings(paths, storedOf)
+  return selectProjected(self, paths.map(storedOf), (raw) => {
+    const item: Record<string, unknown> = {}
+    for (const head of heads) {
+      const value = raw[resolveDbName(head)]
+      if (value !== undefined) item[head] = respelled(value, plans.get(head))
+    }
+    return item
+  })
 }
 
 /**
@@ -1247,7 +1472,11 @@ export const filterBy: {
   <A>(predicate: (item: A) => boolean): (self: Query<A>) => Query<A>
   <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A>
 } = Function.dual(2, <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A> => {
-  if (self._state.projection !== undefined || self._state.projectionPaths !== undefined) {
+  if (
+    self._state.projection !== undefined ||
+    self._state.projectionPaths !== undefined ||
+    self._state.selectsWholeRows === true
+  ) {
     throw new Error(rejectPredicateWithProjection("filterBy() after select()"))
   }
   return new QueryImpl<A>({

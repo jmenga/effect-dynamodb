@@ -1,0 +1,2786 @@
+{
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Two aggregates on one table, each listed by tournament on gsi1: Matches, whose root holds structs that rename their keys on encode (Schema.encodeKeys): meta { amount -> am, tags -> tg, note }, swap { a -> b, b -> a }, outer { inner -> in: { deep -> dp }, list: [{ deep -> dp }] }, recs (a record of { deep -> dp }), either (meta or a struct holding amount as amount), maybe (optional, nullable meta), and plain { x, ys } that renames nothing; and Games, whose root renames nothing. Two of each are created (m1 / m2, g1 / g2). For each list filter, spelled by stored names and by domain names: its outcome and every request the list sent, whole, in order; the table's name is <table>, UUIDs <token> and timestamps <time>. Never regenerate it: it is the record of what 1.40.0 did.",
+ "cases": {
+  "meta.amount": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "amount"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "5"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    }
+   ]
+  },
+  "meta.am": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "am"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "5"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "exists meta.tags": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "tags"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       }
+      },
+      "FilterExpression": "attribute_exists(#e0.#e1)"
+     }
+    }
+   ]
+  },
+  "exists meta.tg": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "tg"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       }
+      },
+      "FilterExpression": "attribute_exists(#e0.#e1)"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "contains meta.tags": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "tags"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "S": "tag"
+       }
+      },
+      "FilterExpression": "contains(#e0.#e1, :e2)"
+     }
+    }
+   ]
+  },
+  "contains meta.tg": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "tg"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "S": "tag"
+       }
+      },
+      "FilterExpression": "contains(#e0.#e1, :e2)"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "size meta.tags": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "tags"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "0"
+       }
+      },
+      "FilterExpression": "size(#e0.#e1) > :e2"
+     }
+    }
+   ]
+  },
+  "size meta.tg": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "tg"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "0"
+       }
+      },
+      "FilterExpression": "size(#e0.#e1) > :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "meta.amount below maybe.amount": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "amount",
+       "#e2": "maybe",
+       "#e3": "amount"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       }
+      },
+      "FilterExpression": "#e0.#e1 < #e2.#e3"
+     }
+    }
+   ]
+  },
+  "meta.am below maybe.am": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "am",
+       "#e2": "maybe",
+       "#e3": "am"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       }
+      },
+      "FilterExpression": "#e0.#e1 < #e2.#e3"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "meta.note": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "S": "n"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "swap.a": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "swap",
+       "#e1": "a"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "1"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    }
+   ]
+  },
+  "swap.b": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "swap",
+       "#e1": "b"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "1"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "outer.inner.deep": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "outer",
+       "#e1": "inner",
+       "#e2": "deep"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e3": {
+        "N": "3"
+       }
+      },
+      "FilterExpression": "#e0.#e1.#e2 = :e3"
+     }
+    }
+   ]
+  },
+  "outer.in.dp": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "outer",
+       "#e1": "in",
+       "#e2": "dp"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e3": {
+        "N": "3"
+       }
+      },
+      "FilterExpression": "#e0.#e1.#e2 = :e3"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "outer.list[0].deep": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "outer",
+       "#e1": "list",
+       "#e2": "deep"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e3": {
+        "N": "4"
+       }
+      },
+      "FilterExpression": "#e0.#e1[0].#e2 = :e3"
+     }
+    }
+   ]
+  },
+  "outer.list[0].dp": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "outer",
+       "#e1": "list",
+       "#e2": "dp"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e3": {
+        "N": "4"
+       }
+      },
+      "FilterExpression": "#e0.#e1[0].#e2 = :e3"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "recs.k.deep": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "recs",
+       "#e1": "k",
+       "#e2": "deep"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e3": {
+        "N": "8"
+       }
+      },
+      "FilterExpression": "#e0.#e1.#e2 = :e3"
+     }
+    }
+   ]
+  },
+  "recs.k.dp": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "recs",
+       "#e1": "k",
+       "#e2": "dp"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e3": {
+        "N": "8"
+       }
+      },
+      "FilterExpression": "#e0.#e1.#e2 = :e3"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "either.amount": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "either",
+       "#e1": "amount"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "9"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    }
+   ]
+  },
+  "maybe.amount": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "maybe",
+       "#e1": "amount"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "7"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    }
+   ]
+  },
+  "maybe.am": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "maybe",
+       "#e1": "am"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "7"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "plain.x": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "plain",
+       "#e1": "x"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "1"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "plain.ys[1]": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "plain",
+       "#e1": "ys"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "2"
+       }
+      },
+      "FilterExpression": "#e0.#e1[1] = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "title": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "title"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e1": {
+        "S": "x"
+       }
+      },
+      "FilterExpression": "#e0 = :e1"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "title shorthand": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "title"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e1": {
+        "S": "x"
+       }
+      },
+      "FilterExpression": "#e0 = :e1"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "title and meta.amount": {
+   "outcome": {
+    "ok": {
+     "data": [],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "title",
+       "#e2": "meta",
+       "#e3": "amount"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e1": {
+        "S": "x"
+       },
+       ":e4": {
+        "N": "5"
+       }
+      },
+      "FilterExpression": "(#e0 = :e1) AND (#e2.#e3 = :e4)"
+     }
+    }
+   ]
+  },
+  "title and meta.am": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "title",
+       "#e2": "meta",
+       "#e3": "am"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e1": {
+        "S": "x"
+       },
+       ":e4": {
+        "N": "5"
+       }
+      },
+      "FilterExpression": "(#e0 = :e1) AND (#e2.#e3 = :e4)"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "not meta.amount": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "note": "n",
+        "tags": [
+         "tag"
+        ]
+       },
+       "swap": {
+        "a": 1,
+        "b": 2
+       },
+       "outer": {
+        "inner": {
+         "deep": 3
+        },
+        "list": [
+         {
+          "deep": 4
+         },
+         {
+          "deep": 6
+         }
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "either": {
+        "amount": 9
+       },
+       "maybe": {
+        "amount": 7
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      },
+      {
+       "matchId": "m2",
+       "tournament": "t",
+       "name": "b",
+       "title": "y",
+       "meta": {
+        "amount": 50
+       },
+       "swap": {
+        "a": 10,
+        "b": 20
+       },
+       "outer": {
+        "inner": {
+         "deep": 30
+        },
+        "list": []
+       },
+       "recs": {},
+       "either": {
+        "amount": 90
+       },
+       "maybe": null,
+       "plain": {
+        "x": 2,
+        "ys": []
+       },
+       "lines": []
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "amount"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "5"
+       }
+      },
+      "FilterExpression": "NOT (#e0.#e1 = :e2)"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m1"
+       }
+      }
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m2"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "not meta.am": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "m2",
+       "tournament": "t",
+       "name": "b",
+       "title": "y",
+       "meta": {
+        "amount": 50
+       },
+       "swap": {
+        "a": 10,
+        "b": 20
+       },
+       "outer": {
+        "inner": {
+         "deep": 30
+        },
+        "list": []
+       },
+       "recs": {},
+       "either": {
+        "amount": 90
+       },
+       "maybe": null,
+       "plain": {
+        "x": 2,
+        "ys": []
+       },
+       "lines": []
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "am"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#matches#t"
+       },
+       ":e2": {
+        "N": "5"
+       }
+      },
+      "FilterExpression": "NOT (#e0.#e1 = :e2)"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#match#m2"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "games: meta.amount": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "g1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "tags": [
+         "tag"
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "amount"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#games#t"
+       },
+       ":e2": {
+        "N": "5"
+       }
+      },
+      "FilterExpression": "#e0.#e1 = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#game#g1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "games: size meta.tags": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "g1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "tags": [
+         "tag"
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "meta",
+       "#e1": "tags"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#games#t"
+       },
+       ":e2": {
+        "N": "0"
+       }
+      },
+      "FilterExpression": "size(#e0.#e1) > :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#game#g1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "games: recs.k.deep": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "g1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "tags": [
+         "tag"
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "recs",
+       "#e1": "k",
+       "#e2": "deep"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#games#t"
+       },
+       ":e3": {
+        "N": "8"
+       }
+      },
+      "FilterExpression": "#e0.#e1.#e2 = :e3"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#game#g1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "games: plain.ys[1]": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "g1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "tags": [
+         "tag"
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "plain",
+       "#e1": "ys"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#games#t"
+       },
+       ":e2": {
+        "N": "2"
+       }
+      },
+      "FilterExpression": "#e0.#e1[1] = :e2"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#game#g1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "games: title shorthand": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "g1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "tags": [
+         "tag"
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#e0": "title"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#games#t"
+       },
+       ":e1": {
+        "S": "x"
+       }
+      },
+      "FilterExpression": "#e0 = :e1"
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#game#g1"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "games: no filter": {
+   "outcome": {
+    "ok": {
+     "data": [
+      {
+       "matchId": "g1",
+       "tournament": "t",
+       "name": "a",
+       "title": "x",
+       "meta": {
+        "amount": 5,
+        "tags": [
+         "tag"
+        ]
+       },
+       "recs": {
+        "k": {
+         "deep": 8
+        }
+       },
+       "plain": {
+        "x": 1,
+        "ys": [
+         1,
+         2
+        ]
+       },
+       "lines": [
+        {
+         "lineId": "l1",
+         "sku": "s"
+        }
+       ]
+      },
+      {
+       "matchId": "g2",
+       "tournament": "t",
+       "name": "b",
+       "title": "y",
+       "meta": {
+        "amount": 50
+       },
+       "recs": {},
+       "plain": {
+        "x": 2,
+        "ys": []
+       },
+       "lines": []
+      }
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#games#t"
+       }
+      }
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#game#g1"
+       }
+      }
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$alf#v1#game#g2"
+       }
+      }
+     }
+    }
+   ]
+  }
+ }
+}

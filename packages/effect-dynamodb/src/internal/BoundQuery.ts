@@ -23,28 +23,95 @@ import * as Query from "../Query.js"
 import * as Capacity from "./Capacity.js"
 import type { ConditionOps, ConditionShorthand, Expr, StoredFormAt } from "./Expr.js"
 import { ExprTag, operandsAsStored, parseSimpleShorthand } from "./Expr.js"
-import { type PackedPath, type Path, type PathBuilder, storedPath } from "./PathBuilder.js"
+import {
+  entryOfPath,
+  type PackedPath,
+  type Path,
+  type PathBuilder,
+  type StoredBelow,
+  storedPath,
+  withEntry,
+} from "./PathBuilder.js"
 
 /**
  * An expression with every attribute path's top-level field renamed to its
- * stored attribute (#133). Values are left alone.
+ * stored attribute (#133), and the segments below it named as `below` names
+ * them (#238). Values are left alone.
  */
-const renamePaths = (node: unknown, resolve: (name: string) => string): unknown => {
-  if (Array.isArray(node)) return node.map((item) => renamePaths(item, resolve))
+const renamePaths = (
+  node: unknown,
+  resolve: (name: string) => string,
+  below?: StoredBelow,
+): unknown => {
+  if (Array.isArray(node)) return node.map((item) => renamePaths(item, resolve, below))
   if (node === null || typeof node !== "object") return node
   const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
   if (record._tag === "value") return node
   if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
     return {
       ...record,
-      segments: storedPath(record.segments as ReadonlyArray<string | number>, resolve),
+      segments: storedPath(record.segments as ReadonlyArray<string | number>, resolve, below),
     }
   }
   // Spread keeps the symbol-keyed Expr brand; string keys are walked.
   const copy: globalThis.Record<string | symbol, unknown> = { ...record }
-  for (const [key, value] of Object.entries(record)) copy[key] = renamePaths(value, resolve)
+  for (const [key, value] of Object.entries(record)) copy[key] = renamePaths(value, resolve, below)
   return copy
 }
+
+/**
+ * An expression with each attribute path's segments as `rename` gives them: the same expression,
+ * by identity, where `rename` gives every path's own segments back.
+ */
+const mapPaths = (
+  node: unknown,
+  rename: (segments: ReadonlyArray<string | number>) => ReadonlyArray<string | number>,
+): unknown => {
+  if (Array.isArray(node)) {
+    const mapped = node.map((item) => mapPaths(item, rename))
+    return mapped.every((item, i) => item === node[i]) ? node : mapped
+  }
+  if (node === null || typeof node !== "object") return node
+  const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
+  if (record._tag === "value") return node
+  if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
+    const segments = rename(record.segments as ReadonlyArray<string | number>)
+    return segments === record.segments ? node : { ...record, segments }
+  }
+  // Spread keeps the symbol-keyed Expr brand; string keys are walked.
+  let copy: globalThis.Record<string | symbol, unknown> | undefined
+  for (const [key, value] of Object.entries(record)) {
+    const mapped = mapPaths(value, rename)
+    if (mapped === value) continue
+    copy ??= { ...record }
+    copy[key] = mapped
+  }
+  return copy ?? node
+}
+
+/** Every path an expression names, in order, as its segments. */
+const pathsIn = (
+  node: unknown,
+  into: Array<ReadonlyArray<string | number>> = [],
+): Array<ReadonlyArray<string | number>> => {
+  if (Array.isArray(node)) {
+    for (const item of node) pathsIn(item, into)
+    return into
+  }
+  if (node === null || typeof node !== "object") return into
+  const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
+  if (record._tag === "value") return into
+  if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
+    into.push(record.segments as ReadonlyArray<string | number>)
+    return into
+  }
+  for (const value of Object.values(record)) pathsIn(value, into)
+  return into
+}
+
+/** Whether `below` names a segment below a path's first other than as written (#238). */
+const renamedBelow = (path: ReadonlyArray<string | number>, below: StoredBelow | undefined) =>
+  below?.(path).some((segment, i) => segment !== path[i + 1]) === true
 
 // ---------------------------------------------------------------------------
 // Sort key condition ops for the `where` callback
@@ -606,6 +673,13 @@ const plainSelect = (
       )
     : Query.selectPaths(query, paths)
 
+/** `paths` without repeats, in order. */
+const uniquePaths = (
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): ReadonlyArray<ReadonlyArray<string | number>> => [
+  ...new Map(paths.map((path) => [JSON.stringify(path), path])).values(),
+]
+
 /** The top-level field names an expression's paths name. */
 const pathHeads = (node: unknown, into: Set<string> = new Set()): Set<string> => {
   if (Array.isArray(node)) {
@@ -625,32 +699,242 @@ const pathHeads = (node: unknown, into: Set<string> = new Set()): Set<string> =>
 }
 
 /**
+ * @internal How an entity's rows are read whole for a select (#238): its sparse map fields, which
+ * no projection can name, the map a stored attribute is read into (an entry's attribute, or the
+ * attribute a `field:` rename stores a map under), and a stored row as a read sees it
+ * (`toDomainView`: the maps rebuilt, then each renamed field under its domain name).
+ */
+export interface WholeRows {
+  readonly sparseFields: ReadonlyArray<string>
+  readonly mapOf: (attribute: string) => string | undefined
+  readonly view: (raw: Record<string, unknown>) => Record<string, unknown>
+  /**
+   * A filter (domain-named) whose conditions on an entry of a sparse map a `field:` rename stores
+   * whole ask the row where it holds the map, as a condition does (`Entity._entryForms`).
+   */
+  readonly entryForms: (expr: Expr) => Expr
+  /** The attribute entry `key` of map `field` is stored under (`<prefix>#<key>`). */
+  readonly entryAttribute: (field: string, key: string) => string
+  /**
+   * The attribute a `field:` rename stores map `field` under whole, if it's renamed: a read takes
+   * it in place of the entries when the row holds it (`Entity._sparseWholeAttribute`).
+   */
+  readonly wholeAttribute: (field: string) => string | undefined
+}
+
+/** @internal An entity's {@link WholeRows}, or `undefined` when it has no sparse map field. */
+export const wholeRowsOf = (entity: {
+  readonly _sparseFieldNames?: ReadonlyArray<string> | undefined
+  readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
+  readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
+  readonly _entryForms?: ((expr: Expr) => Expr) | undefined
+  readonly _sparseEntryAttribute?: ((field: string, key: string) => string) | undefined
+  readonly _sparseWholeAttribute?: ((field: string) => string | undefined) | undefined
+}): WholeRows | undefined =>
+  entity._sparseFieldNames === undefined ||
+  entity._sparseFieldNames.length === 0 ||
+  entity._sparseMapOf === undefined ||
+  entity._toDomainView === undefined ||
+  entity._sparseEntryAttribute === undefined ||
+  entity._sparseWholeAttribute === undefined
+    ? undefined
+    : {
+        sparseFields: entity._sparseFieldNames,
+        mapOf: entity._sparseMapOf,
+        view: entity._toDomainView,
+        entryForms: entity._entryForms ?? ((expr) => expr),
+        entryAttribute: entity._sparseEntryAttribute,
+        wholeAttribute: entity._sparseWholeAttribute,
+      }
+
+/** @internal Whether a selected path names one of `sparseFields` (its first segment, as a field). */
+const namesMap = (path: ReadonlyArray<string | number>, sparseFields: ReadonlyArray<string>) =>
+  typeof path[0] === "string" && sparseFields.includes(path[0])
+
+/**
+ * @internal A selected path as its map's field names it (#238): a path `.entry(key)` built is
+ * `[field, key, ...below]`, so a select of an entry returns the map trimmed to that entry, as the
+ * read rebuilds it. Any other path as given.
+ */
+const asMapPath = (path: ReadonlyArray<string | number>): ReadonlyArray<string | number> => {
+  const entry = entryOfPath(path)
+  return entry === undefined ? path : [entry.field, entry.key, ...path.slice(1)]
+}
+
+/** @internal The entry a selected path names through its map field (`[field, key, ...]`), if any. */
+const mapEntryOf = (path: ReadonlyArray<string | number>, sparseFields: ReadonlyArray<string>) =>
+  namesMap(path, sparseFields) && typeof path[1] === "string"
+    ? { field: path[0] as string, key: path[1] }
+    : undefined
+
+/**
+ * @internal The stored paths a projection of `path` names, for an entity whose sparse maps
+ * `wholeRows` describes (#238): an entry, each place a row may hold it, with the segments below it
+ * as stored; any other path as {@link storedPath} names it.
+ */
+const projectedPaths = (
+  wholeRows: WholeRows | undefined,
+  path: ReadonlyArray<string | number>,
+  storedOf: (path: ReadonlyArray<string | number>) => ReadonlyArray<string | number>,
+): ReadonlyArray<ReadonlyArray<string | number>> => {
+  const entry = wholeRows === undefined ? undefined : mapEntryOf(path, wholeRows.sparseFields)
+  if (entry === undefined) return [storedOf(path)]
+  const whole = wholeRows!.wholeAttribute(entry.field)
+  return [
+    [wholeRows!.entryAttribute(entry.field, entry.key), ...storedOf(path).slice(2)],
+    ...(whole === undefined ? [] : [[whole]]),
+  ]
+}
+
+/**
+ * @internal What a whole row gives a select (#238), for one entity: each path naming a sparse map,
+ * from the map as a read rebuilds it out of the row's attributes for that map alone, trimmed to the
+ * paths ({@link Query.projectRow}); and every other path as its projection gave it, under the name
+ * it was selected by, as a projected select hands it back ({@link Query.selectRenamed}): a path
+ * naming a stored attribute (`nt`, an entry's `m#k`) gets that attribute.
+ *
+ * `entriesProjected`: the row is what a projection of the selected entries gave (an entry select),
+ * so each entry's attribute holds only what was selected below it, its lists closed up as DynamoDB
+ * closes them. A map rebuilt from entries is trimmed only to the selected keys, never again by
+ * position below them; one rebuilt from the attribute a `field:` rename stores it under whole, which
+ * the projection names whole, is trimmed to the paths.
+ */
+const fromWholeRow = (
+  wholeRows: WholeRows,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  resolve: (domainName: string) => string,
+  projected: Record<string, unknown>,
+  raw: Record<string, unknown>,
+  below?: StoredBelow,
+  entriesProjected = false,
+): Record<string, unknown> => {
+  const storedOf = (path: ReadonlyArray<string | number>) => storedPath(path, resolve, below)
+  const maps = paths.filter((path) => namesMap(path, wholeRows.sparseFields))
+  const selected = new Set(maps.map((path) => String(path[0])))
+  const held: Record<string, unknown> = {}
+  for (const attribute of Object.keys(raw)) {
+    const map = wholeRows.mapOf(attribute)
+    if (map !== undefined && selected.has(map)) held[attribute] = raw[attribute]
+  }
+  /** Whether the read takes map `field` from the attribute it's stored under whole. */
+  const readWhole = (field: string) => {
+    const whole = wholeRows.wholeAttribute(field)
+    return whole !== undefined && Object.hasOwn(held, whole)
+  }
+  // A map rebuilt holds its entries as stored: below the map, its paths by stored names (#238).
+  const rebuilt =
+    maps.length === 0
+      ? {}
+      : Query.projectRow(
+          wholeRows.view(held),
+          maps.map((path) => {
+            const stored = [path[0]!, ...storedOf(path).slice(1)]
+            return entriesProjected && !readWhole(String(path[0])) ? stored.slice(0, 2) : stored
+          }),
+        )
+  const plans = Query.respellings(paths, storedOf)
+  // In the order the paths were selected, as a projected row's names come.
+  const item: Record<string, unknown> = {}
+  for (const path of paths) {
+    const head = String(path[0])
+    if (Object.hasOwn(item, head)) continue
+    const [from, name] = namesMap(path, wholeRows.sparseFields)
+      ? [rebuilt, head]
+      : [projected, String(storedOf(path)[0])]
+    if (!Object.hasOwn(from, name) || from[name] === undefined) continue
+    Object.defineProperty(item, head, {
+      value: Query.respelled(from[name], plans.get(head)),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+  }
+  return item
+}
+
+/**
+ * @internal Whether a select of `paths` reads whole rows (#238): one of them names a sparse map
+ * field whole, stored one attribute per entry, which a `ProjectionExpression` can't name by
+ * prefix. A select of an entry (`.entry(key)`, or the map's field with a key below it) projects
+ * the attributes the entry is stored under instead. A path naming the item itself is left to the
+ * projection, which DynamoDB refuses.
+ */
+const readsWholeRows = (
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  sparseFields: ReadonlyArray<string>,
+): boolean =>
+  paths.every((path) => path.length > 0) &&
+  paths.some((path) => namesMap(path, sparseFields) && mapEntryOf(path, sparseFields) === undefined)
+
+/**
  * @internal An entity's naming (#133): filters and selects name the stored
  * attribute of each renamed field. A select of no renamed field stays the
  * plain projection, so an entity without renames sends what it always sent.
  * With `storedAt`, a filter's operand that is one of Effect's instances is
  * sent in the form the attribute holds (`operandsAsStored`, #242), judged by
- * the domain path before it's renamed.
+ * the domain path before it's renamed. A select naming a sparse map field
+ * reads whole rows and trims each to what it selected, as the read rebuilds it
+ * ({@link WholeRows}, #238).
  */
 export const entityNaming = (
   resolve: ((domainName: string) => string) | undefined,
   storedAt?: StoredFormAt,
-): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> =>
-  resolve === undefined
-    ? storedAt === undefined
-      ? {}
-      : { renameExpr: (expr) => operandsAsStored(expr, storedAt) }
-    : {
-        renameExpr: (expr) =>
-          renamePaths(
-            storedAt === undefined ? expr : operandsAsStored(expr, storedAt),
-            resolve,
-          ) as Expr,
-        selectAs: (query, paths, form) =>
-          paths.some((path) => typeof path[0] === "string" && resolve(path[0]) !== path[0])
-            ? Query.selectRenamed(query, paths, resolve)
-            : plainSelect(query, paths, form),
-      }
+  wholeRows?: WholeRows | undefined,
+  below?: StoredBelow | undefined,
+): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
+  if (
+    resolve === undefined &&
+    storedAt === undefined &&
+    wholeRows === undefined &&
+    below === undefined
+  )
+    return {}
+  const stored = resolve ?? ((name: string) => name)
+  const asStored = (expr: Expr): Expr =>
+    storedAt === undefined ? expr : operandsAsStored(expr, storedAt)
+  const forms = wholeRows?.entryForms ?? ((expr: Expr) => expr)
+  return {
+    ...((resolve !== undefined || storedAt !== undefined || below !== undefined) && {
+      renameExpr: (expr: Expr) =>
+        resolve === undefined && below === undefined
+          ? asStored(expr)
+          : (renamePaths(forms(asStored(expr)), stored, below) as Expr),
+    }),
+    ...((resolve !== undefined || wholeRows !== undefined || below !== undefined) && {
+      selectAs: (query, written, form) => {
+        const paths = written.map(asMapPath)
+        if (wholeRows !== undefined && readsWholeRows(paths, wholeRows.sparseFields)) {
+          return Query.selectWhole(
+            query,
+            paths
+              .filter((path) => !namesMap(path, wholeRows.sparseFields))
+              .map((path) => storedPath(path, stored, below)),
+            (projected, raw) => fromWholeRow(wholeRows, paths, stored, projected, raw, below),
+          )
+        }
+        // An entry selected: its attributes projected, and the map rebuilt from what they hold.
+        if (
+          wholeRows !== undefined &&
+          paths.some((path) => mapEntryOf(path, wholeRows.sparseFields) !== undefined)
+        ) {
+          const storedOf = (path: ReadonlyArray<string | number>) => storedPath(path, stored, below)
+          return Query.selectProjected(
+            query,
+            uniquePaths(paths.flatMap((path) => projectedPaths(wholeRows, path, storedOf))),
+            (raw) => fromWholeRow(wholeRows, paths, stored, raw, raw, below, true),
+          )
+        }
+        return paths.some(
+          (path) =>
+            (typeof path[0] === "string" && stored(path[0]) !== path[0]) ||
+            renamedBelow(path, below),
+        )
+          ? Query.selectRenamed(query, paths, stored, below)
+          : plainSelect(query, paths, form)
+      },
+    }),
+  }
+}
 
 /**
  * @internal A collection's naming (#133). Its members may store one domain
@@ -669,6 +953,10 @@ export const collectionNaming = (
     readonly fields?: ReadonlySet<string> | undefined
     /** What a write of a value at a path of the member's stores (#242): see {@link entityNaming}. */
     readonly storedAt?: StoredFormAt | undefined
+    /** How the member's rows are read whole, when it has a sparse map field (#238). */
+    readonly wholeRows?: WholeRows | undefined
+    /** How the member stores the segments below a path's first (#238). */
+    readonly below?: StoredBelow | undefined
   }>,
 ): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
   /**
@@ -686,25 +974,69 @@ export const collectionNaming = (
     }
     return field
   }
+  /** A path below its field, as a member stores it (#238). */
+  const belowOf = (m: (typeof members)[number], path: ReadonlyArray<string | number>) =>
+    JSON.stringify(m.below === undefined ? path.slice(1) : m.below(path))
+  /**
+   * An expression with each path `.entry()` built named as member `m` stores the entry (#238): its
+   * own entry attribute where it declares the map sparse (members may give one map different
+   * prefixes); the map's key below the field where it declares the map otherwise; and where it
+   * doesn't declare the map, the attribute as built, as a field a member lacks: an attribute it
+   * never holds when it reads that attribute as something of its own (a field, or an entry of
+   * one of its maps), so a filter on the entry finds nothing on its rows.
+   */
+  const entriesFor = (m: (typeof members)[number], expr: Expr): Expr =>
+    mapPaths(expr, (segments) => {
+      const entry = entryOfPath(segments)
+      if (entry === undefined) return segments
+      const rest = segments.slice(1)
+      if (m.wholeRows?.sparseFields.includes(entry.field) === true) {
+        const attribute = m.wholeRows.entryAttribute(entry.field, entry.key)
+        return attribute === segments[0] ? segments : withEntry([attribute, ...rest], entry)
+      }
+      if (m.fields === undefined || m.fields.has(entry.field)) {
+        return [entry.field, entry.key, ...rest]
+      }
+      const attribute = String(segments[0])
+      return m.fields.has(attribute) ||
+        attributeOf(m, attribute) !== attribute ||
+        m.wholeRows?.mapOf(attribute) !== undefined
+        ? [ABSENT_ATTRIBUTE]
+        : [attribute, ...rest]
+    }) as Expr
+  /** Each head's respelling of what a member's projection gives for `paths` (#238). */
+  const respellingsOf = (
+    m: (typeof members)[number],
+    paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  ) => Query.respellings(paths, (path) => storedPath(path, (head) => m.resolve(head), m.below))
   return {
     renameExpr: (expr) => {
       const heads = [...pathHeads(expr)]
       const first = members[0]
       if (first === undefined) return expr
-      // Each member's operands in the form its attributes hold (#242).
-      const stored = members.map((m) =>
+      // Each member's operands in the form its attributes hold (#242), then its entries as it
+      // stores them, and its conditions on an entry of a sparse map a `field:` rename stores whole
+      // asking its rows where they hold the map (#238).
+      const asStoredBy = members.map((m) =>
         m.storedAt === undefined ? expr : operandsAsStored(expr, m.storedAt),
       )
+      const stored = members.map((m, at) => {
+        const named = entriesFor(m, asStoredBy[at]!)
+        return m.wholeRows?.entryForms(named) ?? named
+      })
+      const paths = pathsIn(expr)
       // Every member reads the same attributes, each operand in the same form: one expression,
       // as before.
       if (
+        members.every((_, at) => stored[at] === asStoredBy[at]) &&
         members.every(
           (m, at) =>
             heads.every((head) => attributeOf(m, head) === attributeOf(first, head)) &&
             sameOperands(stored[at]!, stored[0]!),
-        )
+        ) &&
+        members.every((m) => paths.every((path) => belowOf(m, path) === belowOf(first, path)))
       ) {
-        return renamePaths(stored[0], (head) => attributeOf(first, head)) as Expr
+        return renamePaths(stored[0], (head) => attributeOf(first, head), first.below) as Expr
       }
       // They differ: each member's rows judged by its own attributes and forms.
       return {
@@ -721,35 +1053,126 @@ export const collectionNaming = (
                 left: { _tag: "path", segments: ["__edd_e__"] },
                 right: { _tag: "value", value: m.entityType },
               } as Expr,
-              renamePaths(stored[at], (head) => attributeOf(m, head)) as Expr,
+              renamePaths(stored[at], (head) => attributeOf(m, head), m.below) as Expr,
             ],
           }),
         ),
       } as Expr
     },
-    selectAs: (query, paths) => {
+    selectAs: (query, written) => {
+      // An entry `.entry()` built, as its map's field names it: each member's own, or nothing for
+      // a member without the map (#238).
+      const paths = written.map(asMapPath)
       const heads = [...new Set(paths.map((path) => String(path[0])))]
       // Only a member's own domain fields are read for it.
       const has = (m: (typeof members)[number], head: string) =>
         m.fields === undefined || m.fields.has(head)
+      /** A member's paths that name an entry of one of its sparse maps (#238). */
+      const namesEntry = (m: (typeof members)[number]) =>
+        m.wholeRows !== undefined &&
+        paths.some(
+          (path) =>
+            has(m, String(path[0])) && mapEntryOf(path, m.wholeRows!.sparseFields) !== undefined,
+        )
       const stored = new Map<string, ReadonlyArray<string | number>>()
       for (const m of members) {
+        const storedOf = (path: ReadonlyArray<string | number>) =>
+          storedPath(path, (head) => m.resolve(head), m.below)
         for (const path of paths) {
           if (!has(m, String(path[0]))) continue
-          const renamed = storedPath(path, (head) => m.resolve(head))
-          stored.set(JSON.stringify(renamed), renamed)
+          for (const renamed of projectedPaths(m.wholeRows, path, storedOf)) {
+            stored.set(JSON.stringify(renamed), renamed)
+          }
         }
       }
+      const plans = new Map(
+        members.map((m) => [
+          m.entityType,
+          respellingsOf(
+            m,
+            paths.filter((path) => has(m, String(path[0]))),
+          ),
+        ]),
+      )
       stored.set(JSON.stringify(["__edd_e__"]), ["__edd_e__"])
       const byType = new Map(members.map((m) => [m.entityType, m]))
+      // A member's sparse map named: every row is read whole, and each is cut to what its member
+      // has of the paths, as a projection of them gives it, with the member's maps rebuilt as its
+      // read rebuilds them (#238).
+      if (
+        members.some(
+          (m) =>
+            m.wholeRows !== undefined &&
+            readsWholeRows(
+              paths.filter((path) => has(m, String(path[0]))),
+              m.wholeRows.sparseFields,
+            ),
+        )
+      ) {
+        const projected = new Map<string, ReadonlyArray<string | number>>()
+        for (const m of members) {
+          for (const path of paths) {
+            if (!has(m, String(path[0]))) continue
+            if (m.wholeRows !== undefined && namesMap(path, m.wholeRows.sparseFields)) continue
+            const renamed = storedPath(path, (head) => m.resolve(head), m.below)
+            projected.set(JSON.stringify(renamed), renamed)
+          }
+        }
+        return Query.selectWhole(query, [...projected.values()], (row, raw) => {
+          const m = byType.get(raw.__edd_e__ as string)
+          if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }
+          const own = paths.filter((path) => has(m, String(path[0])))
+          if (m.wholeRows !== undefined) {
+            return {
+              _memberKey: m.entityKey,
+              _decoded: fromWholeRow(
+                m.wholeRows,
+                own,
+                (head) => m.resolve(head),
+                row,
+                raw,
+                m.below,
+              ),
+            }
+          }
+          // A member without a sparse map: what its projection gave, under its domain names.
+          const item: Record<string, unknown> = {}
+          for (const head of heads) {
+            const attribute = m.resolve(head)
+            if (!has(m, head) || !Object.hasOwn(row, attribute)) continue
+            const value = row[attribute]
+            if (value !== undefined)
+              item[head] = Query.respelled(value, plans.get(m.entityType)?.get(head))
+          }
+          return { _memberKey: m.entityKey, _decoded: item }
+        })
+      }
       return Query.selectProjected(query, [...stored.values()], (raw) => {
         const m = byType.get(raw.__edd_e__ as string)
         if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }
+        // An entry of one of its maps selected: the map rebuilt from the attributes projected.
+        if (namesEntry(m)) {
+          const own = paths.filter((path) => has(m, String(path[0])))
+          return {
+            _memberKey: m.entityKey,
+            _decoded: fromWholeRow(
+              m.wholeRows!,
+              own,
+              (head) => m.resolve(head),
+              raw,
+              raw,
+              m.below,
+              true,
+            ),
+          }
+        }
         const item: Record<string, unknown> = {}
         for (const head of heads) {
           if (!has(m, head)) continue
           const value = raw[m.resolve(head)]
-          if (value !== undefined) item[head] = value
+          if (value !== undefined) {
+            item[head] = Query.respelled(value, plans.get(m.entityType)?.get(head))
+          }
         }
         return { _memberKey: m.entityKey, _decoded: item }
       })

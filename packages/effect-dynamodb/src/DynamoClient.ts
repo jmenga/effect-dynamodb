@@ -180,6 +180,7 @@ import {
   entityNaming,
   type RawSortKeyCondition,
   type WithinOptions,
+  wholeRowsOf,
 } from "./internal/BoundQuery.js"
 import {
   type BoundVectorQuery,
@@ -205,7 +206,7 @@ import {
   type PackedAttributeGuard,
   unregisteredCodecError,
 } from "./internal/Packed.js"
-import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
+import { type PathModel, pathBuilderOf, type StoredBelow } from "./internal/PathBuilder.js"
 import {
   type OutboxCandidate,
   physicalTableName,
@@ -1376,7 +1377,13 @@ const planZOrderWithin = <A>(args: {
     (part) => part.hash === undefined && prefixValues.has(part.field),
   )
 
-  const renameExpr = entityNaming(entityLike._resolveDbName).renameExpr ?? ((expr: Expr) => expr)
+  const renameExpr =
+    entityNaming(
+      entityLike._resolveDbName,
+      undefined,
+      wholeRowsOf(entityLike),
+      entityLike._storedBelow,
+    ).renameExpr ?? ((expr: Expr) => expr)
   const filter =
     filters.length === 0
       ? undefined
@@ -2425,6 +2432,15 @@ interface EntityLike {
   readonly _resolveDbName?: ((domainName: string) => string) | undefined
   /** What a write of a value at a path stores: a filter's operand is sent in it (#242). */
   readonly _storedFormAt?: StoredFormAt | undefined
+  /** The fields stored as sparse maps, which a `.select()` naming one reads whole rows for (#238). */
+  readonly _sparseFieldNames?: ReadonlyArray<string> | undefined
+  /** A stored row as every read sees it: sparse maps rebuilt, renamed fields under their names. */
+  readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
+  /** The sparse map a read takes a stored attribute for, if any (#238). */
+  readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
+  readonly _entryForms?: ((expr: Expr) => Expr) | undefined
+  /** The segments below a path's first as they're stored (#238). */
+  readonly _storedBelow?: StoredBelow | undefined
   /**
    * The entity's refs: a `${ref}Id` composite is not stored on the item, but
    * the ref it names is, as a map holding the referenced identifier.
@@ -2464,6 +2480,14 @@ interface EntityLike {
     readonly inputSchema?: Schema.Top | undefined
   }
 }
+
+/**
+ * A query's path builder over the members' models (`pathBuilderOf`): `.entry(key)` on each sparse
+ * map field, baked with the first member's prefix where members declare one field with different
+ * ones (a collection names each member's entry by its own prefix: `collectionNaming`).
+ */
+const queryPathBuilder = (entities: ReadonlyArray<EntityLike>) =>
+  pathBuilderOf(entities.map((entityLike) => entityLike.model))
 
 /** An entity's domain field names (its record's), when its schema exposes them. */
 const domainFieldsOf = (entityLike: EntityLike): ReadonlySet<string> | undefined => {
@@ -2772,7 +2796,7 @@ const makeFromConfig = (config: {
             )
           : query
 
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder([entityLike])
         const conditionOps = createConditionOps()
 
         // composeSkCondition — compose the user's `.where()` operand into a full
@@ -2949,7 +2973,12 @@ const makeFromConfig = (config: {
                   }),
               }),
           skFields: accessorDef.sk.composite,
-          ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
+          ...entityNaming(
+            entityLike._resolveDbName,
+            entityLike._storedFormAt,
+            wholeRowsOf(entityLike),
+            entityLike._storedBelow,
+          ),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
         return new BoundQueryImpl(pinnedQuery, bqConfig)
@@ -2966,10 +2995,15 @@ const makeFromConfig = (config: {
           () => accessor(rawComposites) as BoundQueryImpl<unknown, unknown, unknown>,
           (refusal) =>
             new BoundQueryImpl(Query.refused(indexDef.index, refusal), {
-              pathBuilder: createPathBuilder(),
+              pathBuilder: queryPathBuilder([entityLike]),
               conditionOps: createConditionOps(),
               provide,
-              ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
+              ...entityNaming(
+                entityLike._resolveDbName,
+                entityLike._storedFormAt,
+                wholeRowsOf(entityLike),
+                entityLike._storedBelow,
+              ),
               operation,
             }),
         )
@@ -3070,13 +3104,18 @@ const makeFromConfig = (config: {
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
           liveRows: entityLike._liveRows?.(),
         })
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder([entityLike])
         const conditionOps = createConditionOps()
         const bqConfig: BoundQueryConfig<unknown> = {
           pathBuilder,
           conditionOps,
           provide,
-          ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
+          ...entityNaming(
+            entityLike._resolveDbName,
+            entityLike._storedFormAt,
+            wholeRowsOf(entityLike),
+            entityLike._storedBelow,
+          ),
           operation: { name: "Entity.scan", target: entityLike.entityType },
         }
         return new BoundQueryImpl(scanQuery, bqConfig)
@@ -3199,7 +3238,7 @@ const makeFromConfig = (config: {
         }
 
         // Wrap in BoundQuery that groups results by entity key
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder(members.map((m) => m.entityLike))
         const conditionOps = createConditionOps()
         const collectionProvide = <X, E>(eff: Effect.Effect<X, E, any>) =>
           Effect.provide(eff, ctx) as Effect.Effect<X, E, never>
@@ -3235,6 +3274,8 @@ const makeFromConfig = (config: {
               resolve: m.entityLike._resolveDbName ?? ((name: string) => name),
               fields: domainFieldsOf(m.entityLike),
               storedAt: m.entityLike._storedFormAt,
+              wholeRows: wholeRowsOf(m.entityLike),
+              below: m.entityLike._storedBelow,
             })),
           ),
           operation: { name: "Collection.query", target: collName },
@@ -3249,7 +3290,7 @@ const makeFromConfig = (config: {
           () => collectionAccessor(composites) as BoundQueryImpl<unknown, unknown, unknown>,
           (refusal) =>
             new BoundQueryImpl(Query.refused(members[0]!.indexDef.index, refusal), {
-              pathBuilder: createPathBuilder(),
+              pathBuilder: queryPathBuilder(members.map((m) => m.entityLike)),
               conditionOps: createConditionOps(),
               provide,
               operation,

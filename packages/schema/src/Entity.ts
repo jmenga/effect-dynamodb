@@ -1488,7 +1488,9 @@ export const buildEntityDefinition = (config: {
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
   // ---------------------------------------------------------------------------
 
-  const fieldRenames: globalThis.Record<string, string> = {}
+  // Null-prototype: read by a field's name (`fieldRenames[name] ?? name`), and a model field may be
+  // named like an `Object.prototype` member (`valueOf`), which a plain object answers with a function.
+  const fieldRenames: globalThis.Record<string, string> = Object.create(null)
   for (const [domainName, attrConfig] of Object.entries(configuredAttributes)) {
     const field = (attrConfig as { field?: string }).field
     if (field) fieldRenames[domainName] = field

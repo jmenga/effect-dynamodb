@@ -157,7 +157,28 @@ describeConnected("an update with an operand, on DynamoDB Local", () => {
                 const was = fixture.cases[each.key]!
                 const got = yield* send(db, row, n, transaction, each.apply, each.seeded, world)
                 const since = RESOLVED.get(nameOf(each.key))?.[0]
-                if (since !== undefined) {
+                const failure = failureOf(got.exit)
+                // A value written into a sparse map's entry is checked against the map's value
+                // schema (#238), but for a `pathIfNotExists` operand, refused where stored below.
+                const entryChecked =
+                  /(^|: )entry: /.test(each.key) &&
+                  since !== "refused where stored" &&
+                  since !== "kept where present"
+                if (entryChecked) {
+                  // Where 1.39.0 wrote one that left a row no read takes, it's refused with
+                  // nothing written, and the row reads as it was.
+                  if (
+                    failure !== undefined &&
+                    refusedOperand({ ok: false, reads: true, requests: [], failure })
+                  ) {
+                    expect(`${each.key}: ${was.ok && was.reads}`).toBe(`${each.key}: false`)
+                    expect(got.after).toEqual(got.before)
+                    expect(`${each.key}: ${Exit.isSuccess(got.read)}`).toBe(`${each.key}: true`)
+                    continue
+                  }
+                  // Written encoded, where 1.39.0's row didn't read: it reads now.
+                  if (!was.reads && Exit.isSuccess(got.exit) && Exit.isSuccess(got.read)) continue
+                } else if (since !== undefined) {
                   // A `pathIfNotExists` operand is refused where the row lacks its path, which
                   // the case's row does: with the error 1.39.0 refused it with.
                   const refusing =
@@ -167,9 +188,9 @@ describeConnected("an update with an operand, on DynamoDB Local", () => {
                   )
                   expect(`${each.key}: ${Exit.isSuccess(got.read)}`).toBe(`${each.key}: true`)
                   if (refusing) {
-                    expect(failureOf(got.exit)).toMatchObject({ error: "ValidationError" })
+                    expect(failure).toMatchObject({ error: "ValidationError" })
                     if (since === "refused where stored" && refusedOperand(was)) {
-                      expect(failureOf(got.exit)).toEqual(was.failure)
+                      expect(failure).toEqual(was.failure)
                     }
                     expect(got.after).toEqual(got.before)
                   }

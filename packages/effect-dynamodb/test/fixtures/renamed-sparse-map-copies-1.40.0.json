@@ -1,0 +1,9636 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Entities Plain and Retained (versioned: { retain: true }) over { id, n?: number, counts: Record<string, number> }, counts configured { storedAs: SparseMap(), field: 'sr' }, on DynamoSchema.make({ name: 'sr', version: 1 }). Each case starts from a row holding the map whole (put { id: 'a', n: 10, counts: { a: 1 } }), as entries (put with counts {}, then a raw UpdateItem SET counts#a = 1 REMOVE sr), or both (the whole-map put, then a raw SET counts#a = 7), and sends one update copying an entry into n (pathSet or pathSubtract with isPath), standalone or in Transaction.transactWrite. Recorded: its outcome (a result, or a failure's tag and the first line of its message), every request it sent, whole and in order, every row of the table after it, and what get read back. The table's name is replaced by <table>, UUIDs by <token> and timestamps by <time>. Never regenerate it: it is the record of what 1.40.0 did.",
+ "cases": {
+  "Plain, the map whole: pathSet(['n'] from ['counts#a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSet(['n'] from ['counts#a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSet(['n'] from counts.entry('a'))": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSet(['n'] from counts.entry('a')), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSet(['n'] from ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1.#ps2",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "sr",
+       "#ps2": "a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSet(['n'] from ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1.#ps2",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSubtract(['n'] by ['counts#a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSubtract(['n'] by ['counts#a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSubtract(['n'] by counts.entry('a'))": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSubtract(['n'] by counts.entry('a')), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSubtract(['n'] by ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1.#psb2",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "sr",
+       "#psb2": "a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: pathSubtract(['n'] by ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1.#psb2",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSet(['n'] from ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSet(['n'] from ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSet(['n'] from counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSet(['n'] from counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSet(['n'] from ['counts', 'a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1.#ps2",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "sr",
+       "#ps2": "a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSet(['n'] from ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1.#ps2",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSubtract(['n'] by ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSubtract(['n'] by ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSubtract(['n'] by counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSubtract(['n'] by counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSubtract(['n'] by ['counts', 'a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1.#psb2",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "sr",
+       "#psb2": "a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map entries: pathSubtract(['n'] by ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1.#psb2",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSet(['n'] from ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSet(['n'] from ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSet(['n'] from counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSet(['n'] from counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSet(['n'] from ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #ps0 = #ps1.#ps2",
+      "ExpressionAttributeNames": {
+       "#ps0": "n",
+       "#ps1": "sr",
+       "#ps2": "a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSet(['n'] from ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #ps0 = #ps1.#ps2",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSubtract(['n'] by ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSubtract(['n'] by ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSubtract(['n'] by counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "counts#a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSubtract(['n'] by counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSubtract(['n'] by ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "UpdateExpression": "SET #psb0 = #psb0 - #psb1.#psb2",
+      "ExpressionAttributeNames": {
+       "#psb0": "n",
+       "#psb1": "sr",
+       "#psb2": "a",
+       "#exists": "pk"
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map both: pathSubtract(['n'] by ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#plain"
+          }
+         },
+         "UpdateExpression": "SET #psb0 = #psb0 - #psb1.#psb2",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Retained, the map whole: pathSet(['n'] from ['counts#a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSet(['n'] from ['counts#a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSet(['n'] from counts.entry('a'))": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSet(['n'] from counts.entry('a')), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSet(['n'] from ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1.#ps2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map whole: pathSet(['n'] from ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1.#ps2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map whole: pathSubtract(['n'] by ['counts#a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSubtract(['n'] by ['counts#a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSubtract(['n'] by counts.entry('a'))": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSubtract(['n'] by counts.entry('a')), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map whole: pathSubtract(['n'] by ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1.#psb2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map whole: pathSubtract(['n'] by ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1.#psb2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSet(['n'] from ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSet(['n'] from ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSet(['n'] from counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSet(['n'] from counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSet(['n'] from ['counts', 'a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1.#ps2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {}
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map entries: pathSet(['n'] from ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1.#ps2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {}
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map entries: pathSubtract(['n'] by ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSubtract(['n'] by ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSubtract(['n'] by counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSubtract(['n'] by counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map entries: pathSubtract(['n'] by ['counts', 'a'])": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1.#psb2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {}
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map entries: pathSubtract(['n'] by ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "fail": "DynamoValidationError",
+    "says": "The provided expression refers to an attribute that does not exist in the item"
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1.#psb2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "1"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {}
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 10,
+     "counts": {
+      "a": 1
+     },
+     "version": 1
+    }
+   }
+  },
+  "Retained, the map both: pathSet(['n'] from ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSet(['n'] from ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSet(['n'] from counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSet(['n'] from counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 7,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSet(['n'] from ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1.#ps2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSet(['n'] from ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0 = #ps1.#ps2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "n",
+          "#ps1": "sr",
+          "#ps2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 1,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSubtract(['n'] by ['counts#a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSubtract(['n'] by ['counts#a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSubtract(['n'] by counts.entry('a'))": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSubtract(['n'] by counts.entry('a')), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "counts#a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "3"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 3,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSubtract(['n'] by ['counts', 'a'])": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1.#psb2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map both: pathSubtract(['n'] by ['counts', 'a']), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$sr#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$sr#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$sr#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #psb0 = #psb0 - #psb1.#psb2",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#psb0": "n",
+          "#psb1": "sr",
+          "#psb2": "a",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$sr#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$sr#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "n": {
+           "N": "10"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "9"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "n": {
+      "N": "10"
+     },
+     "pk": {
+      "S": "$sr#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "n": 9,
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  }
+ }
+}

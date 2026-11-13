@@ -9,6 +9,7 @@
  *   - removeEntries — explicit per-key REMOVE
  *   - clearMap — chained with other combinators in one final UpdateItem
  *   - Conditional ops via attribute_exists on the entry path
+ *   - An entry in a query's filter and select, the select projected
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -174,6 +175,18 @@ const program = Effect.gen(function* () {
   // #region remove-entries
   yield* db.entities.Pages.update({ pageId: "p-1" }).removeEntries("metrics", ["2026-05"])
   // #endregion
+
+  // ---------- An entry in a query's filter and select ----------
+  // `.entry(key)` names the entry's attribute in a filter, as in a condition. A
+  // select of an entry projects only the attributes it's stored under, and
+  // returns the map trimmed to that entry.
+  // #region entry-in-queries
+  const busy = yield* db.entities.Pages.scan()
+    .filter((t, { gt }) => gt(t.metrics.entry("2026-04").views, 100))
+    .select((t) => [t.metrics.entry("2026-04"), t.pageId])
+    .collect()
+  // #endregion
+  yield* Console.log(`Busy pages: ${JSON.stringify(busy)}`)
 
   // ---------- clearMap chained with other combinators ----------
   // Get-then-Update helper. On a `versioned: { retain: true }` entity the

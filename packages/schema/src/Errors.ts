@@ -155,12 +155,19 @@ export class UniqueConstraintViolation extends Data.TaggedError("UniqueConstrain
   readonly fields: Record<string, string>
 }> {}
 
-/** Optimistic concurrency conflict — item was modified since last read */
+/**
+ * Optimistic concurrency conflict — item was modified since last read.
+ *
+ * `attributes`, when present, names what changed without the version moving: a sparse map whose
+ * stored form another writer changed between this write's read and its write, on every attempt
+ * (#238). Retrying the write re-reads the item.
+ */
 export class OptimisticLockError extends Data.TaggedError("OptimisticLockError")<{
   readonly entityType: string
   readonly key: Record<string, unknown>
   readonly expectedVersion: number
   readonly actualVersion: number
+  readonly attributes?: ReadonlyArray<string>
 }> {}
 
 // ---------------------------------------------------------------------------

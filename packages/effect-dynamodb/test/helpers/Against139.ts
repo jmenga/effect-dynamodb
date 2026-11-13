@@ -13,6 +13,7 @@
 
 import { Cause, Exit } from "effect"
 import { expect } from "vitest"
+import { differingPaths } from "./WholeDiff.js"
 
 export interface Request {
   readonly command: string
@@ -80,6 +81,12 @@ export const wrote = (outcome: Outcome): boolean =>
  *   default), so the update succeeds;
  * - `"reads the entry"`: a sparse map's entry keyed `__proto__` is read back as an entry. 1.39.0's
  *   read dropped it, so a value its schema refuses there left a row that still read;
+ * - `"checks the entry"`: a value written into a sparse map's entry named by its attribute is
+ *   checked against the map's value schema and encoded as a field's is (#238). 1.39.0 wrote it as
+ *   given: where its row then didn't read, the value is refused with nothing sent; otherwise
+ *   the requests are 1.39.0's, or differ in that value alone (written encoded) and the row reads
+ *   wherever 1.39.0's did. `"checks the entry keyed `__proto__`"` is the same where 1.39.0's
+ *   read dropped the entry, so the row it left read whatever the value was;
  * - `"names the property"`: a path's segment below the first names the property of that name.
  *   1.39.0 renamed it as if it were a top-level field (`count`, stored as `renamed`), so it wrote
  *   another property, and the row the update leaves reads differently.
@@ -100,6 +107,9 @@ export const wrote = (outcome: Outcome): boolean =>
  *   nothing is written;
  * - `"kept where present"`: the row holds the path, so DynamoDB keeps the stored value and the
  *   operand is never stored. The update is written and succeeds, and the row reads.
+ * - `"refused where stored, keyed `__proto__`"`: `"refused where stored"`, for an operand a sparse
+ *   map's entry keyed `__proto__` checks (#238), where 1.39.0's read dropped the entry, so the
+ *   row it left read whatever the value was.
  *
  * And for every case: an update that wrote a row its reader then couldn't decode failed with a
  * `ValidationError` whose operation was `decode`; the release branch reports the same failure as
@@ -112,7 +122,10 @@ export type Since139 =
   | "refuses what wouldn't read"
   | "stores what reads"
   | "refused where stored"
+  | "refused where stored, keyed `__proto__`"
   | "kept where present"
+  | "checks the entry"
+  | "checks the entry keyed `__proto__`"
 
 /** An update that was written and whose row then didn't decode, in either release's words. */
 const writtenUnreadable = (outcome: Outcome): boolean =>
@@ -181,6 +194,31 @@ const unguarded = (request: Request | undefined): unknown => {
   return { command: request.command, input }
 }
 
+/**
+ * Where each request holds a path operation's operand (`:ps<n>`, `:pa<n>`, `:pp<n>`, `:pi<n>`),
+ * as `differingPaths` names it: `[0].input.ExpressionAttributeValues.:ps2`, or in a transaction
+ * `[1].input.TransactItems[0].Update.ExpressionAttributeValues.:ps2`.
+ */
+const operandValuePaths = (requests: ReadonlyArray<Request>): ReadonlyArray<string> =>
+  requests.flatMap((request, i) => {
+    const input = request.input as {
+      readonly ExpressionAttributeValues?: Record<string, unknown>
+      readonly TransactItems?: ReadonlyArray<{
+        readonly Update?: { readonly ExpressionAttributeValues?: Record<string, unknown> }
+      }>
+    }
+    const at = (values: Record<string, unknown> | undefined, path: string) =>
+      Object.keys(values ?? {})
+        .filter((name) => /^:p[sapi]\d+$/.test(name))
+        .map((name) => `${path}.ExpressionAttributeValues.${name}`)
+    return [
+      ...at(input.ExpressionAttributeValues, `[${i}].input`),
+      ...(input.TransactItems ?? []).flatMap((item, j) =>
+        at(item.Update?.ExpressionAttributeValues, `[${i}].input.TransactItems[${j}].Update`),
+      ),
+    ]
+  })
+
 /** How an update ended. */
 const ending = (outcome: Outcome): unknown =>
   writtenUnreadable(outcome) ? "written, and the row doesn't decode" : (outcome.failure ?? "ok")
@@ -200,9 +238,16 @@ export const expectAs139 = (
     )
     return
   }
-  if (since === "refused where stored" || since === "kept where present") {
-    // 1.39.0 refused it, or wrote it and left a row that didn't read.
-    expect(refusedOperand(was) || (wrote(was) && !was.reads)).toBe(true)
+  if (
+    since === "refused where stored" ||
+    since === "refused where stored, keyed `__proto__`" ||
+    since === "kept where present"
+  ) {
+    // 1.39.0 refused it, or wrote it and left a row that didn't read (or dropped the entry).
+    expect(
+      refusedOperand(was) ||
+        (wrote(was) && (!was.reads || since === "refused where stored, keyed `__proto__`")),
+    ).toBe(true)
     expect(fallbackDecided(got.requests)).toBe(true)
     const guarded = got.requests.find(guardedUpdate)
     if (guarded !== undefined && wrote(was)) {
@@ -211,7 +256,7 @@ export const expectAs139 = (
         was.requests.find((request) => request.command === "UpdateItem"),
       )
     }
-    if (since === "refused where stored") {
+    if (since !== "kept where present") {
       // Reads, or the guarded update DynamoDB refuses: nothing else is sent.
       const writes = got.requests.filter((request) => request.command !== "GetItem")
       expect(writes.length === 0 || (writes.length === 1 && guardedUpdate(writes[0]))).toBe(true)
@@ -240,6 +285,31 @@ export const expectAs139 = (
     }
     expect(got.reads).toBe(true)
     return
+  }
+  if (since === "checks the entry" || since === "checks the entry keyed `__proto__`") {
+    expect(wrote(was)).toBe(true)
+    if (refusedOperand(got)) {
+      // A value no read takes there: 1.39.0 left a row that didn't read (or dropped the entry).
+      expect(got.requests).toEqual([])
+      expect(writtenUnreadable(was) || !was.reads || since !== "checks the entry").toBe(true)
+      return
+    }
+    const differ = differingPaths(was.requests, got.requests)
+    if (differ.length > 0) {
+      // Written encoded: the requests differ in the operand's value alone, and the row reads
+      // wherever 1.39.0's did (where 1.39.0's didn't, it reads now or ends as 1.39.0's ended).
+      const operands = operandValuePaths(was.requests)
+      for (const path of differ) {
+        expect(operands.some((operand) => path.startsWith(operand))).toBe(true)
+      }
+      if (was.reads || !(got.ok && got.reads)) {
+        expect(ending(got)).toEqual(ending(was))
+        expect(got.ok).toBe(was.ok)
+        expect(got.reads).toBe(was.reads)
+      }
+      return
+    }
+    // Written as 1.39.0 wrote it: compared as any other case.
   }
   if (refusedOperand(was)) {
     // 1.39.0 refused it before writing, and after its reads: nothing is sent now.

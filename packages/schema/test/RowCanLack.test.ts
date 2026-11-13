@@ -428,11 +428,48 @@ describe("pathIsRequired", () => {
       ["p", 0],
       true,
     ],
-    // Length alone can't see a value in a position that can't hold it, or a tag ruling out the
-    // member that reads what's left: sent, as 1.39.0 sent them.
+    // What's left is judged by its elements too, and by what's beside the list (#238): a value
+    // moved into a position that can't hold it, or a tag ruling out the member whose list reads
+    // what's left. Published 1.39.0 and 1.40.0 sent these, and the row didn't read back.
     [
       "a required position before an optional one of another type",
       Schema.Tuple([Schema.String, Schema.optional(Schema.Number)]),
+      [0],
+      true,
+    ],
+    [
+      "the optional last position of another type",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.Number)]),
+      [1],
+      false,
+    ],
+    [
+      "a required position before an optional one of the same type",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+      [0],
+      false,
+    ],
+    [
+      "a required position before an optional literal the string can't be",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.Literal("b"))]),
+      [0],
+      false,
+    ],
+    [
+      "a position before a rest of another type",
+      Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.Number]),
+      [0],
+      true,
+    ],
+    [
+      "a rest's position, after one of another type",
+      Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.Number]),
+      [1],
+      false,
+    ],
+    [
+      "a fixed tuple's position before one of another type, shifted into an array",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.Number]), Schema.Array(Schema.Number)]),
       [0],
       false,
     ],
@@ -446,7 +483,91 @@ describe("pathIsRequired", () => {
         Schema.Struct({ kind: Schema.Literal("b"), p: Schema.Tuple([Schema.String]) }),
       ]),
       ["p", 0],
+      true,
+    ],
+    [
+      "tuples of two lengths in tagged structs",
+      Schema.Union([
+        Schema.TaggedStruct("A", { p: Schema.Tuple([Schema.String, Schema.String]) }),
+        Schema.TaggedStruct("B", { p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 0],
+      true,
+    ],
+    [
+      "tuples of two lengths in tagged structs, a position the shorter doesn't hold",
+      Schema.Union([
+        Schema.TaggedStruct("A", { p: Schema.Tuple([Schema.String, Schema.String]) }),
+        Schema.TaggedStruct("B", { p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 1],
       false,
+    ],
+    [
+      "tuples of two lengths, the shorter member's tag optional",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({
+          kind: Schema.optionalKey(Schema.Literal("b")),
+          p: Schema.Tuple([Schema.String]),
+        }),
+      ]),
+      ["p", 0],
+      true,
+    ],
+    [
+      "tuples of two lengths, both members' tags optional",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.optionalKey(Schema.Literal("a")),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({
+          kind: Schema.optionalKey(Schema.Literal("b")),
+          p: Schema.Tuple([Schema.String]),
+        }),
+      ]),
+      ["p", 0],
+      false,
+    ],
+    [
+      "tuples of two lengths, a tag the other member's can be",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({ kind: Schema.String, p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 0],
+      false,
+    ],
+    [
+      "tuples of two lengths below the tagged members",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          q: Schema.Struct({ p: Schema.Tuple([Schema.String, Schema.String]) }),
+        }),
+        Schema.Struct({
+          kind: Schema.Literal("b"),
+          q: Schema.Struct({ p: Schema.Tuple([Schema.String]) }),
+        }),
+      ]),
+      ["q", "p", 0],
+      true,
+    ],
+    [
+      "a tag inside the list itself",
+      Schema.Union([
+        Schema.Tuple([Schema.Literal("a"), Schema.String, Schema.String]),
+        Schema.Tuple([Schema.Literal("b"), Schema.String]),
+      ]),
+      [1],
+      true,
     ],
     ["a recursive schema's required property", Tree, ["next", "value"], true],
     ["a recursive schema's optional property", Tree, ["next", "next"], false],
@@ -528,6 +649,7 @@ describe("pathIsRequired", () => {
       [0, 0],
       false,
     ],
+    // A record's signatures are judged by the key: each it matches reads the entry (#238).
     [
       "a record with two index signatures, the always-unreadable entry",
       Schema.StructWithRest(Schema.Struct({}), [
@@ -541,6 +663,60 @@ describe("pathIsRequired", () => {
         ),
       ]),
       ["fixed-k", 0],
+      true,
+    ],
+    [
+      "a record with two index signatures, a key neither reads",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(
+          Schema.TemplateLiteral(["open-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+        ),
+        Schema.Record(
+          Schema.TemplateLiteral(["fixed-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.String]),
+        ),
+      ]),
+      ["other-k", 0],
+      false,
+    ],
+    [
+      "a record whose signatures overlap, the key read by both",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(Schema.String, Schema.Struct({ x: Schema.optional(Schema.String) })),
+        Schema.Record(Schema.TemplateLiteral(["k-", Schema.String]), Address),
+      ]),
+      ["k-1", "city"],
+      false,
+    ],
+    [
+      "a record whose signatures overlap, both requiring it",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(Schema.String, Address),
+        Schema.Record(Schema.TemplateLiteral(["k-", Schema.String]), Address),
+      ]),
+      ["k-1", "city"],
+      true,
+    ],
+    [
+      "a record keyed by a template literal with a number in it",
+      Schema.Record(Schema.TemplateLiteral(["k-", Schema.Number]), Address),
+      ["k-1", "city"],
+      false,
+    ],
+    [
+      "an entry's required property, as a sparse map's read rebuilds it",
+      Schema.Record(Schema.String, Schema.Struct({ x: Schema.String, y: Schema.String })),
+      ["k", "x"],
+      true,
+    ],
+    [
+      "an entry's optional property",
+      Schema.Record(
+        Schema.String,
+        Schema.Struct({ x: Schema.optional(Schema.String), y: Schema.String }),
+      ),
+      ["k", "x"],
       false,
     ],
     [
@@ -562,7 +738,7 @@ describe("pathIsRequired", () => {
       "a record keyed by a template literal",
       Schema.Record(Schema.TemplateLiteral(["k-", Schema.String]), Address),
       ["k-1", "city"],
-      false,
+      true,
     ],
     [
       "a struct with an index signature",
@@ -589,11 +765,122 @@ describe("pathIsRequired", () => {
       false,
     ],
     ["a checked struct", Address.check(Schema.makeFilter(() => true)), ["city"], false],
+    // A path reaches the guard by the names it's sent with: a renamed key by its stored name, which
+    // is what the request removes (#238). Its own name isn't stored, so removing it leaves the row.
     [
-      "a struct whose keys are renamed",
+      "a struct whose keys are renamed, a renamed key by its own name",
       Address.pipe(Schema.encodeKeys({ city: "City" })),
       ["city"],
       false,
+    ],
+    [
+      "a struct whose keys are renamed, a required key by its stored name",
+      Address.pipe(Schema.encodeKeys({ city: "City" })),
+      ["City"],
+      true,
+    ],
+    [
+      "a struct whose keys are renamed, an optional key by its stored name",
+      Address.pipe(Schema.encodeKeys({ zip: "Zip" })),
+      ["Zip"],
+      false,
+    ],
+    [
+      "a key renamed with a decoding default, by its stored name",
+      Schema.Struct({
+        city: Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("c"))),
+      }).pipe(Schema.encodeKeys({ city: "City" })),
+      ["City"],
+      false,
+    ],
+    [
+      "keys renamed onto each other's names: a, which holds the optional b",
+      Schema.Struct({ a: Schema.String, b: Schema.optional(Schema.String) }).pipe(
+        Schema.encodeKeys({ a: "b", b: "a" }),
+      ),
+      ["a"],
+      false,
+    ],
+    [
+      "keys renamed onto each other's names: b, which holds the required a",
+      Schema.Struct({ a: Schema.String, b: Schema.optional(Schema.String) }).pipe(
+        Schema.encodeKeys({ a: "b", b: "a" }),
+      ),
+      ["b"],
+      true,
+    ],
+    [
+      "below a renamed key",
+      Schema.Struct({ a: Address }).pipe(Schema.encodeKeys({ a: "A" })),
+      ["A", "city"],
+      true,
+    ],
+    [
+      "a class over a struct whose keys are renamed",
+      (() => {
+        class Renamed extends Schema.Class<Renamed>("PIRRenamed")(
+          // A class takes a struct whose keys are renamed, though its type names only a bare one.
+          Address.pipe(Schema.encodeKeys({ city: "City" })) as unknown as typeof Address,
+        ) {}
+        return Renamed
+      })(),
+      ["City"],
+      true,
+    ],
+    [
+      "a checked struct whose keys are renamed",
+      Address.pipe(Schema.encodeKeys({ city: "City" })).check(Schema.makeFilter(() => true)),
+      ["City"],
+      false,
+    ],
+    // A key rename is taken only as `encodeKeys` builds it, by its shape: the model's functions are
+    // never run. A struct another transformation stores is one whose stored names aren't known. One
+    // of `encodeKeys`' shape stores each property's encoded form, so a key it requires is required
+    // whatever its functions do.
+    [
+      "a struct whose transformation defaults a key its stored struct may leave out",
+      Schema.Struct({ amount: Schema.optionalKey(Schema.Number) }).pipe(
+        Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+          decode: SchemaGetter.transform((value: { readonly amount?: number }) => ({
+            amount: value.amount ?? 0,
+          })),
+          encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+            amount: value.amount,
+          })),
+        }),
+      ),
+      ["amount"],
+      false,
+    ],
+    [
+      "a struct whose transformation renames a key it stores optional",
+      Schema.Struct({ am: Schema.optionalKey(Schema.Number) }).pipe(
+        Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+          decode: SchemaGetter.transform((value: { readonly am?: number }) => ({
+            amount: value.am ?? 0,
+          })),
+          encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+            am: value.amount,
+          })),
+        }),
+      ),
+      ["am"],
+      false,
+    ],
+    [
+      "a struct whose transformation has encodeKeys' shape, a key its stored struct requires",
+      Schema.Struct({ am: Schema.Number }).pipe(
+        Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+          decode: SchemaGetter.transform((value: { readonly am: number }) => ({
+            amount: value.am,
+          })),
+          encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+            am: value.amount,
+          })),
+        }),
+      ),
+      ["am"],
+      true,
     ],
     [
       "below a struct with a decoding default",
@@ -659,6 +946,85 @@ describe("pathIsRequired", () => {
   for (const [name, field, path, expected] of CASES) {
     it(`${name}: ${expected}`, () => expect(pathIsRequired(field, path)).toBe(expected))
   }
+})
+
+describe("pathIsRequired, against the update's other clauses in the field (#238)", () => {
+  const T2 = Schema.Tuple([Schema.String, Schema.String])
+  const tagged = Schema.Struct({
+    f: Schema.Union([
+      Schema.Struct({ kind: Schema.Literal("b"), p: Schema.Tuple([Schema.String]) }),
+      Schema.Struct({ kind: Schema.Literal("a"), p: T2 }),
+    ]),
+  })
+  const shifted = Schema.Tuple([Schema.String, Schema.optional(Schema.Number)])
+  const records = Schema.StructWithRest(Schema.Struct({}), [
+    Schema.Record(
+      Schema.TemplateLiteral(["open-", Schema.String]),
+      Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+    ),
+    Schema.Record(Schema.TemplateLiteral(["fixed-", Schema.String]), T2),
+  ])
+  const nested = Schema.Array(Schema.Struct({ p: T2, q: Schema.String }))
+  type Case = readonly [
+    name: string,
+    field: Schema.Top,
+    path: ReadonlyArray<string | number>,
+    beside: ReadonlyArray<ReadonlyArray<string | number>>,
+    expected: boolean,
+  ]
+  const CASES: ReadonlyArray<Case> = [
+    // The tag beside the list: another clause writing it changes which member reads what's left.
+    ["the tag, written beside p[0]", tagged, ["f", "p", 0], [["f", "kind"]], false],
+    ["nothing beside p[0]", tagged, ["f", "p", 0], [], true],
+    // Another position of the list: DynamoDB appends past the end, or closes up another gap.
+    ["another position of the list", shifted, [0], [[1]], false],
+    ["below another position of the list", nested, [0, "p", 0], [[0, "p", 1]], true],
+    ["another element of a list further up", nested, [0, "p", 0], [[1, "q"]], true],
+    // A sibling of a property on the way, where a struct holds it.
+    ["a sibling where a struct holds the list", nested, [0, "p", 0], [[0, "q"]], true],
+    // As 1.40.0 judged it, by length alone: [string, string] one shorter is no length it takes.
+    ["the path itself, beside a removal 1.40.0 refused", T2, [0], [[0]], true],
+    ["the field, written whole, beside one 1.40.0 refused", T2, [0], [[]], true],
+    ["another position, beside one 1.40.0 refused", T2, [0], [[2]], true],
+    // A record's other key isn't read, so the judgement stands; its own list's other position
+    // makes it 1.40.0's, which didn't model a record keyed by template literals.
+    ["a record's other key", records, ["fixed-k", 0], [["open-j"]], true],
+    ["the same key's other position", records, ["fixed-k", 0], [["fixed-k", 2]], false],
+    // Below a struct renaming its keys, which 1.40.0 didn't judge: unjudged once another clause
+    // changes what the position's judgement reads (#238).
+    [
+      "a position below a renamed key, alone",
+      Schema.Struct({ p: T2 }).pipe(Schema.encodeKeys({ p: "q" })),
+      ["q", 0],
+      [],
+      true,
+    ],
+    [
+      "a position below a renamed key, beside another position",
+      Schema.Struct({ p: T2 }).pipe(Schema.encodeKeys({ p: "q" })),
+      ["q", 0],
+      [["q", 2]],
+      false,
+    ],
+    // A property's judgement reads nothing of the row.
+    [
+      "a property, beside its sibling",
+      Schema.Struct({ x: Schema.Number, y: Schema.String }),
+      ["x"],
+      [["y"]],
+      true,
+    ],
+  ]
+  for (const [name, field, path, beside, expected] of CASES) {
+    it(`${name}: ${expected}`, () => expect(pathIsRequired(field, path, { beside })).toBe(expected))
+  }
+
+  it("below a sparse map's entry, which 1.40.0 didn't judge, another clause leaves it unjudged", () => {
+    const entry = Schema.Record(Schema.String, T2)
+    expect(pathIsRequired(entry, ["k", 0], { beside: [], judgedBefore: false })).toBe(true)
+    expect(pathIsRequired(entry, ["k", 0], { beside: [["k", 2]], judgedBefore: false })).toBe(false)
+    expect(pathIsRequired(entry, ["k", 0], { beside: [["k", 2]] })).toBe(true)
+  })
 })
 
 describe("the derived update schema", () => {

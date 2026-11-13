@@ -193,6 +193,8 @@ yield* db.entities.VPages.update({ pageId: "v-1" })
   .set({ status: "reset" })
 ```
 
+The clear comes first: `.clearMap("metrics").set({ metrics: { "2026-06": { views: 1, clicks: 0 } } })` leaves only that entry, an `.add()` or `pathAdd()` to an entry starts from nothing, a `pathIfNotExists()` sets it, and a `.removeEntries()`, `.deleteFromSet()` or `pathRemove()` below it has nothing left to remove. A `.subtract()`, an `.append()`, or a path operation writing below an entry the clear removes has nothing left to work on, and is refused with a `ValidationError` (`EDD-9151`) before anything is written. On a retained entity, `.subtract()` and `.append()` apply to the cleared map in memory, and start from nothing.
+
 **Race window:** between the read and the update, a concurrent writer can add a new bucket. The new bucket survives the clear.
 
 - **`versioned: { retain: true }`** — the existing optimistic-lock CAS closes the race automatically. Clear fails on stale version, retry resolves.
@@ -207,6 +209,38 @@ yield* db.entities.Pages.update({ pageId: "p-1" })
   .set({ status: "updated" })
   .condition((t, { exists }) => exists(t.metrics.entry("2026-01")))
 ```
+
+## Entries in queries
+
+`.entry(key)` names an entry in a query's, a scan's and a collection's `filter` and `select` too, compiled to the attribute a condition names. Up to 1.40.0 it threw in every query callback.
+
+```typescript region="entry-in-queries" example="guide-sparse-maps.ts"
+const busy = yield* db.entities.Pages.scan()
+  .filter((t, { gt }) => gt(t.metrics.entry("2026-04").views, 100))
+  .select((t) => [t.metrics.entry("2026-04"), t.pageId])
+  .collect()
+// → [{ metrics: { "2026-04": { clicks: 10, views: 101 } }, pageId: "p-1" }]
+```
+
+A select of an entry returns the map trimmed to that entry, and projects only the attribute the entry is stored under (with what's below it: `t.metrics.entry("2026-04").views`). A list selected by position comes back as DynamoDB projects it, closed up: `t.scores.entry("a").at(2)` of `[10, 20, 30]` is `{ scores: { a: [30] } }`. A select of the whole map (`t.metrics`) can't be projected: DynamoDB can't name attributes by prefix, so the rows are read whole and the map is rebuilt from their entries. That reads the same capacity a projected query reads (DynamoDB charges by the size of the items it reads, not what it returns), but sends back every attribute of every row.
+
+In a collection each member names an entry by its own prefix. A member without the map reads every entry as absent, even when it stores another map under the same prefix: `eq(t.counts.entry("k"), 5)` never matches its rows, and `notExists(t.counts.entry("k"))` matches every one. A request has one projection, so one member's whole-map select reads every member's rows whole.
+
+## A map renamed with `field:`
+
+A sparse map renamed with `field:` (`{ storedAs: DynamoModel.SparseMap(), field: "sr" }`) has two stored forms. `put` stores it whole, as one map attribute `sr`; an update and a plain entity's `upsert` store its entries, as `counts#<key>`. A read takes `sr` when the row holds it, and the entries otherwise.
+
+A limit: a `prefix` doesn't change this, so `{ storedAs: DynamoModel.SparseMap({ prefix: "c" }), field: "sr" }` still has `put` store a native map under `sr`, as 1.40.0 did, and the prefix names only the entries an update writes (`c#<key>`).
+
+- An update that reads the row (a retained entity's, `clearMap`, any update in `Transaction.transactWrite`) writes an entry where the row holds the map: inside `sr`, or as its own attribute. One that clears the map removes `sr` too, and writes the entries as their own attributes. If another writer changes the map's form between the read and the write, the update reads the row again and writes again; if it changes before each of three attempts, the update fails with `OptimisticLockError` (a versioned or retained entity) or `ConcurrentModification`, with `attributes: ["counts"]`.
+- An update that doesn't read the row, and a plain entity's `upsert`, write the entries as their own attributes, guarded on the row not holding `sr`. On a row `put` wrote, they're refused with a `ValidationError` (`EDD-9150`) and nothing is written: send the update in a transaction, or put the item. Up to 1.40.0 such a write reported success and changed nothing a read sees. A `.condition()` or `expectedVersion` the row doesn't meet still fails with its own error (`ConditionalCheckFailed`, `OptimisticLockError`), and so does a `.condition()` the library can't judge from the row (a `size()` of text beyond ASCII, whose answer depends on how the length is counted): `EDD-9150` means the rest of the condition held.
+- A copy from an entry (`pathSet` with `isPath`) writes no entry and is never refused for the form. Spelled through the map (`counts.entry("a")`), it reads the entry where a read takes it when the update reads the row; otherwise it's sent as before.
+- A condition or a filter on an entry (`t.counts.a`, `t.counts.entry("a")`) asks the row where it holds the map, so it holds on rows of either form.
+- A select of an entry projects `sr` whole beside the entry's attribute, and returns what a read returns, trimmed to the entry. That costs the whole map's attribute on each row it returns, not the row.
+
+In short: on a plain entity whose entries you update, don't rename a sparse map with `field:`.
+
+The next major stores a renamed sparse map as entries everywhere. A read that merged `sr` with the entries would have avoided the refusal, but it would change what rows already stored read as (a row holding both reads as `sr` alone today), so it isn't done.
 
 ## Lifecycle interactions
 
@@ -228,4 +262,4 @@ yield* db.entities.Pages.update({ pageId: "p-1" })
 
 - **Sidecar keys-set** for single-op atomic clear — defer until clearing is shown to be a hot path.
 - **Deeper sparse nesting** (sparse-of-sparse) — keeps wire format symmetric and decode simple.
-- **Wildcard projections** (`metrics#*` in `ProjectionExpression`) — DynamoDB does not support this.
+- **Wildcard projections** (`metrics#*` in `ProjectionExpression`) — DynamoDB does not support this. A `.select()` naming a whole sparse map field reads whole rows instead, and hands back the map rebuilt and trimmed to what was selected (see [Entries in queries](#entries-in-queries) for what that costs). A select of one entry is projected.
