@@ -102,12 +102,13 @@ describe("rekey over unique sentinels whose keys were used again sends 1.40.0's 
           expect(report.conflicts).toEqual([])
           expect(Object.values(report.moved).every((n) => n === 0)).toBe(true)
           // Counted as 1.40.0 counted them: a sentinel no live row holds is `unrecognizedKey`.
+          // 1.40.0 had no `ambiguousOwner`, and there's no outbox item here to count in it.
           const counted = stored.reports[options.dryRun === true ? "dry run" : "run"]!
           expect({
             scanned: report.scanned,
             unchanged: report.unchanged,
             skipped: report.skipped,
-          }).toEqual(counted)
+          }).toEqual({ ...counted, skipped: { ...counted.skipped, ambiguousOwner: 0 } })
           expect(report.reservations).toEqual({
             orphaned: 0,
             released: 0,

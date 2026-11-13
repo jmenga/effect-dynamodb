@@ -121,11 +121,13 @@ describeConnected(
             const world = reservationWorld(RESERVATION_MODULES, setting.endsWith("escapeKeys on"))
             const { report, sent } = yield* replay(world, stored.rows, options)
             expect(report.conflicts).toEqual([])
+            // 1.40.0 had no `ambiguousOwner`, and there's no outbox item here to count in it.
+            const counted = stored.reports[options.dryRun === true ? "dry run" : "run"]!
             expect({
               scanned: report.scanned,
               unchanged: report.unchanged,
               skipped: report.skipped,
-            }).toEqual(stored.reports[options.dryRun === true ? "dry run" : "run"])
+            }).toEqual({ ...counted, skipped: { ...counted.skipped, ambiguousOwner: 0 } })
             expect(sent).toEqual(expected)
           }),
         )

@@ -110,7 +110,8 @@ export const reservationFixture: {
             {
               readonly scanned: number
               readonly unchanged: number
-              readonly skipped: Table.RekeyReport["skipped"]
+              /** 1.40.0's reasons: it had no `ambiguousOwner`. */
+              readonly skipped: Omit<Table.RekeyReport["skipped"], "ambiguousOwner">
             }
           >
         >
