@@ -11,7 +11,7 @@ import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypt
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { DateTime, Effect, Option, Schema } from "effect"
+import { DateTime, Effect, Option, type Schema } from "effect"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
 import type { ConditionInput } from "../Expression.js"
@@ -19,6 +19,7 @@ import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshall
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import { isRefusedValue } from "./Capacity.js"
 import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
+import { encodeInput } from "./InputForm.js"
 
 /**
  * @internal Hidden per-incarnation token of a versioned entity (#133): set
@@ -765,22 +766,17 @@ export const validateAndBuildPutItem = (
     // timestamp builder so the value is deterministic under `TestClock`.
     const now = yield* DateTime.now
     const inputSchema = entity.schemas.inputSchema as Schema.Codec<any>
-    // Encode → fall back to decode-then-encode (mirrors Entity.put).
+    // The input's stored form, decided as `Entity.put` decides it (`InputForm`).
     // Omitted decoding defaults are stored, exactly as `Entity.put` does.
     const filled = yield* entity._fillDecodingDefaults(input)
     const unsentineled = entity._unsentineledDefaults(input)
-    const encoded = yield* Schema.encodeUnknownEffect(inputSchema)(filled).pipe(
-      Effect.catch(() =>
-        Schema.decodeUnknownEffect(inputSchema)(filled).pipe(
-          Effect.flatMap((decoded) => Schema.encodeUnknownEffect(inputSchema)(decoded)),
-        ),
-      ),
+    const encoded = yield* encodeInput(inputSchema, filled).pipe(
       Effect.mapError(
-        (cause) =>
+        ({ stored }) =>
           new ValidationError({
             entityType: entity.entityType,
             operation,
-            cause,
+            cause: stored,
           }),
       ),
     )

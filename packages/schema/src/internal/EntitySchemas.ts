@@ -7,6 +7,7 @@
 import {
   DateTime,
   Effect,
+  Exit,
   Option,
   Redacted,
   Schema,
@@ -44,9 +45,11 @@ import {
   isSchemaLike,
   lackDecision,
   numericTypeWithStringEncoding,
+  ReadsAbsentAs,
   storedList,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
+import { CANT_SAY, issueOf } from "./SchemaIssue.js"
 import { parseZonedIso } from "./ZonedIso.js"
 
 // ---------------------------------------------------------------------------
@@ -1773,11 +1776,14 @@ const absentAsDeclared = (schema: Schema.Top, withUndefined: boolean) => {
 const readingAbsent = (field: Schema.Top, declared: Schema.Top = field): Schema.Top => {
   const reading = absentStored(declared)
   if (reading === undefined) return field
-  return field.pipe(
-    Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
-      self: Schema.Top,
-    ) => Schema.Top,
-  )
+  // A stored value is read as `field` alone (`ReadsAbsentAs`): the default runs where none is.
+  return field
+    .pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
+        self: Schema.Top,
+      ) => Schema.Top,
+    )
+    .annotate({ [ReadsAbsentAs]: field.ast })
 }
 
 /** Whether a struct field anywhere in the schema reads an absent attribute as a value. */
@@ -3220,17 +3226,27 @@ const sameValue = (a: unknown, b: unknown): boolean => {
  * `DateTime` is "its own encoded form" to Effect, but the library stores it as
  * a primitive.
  */
-const makeAmbiguityCheck = (original: Schema.Top): ((value: unknown) => boolean) => {
+const makeAmbiguityCheck = (
+  original: Schema.Top,
+): ((value: unknown) => boolean | typeof CANT_SAY) => {
   if (!isLeafEncodingTransform(original)) return () => false
   // "Already wire" means the value DECODES as wire — a plain string that is not
   // valid base64 is a domain value for `StringFromBase64`, and is encoded.
-  const decodesAsWire = Schema.decodeUnknownOption(original as unknown as Schema.Codec<any>)
+  const decodesAsWire = Schema.decodeUnknownExit(original as unknown as Schema.Codec<any>)
   const isType = Schema.is(Schema.make<Schema.Top>(SchemaAST.toType(original.ast)))
-  const encode = Schema.encodeUnknownOption(original as unknown as Schema.Codec<any>)
+  const encode = Schema.encodeUnknownExit(original as unknown as Schema.Codec<any>)
+  // A transform that can't run synchronously can't tell (#236).
   return (value) => {
-    if (decodesAsWire(value)._tag === "None" || !isType(value)) return false
-    const encoded = encode(value)
-    return encoded._tag === "Some" && !sameValue(encoded.value, value)
+    const asWire = issueOf(() => decodesAsWire(value))
+    if (asWire === CANT_SAY) return CANT_SAY
+    if (asWire !== undefined || !isType(value)) return false
+    let encoded: Exit.Exit<unknown, unknown> | undefined
+    const issue = issueOf(() => {
+      encoded = encode(value)
+      return encoded
+    })
+    if (issue === CANT_SAY) return CANT_SAY
+    return encoded !== undefined && Exit.isSuccess(encoded) && !sameValue(encoded.value, value)
   }
 }
 
@@ -3333,36 +3349,58 @@ export const makePathValueEncoder = (
       const element = leafAwareEncoder(originalElement, storedElement)
       return (value) => (Array.isArray(value) ? value.map((entry) => element(entry)) : value)
     }
-    const encode = Schema.encodeUnknownOption(stored as Schema.Codec<any>)
-    const decode = Schema.decodeUnknownOption(stored as Schema.Codec<any>)
+    const encodeExit = Schema.encodeUnknownExit(stored as Schema.Codec<any>)
+    const decodeExit = Schema.decodeUnknownExit(stored as Schema.Codec<any>)
+    /** A synchronous run's value, `undefined` on a schema issue, `CANT_SAY` when it can't finish. */
+    const attempt = (
+      run: (value: unknown) => Exit.Exit<unknown, unknown>,
+      value: unknown,
+    ): { readonly value: unknown } | typeof CANT_SAY | undefined => {
+      let exit: Exit.Exit<unknown, unknown> | undefined
+      const verdict = issueOf(() => {
+        exit = run(value)
+        return exit
+      })
+      if (verdict === CANT_SAY) return CANT_SAY
+      return verdict === undefined && exit !== undefined && Exit.isSuccess(exit)
+        ? { value: exit.value }
+        : undefined
+    }
     const ambiguous = makeAmbiguityCheck(original)
     return (value: unknown) => {
-      if (ambiguous(value)) return value
+      // Where the check can't tell (a schema that can't run synchronously), the value is
+      // encoded as a domain value, and written as given if that can't finish either.
+      if (ambiguous(value) === true) return value
       // A container holding an ambiguous wire leaf (`{ b64: "aGk=", at }`) is
       // encoded part by part, so that leaf follows the leaf rule instead of
       // being encoded a second time by the whole-value encode.
       if (holdsAmbiguousLeaf(original, value)) return encodeByParts(original, value)
-      const encoded = encode(value)
-      if (encoded._tag === "Some") return encoded.value
+      // A schema that can't run synchronously (an asynchronous step, a defect) says nothing of
+      // the value: it's written as given, as at a position nothing checks (#236).
+      const encoded = attempt(encodeExit, value)
+      if (encoded === CANT_SAY) return value
+      if (encoded !== undefined) return encoded.value
       // `decode -> encode`, as `.set()` / `put` do: a plain object given for a
       // class-typed field, or a value already in wire form, round-trips to its
       // wire form instead of being marshalled as given.
-      const decoded = decode(value)
-      if (decoded._tag === "Some") {
-        const reencoded = encode(decoded.value)
-        if (reencoded._tag === "Some") return reencoded.value
+      const decoded = attempt(decodeExit, value)
+      if (decoded === CANT_SAY) return value
+      if (decoded !== undefined) {
+        const reencoded = attempt(encodeExit, decoded.value)
+        if (reencoded === CANT_SAY) return value
+        if (reencoded !== undefined) return reencoded.value
       }
       return encodeByParts(original, value)
     }
   }
-  const ambiguityChecks = new WeakMap<Schema.Top, (value: unknown) => boolean>()
+  const ambiguityChecks = new WeakMap<Schema.Top, (value: unknown) => boolean | typeof CANT_SAY>()
   const isAmbiguousAt = (schema: Schema.Top, value: unknown): boolean => {
     let check = ambiguityChecks.get(schema)
     if (check === undefined) {
       check = makeAmbiguityCheck(optionalField(schema)?.inner ?? schema)
       ambiguityChecks.set(schema, check)
     }
-    return check(value)
+    return check(value) === true
   }
   /**
    * Whether a container value holds, at any depth, a leaf in ambiguous wire
@@ -3464,9 +3502,11 @@ export const makePathValueEncoder = (
         ? null
         : (() => {
             const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
+            // Only a schema issue refuses: a decode that can't finish synchronously says
+            // nothing of the value (#236).
             return (encoded: unknown): unknown => {
-              const exit = decode(asStored(encoded))
-              return exit._tag === "Success" ? undefined : exit.cause
+              const issue = issueOf(() => decode(asStored(encoded)))
+              return issue === CANT_SAY ? undefined : issue
             }
           })()
     validators.set(key, fn)

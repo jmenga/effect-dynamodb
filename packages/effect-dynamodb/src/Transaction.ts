@@ -93,10 +93,11 @@ export const check: {
     // Sync API — there is no error channel to fail into, so this stays a throw.
     throw new Error(getRejectReason("Transaction.check"))
   }
+  const stored = storedNames(info.entity._resolveDbName, condition)
   // A packed field may be tested only as a whole (`[EDD-9076]`, #147).
   const refused = packedCompiledRefusal(
-    condition.expression,
-    condition.names,
+    stored.expression,
+    stored.names,
     info.entity._packedGuards ?? [],
     "condition check",
   )
@@ -105,9 +106,38 @@ export const check: {
     [ConditionCheckTypeId]: ConditionCheckTypeId,
     _entity: info.entity,
     _key: info.key!,
-    _condition: condition,
+    _condition: stored,
   }
 })
+
+/**
+ * A compiled condition naming the attributes the entity stores (#236). The expression builders
+ * (`Expression.condition`) have no entity, so a name is the one they were given: a model field
+ * stored under another name (`field: "renamed"`) was named as the field, which no row holds.
+ * A name placeholder used only at the start of a document path (an attribute, not a property
+ * below one) whose name is such a field names its stored attribute; every other name is sent as
+ * given, as is a condition holding none.
+ */
+const storedNames = (
+  resolve: (domainName: string) => string,
+  condition: ExpressionResult,
+): ExpressionResult => {
+  const heads = new Set<string>()
+  const below = new Set<string>()
+  for (const match of condition.expression.matchAll(/#[A-Za-z0-9_]+/g)) {
+    const before = condition.expression.slice(0, match.index).trimEnd()
+    ;(before.endsWith(".") ? below : heads).add(match[0])
+  }
+  let names: Record<string, string> | undefined
+  for (const [key, name] of Object.entries(condition.names)) {
+    if (!heads.has(key) || below.has(key)) continue
+    const attribute: unknown = resolve(name)
+    if (typeof attribute !== "string" || attribute === name) continue
+    names ??= { ...condition.names }
+    names[key] = attribute
+  }
+  return names === undefined ? condition : { ...condition, names }
+}
 
 // ---------------------------------------------------------------------------
 // TransactGet — typed tuple return

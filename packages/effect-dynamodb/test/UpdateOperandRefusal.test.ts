@@ -1,9 +1,12 @@
 /**
  * An update's operand its write schema refuses at its path — of `.append()`, `pathSet`,
- * `pathAppend`, `pathPrepend` or `pathIfNotExists` — refuses the update before it reads or sends
- * anything. The decision was made only when the write was built, so an update that reads first (a
- * retained entity's, every planned update of a transaction) read before it was refused, and a
- * failed read reported a `DynamoError` in place of the `ValidationError`.
+ * `pathAppend` or `pathPrepend` — refuses the update before it reads or sends anything. The
+ * decision was made only when the write was built, so an update that reads first (a retained
+ * entity's, every planned update of a transaction) read before it was refused, and a failed read
+ * reported a `DynamoError` in place of the `ValidationError`.
+ *
+ * Not `pathIfNotExists`'s: its operand is stored only where the row lacks the path, so it is
+ * refused there alone, which takes the row (`PathIfNotExistsFallback.test.ts`, #236).
  *
  * So an update refused for a second reason now reports the operand, where 1.39.0 reported whichever
  * it met first as it read and built the write: the last tests here pin each.
@@ -48,10 +51,6 @@ const refused: ReadonlyArray<readonly [operation: string, apply: (update: any) =
   ],
   ["update.pathAppend", (update) => update.pathAppend({ segments: ["list"], value: [-1] })],
   ["update.pathPrepend", (update) => update.pathPrepend({ segments: ["list"], value: [-1] })],
-  [
-    "update.pathIfNotExists",
-    (update) => update.pathIfNotExists({ segments: ["meta", "n"], value: -1 }),
-  ],
 ]
 
 const run = (

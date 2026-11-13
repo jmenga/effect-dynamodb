@@ -34,6 +34,7 @@ import {
   ConditionalCheckFailed,
   DeleteAppliedButUnreadable,
   DynamoError,
+  DynamoValidationError,
   EmbeddingError,
   ItemNotDeleted,
   ItemNotFound,
@@ -69,9 +70,12 @@ import {
   type AbsentReading,
   absentReading,
   absentStored,
+  type OperandKind,
   pathIsRequired,
+  readersAt,
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { CANT_SAY } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { sparseKeyRefusal, sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -116,6 +120,13 @@ import {
 } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import {
+  isNumeric,
+  memberKind,
+  numberSum,
+  setDifference,
+  setUnion,
+} from "./internal/DynamoArithmetic.js"
+import {
   compileExpr,
   createConditionOps,
   type Expr,
@@ -135,6 +146,8 @@ import {
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
+import { encodeInput } from "./internal/InputForm.js"
+import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
   decodeImage,
   imageEntityType,
@@ -148,7 +161,12 @@ import {
   unpackRow,
   withRegistry,
 } from "./internal/Packed.js"
-import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
+import {
+  compilePath,
+  createPathBuilder,
+  type PathModel,
+  storedPath,
+} from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
 import {
@@ -495,6 +513,24 @@ type EncodedOperands = {
   readonly pathAppends: ReadonlyArray<unknown>
   readonly pathPrepends: ReadonlyArray<unknown>
   readonly pathIfNotExists: ReadonlyArray<unknown>
+  /** `.add()`'s and `.deleteFromSet()`'s by field: a set as its members are stored (`setOperand`). */
+  readonly add: globalThis.Record<string, unknown>
+  readonly deleteFromSet: globalThis.Record<string, unknown>
+  /** `pathAdd`'s and `pathDelete`'s at their operation's index, likewise. */
+  readonly pathAdds: ReadonlyArray<unknown>
+  readonly pathDeletes: ReadonlyArray<unknown>
+  /**
+   * The `pathIfNotExists` operands a check refuses: each is refused only where its path is absent
+   * from the row, so the fallback would be stored (`fallbackRefusal`, #236).
+   */
+  readonly fallbacks: ReadonlyArray<RefusedFallback>
+}
+
+/** A `pathIfNotExists` operand a check refuses: its path, and the refusal it gets where stored. */
+type RefusedFallback = {
+  readonly segments: ReadonlyArray<string | number>
+  readonly operation: string
+  readonly cause: unknown
 }
 
 /** An update's operand its write schema refuses at its path: the operation, and the schema's issue. */
@@ -611,29 +647,21 @@ const expressionTargets = (
   return targets
 }
 
+/**
+ * A write's input in its stored form (`internal/InputForm.ts`, the one decision of which form an
+ * input is in). A refusal surfaces the domain form's issue: its message is keyed on the caller's
+ * input shape, which is what the user expects to see.
+ */
 const encodeOrDecodeEncode = (
   schema: Schema.Codec<any>,
   input: unknown,
   entityType: string,
   operation: string,
 ): Effect.Effect<unknown, ValidationError> =>
-  Schema.encodeUnknownEffect(schema)(input).pipe(
-    Effect.catch((primaryCause) =>
-      Schema.decodeUnknownEffect(schema)(input).pipe(
-        Effect.flatMap((decoded) => Schema.encodeUnknownEffect(schema)(decoded)),
-        // On fallback failure, surface the original encode error — its
-        // message is keyed on the caller's input shape, which is what the
-        // user expects to see.
-        Effect.catch(() =>
-          Effect.fail(
-            new ValidationError({
-              entityType,
-              operation: `${operation}.decode`,
-              cause: primaryCause,
-            }),
-          ),
-        ),
-      ),
+  encodeInput(schema, input).pipe(
+    Effect.mapError(
+      ({ domain }) =>
+        new ValidationError({ entityType, operation: `${operation}.decode`, cause: domain }),
     ),
   )
 
@@ -2464,6 +2492,44 @@ const makeImpl = <
     return { encoded, issue: pathValues.validateElements(segments, encoded) }
   }
   /**
+   * DynamoDB's refusal of an update expression (`#f - :v`, `list_append(#f, :v)`, `ADD`, `DELETE`)
+   * on a row holding a value of a kind the expression doesn't take (`fits`): what an update that
+   * applies the record operation to the row it read (a retained entity's, one changing a unique
+   * field, one computing an index composite) answers where the same operation sent as an
+   * expression would be refused. A row without the attribute, or holding `NULL` there, isn't
+   * refused here: such an update starts it from nothing (`0`, `[]`, the operand), as 1.40.0 did,
+   * where DynamoDB refuses `#f - :v` and `list_append(#f, :v)` on a missing attribute and every
+   * expression on `NULL` (DESIGN.md names the difference). Its message is
+   * the library's, in DynamoDB Local's wording (the service's may differ, and nothing depends on
+   * it), named `TransactWriteItems`, the request a retained update sends. `undefined` when the
+   * expression applies.
+   */
+  const expressionRefusal = (fits: boolean): DynamoValidationError | undefined =>
+    fits
+      ? undefined
+      : new DynamoValidationError({
+          operation: "TransactWriteItems",
+          cause: Object.assign(
+            new Error("An operand in the update expression has an incorrect data type"),
+            { name: "ValidationException" },
+          ),
+        })
+
+  /**
+   * Whether `before` is a set of the same kind (number, string, binary) as the set `operand`. A
+   * number set's members are numbers or bigints, as a read and a bigint field's operand give them.
+   */
+  const sameSetKind = (before: unknown, operand: unknown): boolean => {
+    if (!(before instanceof Set) || !(operand instanceof Set)) return false
+    const kind = (set: ReadonlySet<unknown>) => {
+      const [first] = set
+      return first === undefined ? undefined : memberKind(first)
+    }
+    const [was, now] = [kind(before), kind(operand)]
+    return was === undefined || now === undefined || was === now
+  }
+
+  /**
    * A `pathSet` or `pathSubtract` that names another attribute in place of a value: it has no
    * operand of its own. The other path operations always write their `value`, whatever else the
    * operation object holds.
@@ -3359,7 +3425,9 @@ const makeImpl = <
   /**
    * An update's operand that wouldn't read back. An operand of `.add`, `.subtract` or `.deleteFromSet`
    * is a number or a set to apply, not a value of the field, so only what's stored as given counts.
-   * `unstorableOperand` goes first, so each of these has already been through the marshaller.
+   * `unstorableOperand` goes first, so each of these has already been through the marshaller. A
+   * `pathIfNotExists` operand is judged by {@link encodeOperands} (`readBackIssue`): it is refused
+   * only where it would be stored.
    */
   const notReadBackOperand = (uState: UpdateState): string | undefined => {
     if (readBacks.size === 0) return undefined
@@ -3383,7 +3451,6 @@ const makeImpl = <
       ["pathSet of", uState.pathSets, "value"],
       ["pathAppend of", uState.pathAppends, "elements"],
       ["pathPrepend of", uState.pathPrepends, "elements"],
-      ["pathIfNotExists of", uState.pathIfNotExists, "value"],
     ]
     for (const [op, ops, kind] of operands) {
       for (const operand of ops ?? []) {
@@ -3401,6 +3468,19 @@ const makeImpl = <
       }
     }
     return undefined
+  }
+
+  /**
+   * Why a `pathIfNotExists` operand, in the form it's written, wouldn't read back from a field that
+   * can hold a value of a custom declaration (`notReadBackOperand`'s check); `undefined` if it
+   * would, or the field holds none.
+   */
+  const readBackIssue = (segments: ReadonlyArray<string | number>, encoded: unknown) => {
+    if (readBacks.size === 0 || !readBacks.has(String(segments[0]))) return undefined
+    const issue = pathValues.validate(segments, asRead(encoded))
+    return issue === undefined
+      ? undefined
+      : notReadBack(`pathIfNotExists of "${segments.join(".")}"`, issue)
   }
 
   /**
@@ -3477,12 +3557,127 @@ const makeImpl = <
     return undefined
   }
 
+  /** Each field as a row's read decodes it (`decodeRecord`), keyed by domain name. */
+  const readFieldSchemas = (getSchemaFields(schemas.recordSchema as unknown as Schema.Top) ??
+    {}) as globalThis.Record<string, Schema.Top>
+  const readFieldSchema = (field: string): Schema.Top | undefined =>
+    Object.hasOwn(readFieldSchemas, field) ? readFieldSchemas[field] : undefined
+
+  /**
+   * Where a row's read takes an operand written at `segments` (#236): the read schema of the field
+   * it decodes the attribute as, and the segments below it there. `undefined` where that isn't
+   * one field exactly as `decodeRecord` reads it (an attribute that isn't a model field's, a
+   * packed or hidden field, a sparse map written whole, an entry of a sparse map stored under a
+   * `field:` rename, a stored name another field also claims). A path's first segment holding `#` names an attribute as given (`compilePath`); a
+   * record op's key is resolved as the expression compiles it. A sparse map's entry is read in
+   * its field's map under its key, and is encoded by the model at that position (`modelPath`).
+   */
+  const readPosition = (
+    segments: ReadonlyArray<string | number>,
+    naming: "path" | "field",
+  ):
+    | {
+        readonly reader: Schema.Top
+        readonly below: ReadonlyArray<string | number>
+        readonly modelPath?: ReadonlyArray<string | number>
+      }
+    | undefined => {
+    const [head, ...below] = segments
+    if (typeof head !== "string") return undefined
+    const literal = naming === "path" && head.includes("#")
+    const attribute = literal || !isModelField(head) ? head : resolveDbName(head)
+    if (typeof attribute !== "string") return undefined
+    const entry = hasSparseFields ? sparseEntries.entryOf(attribute) : undefined
+    if (entry !== undefined) {
+      if (Object.hasOwn(data.packedFields, entry.field)) return undefined
+      // A map stored under a `field:` rename is read whole from that attribute, which replaces
+      // the entries a read gathered under `<prefix>#<key>`: no read takes this attribute.
+      if (resolveDbName(entry.field) !== entry.field) return undefined
+      const reader = readFieldSchema(entry.field)
+      return reader === undefined
+        ? undefined
+        : { reader, below: [entry.key, ...below], modelPath: [entry.field, entry.key, ...below] }
+    }
+    if (literal || !isModelField(head)) return undefined
+    if (Object.hasOwn(data.packedFields, head) || Object.hasOwn(sparseFields, head))
+      return undefined
+    // The attribute is read as this field alone.
+    if (modelFieldStoredIn(attribute) !== head) return undefined
+    if (attribute !== head && isModelField(attribute)) return undefined
+    const reader = readFieldSchema(head)
+    return reader === undefined ? undefined : { reader, below }
+  }
+
+  /**
+   * An operand as a row's read takes it (#236, `judgeOperand`): where its position is read
+   * exactly, what 1.40.0 sends (`encoded`, past 1.40.0's own checks) is sent unless no row holding
+   * it reads; elsewhere it is sent as 1.40.0 sent it.
+   */
+  const operandAsRead = (
+    segments: ReadonlyArray<string | number>,
+    naming: "path" | "field",
+    kind: OperandKind,
+    value: unknown,
+    encoded: unknown,
+  ): OperandVerdict => {
+    const position = readPosition(segments, naming)
+    const readers =
+      position === undefined ? undefined : readersAt(position.reader, position.below, kind)
+    if (position === undefined || readers === undefined) return { encoded, issue: undefined }
+    const { modelPath } = position
+    return judgeOperand(readers, kind, value, encoded, () => {
+      if (modelPath === undefined) return []
+      try {
+        return [encodePathValue(modelPath, value, kind).encoded]
+      } catch {
+        return CANT_SAY
+      }
+    })
+  }
+
+  /**
+   * A set operand of `.add()`, `.deleteFromSet()`, `pathAdd` or `pathDelete`, as the members of the
+   * set at its position are stored (#236). A set field's members may be stored in another form than
+   * the domain's (`Schema.ReadonlySet(Schema.NumberFromString)` stores strings): sent as given, the
+   * operand was a set of another kind, which DynamoDB refuses (`ADD`, `DELETE`), and which a
+   * retained update applied to the row it read. Where the position is read exactly and the set as
+   * given wouldn't read back there, it is sent as the reader stores it, when there is exactly one
+   * such form; anything else (another operand, a position not read exactly, a set that reads, or
+   * one no form of reads) is sent as given, as 1.40.0 sent it. Never a refusal: a set's operand
+   * isn't the value stored.
+   */
+  const setOperand = (
+    segments: ReadonlyArray<string | number>,
+    naming: "path" | "field",
+    value: unknown,
+  ): unknown => {
+    if (!(value instanceof Set)) return value
+    const position = readPosition(segments, naming)
+    const readers =
+      position === undefined ? undefined : readersAt(position.reader, position.below, "value")
+    if (position === undefined || readers === undefined) return value
+    const modelPath = position.modelPath ?? segments
+    const verdict = judgeOperand(readers, "value", value, value, () => {
+      try {
+        const { encoded, issue } = encodePathValue(modelPath, value, "value")
+        return issue === undefined ? [encoded] : []
+      } catch {
+        return CANT_SAY
+      }
+    })
+    return verdict.issue === undefined ? verdict.encoded : value
+  }
+
   /**
    * An update's operands written as values of its fields — `.append()`'s entries and the values of
    * `pathSet` (a copy excepted), `pathAppend`, `pathPrepend` and `pathIfNotExists` — in the form
    * they're written, each checked against the write schema at its path. Decided once, before the
    * update reads or sends anything: the first one the schema refuses refuses the update, and the
    * write sends the rest as encoded here. Each path operation's value is at its operation's index.
+   * The set operands of `.add()`, `.deleteFromSet()`, `pathAdd` and `pathDelete` are written as
+   * {@link setOperand} has them, and never refused here. Nor is a `pathIfNotExists` operand: one the
+   * write schema, the read or a custom declaration's read-back refuses is written only where its
+   * path is absent, so it's refused there alone (`fallbacks`, {@link fallbackRefusal}).
    */
   const encodeOperands = (uState: UpdateState): EncodedOperands | RefusedOperand => {
     // Keyed by a name the caller supplies: no prototype, so `__proto__` is a key like any other.
@@ -3490,7 +3685,9 @@ const makeImpl = <
     for (const [field, value] of Object.entries(uState.append ?? {})) {
       const { encoded, issue } = encodePathValue([field], value, "elements")
       if (issue !== undefined) return { operation: "update.append", issue }
-      append[field] = encoded
+      const read = operandAsRead([field], "field", "elements", value, encoded)
+      if (read.issue !== undefined) return { operation: "update.append", issue: read.issue }
+      append[field] = read.encoded
     }
     const each = (
       operation: string,
@@ -3515,7 +3712,9 @@ const makeImpl = <
         }
         const { encoded, issue } = encodePathValue(op.segments, op.value, kind)
         if (issue !== undefined) return { operation, issue }
-        values.push(encoded)
+        const read = operandAsRead(op.segments, "path", kind, op.value, encoded)
+        if (read.issue !== undefined) return { operation, issue: read.issue }
+        values.push(read.encoded)
       }
       return values
     }
@@ -3525,9 +3724,102 @@ const makeImpl = <
     if ("issue" in pathAppends) return pathAppends
     const pathPrepends = each("update.pathPrepend", uState.pathPrepends, "elements")
     if ("issue" in pathPrepends) return pathPrepends
-    const pathIfNotExists = each("update.pathIfNotExists", uState.pathIfNotExists, "value")
-    if ("issue" in pathIfNotExists) return pathIfNotExists
-    return { append, pathSets, pathAppends, pathPrepends, pathIfNotExists }
+    const pathIfNotExists: Array<unknown> = []
+    const fallbacks: Array<RefusedFallback> = []
+    for (const op of uState.pathIfNotExists ?? []) {
+      const { encoded, issue } = encodePathValue(op.segments, op.value, "value")
+      // A custom declaration's read-back first, as `notReadBackOperand` judges the others.
+      const readBack = readBackIssue(op.segments, encoded)
+      const read =
+        readBack === undefined && issue === undefined
+          ? operandAsRead(op.segments, "path", "value", op.value, encoded)
+          : { encoded, issue }
+      pathIfNotExists.push(read.encoded)
+      if (readBack !== undefined) {
+        fallbacks.push({ segments: op.segments, operation: "update", cause: readBack })
+      } else if (read.issue !== undefined) {
+        fallbacks.push({
+          segments: op.segments,
+          operation: "update.pathIfNotExists",
+          cause: read.issue,
+        })
+      }
+    }
+    const byField = (record: globalThis.Record<string, unknown> | undefined) => {
+      const out: globalThis.Record<string, unknown> = Object.create(null)
+      for (const [field, value] of Object.entries(record ?? {})) {
+        out[field] = setOperand([field], "field", value)
+      }
+      return out
+    }
+    const byPath = (
+      ops:
+        | ReadonlyArray<{
+            readonly segments: ReadonlyArray<string | number>
+            readonly value: unknown
+          }>
+        | undefined,
+    ) => (ops ?? []).map((op) => setOperand(op.segments, "path", op.value))
+    return {
+      append,
+      pathSets,
+      pathAppends,
+      pathPrepends,
+      pathIfNotExists,
+      add: byField(uState.add),
+      deleteFromSet: byField(uState.deleteFromSet),
+      pathAdds: byPath(uState.pathAdds),
+      pathDeletes: byPath(uState.pathDeletes),
+      fallbacks,
+    }
+  }
+
+  /**
+   * Whether `segments` name a value in `row` (attribute-keyed, as DynamoDB returns it): the path a
+   * `pathIfNotExists` names, resolved as the expression compiles it (`compilePath`).
+   */
+  const pathPresent = (
+    row: globalThis.Record<string, AttributeValue>,
+    segments: ReadonlyArray<string | number>,
+  ): boolean => {
+    const [head, ...below] = storedPath(segments, (name) =>
+      name.includes("#") ? name : resolveDbName(name),
+    )
+    if (typeof head !== "string" || !Object.hasOwn(row, head)) return false
+    let at: AttributeValue | undefined = row[head]
+    for (const segment of below) {
+      if (typeof segment === "number") {
+        at = at?.L !== undefined && segment < at.L.length ? at.L[segment] : undefined
+      } else {
+        at = at?.M !== undefined && Object.hasOwn(at.M, segment) ? at.M[segment] : undefined
+      }
+      if (at === undefined) return false
+    }
+    return true
+  }
+
+  /**
+   * The one decision on a `pathIfNotExists` operand a check refuses (#236): refused where it would
+   * be stored, so where `row`, the item as stored, lacks its path; written as given where the path
+   * is there, since DynamoDB then keeps the stored value and the operand is never stored. An update
+   * that reads its row decides on that read, before sending; one that doesn't sends the operation
+   * guarded by `attribute_exists(<path>)`, and decides on the item its refusal returns. No row: the
+   * update's own missing-row outcome, since a path operation never creates one. A row that isn't
+   * at the version the update expects: that refusal (`OptimisticLockError`), on every path.
+   */
+  const fallbackRefusal = (
+    fallbacks: ReadonlyArray<RefusedFallback>,
+    row: globalThis.Record<string, AttributeValue> | undefined,
+    expectedVersion?: number | undefined,
+  ): ValidationError | undefined => {
+    if (row === undefined || fallbacks.length === 0) return undefined
+    if (expectedVersion !== undefined && (storedVersionOf(row) ?? 0) !== expectedVersion) {
+      return undefined
+    }
+    const absent = fallbacks.find((fallback) => !pathPresent(row, fallback.segments))
+    return absent === undefined
+      ? undefined
+      : new ValidationError({ entityType, operation: absent.operation, cause: absent.cause })
   }
 
   /**
@@ -8149,8 +8441,11 @@ const makeImpl = <
           newItem[entry.field] = map
           return [map, entry.key]
         }
+        // What a record operation starts from. A `NULL` the row holds is taken as nothing, as
+        // 1.40.0 took it (`.add(2)` stores `2`, `.append` the operand alone), where DynamoDB
+        // refuses the expression on `NULL`: named in DESIGN.md, not changed (#236).
         const held = (holder: globalThis.Record<string, unknown>, key: string): unknown =>
-          Object.hasOwn(holder, key) ? holder[key] : undefined
+          Object.hasOwn(holder, key) ? (holder[key] ?? undefined) : undefined
         const hold = (
           holder: globalThis.Record<string, unknown>,
           key: string,
@@ -8164,43 +8459,75 @@ const makeImpl = <
           })
         }
         if (uState.add) {
-          for (const [attr, val] of Object.entries(uState.add)) {
+          for (const attr of Object.keys(uState.add)) {
             // DynamoDB's ADD: a number adds, a set unions, and a row without the attribute
-            // starts from nothing.
+            // starts from nothing. A value of another kind is refused, as `ADD` is. The sum is
+            // DynamoDB's, exact on a bigint field and a number's fraction alike, and a set's
+            // members are compared by value, a set operand as its members are stored, as it's
+            // sent (`setOperand`, `DynamoArithmetic`, #236).
+            const val = operands.add[attr]
             const [holder, key] = slot(attr)
             const before = held(holder, key)
+            const refused = expressionRefusal(
+              before === undefined ||
+                (isNumeric(val) ? isNumeric(before) : sameSetKind(before, val)),
+            )
+            if (refused !== undefined) return yield* refused
             hold(
               holder,
               key,
-              typeof val === "number"
-                ? ((before as number) ?? 0) + val
-                : new Set<unknown>([...(before instanceof Set ? before : []), ...val]),
+              isNumeric(val)
+                ? before === undefined
+                  ? val
+                  : numberSum(before as number | bigint, val, false)
+                : setUnion(before as ReadonlySet<unknown> | undefined, val as ReadonlySet<unknown>),
             )
           }
         }
+        // `.subtract()` and `.append()` are `SET #f = #f - :v` and `SET #f = list_append(#f, :v)`
+        // when sent: DynamoDB refuses either on a value of another kind and writes nothing.
+        // Applied here, they're refused the same way (#236); it used to append to a string its
+        // characters, and die on the `NaN` a string less a number is. A row without the
+        // attribute, or holding `NULL` there, starts from `0` or `[]`, as on 1.40.0, where
+        // DynamoDB refuses the expression (named in DESIGN.md, not changed).
         if (uState.subtract) {
           for (const [attr, val] of Object.entries(uState.subtract)) {
             const [holder, key] = slot(attr)
-            hold(holder, key, ((held(holder, key) as number) ?? 0) - val)
+            const before = held(holder, key)
+            const refused = expressionRefusal(
+              (before === undefined || isNumeric(before)) && isNumeric(val),
+            )
+            if (refused !== undefined) return yield* refused
+            hold(
+              holder,
+              key,
+              numberSum((before ?? 0) as number | bigint, val as number | bigint, true),
+            )
           }
         }
         if (uState.append) {
           for (const attr of Object.keys(uState.append)) {
             const [holder, key] = slot(attr)
-            const existing = (held(holder, key) as Array<unknown>) ?? []
-            hold(holder, key, [...existing, ...(operands.append[attr] as ReadonlyArray<unknown>)])
+            const before = held(holder, key)
+            const refused = expressionRefusal(before === undefined || Array.isArray(before))
+            if (refused !== undefined) return yield* refused
+            hold(holder, key, [
+              ...((before ?? []) as Array<unknown>),
+              ...(operands.append[attr] as ReadonlyArray<unknown>),
+            ])
           }
         }
         if (uState.deleteFromSet) {
-          for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
+          for (const attr of Object.keys(uState.deleteFromSet)) {
+            const val = operands.deleteFromSet[attr]
             const [holder, key] = slot(attr)
             const before = held(holder, key)
+            // DynamoDB's DELETE: nothing on a row without the attribute, and refused on a value
+            // that isn't a set of the operand's kind (#236).
+            const refused = expressionRefusal(before === undefined || sameSetKind(before, val))
+            if (refused !== undefined) return yield* refused
             if (before instanceof Set && val instanceof Set) {
-              const current = new Set(before as Set<unknown>)
-              for (const elem of val as Set<unknown>) {
-                current.delete(elem)
-              }
-              hold(holder, key, current)
+              hold(holder, key, setDifference(before, val))
             }
           }
         }
@@ -8937,6 +9264,9 @@ const makeImpl = <
             actualVersion: version,
           })
         }
+        // Decided on the row read: the write is conditioned on its version (#236).
+        const fallback = fallbackRefusal(operands.fallbacks, current.Item)
+        if (fallback !== undefined) return yield* fallback
         if (!isRetainEnabled()) {
           casRead = { raw: current.Item, version }
         } else {
@@ -9010,6 +9340,8 @@ const makeImpl = <
             cause: packedChange,
           })
         }
+        const fallback = fallbackRefusal(operands.fallbacks, stored.Item, evExpected)
+        if (fallback !== undefined) return yield* fallback
       }
       // Build UpdateExpression
       const setClauses: Array<string> = []
@@ -9259,24 +9591,24 @@ const makeImpl = <
         }
       }
 
-      // ADD (atomic numeric increment / set addition)
+      // ADD (atomic numeric increment / set addition); a set as its members are stored (#236)
       if (uState.add) {
-        for (const [attr, val] of Object.entries(uState.add)) {
+        for (const attr of Object.keys(uState.add)) {
           const nameKey = `#a${addClauses.length}`
           const valKey = `:a${addClauses.length}`
           names[nameKey] = resolveDbName(attr)
-          values[valKey] = toAttributeValue(val)
+          values[valKey] = toAttributeValue(operands.add[attr])
           addClauses.push(`${nameKey} ${valKey}`)
         }
       }
 
-      // DELETE (remove elements from set)
+      // DELETE (remove elements from set), as its members are stored (#236)
       if (uState.deleteFromSet) {
-        for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
+        for (const attr of Object.keys(uState.deleteFromSet)) {
           const nameKey = `#d${deleteClauses.length}`
           const valKey = `:d${deleteClauses.length}`
           names[nameKey] = resolveDbName(attr)
-          values[valKey] = toAttributeValue(val)
+          values[valKey] = toAttributeValue(operands.deleteFromSet[attr])
           deleteClauses.push(`${nameKey} ${valKey}`)
         }
       }
@@ -9354,20 +9686,20 @@ const makeImpl = <
 
       // Path ADD operations
       if (uState.pathAdds) {
-        for (const op of uState.pathAdds) {
+        for (const [index, op] of uState.pathAdds.entries()) {
           const pathExpr = compilePath(op.segments, names, "pad", pathCounter, resolveDbName)
           const valKey = `:pad${pathCounter.value++}`
-          values[valKey] = toAttributeValue(op.value)
+          values[valKey] = toAttributeValue(operands.pathAdds[index])
           addClauses.push(`${pathExpr} ${valKey}`)
         }
       }
 
       // Path DELETE operations
       if (uState.pathDeletes) {
-        for (const op of uState.pathDeletes) {
+        for (const [index, op] of uState.pathDeletes.entries()) {
           const pathExpr = compilePath(op.segments, names, "pd", pathCounter, resolveDbName)
           const valKey = `:pd${pathCounter.value++}`
-          values[valKey] = toAttributeValue(op.value)
+          values[valKey] = toAttributeValue(operands.pathDeletes[index])
           deleteClauses.push(`${pathExpr} ${valKey}`)
         }
       }
@@ -9449,6 +9781,8 @@ const makeImpl = <
             }
             casRead = { raw: clearGetResult.Item, version }
           }
+          const fallback = fallbackRefusal(operands.fallbacks, clearGetResult.Item)
+          if (fallback !== undefined) return yield* fallback
           const clearItemKeys = Object.keys(clearGetResult.Item)
           for (const field of uState.sparseClearFields) {
             // Exactly the attributes the reader takes as the map's entries.
@@ -9528,6 +9862,15 @@ const makeImpl = <
         }
         names["#exists"] = config.indexes.primary.pk.field
         condParts.push("attribute_exists(#exists)")
+        // A `pathIfNotExists` operand a check refuses is written only where its path is absent:
+        // the write requires the path, and a refusal returning an item without it is that
+        // operand's (`fallbackRefusal`, #236). None: the request is as it was.
+        const fallbackCounter = { value: 0 }
+        for (const fallback of operands.fallbacks) {
+          condParts.push(
+            `attribute_exists(${compilePath(fallback.segments, names, "fb", fallbackCounter, resolveDbName)})`,
+          )
+        }
       }
       if (casRead !== undefined && systemFields.version) {
         condParts.push(versionIs(casRead.version, names, values, "#casVer", ":casVer"))
@@ -9702,6 +10045,15 @@ const makeImpl = <
                   cause: immutableChange,
                 })
               }
+              // The item lacks a guarded `pathIfNotExists` path: the fallback would be stored.
+              const fallback = plainWrite
+                ? fallbackRefusal(
+                    operands.fallbacks,
+                    stored as globalThis.Record<string, AttributeValue> | undefined,
+                    evExpected,
+                  )
+                : undefined
+              if (fallback !== undefined) return fallback
               return conditionRejection(
                 encodedKey as globalThis.Record<string, unknown>,
                 stored,
@@ -9846,6 +10198,13 @@ const makeImpl = <
       /** The caller's own `.condition()` — not `patch`'s or `deleteIfExists`'s guard. */
       readonly callerCondition: boolean
       readonly expectedVersion?: number | undefined
+      /**
+       * What the op refuses of the row it would have read: a `pathIfNotExists` fallback that
+       * would be stored (`fallbackRefusal`). The plan's read decides it, before sending.
+       */
+      readonly refuse?: (
+        row: globalThis.Record<string, AttributeValue>,
+      ) => ValidationError | undefined
     },
   ) =>
     Effect.gen(function* () {
@@ -9887,6 +10246,8 @@ const makeImpl = <
               })
             }
           }
+          const refused = request.refuse?.(read.Item)
+          if (refused !== undefined) return yield* refused
         }
       }
       const pkField = config.indexes.primary.pk.field
@@ -10081,6 +10442,7 @@ const makeImpl = <
         },
         callerCondition: uState.condition !== undefined,
         expectedVersion: uState.expectedVersion,
+        refuse: (row) => fallbackRefusal(prepared.operands.fallbacks, row),
       },
     )
 

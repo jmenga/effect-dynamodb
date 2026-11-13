@@ -461,6 +461,9 @@ export const prepareTransactWriteOps = (
         yield* rejectUnsupportedOp(entity, operation, "update", undefined, undefined, {
           updateState,
         })
+        // Its condition, refused here as every op's is, before any op of the transaction reads:
+        // planning compiles it only after the reads (#236).
+        yield* refuseEmptyParts(entity, operation, "update", updateState.condition)
         const encoded = yield* entity._encodeKey(key, `${operation}.update.decodeKey`)
         // What the update decides from its own operands: refused here, and planned from.
         const prepared = yield* entity._prepareUpdate(key, updateState, encoded)
@@ -487,6 +490,7 @@ export const prepareTransactWriteOps = (
           returnValues: deleteRequest.returnValues,
           readsStoredRow: true,
         })
+        yield* refuseEmptyParts(entity, operation, "delete", deleteRequest.condition)
         const encoded = yield* entity._encodeKey(key, `${operation}.delete.decodeKey`)
         ops.push({
           type: "planned",

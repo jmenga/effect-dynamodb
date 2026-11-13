@@ -2354,7 +2354,7 @@ So the ordinary upsert stays one write, no read and no condition. A rejected wri
 
 A time-series `append` has no `updatedAt` (`orderBy` is its clock), and it does the same over `createdAt`: every half holding it is `if_not_exists`, and the CAS also requires the key and that the half's other values are the ones written (`keptValues`). A rejection returns the row. If the key can't stay, the append composes from the row and sends again, guarded on the `orderBy` it was handed (`appendOverRead`); otherwise the rejection was the CAS or the caller's condition, as it always was, and the row saves that follow-up read. With `skipFollowUp` an append over `createdAt` sends no read at all.
 
-**Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Except a `Schema.optional` date transform carrying a `storedAs` of the other wire kind (`DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))`): outside `Schema.optional`, `Entity.make` refuses one as a stamp (`validateNoTransformOverride`), since the transform stores its own form and no stamp in the annotation's could be read back. Under it the field isn't unwrapped (`storedAsOverTransform`, the one test both read) and stays the caller's on every write path, as on 1.39.0 (`test/fixtures/entity-optional-transform-1.39.0.json`). Any other is the caller's (rule b, above), and that includes `Schema.UndefinedOr` of a date with no `storedAs`: it's a union, a required key whose value may be empty, so nothing stamps it and clearing it is the caller's to do (`Marshaller`'s absent attribute, "Values with no stored form"). The types agree: `ManagedDateField` names a managed date, `WithSystemCollisions` makes only one optional, and `RemovableFields` leaves only one out. A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
+**Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Except a `Schema.optional` date transform carrying a `storedAs` of the other wire kind (`DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))`): outside `Schema.optional`, `Entity.make` refuses one as a stamp (`validateNoTransformOverride`), since the transform stores its own form and no stamp in the annotation's could be read back. Under it the field isn't unwrapped (`storedAsOverTransform`, the one test both read) and stays the caller's on every write path, as on 1.39.0 (`test/fixtures/entity-optional-transform-1.39.0.json`). Any other is the caller's (rule b, above), and that includes `Schema.UndefinedOr` of a date with no `storedAs`: it's a union, a required key whose value may be empty, so nothing stamps it and clearing it is the caller's to do (`Marshaller`'s absent attribute, "Values with no stored form"). The types agree: `ManagedDateField` names a managed date, `WithSystemCollisions` makes only one optional, and `RemovableFields` leaves only one out. A type can't see an annotation, so `storedAs` carries its storage schema's encoded type in the type it returns (`DynamoModel.StoredAs<W>`, never at run time), and `StoredAsOtherKindDates` names each `Schema.optional` field whose transform encodes to a string stored as a number, or the other way round: the update and `.remove` types leave those the caller's, as the run time does (#236; through 1.40.0 `.set({ createdAt })` and `.remove(["createdAt"])` didn't compile, though both ran). A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
 
 **Aggregates.** See "Aggregate System Timestamps" (§11). An aggregate's list key and collection sort key compose from the same stamps as the root row (`buildDynamoItems`), so the key and the attribute agree. A partition key over a stamped `updatedAt` and a `many` edge's sort key over one are refused (`EDD-9121`), by the pure `Aggregate.make` in `@effect-dynamodb/schema` and the operational one alike (`refuseManySortKeysOverMovingValue`): both name rows, and neither can move.
 
@@ -2837,14 +2837,16 @@ DynamoModel.DateTimeZoned           // Wire: ISO string with offset/zone ↔ Dom
 When wire format ≠ storage format, use `storedAs` with a target schema:
 
 ```typescript
-// Wire: ISO string, DynamoDB: epoch seconds (for TTL)
-DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
+// A model field: a DateTime.Utc stored as epoch seconds (for TTL)
+Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
 
-// Wire: epoch ms, DynamoDB: ISO string
-DynamoModel.DateEpochMs.pipe(DynamoModel.storedAs(DynamoModel.DateString))
+// A timestamp's `schema`: wire ISO string, DynamoDB epoch seconds
+DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
 ```
 
-**Type safety:** `storedAs` constrains the storage schema to have the same domain type (`A`) as the field schema. Incompatible combinations are rejected at compile time.
+A date transform model field owns its wire form: `Entity.make` refuses one whose `storedAs` names the other wire kind, and under `Schema.optional` the transform's own form is stored (#232).
+
+**Type safety:** `storedAs` constrains the storage schema to have the same domain type (`A`) as the field schema. Incompatible combinations are rejected at compile time; none of them would be stored as asked (a `DateTime.Zoned` forced to an epoch through a cast is refused by `Entity.make`, kept in its ISO form under `Schema.optional`, or refused at the write). `A` is `storedAs`'s first type parameter, so `storedAs<DateTime.Utc>(DateEpochSeconds)` compiles as it always did. Inferred, the schema returned also carries the storage schema's encoded type (`DynamoModel.StoredAs<W>`, an optional type-only property, so it and the field schema are each assignable to the other's type); given `A` alone, or a storage schema typed `Schema.Schema<A>`, it is the field schema's own type (#236, `test/StoredAsSignature.types.test.ts`).
 
 ### Auto-Detecting Epoch Schema
 
@@ -3579,7 +3581,9 @@ left out when compiled. Anywhere else — under `or` (which it would make match
 everything) or `not` (nothing), or an `or()` with no parts (nothing) — it has
 no reading that keeps what the caller wrote, so `emptyPartProblem` refuses it
 with a `ValidationError` before anything is sent: in `EntityPut` / `Update` /
-`Delete` when they run, per op in `transactWrite`, in `append`, for filters
+`Delete` when they run, per op in `transactWrite` (a planned update's or
+delete's too, before any op of the transaction reads: planning compiles it
+only after the reads, so it died in `compileExpr`, #236), in `append`, for filters
 when a query runs, and for aggregate `list` filters. An `isIn` with no values
 is not refused (#144): it compiles to `IN ()`, DynamoDB rejects it as a syntax
 error, and the rejection is diagnosed into a `ValidationError` naming the
@@ -3656,6 +3660,14 @@ the first segment it names the property as written. Through 1.39.0 one such
 path reached the stored key by coincidence, when the nested struct encoded a
 property to the name a top-level field of the same spelling was renamed to; it
 now names the property, like every other path below a key-encoded struct.
+`Transaction.check` takes a compiled condition (`Expression.condition`), which
+is built with no entity to rename by, so it named a renamed field as the field,
+which no row holds: a comparison failed whatever the row held, and
+`attribute_not_exists` held whatever it held (also on 1.39.0). It now applies
+the same rule to the names it is given (`storedNames` in `Transaction.ts`,
+#236): a placeholder used only as a path's first segment, naming a renamed
+model field, names the stored attribute; one below a first segment (`#t.#c`),
+one used at both, and a name no field is renamed from are sent as given.
 
 **Path-addressed values are encoded (#133).** `pathSet`, `pathAppend`,
 `pathPrepend`, `pathIfNotExists` and record-based `append` (including the
@@ -3692,13 +3704,15 @@ a dynamic key of an untyped value) are passed through. Each such operand is
 encoded and checked against the schema at its path once, in `prepareUpdate`
 (`encodeOperands`), and written as encoded there: one the schema refuses fails
 the update with a `ValidationError` (`operation` `update.append`,
-`update.pathSet`, `update.pathAppend`, `update.pathPrepend` or
-`update.pathIfNotExists`) before it reads or sends anything, alone or in a
-`transactWrite`. It used to be decided as the write was built, after the reads
-of an update that reads first, so a failed read was reported in its place.
+`update.pathSet`, `update.pathAppend` or `update.pathPrepend`) before it reads
+or sends anything, alone or in a `transactWrite`. It used to be decided as the
+write was built, after the reads of an update that reads first, so a failed read
+was reported in its place. A `pathIfNotExists` operand is the exception: it is
+refused only where it would be stored (below).
 A copy (`pathSet` or `pathSubtract` naming another attribute, `isPath`) holds no
 operand: its `value` isn't written, so nothing reads it, encodes it or checks
 that it would store or read back.
+
 Only the moment changes: the check, its verdict, its error and the bytes of an
 operand it accepts are the ones the write was built with. An update refused for
 a second reason reports the operand, where it reported whichever it met first
@@ -3707,6 +3721,75 @@ as it read and built the write: a missing item (`ItemNotFound`), a stale
 another value on a retained entity (`ValidationError` `update`), a ref whose
 target isn't there (`RefNotFound`), a packed value with no compressor
 (`ValidationError` `update.packed`).
+
+**A `pathIfNotExists` operand is refused only where it would be stored (#236).**
+DynamoDB stores `if_not_exists(<path>, :v)`'s operand only where the row lacks
+the path; where the row has it, the stored value stays. So an operand a check
+refuses (the schema at its path, the read where it resolves the position, a
+custom declaration's read-back, `EDD-9126`) is not refused before reading:
+`encodeOperands` records it (`fallbacks`), and `fallbackRefusal` (`Entity.ts`),
+the one decision, refuses it with that check's error where the row as stored
+lacks the path (`pathPresent`, the path as `compilePath` resolves it). An update
+that reads its row decides on that read, before sending: a retained entity's,
+one restating a packed immutable, one clearing a sparse map, and every update
+`transactWrite` plans (`planned`'s `refuse`). One that reads nothing sends its
+write requiring the path, `attribute_exists(<path>)` beside its own
+`attribute_exists(#exists)`, and decides on the row DynamoDB's refusal returns
+(`ALL_OLD`); a missing parent fails that condition too, and is refused the same
+way. Where the row has the path the update is written and the stored value
+kept. A version the update expects and the row isn't at is refused first
+(`OptimisticLockError`), on every path, whether the row has the path or not; a
+row that isn't there stores nothing, and the update is answered as it is with
+any operand (`ItemNotFound`). An operand the checks accept is sent as 1.40.0
+sent it, with no condition added. 1.40.0 refused these operands before sending
+(after a retained entity's read) at a position the write schema's walk knows,
+even where DynamoDB would have kept the stored value, and with `ValidationError`
+before `OptimisticLockError` and `ItemNotFound`; at a
+sparse map's entry, which it didn't check, it stored them where the row lacked
+the path, leaving a row that no longer read. `PathIfNotExistsFallback.test.ts`
+and `connected.path-if-not-exists.test.ts` pin both outcomes on every path,
+alone and in a transaction, each beside what 1.40.0 did there.
+
+**Where the read resolves the position (#236): exact or absent.** The write
+schema's walk above doesn't know every position: a sparse map's entry (named by
+its stored name, `target#a`), a union's members past the first, a list of a
+union, a suspended or branded schema. There the operand used to be sent as
+given, and a row could be left that no read decodes. After the check above,
+`operandAsRead` (`Entity.ts`) asks where a row's read takes the operand:
+`readPosition` maps the path to the field `decodeRecord` reads the attribute as
+(a sparse map's entry under its field and key; a path's head as `compilePath`
+resolves it, a record op's as the expression does) and `readersAt`
+(`SchemaAccessors.ts`) walks that field's READ schema through the nodes
+`modelled` models exactly, collecting what decodes the value at the end: the
+node there, one per way through the unions, or each array's element for an
+append. A `Schema.UndefinedOr` field resolves as a `Schema.optional` one does:
+the read takes its absent attribute as `undefined` through a default of its own,
+which runs only where nothing is stored, so the walk takes the field beneath it
+(`ReadsAbsentAs`). Anything it can't resolve exactly (an `Option`, a transformed or
+checked node above the position, a decoding default, a hidden, packed or
+non-model attribute, an entry keyed `__proto__`, an entry of a sparse map stored
+under a `field:` rename, which a read takes whole from that attribute, a tuple
+position whose element depends on the list's length) gives no readers, and the
+operand is sent as 1.40.0 sent it. Where it resolves, `judgeOperand` (`internal/OperandReaders.ts`)
+decides: what 1.40.0 sends is sent when one of the readers reads it back as
+stored, so no operand a row holding it reads is refused or changed; otherwise no
+row holding it reads, and it is written in the one other stored form the readers
+read back (the model's encoding at the position, or a reader's own), or refused
+with a `ValidationError` under the same operation names when there is none, or
+when the union's members would store it differently. Only a schema issue is an
+answer (`SchemaIssue.issueOf`): the check runs a schema synchronously where a
+read runs it as an Effect, so a reader or encoder that can't finish (an
+asynchronous step, a defect) says nothing, and the operand is sent as 1.40.0
+sent it. The write schema's check above follows the same rule, so such a
+schema's operand is sent at every position, encoded where its encoder runs;
+1.39.0 and 1.40.0 died on it at a field, below a struct and in an `.append()`. `readersAt`
+is property-tested in both directions with Effect's decoder as the oracle
+(`ReadersAt.property.test.ts`): no reader reads the operand ⇒ no row holding it
+decodes, and every reader reads it ⇒ every row holding it decodes. The one class
+the second can't check is an operand some readers read and others don't, at a
+position a union's members read differently: whether a row holding it reads
+depends on the member the row holds, which the readers don't see, so it may still
+be wrong for that member, as it always was.
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to
@@ -3717,6 +3800,53 @@ bump, timestamps, GSI recomposition, `expectedVersion`, user condition) as the
 `Update` in one `TransactWriteItems` with the snapshot `Put`, conditioned on
 the version read. DynamoDB therefore applies the path semantics itself — parity
 by construction, never emulated — and a rejected expression writes no snapshot.
+The record operations (`.subtract()`, `.append()`, `.add()`, `.deleteFromSet()`)
+are applied to the row read, here and in the other updates that read the row
+first (one changing a unique field, one computing an index composite), as
+DynamoDB applies their expressions: where it refuses one on a value of another
+kind (a string, a number for `DELETE`, a set of the other kind), the update
+fails with `DynamoValidationError` (`operation` `TransactWriteItems`, its
+message the library's in DynamoDB Local's wording, which the service's may not
+match) and writes nothing (`expressionRefusal`, #236), as the same update of an
+entity without the configuration fails. It used to append a string's characters
+(a row that no longer read), add a number to a string, and die on `NaN`. On an
+attribute or a sparse map's entry the row lacks, and on one it holds as `NULL`,
+the two still differ, as on 1.40.0: an update sent as an expression is refused
+by DynamoDB (`#f - :v` and `list_append(#f, :v)` on a missing attribute, every
+one of them on `NULL`), while one that reads the row first starts the attribute
+from nothing and stores `-v`, `v` or the operand alone (a `DELETE` leaves it as
+it was) (`connected.missing-operand-paths.test.ts` pins both). Where DynamoDB applies
+one, the result is DynamoDB's (`internal/DynamoArithmetic.ts`): a sum or
+difference is taken exactly on the two numbers' decimal text and given back as a
+read gives the stored result (a `number`, or a `bigint` past
+`Number.MAX_SAFE_INTEGER`), so a bigint field computes on both sides of 2^53 and
+`0.2 + 0.1` stores `0.3`; a number DynamoDB can't hold (39 significant digits) is
+sent as it is, for DynamoDB to refuse. A set's members are compared by value (a
+number and a bigint of one value, two arrays of the same bytes). It used to die
+mixing a bigint with a number read back, store a JavaScript float
+(`0.30000000000000004`), and compare a bigint or binary set's members by
+identity, so a union held a member twice (refused by DynamoDB) and a difference
+removed nothing.
+A set operand of `.add()`, `.deleteFromSet()`, `pathAdd` and `pathDelete` is
+sent, on every path, and applied to a row read, as the set at its position stores
+its members (`setOperand`): a `Schema.ReadonlySet(Schema.NumberFromString)`
+operand is sent as strings, where the position is read exactly and exactly one
+form of the set reads back there; anything else is sent as given. It is never
+refused, since a set operand is not the value stored. A `NumberValue`
+(`@aws-sdk/util-dynamodb`) operand is the number its text holds. Through 1.40.0
+the first was sent as numbers, which DynamoDB refuses as a set of the other kind
+(on a row without the attribute it stored a number set, and the row no longer
+read), and a retained update applied it as given (a difference removed
+nothing); a retained `.add()` of a `NumberValue` died, and a set of them was a
+union holding a member twice (refused) or a difference removing nothing.
+An update that sets an attribute and also changes it by `.subtract()`, `.add()`
+or `.append()` (`.set({ m: 9 }).subtract({ m: 1 })`) is sent with two
+overlapping paths wherever its record operations go into the expression (a plain
+entity's, a unique one's, setting the unique field or not), and DynamoDB refuses
+it (`DynamoValidationError`, nothing written); where the update applies them to
+the row it read and writes the result (a retained entity's, one computing an
+index composite), they apply in order, the set and then the change (`8`).
+Unchanged from 1.40.0, and pinned by `connected.overlapping-record-ops.test.ts`.
 Path operations combined with a unique-constraint change, or with a computed
 change to an index composite, are rejected with a `ValidationError`: both are
 read-then-write updates that cannot carry path expressions. Record retain
@@ -4052,6 +4182,10 @@ way, and a sentinel release that raced is planned again from a fresh read
 | A defaulted index composite: omitted, as `omitsIndexedDefault` reads it | Keeps what the row holds; on a new row, the default | Yes |
 
 An empty set follows the second row. **Clearing a secondary index composite reads first**, because what's left of a half depends on the row, and the result is what `.set(...).remove([...])` leaves: `[owner, und]` given `und: undefined` truncates to `owner_o1`, and `[und]` loses the half under `'sparse'` and `'preserve'` alike, a clear being the cascade override. Without it the key would outlive its value. A primary composite, an immutable field, and a date the library stamps aren't cleared this way, so those stay one write. So does a clear no key holds. This read happens only when the input clears a composite: no other upsert pays for it.
+
+**A sparse map's default is stored beside the row's entries, on every path (#236).** An upsert given `undefined` for a sparse map whose decoding default holds keys writes the default's entries and keeps the ones the row holds, as the expression path's `SET` of each entry does: a row holding `data#k`, given a default `{ d1, d2 }`, holds `data#k`, `data#d1` and `data#d2` afterwards, whether the upsert is one `UpdateItem` or reads first (`unique`, `retain`, an omitted defaulted index composite). 1.39.0 gave this one input three outcomes by configuration: the expression path stored the default's entries beside the row's; `unique` naming a field outside the primary key (`unique: { note: ["note"] }`, alone or beside a primary-key one) and `retain` removed every entry and wrote none; `unique` naming only primary-key composites (`unique: { id: ["id"] }`) and the defaulted-composite path left the row's entries alone and wrote none. Nothing in the input names those configurations, so they don't decide what it stores: every path gives the expression path's outcome, as it has since 1.40.0. Leaving the field out keeps the row's entries and writes none, on every path, as on 1.39.0. A default holding a key the write refuses is refused citing the default, before anything is sent, as since 1.40.0: an empty key and one holding `#` on every path (1.39.0 refused them on the expression path and wrote none of the default on the others), and a composed attribute name over 255 bytes where the upsert writes the row whole, with `unique` naming a field outside the primary key or with `retain` (1.39.0 wrote none of the default there). The expression path, `unique` naming only primary-key composites and the defaulted-composite path store that one (on 1.39.0 the expression path stored it, and the other two wrote none of the default). `UpsertSparseDefault.test.ts` and `connected.upsert-sparse-default.test.ts` pin each path.
+
+**`undefined` for a defaulted field is its default, whatever form the rest of the input is in (#236).** A write's input may be in the domain form (encoded) or the stored form (decoded, then encoded), and `internal/InputForm.ts` (`encodeInput`) is the one decision of which, for every write that encodes one: `put`, `create`, `upsert`, `append`, an update's payload, and the put a transaction or a batch builds. `undefined` given for a field with a decoding default is a stored-form value (the domain side has no `undefined`), so it decoded to the default only where every other value was in the stored form too: `{ id, n: 1, data: undefined }` stored `data`'s default beside `n: Schema.Number` and was refused beside `n: Schema.NumberFromString` (`ValidationError`, `put.decode` / `upsert.decode` "Expected object at ["data"]", in a transaction or a batch "Expected string at ["n"]"), by every write. Where neither form takes an input whole, each field it gives as `undefined` now holds what a decode of that field alone makes of it, and the input is encoded: `data` holds its default, and the write stores what it stores beside `n: Schema.Number` (a `put` or `create` the default alone, an `upsert` the default's entries beside the row's). A field whose decode refuses `undefined` (a key-only default) or keeps it is left as given. An input either form takes is written as it was, and one none takes is refused with the issue it was refused with. `UndefinedBesideTransform.test.ts` and `connected.undefined-beside-transform.test.ts` pin each write.
 
 **Transaction puts.** `transactWrite` and `EventStore.append`'s
 `additionalItems` plan a put of a versioned or unique-constrained entity with
@@ -4897,8 +5031,9 @@ that takes the map keeps writing. A value the marshaller refuses is left to
 `marshalOrFail` (`EDD-9124`). The choke points are `encodeForWrite` and
 `_refuseNotReadBack` on an entity (`validateAndBuildPutItem` for Batch and
 `TransactWriteOps`), `notReadBackOperand` for an update's stored operands
-(`.append`, `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists`; `.add`,
-`.subtract` and `.deleteFromSet` apply a value, they don't store it),
+(`.append`, `pathSet`, `pathAppend`, `pathPrepend`; `.add`, `.subtract` and
+`.deleteFromSet` apply a value, they don't store it; a `pathIfNotExists`
+operand is refused only where it would be stored, `fallbackRefusal`),
 `refuseNotReadBack` on an aggregate, which runs the real `assembleAggregate` over the
 marshalled groups so a custom `decompose` and packed edges are covered,
 `encodeToWire` on a stream and `outboxItems` for an outbox. A member holding no custom
