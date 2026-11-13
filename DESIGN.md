@@ -3988,7 +3988,11 @@ the model declares (`Object.hasOwn`): the tables a definition looks fields up in
 `constructor` or `valueOf` is not taken for a sparse map whose prefix is `undefined` (through
 1.40.0 an update of it beside a sparse map wrote `undefined#…` attributes and returned the old
 value). Path operations take segments, not a callback; segments a builder's `.entry()` built
-carry the mark that they name an entry (`entryOfPath`). A
+carry the mark that they name an entry (`entryOfPath`). A model field named like one of the
+builder's own members (`at`, `size`, `entry`, `segments`, `_tag`, `pipe`, `then`, `toJSON`) is
+the member in a callback, not the field, as through 1.40.0 (named, not changed): an equality
+shorthand (`{ eq: { at: 1 } }`, `.filter({ at: 1 })`), a record operation (`.set({ at })`) and a
+path operation's segments (`["at"]`) reach it (`test/PathBuilderMembers.test.ts`). A
 filter on `t.g.entry("b")` names the attribute a condition names, and asks the
 row where it holds a map a `field:` rename stores whole (`entryForms`). In a
 collection each member names the entry by its own prefix, a member that holds
