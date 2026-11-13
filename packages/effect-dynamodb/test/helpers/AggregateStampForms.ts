@@ -2,9 +2,10 @@
  * The form an aggregate stores its stamps in. A stamp in a field a row declares is stored in the form
  * the row stores any value of that field in, on `create` and `update`, on the root and on edges; a
  * row that doesn't declare it holds the stamp in the root's form. That form is the field's own date
- * encoding, except under `Schema.optional`, whose values are stored as ISO text: published 1.39.0
- * stored a value passed for a root date declared `Schema.optional(DynamoModel.DateEpochMs)` as ISO
- * text, and 1.40.0's `update` then wrote its stamp as a number, so one attribute held both forms.
+ * encoding, under `Schema.optional` too since #241, as an entity's write stores it. Published 1.39.0
+ * and 1.40.0 stored a value under `Schema.optional` as ISO text whatever the encoding, and their stamps
+ * followed it (`formOf139`); the cells #241 changes are exactly the `Schema.optional` ones around an
+ * encoding that isn't ISO text, and the fixture's rows stay as captured.
  * The fixture (`fixtures/aggregate-stamp-forms-1.39.0.json`) holds what 1.39.0 did for each date
  * schema, required, `Schema.optional` or `Schema.optionalKey`, declared by the root (beside an
  * undeclared `one` edge), a `one` edge, a `many` element or a sub-aggregate. Run on a recording
@@ -82,8 +83,24 @@ type Supplied = "a value supplied" | "no value supplied"
 
 const epoch = new Date(0)
 
-/** The form a value of a date declared `wrap` around this schema is stored in. */
-const formOf = (form: Form, wrap: Wrap): Form => (wrap === "optional" ? "iso" : form)
+/** The form 1.39.0 and 1.40.0 stored a value of a date declared `wrap` around this schema in. */
+const formOf139 = (form: Form, wrap: Wrap): Form => (wrap === "optional" ? "iso" : form)
+
+/**
+ * The form a value of a date declared `wrap` around this schema is stored in since #241: the
+ * schema's own, whatever the wrap.
+ */
+const formOf = (form: Form, _wrap: Wrap): Form => form
+
+/** A row 1.39.0 stored, with each stamp `fields` holds in `form`: the same instant. */
+const inForm = (row: Row, form: Form): Row => ({
+  ...row,
+  ...Object.fromEntries(
+    ["created", "updated"]
+      .filter((field) => row[field] !== undefined)
+      .map((field) => [field, storedAt(instantOf(row[field]!, "iso"), form)]),
+  ),
+})
 
 /** The instant `at` (epoch ms) as `form` stores it. */
 const storedAt = (at: number, form: Form): Row[string] =>
@@ -228,7 +245,7 @@ export const aggregateStampFormsSuite = (open: OpenTable) => {
       if (position !== "root" || "make" in scenario) continue
       // A value passed for a date the root declares `Schema.optional` is stored as ISO text, and
       // a row that doesn't declare the dates holds the root's form.
-      const allowed = allowedIn(formOf(form, wrap))
+      const allowed = allowedIn(formOf139(form, wrap))
       for (const { step, rows } of scenario) {
         for (const row of rows) {
           for (const field of ["created", "updated"]) {
@@ -239,6 +256,21 @@ export const aggregateStampFormsSuite = (open: OpenTable) => {
         }
       }
     }
+  })
+
+  it("#241 stores a stamp in another form than 1.39.0 exactly under `Schema.optional` around an encoding that isn't ISO text", () => {
+    const changed = scenarios.filter(
+      ({ form, wrap }) => formOf(form, wrap) !== formOf139(form, wrap),
+    )
+    expect(new Set(changed.map(({ name }) => name.split(" | ").slice(1, 3).join(" | ")))).toEqual(
+      new Set([
+        "DateEpochMs | optional",
+        "DateEpochSeconds | optional",
+        "DateString storedAs DateEpochSeconds | optional",
+        "DateTimeUtc storedAs DateEpochSeconds | optional",
+        "DateTimeUtc storedAs DateEpochMs | optional",
+      ]),
+    )
   })
 
   for (const { name, position, date, form, wrap, supplied } of scenarios) {
@@ -301,11 +333,18 @@ export const aggregateStampFormsSuite = (open: OpenTable) => {
         }),
       )
     } else if (wrap === "optional" && supplied === "a value supplied") {
+      // The value passed, stored as 1.39.0 stored it, in the form the field's encoding declares
+      // since #241 (1.39.0 stored it as ISO text whatever the encoding).
       it.effect(`${name}: create stores the value passed, as ${fixture.generatedFrom} did`, () =>
         Effect.gen(function* () {
           const steps: ReadonlyArray<Step> = yield* replay(open, build(position, date, supplied))
-          const root = (rows: ReadonlyArray<Row>) => rows.find((r) => r.__edd_e__?.S === "Match")
-          expect(root(steps[0]!.rows)).toEqual(root(create.rows))
+          const root = (rows: ReadonlyArray<Row>) => rows.find((r) => r.__edd_e__?.S === "Match")!
+          const captured139 = root(create.rows)
+          expect(root(steps[0]!.rows)).toEqual(
+            formOf(form, wrap) === formOf139(form, wrap)
+              ? captured139
+              : inForm(captured139, formOf(form, wrap)),
+          )
         }),
       )
     }

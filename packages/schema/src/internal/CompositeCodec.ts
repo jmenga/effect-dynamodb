@@ -34,14 +34,17 @@
  */
 
 import { Equal, Option, Schema, SchemaAST } from "effect"
-import { substituteSchemaDeep } from "./EntitySchemas.js"
+import { isProtoAbsent, substituteSchemaDeep } from "./EntitySchemas.js"
+import { readingKeyInstances } from "./InstanceReads.js"
 import { isStoredNaN, KeyValueError, STORED_NAN } from "./NumericKey.js"
+import { given, keyEntries, ownValue, setOwn } from "./OwnNames.js"
 import {
   getSchemaFields,
   hasEncodingTransformation,
   holdsPlainBigint,
   numericTypeWithStringEncoding,
 } from "./SchemaAccessors.js"
+import { namesZone, zonesAsStored } from "./StoredForm.js"
 
 /** The same encoded composite value: a scalar, or a `Date` of the same instant. */
 const sameValue = (a: unknown, b: unknown): boolean =>
@@ -73,6 +76,8 @@ export interface CompositeKeyFormOptions {
    */
   readonly reads?: ((attr: string) => boolean) | undefined
 }
+
+export { defaultObjectText, objectKeyRefusal } from "./ObjectKeyText.js"
 
 /**
  * The refusal of a composite's number its declared kind can't hold exactly (the
@@ -211,13 +216,24 @@ export const makeCompositeKeyForm = (
           : declared === undefined
             ? onlyNumericKind(storedNumericKinds(field))
             : undefined
-      const fn =
+      // A field encoding a zone to text inside it (a list of `TimeZoneNamedFromString`) is keyed by
+      // the value it stores, with each zone named as every key names one (`storedZoneText`).
+      const zoneText = storedZoneText(field)
+      const numeric =
         kind === undefined
-          ? null
+          ? undefined
           : (value: unknown): unknown =>
               typeof value === "number" || typeof value === "bigint"
                 ? exactly(attr, kind, value)
                 : value
+      const fn =
+        zoneText === undefined
+          ? (numeric ?? null)
+          : (value: unknown): unknown => {
+              const named = zoneText(value)
+              const keyed = named === undefined ? value : named
+              return numeric === undefined ? keyed : numeric(keyed)
+            }
       cache.set(attr, fn)
       return fn
     }
@@ -232,8 +248,13 @@ export const makeCompositeKeyForm = (
       const reencoded = encode(decoded.value)
       return Option.isSome(reencoded) && sameValue(reencoded.value, value)
     }
+    // A zone's key text is its name as `storedZoneName` gives it, whichever Effect is installed:
+    // Effect's own string codecs encode the name a zone was made from on 4.1.3 (`Etc/UTC` where
+    // 4.1.2 encoded `UTC`), and the key encodes the zone 4.1.2 held (`zonesAsStored`). The stored
+    // attribute is the codec's, untouched.
+    const encodeNamed = (value: unknown) => encode(zonesAsStored(value))
     const toEncoded = (value: unknown): Option.Option<unknown> => {
-      const direct = encode(value)
+      const direct = encodeNamed(value)
       if (Option.isSome(direct)) {
         // `encode` takes the value and changes it: a domain value, or, for a codec whose
         // `encode` takes its own output, its stored text, which is its key text.
@@ -242,7 +263,7 @@ export const makeCompositeKeyForm = (
         }
         return direct
       }
-      return Option.flatMap(decode(value), (decoded) => encode(decoded))
+      return Option.flatMap(decode(value), (decoded) => encodeNamed(decoded))
     }
     // The stored form, as case 3a takes it (`OptionFromNullOr(BigInt)`, a
     // `BigInt` under a decoding default): asked only when the value as given
@@ -268,7 +289,7 @@ export const makeCompositeKeyForm = (
         const fromStored = toEncoded(lifted)
         if (Option.isSome(fromStored)) return fromStored.value
       }
-      const fromRead = Option.flatMap(asRead(value), (decoded) => encode(decoded))
+      const fromRead = Option.flatMap(asRead(value), (decoded) => encodeNamed(decoded))
       if (Option.isSome(fromRead)) return fromRead.value
       return refuse(attr, value)
     }
@@ -324,11 +345,15 @@ const holdsDeclaration = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set
 /**
  * A field's decode as an entity's read decodes a row's value (`legacyReads`): what the marshaller
  * changed is taken back first, a stored bigint read back as a number lifted wherever it sits (in a
- * list, a struct, a declaration's value).
+ * list, a struct, a declaration's value), and each of Effect's look-alike declarations (a
+ * `Duration`, a zone, a date in an `Option`, ...) comes back as the instance a read hands back
+ * (`readingKeyInstances`), so a key composed again from the row is the text `put` composed for it.
  */
 const readDecodeOf = (field: Schema.Top): ((value: unknown) => Option.Option<unknown>) =>
   Schema.decodeUnknownOption(
-    substituteSchemaDeep(field, { legacyReads: true }) as unknown as Schema.Codec<unknown, unknown>,
+    readingKeyInstances(
+      substituteSchemaDeep(field, { legacyReads: true }),
+    ) as unknown as Schema.Codec<unknown, unknown>,
   )
 
 /**
@@ -368,6 +393,84 @@ export const storedFormOfDeclaration = (
  */
 export const storedNumericForm = (field: Schema.Top): ((value: unknown) => unknown) | undefined =>
   liftToKind(storedNumericKinds(field))
+
+/** The parse function of each declaration whose value can name a zone: a zone, a zoned date. */
+const ZONE_RUNS = new Set<unknown>(
+  [Schema.TimeZone, Schema.TimeZoneNamed, Schema.DateTimeZoned].map(
+    (schema) => (schema.ast as SchemaAST.Declaration).run,
+  ),
+)
+
+/** Whether a schema's Type side can hold a value naming a zone, wherever it sits. */
+export const holdsZone = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (SchemaAST.isDeclaration(ast)) {
+    return ZONE_RUNS.has(ast.run) || ast.typeParameters.some((type) => holdsZone(type, seen))
+  }
+  if (SchemaAST.isSuspend(ast)) return holdsZone(ast.thunk(), seen)
+  if (SchemaAST.isUnion(ast)) return ast.types.some((member) => holdsZone(member, seen))
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((property) => holdsZone(property.type, seen)) ||
+      ast.indexSignatures.some((index) => holdsZone(index.type, seen))
+    )
+  }
+  if (SchemaAST.isArrays(ast)) {
+    return [...ast.elements, ...ast.rest].some((element) => holdsZone(element, seen))
+  }
+  return false
+}
+
+/**
+ * Whether a schema encodes anywhere: at its top, or in a member, property, element, type parameter
+ * or suspension. `Schema.Array(Schema.TimeZoneNamedFromString)` has no encoding of its own, and its
+ * elements do.
+ */
+const holdsEncoding = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (ast.encoding !== undefined) return true
+  if (SchemaAST.isDeclaration(ast)) {
+    return ast.typeParameters.some((type) => holdsEncoding(type, seen))
+  }
+  if (SchemaAST.isSuspend(ast)) return holdsEncoding(ast.thunk(), seen)
+  if (SchemaAST.isUnion(ast)) return ast.types.some((member) => holdsEncoding(member, seen))
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((property) => holdsEncoding(property.type, seen)) ||
+      ast.indexSignatures.some((index) => holdsEncoding(index.type, seen))
+    )
+  }
+  if (SchemaAST.isArrays(ast)) {
+    return [...ast.elements, ...ast.rest].some((element) => holdsEncoding(element, seen))
+  }
+  return false
+}
+
+/**
+ * For a field encoding a zone, or a date zoned in one, to text (Effect's `TimeZoneNamedFromString`,
+ * `TimeZoneFromString`, `DateTimeZonedFromString`, or an application's own), at its top or anywhere
+ * in it (a list of them, an `Option` of one): the value it stores, or one read back, with each zone
+ * named as the key form names it (`zonesAsStored`). A key is composed from the value stored (case 3a,
+ * a list of them) or from the field's text (case 3b, which names it itself), a unique sentinel and a
+ * time-series event's sort key from the value stored, and Effect's codecs write the name a zone was
+ * made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`), so these take this value instead, which is
+ * the same on both. `undefined` for any other field, and from the function returned for a value
+ * already so named, a value naming no zone, and one the field doesn't decode.
+ */
+export const storedZoneText = (field: Schema.Top): ((value: unknown) => unknown) | undefined => {
+  if (!holdsEncoding(field.ast) || !holdsZone(SchemaAST.toType(field.ast))) return undefined
+  const codec = field as unknown as Schema.Codec<unknown, unknown>
+  const decode = Schema.decodeUnknownOption(codec)
+  const encode = Schema.encodeUnknownOption(codec)
+  return (value) => {
+    const decoded = decode(value)
+    if (Option.isNone(decoded) || !namesZone(decoded.value)) return undefined
+    const stored = encode(zonesAsStored(decoded.value))
+    return Option.isSome(stored) && !sameValue(stored.value, value) ? stored.value : undefined
+  }
+}
 
 /** {@link storedNumericForm}, from the kinds a field stores. */
 const liftToKind = (kinds: ReadonlySet<NumericKind>): ((value: unknown) => unknown) | undefined => {
@@ -701,13 +804,17 @@ export const storedFieldAtPath = (
 /**
  * The field a model declares under `name`. Never a member every object
  * inherits: an attribute named `toString` that the model doesn't declare (a
- * version or timestamp attribute) is not a field.
+ * version or timestamp attribute) is not a field. Nor one a derived struct holds
+ * as 1.40.0's didn't hold it (`isProtoAbsent`): its value is key text as given,
+ * as it was.
  */
 const declared = (
   fields: Record<string, Schema.Top> | undefined,
   name: string,
-): Schema.Top | undefined =>
-  fields !== undefined && Object.hasOwn(fields, name) ? fields[name] : undefined
+): Schema.Top | undefined => {
+  const field = ownValue(fields, name)
+  return isProtoAbsent(field) ? undefined : field
+}
 
 const followPath = (
   fields: Record<string, Schema.Top> | undefined,
@@ -858,11 +965,11 @@ export const kindReadingOf = (
       return undefined
     }
   }
-  const given: KindReading = { record, asOther: new Set() }
-  const segments = composed(given)
+  const asGiven: KindReading = { record, asOther: new Set() }
+  const segments = composed(asGiven)
   if (segments === undefined) return undefined
   const base = segments.join("")
-  if (targets.has(base)) return given
+  if (targets.has(base)) return asGiven
   const offsets: Array<number> = []
   let offset = 0
   for (const segment of segments) {
@@ -872,7 +979,7 @@ export const kindReadingOf = (
   const others = new Map<string, number | bigint>()
   const edits: Array<KindEdit> = []
   for (const field of new Set(fields)) {
-    const other = otherNumericKind(record[field], digits(field))
+    const other = otherNumericKind(given(record, field), digits(field))
     if (other === undefined) continue
     const alone: KindReading = { record: { ...record, [field]: other }, asOther: new Set([field]) }
     const parts = composed(alone)
@@ -946,7 +1053,7 @@ export const kindReadingOf = (
     const flipped = [...decided].filter(([, asOther]) => asOther).map(([field]) => field)
     if (flipped.length < 2 || !targets.has(`${text}${rest}`)) continue
     const values = { ...record }
-    for (const field of flipped) values[field] = others.get(field)
+    for (const field of flipped) setOwn(values, field, others.get(field))
     const reading: KindReading = { record: values, asOther: new Set(flipped) }
     const confirmed = composed(reading)
     if (confirmed !== undefined && targets.has(confirmed.join(""))) return reading
@@ -982,9 +1089,14 @@ export const kindReadingOf = (
  */
 export const makeCompositeStoredForm = (
   source: Schema.Top,
-): ((record: Record<string, unknown>) => Record<string, unknown>) => {
+): ((
+  record: Record<string, unknown>,
+  required?: ReadonlyArray<string>,
+  optional?: ReadonlyArray<string>,
+) => Record<string, unknown>) => {
   const storedForm = compositeStoredForm(source)
-  return (record) => toCompositeKeyRecord(storedForm, record)
+  return (record, required, optional) =>
+    toCompositeKeyRecord(storedForm, record, required, optional)
 }
 
 /** {@link makeCompositeStoredForm}, one attribute at a time. */
@@ -1051,18 +1163,21 @@ export const makeCompositeDomainKeyForm = (
 
 /**
  * Apply a `CompositeKeyForm` across every entry of a record, so a whole key or
- * composite record can be normalised in one call.
+ * composite record can be normalised in one call. The result is a plain record
+ * of own entries: the record's own enumerable entries, read as 1.40.0 read them
+ * (`Object.entries`) and nothing else of the record, wherever they hold every
+ * composite in `required` (the composites the key can't be composed without).
+ * Only where they lack one, where 1.40.0 failed ("Missing composite
+ * attribute"), is each composite of `required` and `optional` they lack read by
+ * name (`keyEntries`): from a prototype, a class's getter or a proxy (#239),
+ * never a function there. A record the library built holds its entries itself.
  */
 export const toCompositeKeyRecord = (
   keyForm: CompositeKeyForm,
   record: Record<string, unknown>,
-): Record<string, unknown> => {
-  const out: Record<string, unknown> = {}
-  for (const [attr, value] of Object.entries(record)) {
-    out[attr] = keyForm(attr, value)
-  }
-  return out
-}
+  required: ReadonlyArray<string> = [],
+  optional: ReadonlyArray<string> = [],
+): Record<string, unknown> => keyEntries(record, required, optional, keyForm)
 
 /**
  * How a composite's key form is derived — the branch `makeCompositeKeyForm`
@@ -1079,7 +1194,7 @@ export type CompositeKeyFormKind = "absent" | "identity" | "type-numeric" | "enc
 
 /** Classify one composite attribute of a model/derived schema. */
 export const compositeKeyFormKind = (source: Schema.Top, attr: string): CompositeKeyFormKind => {
-  const field = getSchemaFields(source)?.[attr]
+  const field = declared(getSchemaFields(source), attr)
   if (field === undefined) return "absent"
   if (numericTypeWithStringEncoding(field)) return "type-numeric"
   if (!hasEncodingTransformation(field)) return "identity"

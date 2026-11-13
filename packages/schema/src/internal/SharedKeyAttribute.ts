@@ -26,6 +26,7 @@ import {
   isZOrderHalf,
   unshardedView,
 } from "../KeyComposer.js"
+import { setOwn } from "./OwnNames.js"
 import { sparseReader } from "./SparseKey.js"
 
 interface KeyHalf {
@@ -64,7 +65,7 @@ const textForm = (
   const record: Record<string, string> = {}
   for (const attr of half === "pk" ? index.pk.composite : index.sk.composite) {
     if (!standIns.has(attr)) standIns.set(attr, String.fromCharCode(0xe000 + standIns.size))
-    record[attr] = standIns.get(attr)!
+    setOwn(record, attr, standIns.get(attr)!)
   }
   return half === "pk"
     ? composePk(schema, entityType, unshardedView(index), record)

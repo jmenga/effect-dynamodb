@@ -17,8 +17,13 @@ import {
   KEY_DELIMITER,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
-import { encodeBigInt, encodeNumber, isStoredNaN } from "./internal/NumericKey.js"
+import { encodeBigInt, encodeNumber, isStoredNaN, KeyValueError } from "./internal/NumericKey.js"
+import { judgeObjectKeyText } from "./internal/ObjectKeyText.js"
+// A record composed from may be a caller's key or query composites: a composite's value is read as
+// a caller's payload is (`given`), so a member every object inherits is no value (#239).
+import { given, PROTO_ENTRY, setOwn } from "./internal/OwnNames.js"
 import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
+import { zonesAsStored } from "./internal/StoredForm.js"
 import {
   concatBytes,
   interleave,
@@ -493,7 +498,7 @@ export const extractComposites = (
   record: Record<string, unknown>,
 ): ReadonlyArray<string> =>
   composite.map((attr) => {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${attr}" in record`)
     }
@@ -511,7 +516,7 @@ export const tryExtractComposites = (
 ): ReadonlyArray<string> | undefined => {
   const values: Array<string> = []
   for (const attr of composite) {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) return undefined
     values.push(serializeValue(value))
   }
@@ -535,7 +540,31 @@ const serializeWith = (
   }
   // Native Date
   if (value instanceof Date) return value.toISOString()
-  return String(value)
+  // A named zone's text names it as 4.1.2 did, whichever Effect is installed
+  return String(zonesAsStored(value))
+}
+
+/**
+ * Whether `value` has key text of its own ({@link serializeValue}): a string, a number, a bigint, a
+ * boolean, a `DateTime` or a `Date`. Any other value's text is its `String` form, which says nothing
+ * exact about the value: a map read back from a row gives `[object Object]`, where the instance it
+ * was stored from gave its own `toString`. Two such texts compared say nothing either way. A map
+ * read back from a marshalled `DateTime` carries its type id but isn't one (#133): not exact.
+ */
+export const hasExactText = (value: unknown): boolean => {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "bigint" ||
+    typeof value === "boolean" ||
+    isStoredNaN(value) ||
+    value instanceof Date
+  ) {
+    return true
+  }
+  if (typeof value !== "object" || value === null || !DateTime.isDateTime(value)) return false
+  const proto = Object.getPrototypeOf(value)
+  return proto !== Object.prototype && proto !== null
 }
 
 /**
@@ -663,19 +692,47 @@ export const keyValueText = (
   casing: DynamoSchema.Casing,
 ): string => keyText(schema, compositeText(schema, value), casing)
 
-/** {@link extractComposites} under the schema's setting, each value's {@link keyValueText}. */
+/**
+ * {@link compositeText} of `attr`'s `value` where a key is composed: `key` is the definition whose
+ * key it is and `half` its half. Under a write's own schema (`objectKeys`) an object composing
+ * `[object Object]` is refused here (#242, `EDD-9162`), so only a key actually composed refuses: an
+ * index a write leaves out (sparse, a half skipped) never composes its composites.
+ */
+export const siteCompositeText = (
+  schema: DynamoSchema.DynamoSchema,
+  value: unknown,
+  attr: string | undefined,
+  key: unknown,
+  half: "pk" | "sk" | undefined,
+): string => {
+  const text = compositeText(schema, value)
+  if (schema.objectKeys !== undefined) {
+    judgeObjectKeyText(schema, value, text, () => ({ attr, value, key, half }))
+  }
+  return text
+}
+
+/**
+ * {@link extractComposites} under the schema's setting, each value's {@link keyValueText}. `half`
+ * says which half of `index` they're composed into, for {@link siteCompositeText}.
+ */
 export const extractKeyComposites = (
   schema: DynamoSchema.DynamoSchema,
   index: { readonly casing?: DynamoSchema.Casing | undefined },
   composite: ReadonlyArray<string>,
   record: Record<string, unknown>,
+  half?: "pk" | "sk",
 ): ReadonlyArray<string> =>
   composite.map((attr) => {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${attr}" in record`)
     }
-    return keyValueText(schema, value, index.casing ?? schema.casing)
+    return keyText(
+      schema,
+      siteCompositeText(schema, value, attr, index, half),
+      index.casing ?? schema.casing,
+    )
   })
 
 /**
@@ -690,7 +747,7 @@ export const composePk = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
-  const composites = extractKeyComposites(schema, index, index.pk.composite, record)
+  const composites = extractKeyComposites(schema, index, index.pk.composite, record, "pk")
   return composePkText(
     schema,
     entityType,
@@ -741,7 +798,9 @@ const composedShardMarker = (
   const shards = index.shards
   if (shards === undefined) return undefined
   const source = boundShardSource(index, shards)
-  const absent = source.filter((attr) => record[attr] === undefined || record[attr] === null)
+  const absent = source.filter(
+    (attr) => given(record, attr) === undefined || given(record, attr) === null,
+  )
   if (absent.length > 0) {
     throw new ShardSourceError({
       message:
@@ -754,7 +813,7 @@ const composedShardMarker = (
   return shardMarker(
     shards.count,
     shardOf(
-      source.map((attr) => serializeValue(record[attr])),
+      source.map((attr) => serializeValue(given(record, attr))),
       shards.count,
     ),
   )
@@ -786,7 +845,7 @@ export const composeStoredPk = (
   const shards = index.shards
   if (
     shards !== undefined &&
-    !boundShardSource(index, shards).every((attr) => hasValue(record[attr]))
+    !boundShardSource(index, shards).every((attr) => hasValue(given(record, attr)))
   ) {
     return undefined
   }
@@ -862,11 +921,11 @@ const pinsShardSource = (
   const pins = new Set(index.pk.composite)
   if (!isZOrderHalf(index.sk)) {
     for (const attr of index.sk.composite) {
-      if (!hasValue(record[attr])) break
+      if (!hasValue(given(record, attr))) break
       pins.add(attr)
     }
   }
-  return source.every((attr) => pins.has(attr) && hasValue(record[attr]))
+  return source.every((attr) => pins.has(attr) && hasValue(given(record, attr)))
 }
 
 /**
@@ -932,7 +991,7 @@ export const composeReadPartitions = (
         partition(
           shards.count,
           shardOf(
-            source.map((attr) => serializeValue(record[attr])),
+            source.map((attr) => serializeValue(given(record, attr))),
             shards.count,
           ),
         ),
@@ -975,7 +1034,7 @@ export const composeSk = (
   record: Record<string, unknown>,
 ): string => {
   assertStringHalf(index, "composeSk")
-  const composites = extractKeyComposites(schema, index, index.sk.composite, record)
+  const composites = extractKeyComposites(schema, index, index.sk.composite, record, "sk")
   const names = [...index.sk.composite]
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
@@ -1044,14 +1103,17 @@ export const composeZOrderSk = (
   }
   const casing = effectiveCasing(schema, index)
   const segments = prefix.map((part) => {
-    const value = record[part.field]
+    const value = given(record, part.field)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${part.field}" in record`)
     }
-    return prefixSegment(keyValueText(schema, value, casing), part.hash)
+    return prefixSegment(
+      keyText(schema, siteCompositeText(schema, value, part.field, index, "sk"), casing),
+      part.hash,
+    )
   })
   const levels = layout.dimensions.map((dim) => {
-    const value = record[dim.field]
+    const value = given(record, dim.field)
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${dim.field}" in record`)
     }
@@ -1099,6 +1161,25 @@ export const composeHistoryItemSegment = (
 }
 
 /**
+ * The attribute an index's `half` is stored under, for a write giving it a value. One named
+ * `__proto__` (an index whose composites a row may lack, so its definition loads) is refused
+ * (`[EDD-9165]`, a `KeyValueError`): the AWS SDK's marshaller drops it, and its unmarshaller drops
+ * one an update stored. A write that gives it no value (the index left out, or its half removed)
+ * is as it was.
+ */
+const keyAttribute = (index: IndexDefinition, half: "pk" | "sk"): string => {
+  const field = index[half].field
+  if (field !== "__proto__") return field
+  const which = half === "pk" ? "partition" : "sort"
+  const named = index.index === undefined ? "the table" : `index "${index.index}"`
+  throw new KeyValueError({
+    value: field,
+    reason: PROTO_ENTRY,
+    message: `The ${which} key attribute of ${named}: ${PROTO_ENTRY} [EDD-9165]`,
+  })
+}
+
+/**
  * Compose all key attributes for a single index.
  * Returns a record mapping field names to composed key values.
  */
@@ -1109,8 +1190,8 @@ export const composeIndexKeys = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): Record<string, KeyValue> => ({
-  [index.pk.field]: composePk(schema, entityType, index, record),
-  [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record),
+  [keyAttribute(index, "pk")]: composePk(schema, entityType, index, record),
+  [keyAttribute(index, "sk")]: composeSkValue(schema, entityType, entityVersion, index, record),
 })
 
 /**
@@ -1130,7 +1211,7 @@ export const tryComposeIndexKeys = (
   record: Record<string, unknown>,
 ): Record<string, KeyValue> | undefined => {
   const present = (composite: ReadonlyArray<string>) =>
-    composite.every((attr) => record[attr] !== undefined && record[attr] !== null)
+    composite.every((attr) => given(record, attr) !== undefined && given(record, attr) !== null)
   if (!present(index.pk.composite) || !present(index.sk.composite)) return undefined
   return composeIndexKeys(schema, entityType, entityVersion, index, record)
 }
@@ -1149,13 +1230,21 @@ export const composeKnownHalves = (
 ): Record<string, KeyValue> => {
   const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
   const complete = (composite: ReadonlyArray<string>) =>
-    composite.every((attr) => hasValue(record[attr]))
+    composite.every((attr) => hasValue(given(record, attr)))
   return {
     ...(complete([...index.pk.composite, ...shardSource])
-      ? { [index.pk.field]: composePk(schema, entityType, index, record) }
+      ? { [keyAttribute(index, "pk")]: composePk(schema, entityType, index, record) }
       : {}),
     ...(complete(index.sk.composite)
-      ? { [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record) }
+      ? {
+          [keyAttribute(index, "sk")]: composeSkValue(
+            schema,
+            entityType,
+            entityVersion,
+            index,
+            record,
+          ),
+        }
       : {}),
   }
 }
@@ -1220,7 +1309,7 @@ const composePkPrefixUpTo = (
     schema,
     entityType,
     index,
-    extractKeyComposites(schema, index, slice, record),
+    extractKeyComposites(schema, index, slice, record, "pk"),
     slice,
     composedShardMarker(entityType, index, record),
   )
@@ -1249,7 +1338,7 @@ export const composeSkPrefixUpTo = (
 ): string => {
   assertStringHalf(index, "composeSkPrefixUpTo")
   const slice = index.sk.composite.slice(0, stopBefore)
-  const composites = extractKeyComposites(schema, index, slice, record)
+  const composites = extractKeyComposites(schema, index, slice, record, "sk")
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
 
@@ -1337,7 +1426,7 @@ const classifyHalf = (
 
   let leadingLen = 0
   while (leadingLen < composites.length) {
-    const v = record[composites[leadingLen]!]
+    const v = given(record, composites[leadingLen]!)
     if (v === undefined || v === null) break
     leadingLen++
   }
@@ -1350,7 +1439,7 @@ const classifyHalf = (
   // Some absent. Check for hole (a present composite after the absent run).
   let hasHole = false
   for (let j = leadingLen + 1; j < composites.length; j++) {
-    const v = record[composites[j]!]
+    const v = given(record, composites[j]!)
     if (v !== undefined && v !== null) {
       hasHole = true
       break
@@ -1385,7 +1474,8 @@ const classifyZOrderHalf = (
   policy: IndexPolicyKey,
   halfHasRemoved: boolean,
 ): "set" | "drop" | "noop" => {
-  if (fields.every((field) => record[field] !== undefined && record[field] !== null)) return "set"
+  if (fields.every((field) => given(record, field) !== undefined && given(record, field) !== null))
+    return "set"
   if (policy === "sparse" || halfHasRemoved) return "drop"
   return "noop"
 }
@@ -1549,7 +1639,7 @@ export const judgeIndexHalf = (
   const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
   const policy = resolveIndexPolicy(index.indexPolicy)[half]
   try {
-    if (composites.every((attr) => hasValue(record[attr]))) {
+    if (composites.every((attr) => hasValue(given(record, attr)))) {
       const full =
         half === "pk"
           ? composePk(schema, entityType, index, record)
@@ -1573,7 +1663,7 @@ export const judgeIndexHalf = (
       }
       // `put` writes an index whole or not at all.
       const wholeIndex = [...index.pk.composite, ...index.sk.composite, ...shardSource].every(
-        (attr) => hasValue(record[attr]),
+        (attr) => hasValue(given(record, attr)),
       )
       if (!wholeIndex) return FINE
       const outsidePrimary = new Set(
@@ -1608,8 +1698,8 @@ const writerLeavesHalf = (
   updatePayload: Record<string, unknown>,
   keyRecord: Record<string, unknown>,
 ): boolean =>
-  composites.every((attr) => !(attr in updatePayload)) &&
-  composites.some((attr) => !hasValue(keyRecord[attr]))
+  composites.every((attr) => !Object.hasOwn(updatePayload, attr)) &&
+  composites.some((attr) => !hasValue(given(keyRecord, attr)))
 
 /**
  * Whether a write leaves a half holding a value it stamps itself (`DESIGN.md` §7, "Composites the
@@ -1625,10 +1715,14 @@ const writerLeavesStampedHalf = (
   updatePayload: Record<string, unknown>,
   keyRecord: Record<string, unknown>,
 ): boolean => {
-  const others = composites.filter((attr) => !(attr in stamped))
+  const others = composites.filter((attr) => !Object.hasOwn(stamped, attr))
   return (
-    others.some((attr) => !hasValue(updatePayload[attr]) && !hasValue(keyRecord[attr])) &&
-    others.every((attr) => !(attr in updatePayload) || hasValue(updatePayload[attr]))
+    others.some(
+      (attr) => !hasValue(given(updatePayload, attr)) && !hasValue(given(keyRecord, attr)),
+    ) &&
+    others.every(
+      (attr) => !Object.hasOwn(updatePayload, attr) || hasValue(given(updatePayload, attr)),
+    )
   )
 }
 
@@ -1665,8 +1759,9 @@ const shardedPkOutcome = (
   const pkComposites = index.pk.composite
   const refuse = (): HalfOutcome => {
     if (update.onMissing === "keep") return { kind: "noop" }
-    const absent = boundShardSource(index, shards).filter((attr) => !hasValue(merged[attr]))
-    const missing = absent.length > 0 ? absent : pkComposites.filter((a) => !hasValue(merged[a]))
+    const absent = boundShardSource(index, shards).filter((attr) => !hasValue(given(merged, attr)))
+    const missing =
+      absent.length > 0 ? absent : pkComposites.filter((a) => !hasValue(given(merged, a)))
     throw new ShardSourceError({
       message:
         `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
@@ -1679,18 +1774,20 @@ const shardedPkOutcome = (
   if (outcome.kind === "drop") {
     const pkExplicitlyGone =
       update.pkHasRemoved ||
-      pkComposites.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+      pkComposites.some(
+        (attr) => Object.hasOwn(updatePayload, attr) && !hasValue(given(updatePayload, attr)),
+      )
     return update.byTouched && !pkExplicitlyGone ? refuse() : outcome
   }
   if (outcome.kind === "noop") return update.byTouched ? refuse() : outcome
-  if (boundShardSource(index, shards).every((attr) => hasValue(merged[attr]))) {
+  if (boundShardSource(index, shards).every((attr) => hasValue(given(merged, attr)))) {
     // The shard follows `by`, and the sort key would stay at the old value: no pin
     // could reach the row, since each searches the shard its own value hashes to and
     // only the old value's text is stored. The update may name the value the row
     // already holds, but nothing was read to tell.
     if (update.byTouched && update.skKept) {
       if (update.onMissing === "keep") return { kind: "noop" }
-      const missing = index.sk.composite.filter((attr) => !hasValue(merged[attr]))
+      const missing = index.sk.composite.filter((attr) => !hasValue(given(merged, attr)))
       throw new ShardSourceError({
         message:
           `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
@@ -1706,7 +1803,7 @@ const shardedPkOutcome = (
   if (update.byCleared && policy === "sparse") return { kind: "drop" }
   // The source is incomplete: an update changing the partition or part of `by`
   // can't compute the shard; any other leaves the stored key alone.
-  return update.byTouched || pkComposites.some((attr) => hasValue(updatePayload[attr]))
+  return update.byTouched || pkComposites.some((attr) => hasValue(given(updatePayload, attr)))
     ? refuse()
     : { kind: "noop" }
 }
@@ -1813,7 +1910,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
   const removedSet = options?.removedSet
   const stamped = options?.stamped
   const leavesHalf = (composites: ReadonlyArray<string>): boolean =>
-    stamped !== undefined && composites.some((attr) => attr in stamped)
+    stamped !== undefined && composites.some((attr) => Object.hasOwn(stamped, attr))
       ? writerLeavesStampedHalf(composites, stamped, updatePayload, keyRecord)
       : writerLeavesHalf(composites, updatePayload, keyRecord)
 
@@ -1854,14 +1951,16 @@ export const composeGsiKeysForUpdatePolicyAware = (
     // touches it: the shard follows its value. Its presence in `keyRecord` is no
     // evidence of a change. The retain path's holds the whole item.
     const by = index.shards?.by ?? []
-    const byTouched = by.some((attr) => hasValue(updatePayload[attr]))
-    const byCleared = by.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+    const byTouched = by.some((attr) => hasValue(given(updatePayload, attr)))
+    const byCleared = by.some(
+      (attr) => Object.hasOwn(updatePayload, attr) && !hasValue(given(updatePayload, attr)),
+    )
     const byRemoved = removedSet !== undefined && by.some((attr) => removedSet.has(attr))
     // An empty PK half is a constant prefix, unless `by` makes its marker vary.
     const skipPk =
       (pkComposites.length > 0
         ? !pkHasRemoved && leavesHalf(pkComposites)
-        : by.length > 0 && by.some((attr) => !hasValue(keyRecord[attr]))) &&
+        : by.length > 0 && by.some((attr) => !hasValue(given(keyRecord, attr)))) &&
       !byTouched &&
       !byCleared &&
       !byRemoved
@@ -1881,7 +1980,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
         delete merged[k]
         continue
       }
-      merged[k] = v
+      setOwn(merged, k, v)
     }
     if (removedSet !== undefined) {
       for (const attr of removedSet) {
@@ -1917,7 +2016,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
       if (pkOutcome.kind === "drop") {
         removes.push(index.pk.field)
       } else if (pkOutcome.kind === "set") {
-        sets[index.pk.field] =
+        sets[keyAttribute(index, "pk")] =
           pkOutcome.length === pkComposites.length
             ? composePk(schema, entityType, index, merged)
             : composePkPrefixUpTo(schema, entityType, index, merged, pkOutcome.length)
@@ -1930,13 +2029,14 @@ export const composeGsiKeysForUpdatePolicyAware = (
       // field, so it is never truncated.
       const outcome = classifyZOrderHalf(skComposites, merged, policy.sk, skHasRemoved)
       if (outcome === "drop") removes.push(index.sk.field)
-      else if (outcome === "set") sets[index.sk.field] = composeZOrderSk(schema, index, merged)
+      else if (outcome === "set")
+        sets[keyAttribute(index, "sk")] = composeZOrderSk(schema, index, merged)
     } else if (!skipSk) {
       const skOutcome = classifyHalf(skComposites, merged, policy.sk, skHasRemoved)
       if (skOutcome.kind === "drop") {
         removes.push(index.sk.field)
       } else if (skOutcome.kind === "set") {
-        sets[index.sk.field] =
+        sets[keyAttribute(index, "sk")] =
           skOutcome.length === skComposites.length
             ? composeSk(schema, entityType, entityVersion, index, merged)
             : composeSkPrefixUpTo(
@@ -2013,7 +2113,7 @@ export const composeVectorPartition = (
   },
   record: Record<string, unknown>,
 ): string => {
-  const composites = extractKeyComposites(schema, index, index.partition, record)
+  const composites = extractKeyComposites(schema, index, index.partition, record, "pk")
   return composeKey(schema, entityType, composites, {
     casing: index.casing,
     names: [...index.partition],
@@ -2031,7 +2131,7 @@ const availableSkCount = (index: IndexDefinition, record: Record<string, unknown
   assertStringHalf(index, "availableSkCount")
   let n = 0
   for (const attr of index.sk.composite) {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) break
     n++
   }
@@ -2094,25 +2194,34 @@ export const SORT_KEY_MAX = "\uFFFF"
 /**
  * @internal What a composite's values can be in a key, for {@link composeKeySpace}: `"open"`, any
  * text, the key delimiter included (the walk stops there); `"text"`, any text without the
- * delimiter; `"number"`, a number's or a bigint's key text; or exactly the key text of `values`
- * (a literal union, `true` and `false`).
+ * delimiter; `"number"`, a number's or a bigint's key text; `"date"`, an instant's ISO text (a
+ * date stored as a string: `DateTime.formatIso`, `Date.prototype.toISOString`); `"zonedDate"`, a
+ * zoned date's (`DateTime.formatIsoZoned`); or exactly the key text of `values` (a literal union,
+ * `true` and `false`).
  */
 export type CompositeValues =
   | "open"
   | "text"
   | "number"
+  | "date"
+  | "zonedDate"
   | { readonly values: ReadonlyArray<unknown> }
 
 /**
  * @internal A walked composite's value in a {@link KeySpace}: any text without the delimiter, the
- * empty text included (`text`); a number's or a bigint's key text under any setting (`number`:
+ * empty text included (`text`); any text at all, the delimiter included (`any`: a value walked past
+ * with `walkOpen`); a number's or a bigint's key text under any setting (`number`:
  * digits and `-+.:;)*`, never the delimiter, and of letters only `e` and those of `Infinity`, as
- * 1.36's text spells them, in any casing; it starts with a digit, `-`, `:` or `;`); or one of
- * `texts`.
+ * 1.36's text spells them, in any casing; it starts with a digit, `-`, `:` or `;`); a date's ISO
+ * text under any setting and casing (`date`: it starts with a digit, or the sign of a year past
+ * 9999 or before 0; an instant's goes on in digits and `-+:.TZ`, a zoned date's (`zoned`) in any
+ * text without the delimiter, its zone's name included); or one of `texts`.
  */
 export type KeyValueText =
   | { readonly kind: "text" }
+  | { readonly kind: "any" }
   | { readonly kind: "number" }
+  | { readonly kind: "date"; readonly zoned: boolean }
   | { readonly kind: "oneOf"; readonly texts: ReadonlyArray<string> }
 
 /**
@@ -2139,7 +2248,10 @@ export interface KeySpace {
  * escaped, so text after one can always match another key's. Without `valuesOf`, at the first
  * composite. A composite limited to `values` is their key text under the schema's setting, or
  * with `everyForm` under every setting a row can have been written under (`escapeKeys` on, off,
- * and the 1.37 numeric text): the fixed text is the same under all of them.
+ * and the 1.37 numeric text): the fixed text is the same under all of them. With `walkOpen` the
+ * walk goes on past a composite that can hold the delimiter too, its value any text (`any`), so
+ * the space is exactly the keys the composer writes for values of those kinds, to the end of the
+ * key.
  */
 export const composeKeySpace = (
   schema: DynamoSchema.DynamoSchema,
@@ -2147,7 +2259,9 @@ export const composeKeySpace = (
   entityVersion: number,
   index: IndexDefinition,
   valuesOf: (composite: string) => CompositeValues = () => "open",
-  options?: { readonly everyForm?: boolean | undefined } | undefined,
+  options?:
+    | { readonly everyForm?: boolean | undefined; readonly walkOpen?: boolean | undefined }
+    | undefined,
 ): { readonly pk: KeySpace; readonly sk: KeySpace } => {
   const casing = index.casing ?? schema.casing
   const forms: ReadonlyArray<DynamoSchema.DynamoSchema> =
@@ -2161,6 +2275,9 @@ export const composeKeySpace = (
   const valueText = (values: Exclude<CompositeValues, "open">): KeyValueText => {
     if (values === "text") return { kind: "text" }
     if (values === "number") return { kind: "number" }
+    if (values === "date" || values === "zonedDate") {
+      return { kind: "date", zoned: values === "zonedDate" }
+    }
     const texts = new Set<string>()
     for (const value of values.values) {
       for (const form of forms) {
@@ -2184,6 +2301,10 @@ export const composeKeySpace = (
     for (const name of composite) {
       walked.push(name)
       const of = valuesOf(name)
+      if (of === "open" && options?.walkOpen === true) {
+        values.push({ kind: "any" })
+        continue
+      }
       if (of === "open") {
         open = true
         break
@@ -2230,6 +2351,10 @@ const NOT_DELIMITER: CharClass = { chars: KEY_DELIMITER, negated: true }
 const NUMBER_FIRST: CharClass = { chars: "0123456789-:;", negated: false }
 /** Any other character of it: `NumericKey`'s, and 1.36's (`1e+21`, `Infinity`), in any casing. */
 const NUMBER_REST: CharClass = { chars: "0123456789-+.:;)*eEiInNfFtTyY", negated: false }
+/** The first character of a date's ISO text: its year's first digit, or the sign of a wide year. */
+const DATE_FIRST: CharClass = { chars: "0123456789+-", negated: false }
+/** Any other character of an instant's ISO text (`+275760-09-13T00:00:00.000Z`), in any casing. */
+const DATE_REST: CharClass = { chars: "0123456789-+:.TtZz", negated: false }
 
 /** Whether some character is in both. */
 const classesMeet = (a: CharClass, b: CharClass): boolean => {
@@ -2272,16 +2397,21 @@ const keyAutomaton = (
   space.after.forEach((text, i) => {
     const value = space.values?.[i] ?? { kind: "text" }
     const end = state()
-    if (value.kind === "text") {
+    if (value.kind === "text" || value.kind === "any") {
       const loop = state()
       empty[at]!.push(loop)
-      edges[loop]!.push([NOT_DELIMITER, loop])
+      edges[loop]!.push([value.kind === "any" ? ANY_CHARACTER : NOT_DELIMITER, loop])
       empty[loop]!.push(end)
     } else if (value.kind === "number") {
       const digits = state()
       edges[at]!.push([NUMBER_FIRST, digits])
       edges[digits]!.push([NUMBER_REST, digits])
       empty[digits]!.push(end)
+    } else if (value.kind === "date") {
+      const rest = state()
+      edges[at]!.push([DATE_FIRST, rest])
+      edges[rest]!.push([value.zoned ? NOT_DELIMITER : DATE_REST, rest])
+      empty[rest]!.push(end)
     } else {
       for (const option of value.texts) empty[spell(at, option)]!.push(end)
     }
@@ -2417,7 +2547,7 @@ export const composeSortKeyPrefix = (
   const available: Array<string> = []
   const names: Array<string> = []
   for (const attr of index.sk.composite) {
-    const value = record[attr]
+    const value = given(record, attr)
     if (value === undefined || value === null) break
     available.push(keyValueText(schema, value, casing))
     names.push(attr)
@@ -2479,8 +2609,19 @@ export const composeEventSk: {
     return `${first}#${applyCasing(EVENT_SK_INFIX, casing)}#${escapeKeyText(serializeValue(rest[0]), casing)}`
   }
   const casing = (rest[2] ?? first.casing) as DynamoSchema.Casing
-  return `${rest[0] as string}#${applyCasing(EVENT_SK_INFIX, casing)}#${keyValueText(first, rest[1], casing)}`
+  const text = keyText(
+    first,
+    siteCompositeText(first, rest[1], undefined, EVENT_SORT_KEY, "sk"),
+    casing,
+  )
+  return `${rest[0] as string}#${applyCasing(EVENT_SK_INFIX, casing)}#${text}`
 }
+
+/**
+ * The `key` of the site {@link composeEventSk} composes a time-series event's `orderBy` value at
+ * (`DynamoSchema.ObjectKeySite`), which names no attribute.
+ */
+export const EVENT_SORT_KEY = "timeSeries.orderBy"
 
 /**
  * The value of the `orderBy` attribute an event's sort key holds: its key form with numeric key

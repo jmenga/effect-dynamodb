@@ -25,6 +25,7 @@ import {
   ValidationError as ValidationErrorClass,
   VectorIndexBackfilling,
 } from "@effect-dynamodb/schema/Errors.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import type {
   Similarity,
@@ -37,6 +38,7 @@ import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import { fromAttributeMap, toAttributeValue } from "../Marshaller.js"
 import type { TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
+import { operandAsStored, type StoredFormAt } from "./Expr.js"
 import { marshalOrFail } from "./TransactableOps.js"
 import { diagnoseFailure, explainDiagnosis, withCause } from "./WriteDiagnosis.js"
 
@@ -170,6 +172,11 @@ export interface BoundVectorQueryConfig {
    */
   readonly resolveDbName: (domainName: string) => string
   /**
+   * How the entity stores a filter's value at a field (#242): an equality filter's value that is
+   * one of Effect's instances or a `Date` is sent in that form (`operandAsStored`).
+   */
+  readonly storedAt?: StoredFormAt | undefined
+  /**
    * The entity's composite key form (`internal/CompositeCodec.ts`).
    *
    * `.partition(composites)` takes Type-side domain values, while the write
@@ -260,6 +267,7 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
       unpackAttributes,
       resolveDbName,
       keyForm,
+      storedAt,
     } = this._config
     const state = this._state
     return Effect.gen(function* () {
@@ -330,7 +338,11 @@ export class BoundVectorQueryImpl<Model, Partition, Filters extends string, A> {
         values[valueKey] = yield* marshalOrFail(
           entityType,
           "search",
-          () => toAttributeValue(value, field),
+          () =>
+            toAttributeValue(
+              storedAt === undefined ? value : operandAsStored(storedAt, [field], value, "value"),
+              field,
+            ),
           { outcome: "Nothing was sent." },
         )
         conditions.push(`${nameKey} = ${valueKey}`)
@@ -526,8 +538,8 @@ const projectDomainNames = (
 ): Record<string, unknown> => {
   const out: Record<string, unknown> = {}
   for (const domainName of projection) {
-    const value = raw[resolveDbName(domainName)]
-    if (value !== undefined) out[domainName] = value
+    const value = ownValue(raw, resolveDbName(domainName))
+    if (value !== undefined) setOwn(out, domainName, value)
   }
   return out
 }

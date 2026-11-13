@@ -7,12 +7,14 @@
 import {
   DateTime,
   Effect,
+  Exit,
   Option,
   Redacted,
   Schema,
   SchemaAST,
   SchemaGetter,
   SchemaIssue,
+  SchemaTransformation,
 } from "effect"
 import {
   type ConfiguredModel,
@@ -32,6 +34,7 @@ import type {
   VersionedConfig,
 } from "./EntityConfig.js"
 import { readingInstances } from "./InstanceReads.js"
+import { hasOwnName, ownValue, PROTO_ENTRY, setOwn } from "./OwnNames.js"
 import { BETA_DATE_MARKER, DATE_MARKER } from "./PackedCodec.js"
 import {
   absentStored,
@@ -42,11 +45,18 @@ import {
   holdsUndefined,
   isDecodingDefault,
   isSchemaLike,
+  isSetDeclaration,
+  keyRenamesOf,
   lackDecision,
+  membersNamedExactly,
   numericTypeWithStringEncoding,
+  ReadsAbsentAs,
+  rowCanLack,
   storedList,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
+import { CANT_SAY, issueOf } from "./SchemaIssue.js"
+import { zonedIsoText } from "./StoredForm.js"
 import { parseZonedIso } from "./ZonedIso.js"
 
 // ---------------------------------------------------------------------------
@@ -111,8 +121,11 @@ export const buildFieldEncodings = (
 ): globalThis.Record<string, DynamoEncoding> => {
   const encodings: globalThis.Record<string, DynamoEncoding> = {}
   for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    const encoding = resolveFieldEncoding(fieldSchema, configuredAttributes[fieldName]?.encoding)
-    if (encoding) encodings[fieldName] = encoding
+    const encoding = resolveFieldEncoding(
+      fieldSchema,
+      ownValue(configuredAttributes, fieldName)?.encoding,
+    )
+    if (encoding) setOwn(encodings, fieldName, encoding)
   }
   return encodings
 }
@@ -244,7 +257,7 @@ export const resolveSystemFields = (
   //       This preserves existing patterns where users declare `createdAt`
   //       as a plain string composite.
   let createdAtCollision = false
-  if (createdAt && createdAt in modelFields) {
+  if (createdAt && hasOwnName(modelFields, createdAt)) {
     const modelEncoding = resolveFieldEncoding(
       modelFields[createdAt]!,
       configuredAttributes[createdAt]?.encoding,
@@ -259,7 +272,7 @@ export const resolveSystemFields = (
     }
   }
   let updatedAtCollision = false
-  if (updatedAt && updatedAt in modelFields) {
+  if (updatedAt && hasOwnName(modelFields, updatedAt)) {
     const modelEncoding = resolveFieldEncoding(
       modelFields[updatedAt]!,
       configuredAttributes[updatedAt]?.encoding,
@@ -272,7 +285,7 @@ export const resolveSystemFields = (
       updatedAtEncoding = null
     }
   }
-  const versionCollision = !!(version && version in modelFields)
+  const versionCollision = !!(version && hasOwnName(modelFields, version))
 
   return {
     createdAt,
@@ -555,7 +568,7 @@ const toWirePrimitive = (input: unknown, encoding: DynamoEncoding): string | num
   }
   switch (encoding.storage) {
     case "string":
-      if (encoding.domain === "DateTime.Zoned" && zoned) return DateTime.formatIsoZoned(zoned)
+      if (encoding.domain === "DateTime.Zoned" && zoned) return zonedIsoText(zoned)
       return new Date(epochMs).toISOString()
     case "epochMs":
       return epochMs
@@ -1766,6 +1779,92 @@ const absentAsDeclared = (schema: Schema.Top, withUndefined: boolean) => {
   )
 }
 
+/** `undefined`, or a set holding nothing once `undefined` is removed: no attribute is stored. */
+const storesNothing = (value: unknown): boolean =>
+  value === undefined ||
+  (value instanceof Set && [...value].every((element) => element === undefined))
+
+/**
+ * The annotation marking a field {@link protoAbsent} made: an annotation, not identity, since the
+ * modules reading it may be loaded twice (the package's source beside its build).
+ */
+const PROTO_ABSENT: unique symbol = Symbol.for("@effect-dynamodb/schema/ProtoAbsent")
+
+/** Whether `field` is one {@link protoAbsent} made. */
+export const isProtoAbsent = (field: unknown): boolean => {
+  const ast = (field as { readonly ast?: SchemaAST.AST } | null | undefined)?.ast
+  return (ast?.annotations as Record<symbol, unknown> | undefined)?.[PROTO_ABSENT] === true
+}
+
+/**
+ * A field named `__proto__`, stored under that name, of a struct the library builds over the
+ * model's (#239). 1.40.0 built each such struct by assignment, `fields[name] = schema`, and
+ * assigning `__proto__` set the map's prototype instead: the field wasn't in the struct. A payload
+ * leaving it out was taken, and one giving it lost the value, which the parser dropped. Here a
+ * payload leaving it out, or giving a value that stores nothing (`undefined`, a `None` encoded as
+ * `undefined`, a set holding nothing), is read as 1.40.0 read it: the field isn't in what the struct
+ * makes. A value that stores something is refused (`EDD-9165`), since no write can store it and no
+ * read can return it. What a value stores is what the field, as declared, makes of it on the way to
+ * storage: encoded, or as it is where it's already in its stored form.
+ */
+const protoAbsent = (field: Schema.Top): Schema.Top => {
+  const holder = Schema.Struct({ v: field } as Schema.Struct.Fields) as unknown as Schema.Codec<
+    { readonly v?: unknown },
+    { readonly v?: unknown }
+  >
+  const decode = Schema.decodeUnknownExit(holder)
+  const encode = Schema.encodeUnknownExit(holder)
+  /** The value as stored, `undefined` for none; the value as given where the field takes neither. */
+  const stored = (value: unknown, encoding: boolean): unknown => {
+    const asIs = () =>
+      Exit.isSuccess(decode({ v: value })) ? Exit.succeed({ v: value }) : undefined
+    const toStored = () => {
+      const encoded = encode({ v: value })
+      return Exit.isSuccess(encoded) ? encoded : undefined
+    }
+    for (const attempt of encoding ? [toStored, asIs] : [asIs, toStored]) {
+      const held = attempt()
+      if (held !== undefined && Exit.isSuccess(held)) {
+        return Object.hasOwn(held.value, "v") ? held.value.v : undefined
+      }
+    }
+    return value
+  }
+  const judge = (encoding: boolean) =>
+    SchemaGetter.transformOptionalEffect<unknown, unknown>((given) =>
+      Option.isNone(given) ||
+      storesNothing(given.value) ||
+      storesNothing(stored(given.value, encoding))
+        ? Effect.succeed(Option.none())
+        : Effect.fail(
+            new SchemaIssue.InvalidValue(
+              { message: `${PROTO_ENTRY} [EDD-9165]` },
+              Option.some(given.value),
+            ),
+          ),
+    )
+  return Schema.optionalKey(
+    Schema.Unknown.pipe(
+      Schema.decodeTo(
+        Schema.Unknown.annotate({ [PROTO_ABSENT]: true } as Schema.Annotations.Annotations),
+        new SchemaTransformation.Transformation(judge(false), judge(true)),
+      ),
+    ),
+  ) as unknown as Schema.Top
+}
+
+/**
+ * `field` under `name`: where that's `__proto__`, stored so, the field {@link protoAbsent} makes of
+ * the one the model `declared`, whose encoding is the stored form.
+ */
+const fieldNamed = (
+  name: string,
+  field: Schema.Top,
+  declared: Schema.Top,
+  storedAsProto = true,
+): Schema.Top =>
+  name === "__proto__" && storedAsProto && !isProtoAbsent(field) ? protoAbsent(declared) : field
+
 /**
  * The field, reading an absent attribute as the value it stands for (`absentStored`), which is what
  * its `declared` schema says, if the field is that schema read some other way.
@@ -1773,11 +1872,14 @@ const absentAsDeclared = (schema: Schema.Top, withUndefined: boolean) => {
 const readingAbsent = (field: Schema.Top, declared: Schema.Top = field): Schema.Top => {
   const reading = absentStored(declared)
   if (reading === undefined) return field
-  return field.pipe(
-    Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
-      self: Schema.Top,
-    ) => Schema.Top,
-  )
+  // A stored value is read as `field` alone (`ReadsAbsentAs`): the default runs where none is.
+  return field
+    .pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
+        self: Schema.Top,
+      ) => Schema.Top,
+    )
+    .annotate({ [ReadsAbsentAs]: field.ast })
 }
 
 /** Whether a struct field anywhere in the schema reads an absent attribute as a value. */
@@ -1875,6 +1977,9 @@ const refusesUndefinedPositions = (
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
+  // A ref held as less than its class (`refHeldTarget`) is another schema than the field it
+  // re-points, whatever its leaves.
+  if (heldStructs.has(schema)) return true
   if (opts?.undefinedPositionsOnly) return holdsUndefinedPosition(schema)
   if (opts?.absentReads === "only") return holdsAbsentRead(schema)
   if (opts?.absentReads && holdsUnwalkedAbsent(schema)) return true
@@ -2254,20 +2359,29 @@ export const substituteSchemaDeep = (
   // by the recursion (and class instance identity is preserved).
   const fields = schemaFieldsOf(schema)
   if (fields) {
+    // A field named `__proto__` is one 1.40.0's rebuilt struct didn't hold (`protoAbsent`).
     const subFields: SchemaFields = {}
     for (const [name, field] of Object.entries(fields)) {
       if (opts?.skipTopLevel?.has(name) === true) {
-        subFields[name] = field
+        setOwn(subFields, name, fieldNamed(name, field, field))
         continue
       }
       const refTarget = opts?.resolveRef?.(name, field)
       if (refTarget !== undefined) {
         const fieldOpt = optionalField(field)
         const sub = substituteSchemaDeep(refTarget, atField(deeper, opts, name))
-        subFields[name] = fieldOpt ? fieldOpt.rewrap(sub) : sub
+        setOwn(subFields, name, fieldNamed(name, fieldOpt ? fieldOpt.rewrap(sub) : sub, field))
       } else {
         const sub = substituteSchemaDeep(field, atField(deeper, opts, name))
-        subFields[name] = opts?.absentReads ? readingAbsent(sub) : sub
+        setOwn(
+          subFields,
+          name,
+          name === "__proto__"
+            ? fieldNamed(name, sub, field)
+            : opts?.absentReads
+              ? readingAbsent(sub)
+              : sub,
+        )
       }
     }
     const plainStruct = Schema.Struct(subFields as Schema.Struct.Fields) as unknown as Schema.Top
@@ -2583,9 +2697,16 @@ export const substituteSchemas = (
     readonly enforceChecks?: boolean | undefined
     /** Build READ schemas: see `DeepSubstitutionOptions.absentReads`. */
     readonly absentReads?: boolean | undefined
+    /**
+     * A field named `__proto__` is stored under another attribute (`DynamoModel.configure`'s
+     * `field`), so it's held as declared. Otherwise it's held as 1.40.0's map, built by
+     * assignment, held it: not at all (`protoAbsent`).
+     */
+    readonly protoRenamed?: boolean | undefined
   },
 ): SchemaFields => {
   const out: SchemaFields = {}
+  const storedAsProto = options?.protoRenamed !== true
   const deep: DeepSubstitutionOptions = {
     ...(options?.legacyReads ? { legacyReads: true } : {}),
     ...(options?.enforceChecks ? { enforceChecks: true } : {}),
@@ -2597,18 +2718,22 @@ export const substituteSchemas = (
     //    tolerant date transform so the encode pipeline produces the right
     //    wire primitive.
     if (isSelfDateSchema(schema)) {
-      const enc = fieldEncodings[name]
+      const enc = ownValue(fieldEncodings, name)
       if (enc) {
-        out[name] = buildDateTransform(enc)
+        setOwn(out, name, fieldNamed(name, buildDateTransform(enc), schema, storedAsProto))
         continue
       }
     }
     // …also beneath a decoding default, which is kept on top (#133).
     const defaulted = decodingDefaultField(schema)
     if (defaulted !== undefined && isSelfDateSchema(defaulted.inner)) {
-      const enc = fieldEncodings[name]
+      const enc = ownValue(fieldEncodings, name)
       if (enc) {
-        out[name] = defaulted.rewrap(buildDateTransform(enc))
+        setOwn(
+          out,
+          name,
+          fieldNamed(name, defaulted.rewrap(buildDateTransform(enc)), schema, storedAsProto),
+        )
         continue
       }
     }
@@ -2617,7 +2742,11 @@ export const substituteSchemas = (
     //    transform so the round-trip works for storage.
     const redactedInner = tryGetRedactedInner(schema)
     if (redactedInner !== undefined) {
-      out[name] = buildRedactedSubstitute(schema, redactedInner)
+      setOwn(
+        out,
+        name,
+        fieldNamed(name, buildRedactedSubstitute(schema, redactedInner), schema, storedAsProto),
+      )
       continue
     }
     // 3. Default: recurse for nested substitution. Pattern B transforms
@@ -2629,15 +2758,26 @@ export const substituteSchemas = (
     //    identity, and returns the schema unchanged when nothing nested needs it.
     //    A configured storage override on a UNION field (`NullOr(DateTimeUtc)`)
     //    is applied to the union's self-date member (#133).
-    const unionOverride = unionDateOverride(name, schema, fieldEncodings[name])
-    out[name] = substituteSchemaDeep(schema, {
-      ...deep,
-      path: [name],
-      ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
-    })
+    const unionOverride = unionDateOverride(name, schema, ownValue(fieldEncodings, name))
+    setOwn(
+      out,
+      name,
+      fieldNamed(
+        name,
+        substituteSchemaDeep(schema, {
+          ...deep,
+          path: [name],
+          ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
+        }),
+        schema,
+        storedAsProto,
+      ),
+    )
   }
   if (options?.absentReads) {
-    for (const [name, field] of Object.entries(out)) out[name] = readingAbsent(field)
+    for (const [name, field] of Object.entries(out)) {
+      if (!isProtoAbsent(field)) setOwn(out, name, readingAbsent(field))
+    }
   }
   return out
 }
@@ -2710,7 +2850,7 @@ export const validateNoTransformOverride = (
     if (!isDateTransform(schema)) continue
 
     // 1. ConfiguredModel.storedAs override?
-    const configOverride = configuredAttributes[name]?.encoding
+    const configOverride = ownValue(configuredAttributes, name)?.encoding
     if (configOverride !== undefined) {
       throw new Error(conflictMessage(name))
     }
@@ -2800,6 +2940,61 @@ export interface DerivedSchemas {
   readonly historyRecordSchema: Schema.Codec<any> | null
 }
 
+/**
+ * @internal The `DynamoModel.Hidden` fields of a model: a read in "model" or "record" mode leaves
+ * them out, of the entity's own items and of a ref to it ({@link refHeldSchema}).
+ */
+export const hiddenFieldNamesOf = (fields: SchemaFields): ReadonlySet<string> =>
+  new Set(Object.keys(fields).filter((name) => isHidden(fields[name] as Schema.Top)))
+
+/** The targets {@link refHeldTarget} decided, each once. */
+const refHeldTargets = new WeakMap<Schema.Top, Schema.Top>()
+/** The schemas {@link refHeldTarget} built: a target's fields without its hidden ones. */
+const heldStructs = new WeakSet<Schema.Top>()
+
+/**
+ * @internal What a ref to an entity of model `target` holds (#241), the one decision every ref
+ * position takes (an entity's `refs`, an aggregate's edges and the refs nested in their entities):
+ * what a read of that entity returns, which put-time hydration and a cascade store, both through
+ * `refDataOf` (the entity's own read schema encoding the item it read). A read leaves out the
+ * target's `DynamoModel.Hidden` fields ({@link hiddenFieldNamesOf}), so the stored ref holds none
+ * of them. Where a hidden field read absent fails, as a read decodes it (`Missing key`), the ref is
+ * the target's other fields, a plain object as the entity's own read decodes it: up to 1.40.0 it
+ * was the whole target, so the referencing row failed every read, after its write. Every other
+ * target is held as declared, a class read back as its instance, as up to 1.40.0: one whose hidden
+ * fields are optional, or read absent as a value (`Schema.Unknown`, `Schema.Any`,
+ * `Schema.UndefinedOr`, a decoding default).
+ */
+export const refHeldTarget = (target: Schema.Top): Schema.Top => {
+  const decided = refHeldTargets.get(target)
+  if (decided !== undefined) return decided
+  const fields = getSchemaFields(target)
+  const hidden = fields === undefined ? new Set<string>() : hiddenFieldNamesOf(fields)
+  // A hidden field read absent, as a read of the referencing row decodes it.
+  const failsAbsent = (name: string) =>
+    Option.isNone(
+      Schema.decodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [name]: fields![name] as Schema.Top }), {
+          legacyReads: true,
+          absentReads: true,
+        }) as unknown as Schema.Codec<unknown>,
+      )({}),
+    )
+  const held =
+    fields !== undefined && [...hidden].some(failsAbsent)
+      ? (Schema.Struct(
+          Object.fromEntries(Object.entries(fields).filter(([name]) => !hidden.has(name))),
+        ) as unknown as Schema.Top)
+      : target
+  if (held !== target) heldStructs.add(held)
+  refHeldTargets.set(target, held)
+  return held
+}
+
+/** @internal {@link refHeldTarget}, substituted as a read or a write takes it (`options`). */
+export const refHeldSchema = (target: Schema.Top, options: DeepSubstitutionOptions): Schema.Top =>
+  substituteSchemaDeep(refHeldTarget(target), options)
+
 export const buildDerivedSchemas = (
   modelFields: SchemaFields,
   indexes: globalThis.Record<string, IndexDefinition>,
@@ -2807,7 +3002,7 @@ export const buildDerivedSchemas = (
   resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierSchema: Schema.Top
+    readonly keySchema: Schema.Top
     readonly refEntity?: { readonly model: Schema.Top } | undefined
   }> = [],
   immutableFields: ReadonlySet<string> = new Set(),
@@ -2815,6 +3010,8 @@ export const buildDerivedSchemas = (
   timeSeries: TimeSeriesConfig<any> | undefined = undefined,
   fieldEncodings: globalThis.Record<string, DynamoEncoding> = {},
   generatedIdField: string | undefined = undefined,
+  /** The field `__proto__` is stored under another attribute: see `substituteSchemas`. */
+  protoRenamed = false,
 ): DerivedSchemas => {
   // --- Substitute model fields ---
   // Self date schemas (with effective encoding) are replaced with bidirectional
@@ -2824,7 +3021,10 @@ export const buildDerivedSchemas = (
   // transform IS the wire format and we never override it.
   // WRITE schemas (input / create / update / key) enforce the container checks
   // the substitution rebuilds; the READ schemas below do not (#133).
-  const fields = substituteSchemas(modelFields, fieldEncodings, { enforceChecks: true })
+  const fields = substituteSchemas(modelFields, fieldEncodings, {
+    enforceChecks: true,
+    protoRenamed,
+  })
   // READ schemas (model / record / item / deleted / history decode) also take
   // the domain-form values earlier releases left on transform fields (#133),
   // and read an absent attribute as the value it stands for (`absentStored`).
@@ -2833,6 +3033,7 @@ export const buildDerivedSchemas = (
   const readFields = substituteSchemas(modelFields, fieldEncodings, {
     legacyReads: true,
     absentReads: true,
+    protoRenamed,
   })
 
   // Ref fields carry the `DynamoModel.ref` annotation (an opaque Declaration that
@@ -2843,22 +3044,34 @@ export const buildDerivedSchemas = (
   // only model/record/item schemas — input/create/update replace refs with IDs.
   for (const ref of resolvedRefs) {
     const targetModel = ref.refEntity?.model
-    if (!targetModel || !(ref.fieldName in fields)) continue
+    if (!targetModel || !hasOwnName(fields, ref.fieldName)) continue
     const resolved = isConfiguredModel(targetModel)
       ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
       : targetModel
-    fields[ref.fieldName] = substituteSchemaDeep(resolved, { enforceChecks: true })
-    readFields[ref.fieldName] = substituteSchemaDeep(resolved, {
-      legacyReads: true,
-      absentReads: true,
-    })
+    // As optional as the model declares it (#241): a row an optional ref was left out of, or
+    // removed from, reads without it. Up to 1.40.0 the target replaced the declaration whole.
+    const optional = optionalField(ownValue(modelFields, ref.fieldName) as Schema.Top)
+    const asDeclared = (target: Schema.Top) =>
+      optional === undefined ? target : optional.rewrap(target)
+    // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
+    setOwn(fields, ref.fieldName, asDeclared(refHeldSchema(resolved, { enforceChecks: true })))
+    setOwn(
+      readFields,
+      ref.fieldName,
+      asDeclared(
+        refHeldSchema(resolved, {
+          legacyReads: true,
+          absentReads: true,
+        }),
+      ),
+    )
   }
 
   // Each of Effect's look-alike declarations (a `BigDecimal`, a `Duration`, an address, a date in
   // an `Option`, ...) reads back as a real instance, not the map DynamoDB hands back for it. A field
   // holding none is the same schema it was. Encoding through one is as it was.
   for (const [name, field] of Object.entries(readFields)) {
-    readFields[name] = readingInstances(field as Schema.Top)
+    if (!isProtoAbsent(field)) setOwn(readFields, name, readingInstances(field as Schema.Top))
   }
 
   // --- Model Schema: pure model fields (decode of stored items in "model" mode) ---
@@ -2871,20 +3084,30 @@ export const buildDerivedSchemas = (
   // already in `fields` and we don't add a system-schema entry.
   const systemSchemaFields: globalThis.Record<string, Schema.Top> = {}
   if (systemFields.createdAt && !systemFields.createdAtCollision) {
-    systemSchemaFields[systemFields.createdAt] = systemFields.createdAtEncoding
-      ? buildDateTransform(systemFields.createdAtEncoding)
-      : Schema.DateTimeUtcFromString
+    setOwn(
+      systemSchemaFields,
+      systemFields.createdAt,
+      systemFields.createdAtEncoding
+        ? buildDateTransform(systemFields.createdAtEncoding)
+        : Schema.DateTimeUtcFromString,
+    )
   }
   if (systemFields.updatedAt && !systemFields.updatedAtCollision) {
-    systemSchemaFields[systemFields.updatedAt] = systemFields.updatedAtEncoding
-      ? buildDateTransform(systemFields.updatedAtEncoding)
-      : Schema.DateTimeUtcFromString
+    setOwn(
+      systemSchemaFields,
+      systemFields.updatedAt,
+      systemFields.updatedAtEncoding
+        ? buildDateTransform(systemFields.updatedAtEncoding)
+        : Schema.DateTimeUtcFromString,
+    )
   }
   if (systemFields.version && !systemFields.versionCollision) {
     // An item written before the entity was `versioned` has no version: it
     // reads as version 0 — real versions start at 1 (#133).
-    systemSchemaFields[systemFields.version] = Schema.Number.pipe(
-      Schema.withDecodingDefaultKey(Effect.succeed(0)),
+    setOwn(
+      systemSchemaFields,
+      systemFields.version,
+      Schema.Number.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
     )
   }
   const recordSchema = Schema.Struct({
@@ -2929,15 +3152,23 @@ export const buildDerivedSchemas = (
 
   // --- Input Schema: ref-aware (swap ref fields for ID fields when refs present) ---
   const refFieldSet = new Set(resolvedRefs.map((r) => r.fieldName))
+  // A ref's id is taken as the model takes the ref (#241): required where it's required, and left
+  // out (`Schema.optionalKey`) or `undefined` too (`Schema.optional`) where the model declares the
+  // ref optional, which then stores no ref. Up to 1.40.0 the id was always required.
+  const refIdInput = (ref: (typeof resolvedRefs)[number]): Schema.Top => {
+    const declared = modelFields[ref.fieldName]
+    const optional = declared === undefined ? undefined : optionalField(declared as Schema.Top)
+    return optional === undefined ? ref.keySchema : optional.rewrap(ref.keySchema)
+  }
   const buildInputFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
     const acc: globalThis.Record<string, Schema.Top> = {}
     for (const [key, field] of Object.entries(fields)) {
       if (refFieldSet.has(key)) continue
       const adjusted = applySystemCollisionAdjustments(key, field, "input")
-      if (adjusted !== null) acc[key] = adjusted
+      if (adjusted !== null) setOwn(acc, key, adjusted)
     }
     for (const ref of resolvedRefs) {
-      acc[ref.idFieldName] = ref.identifierSchema
+      setOwn(acc, ref.idFieldName, refIdInput(ref))
     }
     return acc
   }
@@ -2951,12 +3182,12 @@ export const buildDerivedSchemas = (
     if (createOmitFields.has(key)) continue // skip identifier/PK composites (auto-generated)
     if (refFieldSet.has(key)) continue // skip ref fields (replaced by ID fields)
     const adjusted = applySystemCollisionAdjustments(key, field, "input")
-    if (adjusted !== null) createFieldsAcc[key] = adjusted
+    if (adjusted !== null) setOwn(createFieldsAcc, key, adjusted)
   }
   // Add ID fields for each ref (skip if the ref field is an omitted field)
   for (const ref of resolvedRefs) {
     if (createOmitFields.has(ref.fieldName)) continue
-    createFieldsAcc[ref.idFieldName] = ref.identifierSchema
+    setOwn(createFieldsAcc, ref.idFieldName, refIdInput(ref))
   }
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
@@ -2980,26 +3211,37 @@ export const buildDerivedSchemas = (
       if (immutableFields.has(key)) continue
       if (refFieldSet.has(key)) continue
       if (strippedFromUpdate.has(key)) continue
+      // A field 1.40.0's map didn't hold is one an update may leave out already (`protoAbsent`).
+      if (isProtoAbsent(field)) {
+        setOwn(acc, key, field)
+        continue
+      }
       const clearable = optionalOnCollide.has(key) || lackDecision(field as Schema.Top) !== "refuse"
-      acc[key] = clearable
-        ? Schema.optional(field as Schema.Top)
-        : Schema.optionalKey(field as Schema.Top)
+      setOwn(
+        acc,
+        key,
+        clearable ? Schema.optional(field as Schema.Top) : Schema.optionalKey(field as Schema.Top),
+      )
     }
     for (const ref of resolvedRefs) {
-      if (pkComposites.has(ref.fieldName)) continue
+      // A ref's id that is a primary key composite is part of the key, which no update changes.
+      if (pkComposites.has(ref.fieldName) || pkComposites.has(ref.idFieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optionalKey(ref.identifierSchema as Schema.Top)
+      setOwn(acc, ref.idFieldName, Schema.optionalKey(ref.keySchema as Schema.Top))
     }
     return acc
   }
   const updateSchema = Schema.Struct(buildUpdateFieldsAcc() as Schema.Struct.Fields)
 
   // --- Key Schema: primary key composite attributes only ---
+  // A composite is a model field or a ref's id (`projectId` for `project`), which a key takes as
+  // the input does. Up to 1.40.0 a ref's id was left out, and every key-taking operation died.
   const keyCompositeNames = primaryKeyComposites(indexes)
   const keyFields: globalThis.Record<string, Schema.Top> = {}
   for (const name of keyCompositeNames) {
-    const field = fields[name]
-    if (field) keyFields[name] = field
+    const field =
+      ownValue(fields, name) ?? resolvedRefs.find((ref) => ref.idFieldName === name)?.keySchema
+    if (field) setOwn(keyFields, name, field)
   }
   const keySchema = Schema.Struct(keyFields)
 
@@ -3017,9 +3259,11 @@ export const buildDerivedSchemas = (
   }
   const keyAttrFields: globalThis.Record<string, Schema.Top> = {}
   for (const fieldName of allKeyFieldNames(indexes)) {
-    keyAttrFields[fieldName] = primaryKeyFieldNames.has(fieldName)
-      ? Schema.String
-      : Schema.optional(Schema.String)
+    setOwn(
+      keyAttrFields,
+      fieldName,
+      primaryKeyFieldNames.has(fieldName) ? Schema.String : Schema.optional(Schema.String),
+    )
   }
   const itemSchema = Schema.Struct({
     ...readFields,
@@ -3038,10 +3282,7 @@ export const buildDerivedSchemas = (
   // --- Hidden-aware decode schemas: strip DynamoModel.Hidden fields from model/record ---
   // These are used for "model" and "record" decode modes. Hidden fields are
   // still present in "item" and "native" modes.
-  const hiddenFieldNames = new Set<string>()
-  for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    if (isHidden(fieldSchema)) hiddenFieldNames.add(fieldName)
-  }
+  const hiddenFieldNames = hiddenFieldNamesOf(modelFields)
   const hasHiddenFields = hiddenFieldNames.size > 0
 
   const modelVisibleSchema = hasHiddenFields
@@ -3077,7 +3318,10 @@ export const buildDerivedSchemas = (
         // Compute encodings for the appendInput fields (annotation +
         // inferred from typeConstructor for self schemas).
         const appendEncodings = buildFieldEncodings(userFields, {})
-        const subbedFields = substituteSchemas(userFields, appendEncodings, { enforceChecks: true })
+        const subbedFields = substituteSchemas(userFields, appendEncodings, {
+          enforceChecks: true,
+          protoRenamed,
+        })
         return Schema.Struct(subbedFields as Schema.Struct.Fields) as unknown as Schema.Top
       })()
     : null
@@ -3127,7 +3371,8 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   const inner = opt?.union ?? opt?.inner ?? schema
   const s = inner as unknown as globalThis.Record<string, unknown>
   const fields = schemaFieldsOf(inner)
-  if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
+  if (fields !== undefined)
+    return typeof segment === "string" ? ownValue(fields, segment) : undefined
   // An OPAQUE class — `X.check(…)`, `X.annotate(…)`, a `DynamoModel.ref` nested
   // in a ref target — is deliberately NOT followed. Its `.fields` are gone, so
   // the derived read schema keeps it unsubstituted and decodes its leaves
@@ -3160,7 +3405,7 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   if (SchemaAST.isObjects(inner.ast) && typeof segment === "string") {
     if (isSchemaLike(s.value) && isSchemaLike(s.key)) return s.value
     if (isSchemaLike(s.schema) && Array.isArray(s.records)) {
-      const declared = schemaFieldsOf(s.schema)?.[segment]
+      const declared = ownValue(schemaFieldsOf(s.schema), segment)
       if (declared !== undefined) return declared
       const record = s.records[0] as unknown as { readonly value?: Schema.Top } | undefined
       return record?.value
@@ -3198,7 +3443,10 @@ const sameValue = (a: unknown, b: unknown): boolean => {
   }
   if (isPlainObject(a) && isPlainObject(b)) {
     const keys = Object.keys(a)
-    return keys.length === Object.keys(b).length && keys.every((k) => sameValue(a[k], b[k]))
+    return (
+      keys.length === Object.keys(b).length &&
+      keys.every((k) => Object.hasOwn(b, k) && sameValue(a[k], b[k]))
+    )
   }
   return false
 }
@@ -3220,17 +3468,27 @@ const sameValue = (a: unknown, b: unknown): boolean => {
  * `DateTime` is "its own encoded form" to Effect, but the library stores it as
  * a primitive.
  */
-const makeAmbiguityCheck = (original: Schema.Top): ((value: unknown) => boolean) => {
+const makeAmbiguityCheck = (
+  original: Schema.Top,
+): ((value: unknown) => boolean | typeof CANT_SAY) => {
   if (!isLeafEncodingTransform(original)) return () => false
   // "Already wire" means the value DECODES as wire — a plain string that is not
   // valid base64 is a domain value for `StringFromBase64`, and is encoded.
-  const decodesAsWire = Schema.decodeUnknownOption(original as unknown as Schema.Codec<any>)
+  const decodesAsWire = Schema.decodeUnknownExit(original as unknown as Schema.Codec<any>)
   const isType = Schema.is(Schema.make<Schema.Top>(SchemaAST.toType(original.ast)))
-  const encode = Schema.encodeUnknownOption(original as unknown as Schema.Codec<any>)
+  const encode = Schema.encodeUnknownExit(original as unknown as Schema.Codec<any>)
+  // A transform that can't run synchronously can't tell (#236).
   return (value) => {
-    if (decodesAsWire(value)._tag === "None" || !isType(value)) return false
-    const encoded = encode(value)
-    return encoded._tag === "Some" && !sameValue(encoded.value, value)
+    const asWire = issueOf(() => decodesAsWire(value))
+    if (asWire === CANT_SAY) return CANT_SAY
+    if (asWire !== undefined || !isType(value)) return false
+    let encoded: Exit.Exit<unknown, unknown> | undefined
+    const issue = issueOf(() => {
+      encoded = encode(value)
+      return encoded
+    })
+    if (issue === CANT_SAY) return CANT_SAY
+    return encoded !== undefined && Exit.isSuccess(encoded) && !sameValue(encoded.value, value)
   }
 }
 
@@ -3245,7 +3503,7 @@ const asStored = (value: unknown): unknown => {
   if (!isPlainObject(value)) return value
   const out: globalThis.Record<string, unknown> = {}
   for (const [key, entry] of Object.entries(value)) {
-    if (entry !== undefined) out[key] = asStored(entry)
+    if (entry !== undefined) setOwn(out, key, asStored(entry))
   }
   return out
 }
@@ -3258,6 +3516,164 @@ const isWalkableObject = (value: unknown): value is object =>
   !(value instanceof Date) &&
   !DateTime.isDateTime(value) &&
   !Redacted.isRedacted(value)
+
+/**
+ * What `contains` compares in what a field stores (#242): an element of a list (`Schema.Array`, a
+ * tuple), a member of a set (`Schema.ReadonlySet`, stored as DynamoDB's set), and otherwise a
+ * substring of text.
+ *
+ * @internal
+ */
+export const containedKindOf = (field: Schema.Top): "list" | "set" | "text" => {
+  const inner = optionalField(field)?.inner ?? field
+  return SchemaAST.isArrays(inner.ast) ? "list" : isSetDeclaration(inner.ast) ? "set" : "text"
+}
+
+/**
+ * A `contains` operand in the form the field stores what it compares (#242), from what a write of
+ * a whole value there stores (`value`) and of one list element (`element`): the element as a list
+ * stores it; the single member of a write of a set holding it; the text a write of it stores, when
+ * that's text. `undefined` when the field doesn't take it so, and the operand is sent as given.
+ *
+ * @internal
+ */
+export const containedOperand =
+  (
+    kind: "list" | "set" | "text",
+    value: (value: unknown) => { readonly stored: unknown } | undefined,
+    element: (value: unknown) => { readonly stored: unknown } | undefined,
+  ) =>
+  (operand: unknown): { readonly stored: unknown } | undefined => {
+    if (kind === "list") return element(operand)
+    if (kind === "set") {
+      const set = value(new Set([operand]))?.stored
+      return set instanceof Set && set.size === 1 ? { stored: [...set][0] } : undefined
+    }
+    const text = value(operand)
+    return typeof text?.stored === "string" ? text : undefined
+  }
+
+/**
+ * A `pathSet` value as it's written (#238): `encoded` by the schema at its path, or, where that
+ * refuses it, by the first other member of a union on the way that takes it (`otherWay`, with the
+ * issue the schema at its path raised, which is how 1.40.0 refused it, as `refusedBefore`).
+ * `issue` is `undefined` when some way takes it; `check` validates a value at the way that did.
+ *
+ * @internal
+ */
+export interface PathSetValue {
+  readonly encoded: unknown
+  readonly issue: unknown
+  readonly otherWay: boolean
+  readonly refusedBefore?: unknown
+  readonly check: (encoded: unknown) => unknown
+}
+
+/**
+ * One clause of an update inside a field, as a union on the way judges it (#238): a value written
+ * at a path (`encoded`, as sent), a property removed, or anything else (a copy, an increment, a
+ * list position removed, the whole field), which the schema can't judge.
+ *
+ * @internal
+ */
+export type UnionClause =
+  | {
+      readonly _tag: "Value"
+      readonly segments: ReadonlyArray<string | number>
+      readonly encoded: unknown
+    }
+  | { readonly _tag: "Removal"; readonly segments: ReadonlyArray<string | number> }
+  | { readonly _tag: "Other"; readonly segments: ReadonlyArray<string | number> }
+
+/** What holds a way's end: a struct, a record, or something else. */
+type UnionParent = "struct" | "record" | "other"
+
+type UnionWayAt = {
+  readonly _tag: "At"
+  readonly original: Schema.Top
+  readonly asDeclared: boolean
+  readonly parent: UnionParent
+}
+
+/**
+ * A way to a path's end through the unions on it ({@link makePathValueEncoder}'s `waysTo`): `At`
+ * the schema there; `Unread`, a plain struct without the next property, which reads past whatever
+ * is under it; `CannotHold`, a scalar, a list given a property or a struct given a position, which
+ * holds nothing there (a value there isn't one it reads, and DynamoDB refuses a path through one);
+ * `Unknown`, anything else.
+ */
+type UnionWay = {
+  readonly choices: ReadonlyMap<string, Schema.Top>
+  readonly end: UnionWayAt | { readonly _tag: "Unread" | "CannotHold" | "Unknown" }
+}
+
+/** Whether a node carries nothing a read runs: no transformation, no check. */
+const plainNode = (ast: SchemaAST.AST): boolean =>
+  ast.checks === undefined &&
+  ast.encoding === undefined &&
+  (ast as { readonly encodingChecks?: unknown }).encodingChecks === undefined
+
+/** The members of a plain union, each union among them in turn; any other schema alone. */
+const membersOf = (schema: Schema.Top): ReadonlyArray<Schema.Top> => {
+  const members = (schema as { readonly members?: unknown }).members
+  if (!SchemaAST.isUnion(schema.ast) || !plainNode(schema.ast) || !Array.isArray(members)) {
+    return [schema]
+  }
+  return (members as ReadonlyArray<Schema.Top>).flatMap(membersOf)
+}
+
+const SCALAR_TAGS: ReadonlySet<string> = new Set([
+  "Null",
+  "Undefined",
+  "String",
+  "Number",
+  "Boolean",
+  "BigInt",
+  "Symbol",
+  "Literal",
+  "UniqueSymbol",
+  "Enum",
+  "TemplateLiteral",
+])
+
+/** What holds a path's next segment: a plain struct, a plain record, or something else. */
+const parentOf = (member: Schema.Top): UnionParent => {
+  const ast = member.ast
+  if (!SchemaAST.isObjects(ast) || !plainNode(ast)) return "other"
+  if (ast.indexSignatures.length === 0) return "struct"
+  return ast.propertySignatures.length === 0 ? "record" : "other"
+}
+
+/** A way's end where a member doesn't hold the path's next segment ({@link UnionWay}). */
+const missingAt = (
+  member: Schema.Top,
+  segment: string | number,
+): { readonly _tag: "Unread" | "CannotHold" | "Unknown" } => {
+  const ast = member.ast
+  if (!plainNode(ast)) return { _tag: "Unknown" }
+  if (SCALAR_TAGS.has(ast._tag)) return { _tag: "CannotHold" }
+  if (SchemaAST.isArrays(ast))
+    return { _tag: typeof segment === "string" ? "CannotHold" : "Unknown" }
+  if (SchemaAST.isObjects(ast) && ast.indexSignatures.length === 0) {
+    return { _tag: typeof segment === "string" ? "Unread" : "CannotHold" }
+  }
+  return { _tag: "Unknown" }
+}
+
+/**
+ * A union's member as a path's judgement reads it (#238): a struct that renames its keys as it's
+ * stored ({@link keyRenamesOf}) is read as the struct it renames, by its properties' own names,
+ * which a path names (each written under its stored name, which the struct reads it from).
+ * Anything else as it is.
+ */
+const readAs = (member: Schema.Top): Schema.Top => {
+  const ast = member.ast
+  if (!SchemaAST.isObjects(ast) || ast.encoding === undefined || !keyRenamesOf(ast)) return member
+  const renamed = (member as { readonly to?: unknown }).to
+  return isSchemaLike(renamed) && SchemaAST.isObjects(renamed.ast) && plainNode(renamed.ast)
+    ? renamed
+    : member
+}
 
 /**
  * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
@@ -3287,7 +3703,29 @@ export const makePathValueEncoder = (
    * `.fields`), so a path under it is followed through the target model.
    */
   refTargets: globalThis.Record<string, Schema.Top> = {},
+  /**
+   * Whether DynamoDB can store an encoded value: an operand whose stored form it can't store is
+   * sent as given ({@link operand}).
+   */
+  storable?: (encoded: unknown) => boolean,
+  /** The entity's READ schemas of the model's fields, which a row is decoded by (`readsAsGiven`). */
+  readFields: SchemaFields = {},
 ): {
+  /**
+   * A condition's or filter's operand as the attribute at `segments` holds it (#242): the one
+   * function that decides it. `kind` `"value"` compares the value there (a comparison, `between`,
+   * `in`); `"contained"` an element of it (`contains`): an element of the list, a member of the
+   * set, or a substring of the text the field stores. The stored form is used only where the schema
+   * alone determines it — every position a row can hold the path under that takes the value stores
+   * it in the same form (`declaredAt`). Anywhere else (union members that store it differently, an
+   * `Unknown` or `Any`, a suspended schema or a declaration the walk doesn't follow, a value no
+   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it.
+   */
+  readonly operand: (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "contained",
+  ) => unknown
   readonly value: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
   readonly elements: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
   /**
@@ -3298,6 +3736,38 @@ export const makePathValueEncoder = (
   readonly validate: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
   /** `validate` for each element of a list value (append / prepend). */
   readonly validateElements: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
+  /**
+   * A `pathSet` value, encoded as it's written ({@link PathSetValue}): by the schema at its path, or,
+   * where that refuses it, by the first other member of a union on the way that takes it (#238).
+   */
+  readonly pathSet: (segments: ReadonlyArray<string | number>, value: unknown) => PathSetValue
+  /**
+   * Whether what an update's clauses inside one field leave there ({@link UnionClause}) is read
+   * (#238). `strict`: whatever the row holds, at every union the clauses pass — every member reads
+   * it, or the clauses write all of one member that does. Otherwise: by some member at each union.
+   */
+  readonly reads: (clauses: ReadonlyArray<UnionClause>, strict: boolean) => boolean
+  /** Whether a path passes a union of several members. */
+  readonly passesUnion: (segments: ReadonlyArray<string | number>) => boolean
+  /**
+   * Whether a value written at a path is checked exactly against the schema there (`validate` for
+   * a `"value"`, `validateElements` for a list's `"elements"`): not where the walk can't follow the
+   * path (an opaque class, a dynamic key), nor a list operation's elements where the path holds no
+   * list, or a list with checks or a transformation of its own, which checking each element
+   * doesn't judge (#238).
+   */
+  readonly checks: (segments: ReadonlyArray<string | number>, kind: "value" | "elements") => boolean
+  /**
+   * Whether a read takes a value written as given at a path (`"value"`), or each element added as
+   * given to the list there (`"elements"`): whether the READ schema there decodes it, by some
+   * member of each union on the way (#238). A read takes more than a write stores: the domain form
+   * earlier releases left on a field stored as text, for one.
+   */
+  readonly readsAsGiven: (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "elements",
+  ) => boolean
 } => {
   const recordFields = writeFields
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
@@ -3333,36 +3803,58 @@ export const makePathValueEncoder = (
       const element = leafAwareEncoder(originalElement, storedElement)
       return (value) => (Array.isArray(value) ? value.map((entry) => element(entry)) : value)
     }
-    const encode = Schema.encodeUnknownOption(stored as Schema.Codec<any>)
-    const decode = Schema.decodeUnknownOption(stored as Schema.Codec<any>)
+    const encodeExit = Schema.encodeUnknownExit(stored as Schema.Codec<any>)
+    const decodeExit = Schema.decodeUnknownExit(stored as Schema.Codec<any>)
+    /** A synchronous run's value, `undefined` on a schema issue, `CANT_SAY` when it can't finish. */
+    const attempt = (
+      run: (value: unknown) => Exit.Exit<unknown, unknown>,
+      value: unknown,
+    ): { readonly value: unknown } | typeof CANT_SAY | undefined => {
+      let exit: Exit.Exit<unknown, unknown> | undefined
+      const verdict = issueOf(() => {
+        exit = run(value)
+        return exit
+      })
+      if (verdict === CANT_SAY) return CANT_SAY
+      return verdict === undefined && exit !== undefined && Exit.isSuccess(exit)
+        ? { value: exit.value }
+        : undefined
+    }
     const ambiguous = makeAmbiguityCheck(original)
     return (value: unknown) => {
-      if (ambiguous(value)) return value
+      // Where the check can't tell (a schema that can't run synchronously), the value is
+      // encoded as a domain value, and written as given if that can't finish either.
+      if (ambiguous(value) === true) return value
       // A container holding an ambiguous wire leaf (`{ b64: "aGk=", at }`) is
       // encoded part by part, so that leaf follows the leaf rule instead of
       // being encoded a second time by the whole-value encode.
       if (holdsAmbiguousLeaf(original, value)) return encodeByParts(original, value)
-      const encoded = encode(value)
-      if (encoded._tag === "Some") return encoded.value
+      // A schema that can't run synchronously (an asynchronous step, a defect) says nothing of
+      // the value: it's written as given, as at a position nothing checks (#236).
+      const encoded = attempt(encodeExit, value)
+      if (encoded === CANT_SAY) return value
+      if (encoded !== undefined) return encoded.value
       // `decode -> encode`, as `.set()` / `put` do: a plain object given for a
       // class-typed field, or a value already in wire form, round-trips to its
       // wire form instead of being marshalled as given.
-      const decoded = decode(value)
-      if (decoded._tag === "Some") {
-        const reencoded = encode(decoded.value)
-        if (reencoded._tag === "Some") return reencoded.value
+      const decoded = attempt(decodeExit, value)
+      if (decoded === CANT_SAY) return value
+      if (decoded !== undefined) {
+        const reencoded = attempt(encodeExit, decoded.value)
+        if (reencoded === CANT_SAY) return value
+        if (reencoded !== undefined) return reencoded.value
       }
       return encodeByParts(original, value)
     }
   }
-  const ambiguityChecks = new WeakMap<Schema.Top, (value: unknown) => boolean>()
+  const ambiguityChecks = new WeakMap<Schema.Top, (value: unknown) => boolean | typeof CANT_SAY>()
   const isAmbiguousAt = (schema: Schema.Top, value: unknown): boolean => {
     let check = ambiguityChecks.get(schema)
     if (check === undefined) {
       check = makeAmbiguityCheck(optionalField(schema)?.inner ?? schema)
       ambiguityChecks.set(schema, check)
     }
-    return check(value)
+    return check(value) === true
   }
   /**
    * Whether a container value holds, at any depth, a leaf in ambiguous wire
@@ -3415,7 +3907,7 @@ export const makePathValueEncoder = (
     const out: globalThis.Record<string, unknown> = {}
     for (const [key, entry] of Object.entries(value)) {
       const child = childAtSegment(schema, key)
-      out[key] = child === undefined ? entry : partEncoder(child)(entry)
+      setOwn(out, key, child === undefined ? entry : partEncoder(child)(entry))
     }
     return out
   }
@@ -3426,7 +3918,7 @@ export const makePathValueEncoder = (
   const originalAt = (segments: ReadonlyArray<string | number>) => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return undefined
-    let current: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    let current: Schema.Top | undefined = ownValue(refTargets, head) ?? ownValue(modelFields, head)
     let asDeclared = false
     for (const segment of rest) {
       if (current === undefined) return undefined
@@ -3445,7 +3937,7 @@ export const makePathValueEncoder = (
     const head = segments[0] as string
     const stored =
       segments.length === 1
-        ? recordFields[head]
+        ? ownValue(recordFields, head)
         : at.asDeclared
           ? original
           : substituteSchemaDeep(original, { enforceChecks: true })
@@ -3464,15 +3956,508 @@ export const makePathValueEncoder = (
         ? null
         : (() => {
             const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
+            // Only a schema issue refuses: a decode that can't finish synchronously says
+            // nothing of the value (#236).
             return (encoded: unknown): unknown => {
-              const exit = decode(asStored(encoded))
-              return exit._tag === "Success" ? undefined : exit.cause
+              const issue = issueOf(() => decode(asStored(encoded)))
+              return issue === CANT_SAY ? undefined : issue
             }
           })()
     validators.set(key, fn)
     return fn
   }
+  /**
+   * Every schema a row can hold the value at `segments` under (#242), each with whether it's written
+   * as declared ({@link writesFirstMemberOnly}), or `undefined` where the schema alone doesn't
+   * determine what a row holds there. The walk follows EVERY union member that can hold the path,
+   * not only the first: a row holding a later member stores its value there under that member's
+   * schema. A position that can't hold the rest of the path (a string, a number, a literal, `null`,
+   * a struct without the field) is left out. One that could hold it but isn't modelled here (an
+   * `Unknown` or `Any`, a suspended schema, a declaration such as an `Option` or an opaque class, a
+   * container the walk can't read) makes the path undetermined, and so does an `Unknown` or `Any` at
+   * the path itself.
+   */
+  const declaredAt = (
+    segments: ReadonlyArray<string | number>,
+  ): ReadonlyArray<{ readonly schema: Schema.Top; readonly asDeclared: boolean }> | undefined => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string") return undefined
+    const top = refTargets[head] ?? modelFields[head]
+    if (top === undefined) return undefined
+    type Position = { readonly schema: Schema.Top; readonly asDeclared: boolean }
+    const holdsNoPath = new Set([
+      "Null",
+      "Undefined",
+      "Void",
+      "Never",
+      "String",
+      "Number",
+      "Boolean",
+      "BigInt",
+      "Symbol",
+      "UniqueSymbol",
+      "Literal",
+      "TemplateLiteral",
+      "Enum",
+    ])
+    const membersOf = (union: Schema.Top): ReadonlyArray<Schema.Top> | undefined => {
+      const members = (union as unknown as { readonly members?: unknown }).members
+      return Array.isArray(members) ? (members as ReadonlyArray<Schema.Top>) : undefined
+    }
+    const through = (
+      members: ReadonlyArray<Schema.Top>,
+      segment: string | number,
+      asDeclared: (index: number) => boolean,
+    ): ReadonlyArray<Position> | undefined => {
+      const out: Array<Position> = []
+      for (const [index, member] of members.entries()) {
+        const reached = reach(member, segment, asDeclared(index))
+        if (reached === undefined) return undefined
+        out.push(...reached)
+      }
+      return out
+    }
+    const reach = (
+      schema: Schema.Top,
+      segment: string | number,
+      asDeclared: boolean,
+    ): ReadonlyArray<Position> | undefined => {
+      const opt = optionalField(schema)
+      if (opt?.union !== undefined) {
+        // An optional union writes its first member substituted and the later ones as declared.
+        const members = membersOf(opt.union)?.filter((m) => m.ast._tag !== "Undefined")
+        if (members === undefined) return undefined
+        return through(members, segment, (index) => asDeclared || index > 0)
+      }
+      const inner = opt?.inner ?? schema
+      const fields = schemaFieldsOf(inner)
+      if (fields !== undefined) {
+        const child = typeof segment === "string" ? fields[segment] : undefined
+        return child === undefined ? [] : [{ schema: child, asDeclared }]
+      }
+      const ast = inner.ast
+      if (holdsNoPath.has(ast._tag)) return []
+      if (SchemaAST.isUnion(ast)) {
+        const members = membersOf(inner)
+        return members === undefined ? undefined : through(members, segment, () => asDeclared)
+      }
+      if (SchemaAST.isArrays(ast)) {
+        if (typeof segment !== "number") return []
+        const child = childAtSegment(inner, segment)
+        if (child !== undefined) return [{ schema: child, asDeclared }]
+        // A tuple with no element there and no rest holds nothing there.
+        const s = inner as unknown as { readonly elements?: unknown; readonly rest?: unknown }
+        return Array.isArray(s.elements) && ast.rest.length === 0 ? [] : undefined
+      }
+      if (SchemaAST.isObjects(ast)) {
+        if (typeof segment !== "string") return []
+        const child = childAtSegment(inner, segment)
+        return child === undefined ? undefined : [{ schema: child, asDeclared }]
+      }
+      return undefined
+    }
+    let positions: ReadonlyArray<Position> = [{ schema: top, asDeclared: false }]
+    for (const segment of rest) {
+      const next: Array<Position> = []
+      for (const position of positions) {
+        const reached = reach(position.schema, segment, position.asDeclared)
+        if (reached === undefined) return undefined
+        for (const p of reached) {
+          if (!next.some((q) => q.schema === p.schema && q.asDeclared === p.asDeclared))
+            next.push(p)
+        }
+      }
+      positions = next
+    }
+    const holdsAnything = (schema: Schema.Top) => {
+      const tag = (optionalField(schema)?.inner ?? schema).ast._tag
+      return tag === "Unknown" || tag === "Any"
+    }
+    return positions.some((p) => holdsAnything(p.schema)) ? undefined : positions
+  }
+  /**
+   * What `contains` compares at a position: an element of the list it holds, a member of the set, or
+   * a substring of the text.
+   */
+  type OperandForm = {
+    readonly value: (value: unknown) => { readonly stored: unknown } | undefined
+    readonly contained: (value: unknown) => { readonly stored: unknown } | undefined
+  }
+  const operandForms = new Map<string, ReadonlyArray<OperandForm> | null>()
+  const formsAt = (segments: ReadonlyArray<string | number>): ReadonlyArray<OperandForm> | null => {
+    const key = JSON.stringify(segments)
+    const cached = operandForms.get(key)
+    if (cached !== undefined) return cached
+    const declared = declaredAt(segments)
+    const head = segments[0] as string
+    const forms =
+      declared === undefined || declared.length === 0
+        ? null
+        : declared.flatMap((position): ReadonlyArray<OperandForm> => {
+            const original = position.schema
+            const stored =
+              segments.length === 1
+                ? recordFields[head]
+                : position.asDeclared
+                  ? original
+                  : substituteSchemaDeep(original, { enforceChecks: true })
+            if (stored === undefined) return []
+            const formOf = (from: Schema.Top, to: Schema.Top) => {
+              const encode = leafAwareEncoder(from, to)
+              const decode = Schema.decodeUnknownExit(to as Schema.Codec<any>)
+              return (value: unknown): { readonly stored: unknown } | undefined => {
+                const encoded = encode(value)
+                if (decode(asStored(encoded))._tag !== "Success") return undefined
+                if (storable !== undefined && !storable(encoded)) return undefined
+                return { stored: encoded }
+              }
+            }
+            const value = formOf(original, stored)
+            const originalElement = listElementOf(original)
+            const storedElement = listElementOf(stored)
+            const contained = containedOperand(
+              containedKindOf(original),
+              value,
+              originalElement !== undefined && storedElement !== undefined
+                ? formOf(originalElement, storedElement)
+                : () => undefined,
+            )
+            return [{ value, contained }]
+          })
+    const result = forms === null || forms.length === 0 ? null : forms
+    operandForms.set(key, result)
+    return result
+  }
+  /**
+   * Every way to the end of a path through the model's schema, by the member it takes at each union
+   * of several members on the way (`choices`, keyed by where the union is: the path up to the map
+   * it reads). Within a union's member a path is followed as {@link childAtSegment} follows it.
+   */
+  const waysTo = (segments: ReadonlyArray<string | number>): ReadonlyArray<UnionWay> => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string") return []
+    const start: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    if (start === undefined) return []
+    const ways: Array<UnionWay> = []
+    const walk = (
+      schema: Schema.Top,
+      depth: number,
+      choices: ReadonlyMap<string, Schema.Top>,
+      asDeclared: boolean,
+      parent: UnionParent,
+    ): void => {
+      if (depth === rest.length) {
+        ways.push({ choices, end: { _tag: "At", original: schema, asDeclared, parent } })
+        return
+      }
+      const segment = rest[depth]!
+      const opt = optionalField(schema)
+      const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+      // Through a later member of an optional union, a path is written as declared, as
+      // `originalAt` writes it ({@link writesFirstMemberOnly}).
+      const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
+      const at = JSON.stringify(segments.slice(0, depth + 1))
+      for (const member of members) {
+        const chosen = members.length > 1 ? new Map(choices).set(at, member) : choices
+        const declared = asDeclared || (first !== undefined && !first.has(member))
+        const child = childAtSegment(member, segment)
+        if (child !== undefined) walk(child, depth + 1, chosen, declared, parentOf(member))
+        else ways.push({ choices: chosen, end: missingAt(member, segment) })
+      }
+    }
+    walk(start, 0, new Map(), false, "other")
+    return ways
+  }
+  const wayStored = new Map<Schema.Top, Schema.Top>()
+  const wayDeclared = (way: UnionWayAt): Schema.Top => {
+    if (way.asDeclared) return way.original
+    const found = wayStored.get(way.original)
+    if (found !== undefined) return found
+    const stored = substituteSchemaDeep(way.original, { enforceChecks: true })
+    wayStored.set(way.original, stored)
+    return stored
+  }
+  const wayValidators = new Map<Schema.Top, (encoded: unknown) => unknown>()
+  const wayValidator = (way: UnionWayAt): ((encoded: unknown) => unknown) => {
+    const stored = wayDeclared(way)
+    const found = wayValidators.get(stored)
+    if (found !== undefined) return found
+    const decode = Schema.decodeUnknownExit(stored as Schema.Codec<any>)
+    const fn = (encoded: unknown): unknown => {
+      const exit = decode(asStored(encoded))
+      return exit._tag === "Success" ? undefined : exit.cause
+    }
+    wayValidators.set(stored, fn)
+    return fn
+  }
+  const wayEncoders = new Map<Schema.Top, (value: unknown) => unknown>()
+  const wayEncoder = (way: UnionWayAt): ((value: unknown) => unknown) => {
+    const stored = wayDeclared(way)
+    const found = wayEncoders.get(stored)
+    if (found !== undefined) return found
+    const fn = leafAwareEncoder(way.original, stored)
+    wayEncoders.set(stored, fn)
+    return fn
+  }
+  /**
+   * What one clause leaves at the node it ends at (`schema`, reached as `asDeclared` says, held by a
+   * `parent`): read, not read, or `"unknown"`, which the schema can't judge — a copy, an
+   * increment, an append, a whole field, a list position removed.
+   */
+  const endVerdict = (clause: UnionClause, at: UnionWayAt): boolean | "unknown" => {
+    if (clause._tag === "Other") return "unknown"
+    if (clause._tag === "Value") return wayValidator(at)(clause.encoded) === undefined
+    if (typeof clause.segments[clause.segments.length - 1] !== "string") return "unknown"
+    if (at.parent === "record") return true
+    if (at.parent === "struct") return rowCanLack(at.original)
+    return "unknown"
+  }
+  /** Clauses below a node, each with the path left from there. */
+  type Below = ReadonlyArray<{
+    readonly rest: ReadonlyArray<string | number>
+    readonly clause: UnionClause
+  }>
+  /** The clauses going further from a node, by the segment they take next, in order. */
+  const bySegment = (below: Below): ReadonlyArray<readonly [string | number, Below]> => {
+    const groups: Array<[string | number, Array<Below[number]>]> = []
+    for (const { rest, clause } of below) {
+      if (rest.length === 0) continue
+      const [segment, ...after] = rest
+      const group = groups.find(([held]) => held === segment)
+      const entry = { rest: after, clause }
+      if (group === undefined) groups.push([segment!, [entry]])
+      else group[1].push(entry)
+    }
+    return groups
+  }
+  /**
+   * The judgement of an update's clauses inside one field (#238), at a node: `schema`, reached as
+   * `asDeclared` says ({@link writesFirstMemberOnly}), held by a `parent`.
+   *
+   * `strict` asks whether what they leave is read WHATEVER the row holds there, at every union the
+   * clauses pass, passed through or ended at, at any depth: at a union, either (a) every member
+   * reads what they leave below it, or (b) they write every property of one member that reads it
+   * ({@link fixes}), so that the update itself sets which member the row holds. A member without
+   * the next segment reads past it (a plain struct), or holds nothing there for DynamoDB to write
+   * into (a scalar, a list given a property, a struct given a position), which refuses the update
+   * and leaves the row as it was. Anything the schema can't judge isn't read, and two clauses on
+   * one path (which DynamoDB refuses) aren't either.
+   *
+   * Otherwise it asks whether SOME row reads what they leave: one member at each union reads every
+   * clause below it, the member taken alike for every clause under the same union. Anything the
+   * schema can't judge is taken as read, and a member holding nothing there as not reading it.
+   */
+  const judge = (
+    schema: Schema.Top,
+    below: Below,
+    asDeclared: boolean,
+    parent: UnionParent,
+    strict: boolean,
+  ): boolean => {
+    const ending = below.filter(({ rest }) => rest.length === 0)
+    const further = bySegment(below)
+    const at: UnionWayAt = { _tag: "At", original: schema, asDeclared, parent }
+    if (strict && ending.length > 0 && (ending.length > 1 || further.length > 0)) return false
+    for (const { clause } of ending) {
+      const verdict = endVerdict(clause, at)
+      if (verdict === "unknown" ? !strict : verdict) continue
+      return false
+    }
+    if (further.length === 0) return true
+    const opt = optionalField(schema)
+    const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+    // Through a later member of an optional union, a path is written as declared, as `originalAt`
+    // writes it ({@link writesFirstMemberOnly}).
+    const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
+    const declaredFor = (member: Schema.Top) =>
+      asDeclared || (first !== undefined && !first.has(member))
+    const reads = (member: Schema.Top) => memberReads(member, further, declaredFor(member), strict)
+    if (members.length === 1) return reads(members[0]!)
+    // Members that don't name every segment alike are written as 1.40.0 wrote them, by the names
+    // given ({@link membersNamedExactly}): what they leave isn't judged.
+    if (!membersNamedExactly(members)) return !strict
+    if (!strict) return members.some(reads)
+    return (
+      members.every(reads) ||
+      members.some((member) => fixes(member, further, declaredFor(member)) && reads(member))
+    )
+  }
+  /** {@link judge} under one member, for the clauses going further, by segment. */
+  const memberReads = (
+    member: Schema.Top,
+    further: ReadonlyArray<readonly [string | number, Below]>,
+    asDeclared: boolean,
+    strict: boolean,
+  ): boolean =>
+    further.every(([segment, below]) => {
+      const read = readAs(member)
+      const child = childAtSegment(read, segment)
+      if (child !== undefined) return judge(child, below, asDeclared, parentOf(read), strict)
+      const end = missingAt(read, segment)
+      if (strict) return end._tag !== "Unknown"
+      // A clause the schema can't judge is taken as read, wherever the member leaves it.
+      if (below.every(({ clause }) => clause._tag === "Other")) return true
+      return end._tag === "Unread" || end._tag === "Unknown"
+    })
+  /**
+   * Whether the clauses going further from a union's member write every property of it (#238):
+   * each set or removed, or, for a property holding a plain struct, every property of THAT written
+   * in turn, or for one holding a union, every property of one of its members that reads what they
+   * leave. What the member holds after the update is then all theirs, whatever the row held. A
+   * member that isn't a plain struct isn't known to be.
+   */
+  const fixes = (
+    member: Schema.Top,
+    further: ReadonlyArray<readonly [string | number, Below]>,
+    asDeclared: boolean,
+  ): boolean => {
+    const read = readAs(member)
+    if (parentOf(read) !== "struct") return false
+    return (read.ast as SchemaAST.Objects).propertySignatures.every((property) => {
+      const group = further.find(([segment]) => segment === property.name)
+      if (group === undefined) return false
+      const child = childAtSegment(read, property.name as string)
+      return child !== undefined && fixedBy(child, group[1], asDeclared)
+    })
+  }
+  /** Whether the clauses below a node set all of it ({@link fixes}). */
+  const fixedBy = (schema: Schema.Top, below: Below, asDeclared: boolean): boolean => {
+    const ending = below.filter(({ rest }) => rest.length === 0)
+    if (ending.length > 0) {
+      return ending.length === 1 && below.length === 1 && ending[0]!.clause._tag !== "Other"
+    }
+    const further = bySegment(below)
+    const opt = optionalField(schema)
+    const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+    const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
+    if (members.length > 1 && !membersNamedExactly(members)) return false
+    return members.some((member) => {
+      const declared = asDeclared || (first !== undefined && !first.has(member))
+      return (
+        fixes(member, further, declared) &&
+        (members.length === 1 || memberReads(member, further, declared, true))
+      )
+    })
+  }
+  const reads = (clauses: ReadonlyArray<UnionClause>, strict: boolean): boolean => {
+    const head = clauses[0]?.segments[0]
+    const start = typeof head === "string" ? (refTargets[head] ?? modelFields[head]) : undefined
+    // A field the walk can't follow is one the schema can't judge.
+    if (start === undefined || clauses.some((clause) => clause.segments[0] !== head)) {
+      return !strict
+    }
+    const below = clauses.map((clause) => ({ rest: clause.segments.slice(1), clause }))
+    return judge(start, below, false, "other", strict)
+  }
+  const readDecoders = new WeakMap<Schema.Top, (value: unknown) => boolean>()
+  const readDecoder = (schema: Schema.Top): ((value: unknown) => boolean) => {
+    const found = readDecoders.get(schema)
+    if (found !== undefined) return found
+    const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
+    const fn = (value: unknown) => decode(asStored(value))._tag === "Success"
+    readDecoders.set(schema, fn)
+    return fn
+  }
+  /**
+   * A class as a read decodes it: from the struct of its fields (`from`), which a path into it
+   * walks. Any other schema as it is.
+   */
+  const readSide = (schema: Schema.Top): Schema.Top => {
+    const { from, to } = schema as unknown as { readonly from?: unknown; readonly to?: unknown }
+    return schemaFieldsOf(schema) === undefined &&
+      isSchemaLike(from) &&
+      schemaFieldsOf(from) !== undefined &&
+      isSchemaLike(to) &&
+      SchemaAST.isDeclaration(to.ast)
+      ? from
+      : schema
+  }
+  /** The READ schema's nodes at the end of a path: one by each member of each union on the way. */
+  const readNodesAt = (segments: ReadonlyArray<string | number>): ReadonlyArray<Schema.Top> => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string" || !Object.hasOwn(readFields, head)) return []
+    const nodes: Array<Schema.Top> = []
+    const walk = (schema: Schema.Top, depth: number): void => {
+      const opt = optionalField(schema)
+      const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+      if (depth === rest.length) {
+        nodes.push(...members)
+        return
+      }
+      for (const member of members) {
+        const child = childAtSegment(readSide(member), rest[depth]!)
+        if (child !== undefined) walk(child, depth + 1)
+      }
+    }
+    walk(readFields[head]!, 0)
+    return nodes
+  }
   return {
+    operand: (segments, value, kind) => {
+      const forms = formsAt(segments)
+      if (forms === null) return value
+      let chosen: { readonly stored: unknown } | undefined
+      for (const form of forms) {
+        // A position that can't hold the value holds no row it could match.
+        const stored = kind === "value" ? form.value(value) : form.contained(value)
+        if (stored === undefined) continue
+        if (chosen !== undefined && !sameValue(chosen.stored, stored.stored)) return value
+        chosen = stored
+      }
+      return chosen === undefined ? value : chosen.stored
+    },
+    readsAsGiven: (segments, value, kind) => {
+      const nodes = readNodesAt(segments)
+      if (kind === "value") return nodes.some((node) => readDecoder(node)(value))
+      if (!Array.isArray(value)) return false
+      return nodes.some((node) => {
+        const element = listElementOf(node)
+        return element !== undefined && value.every((each) => readDecoder(element)(each))
+      })
+    },
+    pathSet: (segments, value) => {
+      const first = schemaAt(segments)
+      const encoded = encoderFor(`v:${JSON.stringify(segments)}`, () => first)
+      const firstValidator = validatorFor(`v:${JSON.stringify(segments)}`, () => first?.stored)
+      const written = encoded === null ? value : encoded(value)
+      const check = (read: unknown) => (firstValidator === null ? undefined : firstValidator(read))
+      const issue = check(written)
+      if (issue === undefined) return { encoded: written, issue, otherWay: false, check }
+      for (const way of waysTo(segments)) {
+        if (way.end._tag !== "At") continue
+        const other = wayEncoder(way.end)(value)
+        const taken = wayValidator(way.end)
+        if (taken(other) === undefined) {
+          return {
+            encoded: other,
+            issue: undefined,
+            otherWay: true,
+            refusedBefore: issue,
+            check: taken,
+          }
+        }
+      }
+      return { encoded: written, issue, otherWay: false, check }
+    },
+    reads,
+    passesUnion: (segments) => waysTo(segments).some((way) => way.choices.size > 0),
+    checks: (segments, kind) => {
+      const at = schemaAt(segments)
+      if (at === undefined) return false
+      if (kind === "value") return true
+      // Elements are checked one by one: only a list that checks nothing of its own, and isn't
+      // transformed as a whole, reads what they leave as they're checked.
+      const opt = optionalField(at.stored)
+      const lists = opt?.union !== undefined ? membersOf(opt.union) : [opt?.inner ?? at.stored]
+      return (
+        listElementOf(at.stored) !== undefined &&
+        lists.every(
+          (list) =>
+            !SchemaAST.isArrays(list.ast) ||
+            (plainNode(list.ast) && list.ast.encoding === undefined),
+        )
+      )
+    },
     validate: (segments, encoded) => {
       const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)
       return fn === null ? undefined : fn(encoded)

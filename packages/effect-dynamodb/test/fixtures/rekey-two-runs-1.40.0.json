@@ -1,0 +1,1292 @@
+{
+  "generatedWith": "effect-dynamodb@1.40.0",
+  "scenario": "A random table (seed 18 of RF240b's writer) written by 1.40.0 with escapeKeys on, then two 1.40.0 rekey() runs at once with escapeKeys off ({ segments: 2, pageSize: 3 } and { segments: 3, pageSize: 2 }, each request yielding first). 1.40.0 left one unique sentinel naming a key where no row of its entity is.",
+  "written": [
+    {
+      "id": {
+        "S": "a%2520b"
+      },
+      "customer": {
+        "S": "a%2520b"
+      },
+      "__edd_e__": {
+        "S": "Order"
+      },
+      "pk": {
+        "S": "$fz#v1#orders#a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#order"
+      }
+    },
+    {
+      "lid": {
+        "S": "a b"
+      },
+      "qty": {
+        "N": "1"
+      },
+      "__edd_e__": {
+        "S": "OrderLine"
+      },
+      "pk": {
+        "S": "$fz#v1#orders#a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#orderline#a%20b"
+      }
+    },
+    {
+      "lid": {
+        "S": "l1"
+      },
+      "qty": {
+        "N": "2"
+      },
+      "__edd_e__": {
+        "S": "OrderLine"
+      },
+      "pk": {
+        "S": "$fz#v1#orders#a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#orderline#l1"
+      }
+    },
+    {
+      "team": {
+        "S": "a%2520b"
+      },
+      "id": {
+        "S": "a%20b"
+      },
+      "email": {
+        "S": "a b"
+      },
+      "name": {
+        "S": "a%252520b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      },
+      "__edd_i__": {
+        "S": "9f78f541-b8af-4fde-95ed-4e131d8a732a"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#id_a%2520b"
+      },
+      "gsi1pk": {
+        "S": "$fz#v1#user#team_a%252520b"
+      },
+      "gsi1sk": {
+        "S": "$fz#v1#user#name_a%25252520b"
+      }
+    },
+    {
+      "team": {
+        "S": "a%2520b"
+      },
+      "id": {
+        "S": "a%20b"
+      },
+      "email": {
+        "S": "a%2520b"
+      },
+      "name": {
+        "S": "a b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "1"
+      },
+      "__edd_i__": {
+        "S": "9f78f541-b8af-4fde-95ed-4e131d8a732a"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#v#id_a%2520b#0000001"
+      }
+    },
+    {
+      "team": {
+        "S": "a%252520b"
+      },
+      "id": {
+        "S": "a%2520b"
+      },
+      "email": {
+        "S": "a%252520b"
+      },
+      "name": {
+        "S": "a%20b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "1"
+      },
+      "__edd_i__": {
+        "S": "f3feacaf-9fce-4a8a-b85a-a4baadd846e9"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#v#id_a%252520b#0000001"
+      }
+    },
+    {
+      "id": {
+        "S": "a%252520b"
+      },
+      "email": {
+        "S": "a b"
+      },
+      "nick": {
+        "S": "a%20b"
+      },
+      "__edd_e__": {
+        "S": "Member"
+      },
+      "pk": {
+        "S": "$fz#v1#member#id_a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#member"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#member.email#a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#member.email"
+      },
+      "__edd_e__": {
+        "S": "Member._unique.email"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#member#id_a%25252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#member"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#counters#a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#counters.event_1#0000000001"
+      },
+      "__edd_e__": {
+        "S": "counters.event"
+      },
+      "streamId": {
+        "S": "a%2520b"
+      },
+      "version": {
+        "N": "1"
+      },
+      "eventType": {
+        "S": "Counted"
+      },
+      "data": {
+        "M": {
+          "_tag": {
+            "S": "Counted"
+          },
+          "by": {
+            "N": "9"
+          }
+        }
+      },
+      "timestamp": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "__edd_wt__": {
+        "S": "cd4705daaa21695525e7111750e5f96a"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#counters#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#counters.event_1#0000000001"
+      },
+      "__edd_e__": {
+        "S": "counters.event"
+      },
+      "streamId": {
+        "S": "a%20b"
+      },
+      "version": {
+        "N": "1"
+      },
+      "eventType": {
+        "S": "Counted"
+      },
+      "data": {
+        "M": {
+          "_tag": {
+            "S": "Counted"
+          },
+          "by": {
+            "N": "10"
+          }
+        }
+      },
+      "timestamp": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "__edd_wt__": {
+        "S": "92059079bb28763bbe164a432d61f738"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#user.email#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user.email"
+      },
+      "__edd_e__": {
+        "S": "User._unique.email"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#user#team_a%25252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#user#id_a%252520b"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#user.email#a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#user.email"
+      },
+      "__edd_e__": {
+        "S": "User._unique.email"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#user#team_a%252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#user#id_a%2520b"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a%20b"
+      },
+      "at": {
+        "N": "18"
+      },
+      "value": {
+        "N": "18"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "device": {
+        "S": "a%20b"
+      },
+      "at": {
+        "N": "18"
+      },
+      "value": {
+        "N": "18"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000018"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#counters#a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#counters.event_1#0000000001"
+      },
+      "__edd_e__": {
+        "S": "counters.event"
+      },
+      "streamId": {
+        "S": "a%252520b"
+      },
+      "version": {
+        "N": "1"
+      },
+      "eventType": {
+        "S": "Counted"
+      },
+      "data": {
+        "M": {
+          "_tag": {
+            "S": "Counted"
+          },
+          "by": {
+            "N": "19"
+          }
+        }
+      },
+      "timestamp": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "__edd_wt__": {
+        "S": "f679561e7f88c91e1f6bca4fa677cfe8"
+      }
+    },
+    {
+      "id": {
+        "S": "a%2520b"
+      },
+      "code": {
+        "S": "a%252520b"
+      },
+      "__edd_e__": {
+        "S": "Soft"
+      },
+      "pk": {
+        "S": "$fz#v1#soft#id_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#soft"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#soft.code#a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#soft.code"
+      },
+      "__edd_e__": {
+        "S": "Soft._unique.code"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#soft#id_a%252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#soft"
+      }
+    },
+    {
+      "id": {
+        "S": "a%2520b"
+      },
+      "note": {
+        "S": "n22"
+      },
+      "__edd_e__": {
+        "S": "Row"
+      },
+      "pk": {
+        "S": "$fz#v1#row"
+      },
+      "sk": {
+        "S": "$fz#v1#row#id_a%252520b"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a%252520b"
+      },
+      "at": {
+        "N": "23"
+      },
+      "value": {
+        "N": "23"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "device": {
+        "S": "a%252520b"
+      },
+      "at": {
+        "N": "23"
+      },
+      "value": {
+        "N": "23"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000023"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "team": {
+        "S": "a%252520b"
+      },
+      "id": {
+        "S": "a%2520b"
+      },
+      "email": {
+        "S": "a%20b"
+      },
+      "name": {
+        "S": "a b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      },
+      "__edd_i__": {
+        "S": "f3feacaf-9fce-4a8a-b85a-a4baadd846e9"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#deleted#id_a%252520b#1970-01-01T00:00:00.000Z"
+      },
+      "deletedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      }
+    },
+    {
+      "team": {
+        "S": "a%252520b"
+      },
+      "id": {
+        "S": "a%2520b"
+      },
+      "email": {
+        "S": "a%20b"
+      },
+      "name": {
+        "S": "a b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      },
+      "__edd_i__": {
+        "S": "f3feacaf-9fce-4a8a-b85a-a4baadd846e9"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%25252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#v#id_a%252520b#0000002"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#member.nick#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#member.nick"
+      },
+      "__edd_e__": {
+        "S": "Member._unique.nick"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#member#id_a%25252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#member"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a b"
+      },
+      "at": {
+        "N": "28"
+      },
+      "value": {
+        "N": "28"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "device": {
+        "S": "a b"
+      },
+      "at": {
+        "N": "28"
+      },
+      "value": {
+        "N": "28"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000028"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a%2520b"
+      },
+      "at": {
+        "N": "29"
+      },
+      "value": {
+        "N": "29"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "device": {
+        "S": "a%2520b"
+      },
+      "at": {
+        "N": "29"
+      },
+      "value": {
+        "N": "29"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000029"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    }
+  ],
+  "leftBy140": [
+    {
+      "pk": {
+        "S": "$fz#v1#user.email#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user.email"
+      },
+      "__edd_e__": {
+        "S": "User._unique.email"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#user#team_a%25252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#user#id_a%252520b"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#counters#a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#counters.event_1#0000000001"
+      },
+      "__edd_e__": {
+        "S": "counters.event"
+      },
+      "streamId": {
+        "S": "a%20b"
+      },
+      "version": {
+        "N": "1"
+      },
+      "eventType": {
+        "S": "Counted"
+      },
+      "data": {
+        "M": {
+          "_tag": {
+            "S": "Counted"
+          },
+          "by": {
+            "N": "10"
+          }
+        }
+      },
+      "timestamp": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "__edd_wt__": {
+        "S": "92059079bb28763bbe164a432d61f738"
+      }
+    },
+    {
+      "lid": {
+        "S": "a b"
+      },
+      "qty": {
+        "N": "1"
+      },
+      "__edd_e__": {
+        "S": "OrderLine"
+      },
+      "pk": {
+        "S": "$fz#v1#orders#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#orderline#a b"
+      }
+    },
+    {
+      "lid": {
+        "S": "l1"
+      },
+      "qty": {
+        "N": "2"
+      },
+      "__edd_e__": {
+        "S": "OrderLine"
+      },
+      "pk": {
+        "S": "$fz#v1#orders#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#orderline#l1"
+      }
+    },
+    {
+      "device": {
+        "S": "a%20b"
+      },
+      "at": {
+        "N": "18"
+      },
+      "value": {
+        "N": "18"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000018"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "id": {
+        "S": "a%2520b"
+      },
+      "customer": {
+        "S": "a%2520b"
+      },
+      "__edd_e__": {
+        "S": "Order"
+      },
+      "pk": {
+        "S": "$fz#v1#orders#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#order"
+      }
+    },
+    {
+      "id": {
+        "S": "a%252520b"
+      },
+      "email": {
+        "S": "a b"
+      },
+      "nick": {
+        "S": "a%20b"
+      },
+      "__edd_e__": {
+        "S": "Member"
+      },
+      "pk": {
+        "S": "$fz#v1#member#id_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#member"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#member.email#a b"
+      },
+      "sk": {
+        "S": "$fz#v1#member.email"
+      },
+      "__edd_e__": {
+        "S": "Member._unique.email"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#member#id_a%252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#member"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#member.nick#a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#member.nick"
+      },
+      "__edd_e__": {
+        "S": "Member._unique.nick"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#member#id_a%252520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#member"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#counters#a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#counters.event_1#0000000001"
+      },
+      "__edd_e__": {
+        "S": "counters.event"
+      },
+      "streamId": {
+        "S": "a%2520b"
+      },
+      "version": {
+        "N": "1"
+      },
+      "eventType": {
+        "S": "Counted"
+      },
+      "data": {
+        "M": {
+          "_tag": {
+            "S": "Counted"
+          },
+          "by": {
+            "N": "9"
+          }
+        }
+      },
+      "timestamp": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "__edd_wt__": {
+        "S": "cd4705daaa21695525e7111750e5f96a"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a b"
+      },
+      "at": {
+        "N": "28"
+      },
+      "value": {
+        "N": "28"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a%20b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a%20b"
+      },
+      "at": {
+        "N": "18"
+      },
+      "value": {
+        "N": "18"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a%2520b"
+      },
+      "at": {
+        "N": "29"
+      },
+      "value": {
+        "N": "29"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#reading#device_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading"
+      },
+      "device": {
+        "S": "a%252520b"
+      },
+      "at": {
+        "N": "23"
+      },
+      "value": {
+        "N": "23"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "device": {
+        "S": "a%252520b"
+      },
+      "at": {
+        "N": "23"
+      },
+      "value": {
+        "N": "23"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000023"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "id": {
+        "S": "a%2520b"
+      },
+      "note": {
+        "S": "n22"
+      },
+      "__edd_e__": {
+        "S": "Row"
+      },
+      "pk": {
+        "S": "$fz#v1#row"
+      },
+      "sk": {
+        "S": "$fz#v1#row#id_a%2520b"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#counters#a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#counters.event_1#0000000001"
+      },
+      "__edd_e__": {
+        "S": "counters.event"
+      },
+      "streamId": {
+        "S": "a%252520b"
+      },
+      "version": {
+        "N": "1"
+      },
+      "eventType": {
+        "S": "Counted"
+      },
+      "data": {
+        "M": {
+          "_tag": {
+            "S": "Counted"
+          },
+          "by": {
+            "N": "19"
+          }
+        }
+      },
+      "timestamp": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "__edd_wt__": {
+        "S": "f679561e7f88c91e1f6bca4fa677cfe8"
+      }
+    },
+    {
+      "device": {
+        "S": "a b"
+      },
+      "at": {
+        "N": "28"
+      },
+      "value": {
+        "N": "28"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000028"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "device": {
+        "S": "a%2520b"
+      },
+      "at": {
+        "N": "29"
+      },
+      "value": {
+        "N": "29"
+      },
+      "pk": {
+        "S": "$fz#v1#reading#device_a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#reading#e#0000000000000029"
+      },
+      "__edd_e__": {
+        "S": "Reading"
+      }
+    },
+    {
+      "id": {
+        "S": "a%2520b"
+      },
+      "code": {
+        "S": "a%252520b"
+      },
+      "__edd_e__": {
+        "S": "Soft"
+      },
+      "pk": {
+        "S": "$fz#v1#soft#id_a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#soft"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#soft.code#a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#soft.code"
+      },
+      "__edd_e__": {
+        "S": "Soft._unique.code"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#soft#id_a%2520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#soft"
+      }
+    },
+    {
+      "team": {
+        "S": "a%2520b"
+      },
+      "id": {
+        "S": "a%20b"
+      },
+      "email": {
+        "S": "a%2520b"
+      },
+      "name": {
+        "S": "a b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "1"
+      },
+      "__edd_i__": {
+        "S": "9f78f541-b8af-4fde-95ed-4e131d8a732a"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#v#id_a%20b#0000001"
+      }
+    },
+    {
+      "team": {
+        "S": "a%2520b"
+      },
+      "id": {
+        "S": "a%20b"
+      },
+      "email": {
+        "S": "a b"
+      },
+      "name": {
+        "S": "a%252520b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      },
+      "__edd_i__": {
+        "S": "9f78f541-b8af-4fde-95ed-4e131d8a732a"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%2520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#id_a%20b"
+      },
+      "gsi1pk": {
+        "S": "$fz#v1#user#team_a%2520b"
+      },
+      "gsi1sk": {
+        "S": "$fz#v1#user#name_a%252520b"
+      }
+    },
+    {
+      "pk": {
+        "S": "$fz#v1#user.email#a b"
+      },
+      "sk": {
+        "S": "$fz#v1#user.email"
+      },
+      "__edd_e__": {
+        "S": "User._unique.email"
+      },
+      "_entity_pk": {
+        "S": "$fz#v1#user#team_a%2520b"
+      },
+      "_entity_sk": {
+        "S": "$fz#v1#user#id_a%20b"
+      }
+    },
+    {
+      "team": {
+        "S": "a%252520b"
+      },
+      "id": {
+        "S": "a%2520b"
+      },
+      "email": {
+        "S": "a%20b"
+      },
+      "name": {
+        "S": "a b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      },
+      "__edd_i__": {
+        "S": "f3feacaf-9fce-4a8a-b85a-a4baadd846e9"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#deleted#id_a%2520b#1970-01-01T00:00:00.000Z"
+      },
+      "deletedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      }
+    },
+    {
+      "team": {
+        "S": "a%252520b"
+      },
+      "id": {
+        "S": "a%2520b"
+      },
+      "email": {
+        "S": "a%252520b"
+      },
+      "name": {
+        "S": "a%20b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "1"
+      },
+      "__edd_i__": {
+        "S": "f3feacaf-9fce-4a8a-b85a-a4baadd846e9"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#v#id_a%2520b#0000001"
+      }
+    },
+    {
+      "team": {
+        "S": "a%252520b"
+      },
+      "id": {
+        "S": "a%2520b"
+      },
+      "email": {
+        "S": "a%20b"
+      },
+      "name": {
+        "S": "a b"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      },
+      "__edd_i__": {
+        "S": "f3feacaf-9fce-4a8a-b85a-a4baadd846e9"
+      },
+      "__edd_e__": {
+        "S": "User"
+      },
+      "pk": {
+        "S": "$fz#v1#user#team_a%252520b"
+      },
+      "sk": {
+        "S": "$fz#v1#user#v#id_a%2520b#0000002"
+      }
+    }
+  ]
+}

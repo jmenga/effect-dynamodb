@@ -91,6 +91,15 @@ describe("OperationDetector", () => {
     expect(op!.type).toBe("create")
   })
 
+  it("should detect Users.insert() operation", () => {
+    const source = `Users.insert({ userId: "u-new", email: "new@example.com" })`
+    const sf = parseSource(source)
+    const op = detectOperation(ts, sf, 6, entities)
+
+    expect(op).toBeDefined()
+    expect(op!.type).toBe("insert")
+  })
+
   it("should detect Users.update() operation", () => {
     const source = `Users.update({ userId: "u-alice" })`
     const sf = parseSource(source)

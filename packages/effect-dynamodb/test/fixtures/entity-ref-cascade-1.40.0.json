@@ -1,0 +1,2310 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published package on DynamoDB Local (1.39.0 sends, stores and returns the same): never regenerate or \"fix\" it. Each shape (helpers/EntityRefCascade.ts): a Team holding every transformed field kind seeded, then a Player put with `teamId`, read, the team renamed with a cascade to Players, the Player read again. Outcomes are a failure by tag, operation and cause text, or the value with a date as its epoch milliseconds, a Redacted as its value and a bigint as `<digits>n`; requests are the commands and inputs sent, the table name as <table>; rows are the table's items after each step, sorted by key.",
+ "shapes": {
+  "keyed by a string": {
+   "seeded": {
+    "ok": {
+     "id": "t1",
+     "name": "Tigers",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "put": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "id": "t1",
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "putRequests": [
+    {
+     "command": "GetItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#id_t1"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      }
+     }
+    },
+    {
+     "command": "PutItem",
+     "input": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "p1"
+       },
+       "team": {
+        "M": {
+         "id": {
+          "S": "t1"
+         },
+         "name": {
+          "S": "Tigers"
+         },
+         "secret": {
+          "S": "s3"
+         },
+         "at": {
+          "S": "2023-11-14T22:13:20.000Z"
+         },
+         "atMs": {
+          "N": "1700000000000"
+         },
+         "atS": {
+          "N": "1700000000"
+         },
+         "count": {
+          "S": "7"
+         },
+         "big": {
+          "N": "9"
+         },
+         "label": {
+          "S": "L"
+         },
+         "tags": {
+          "M": {
+           "a": {
+            "N": "1"
+           }
+          }
+         },
+         "blob": {
+          "M": {
+           "a": {
+            "N": "2"
+           }
+          }
+         }
+        }
+       },
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "pk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$cascade#v1#player"
+       },
+       "gsi1pk": {
+        "S": "$cascade#v1#player#teamid_t1"
+       },
+       "gsi1sk": {
+        "S": "$cascade#v1#player#id_p1"
+       }
+      }
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "id": "t1",
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "team": {
+      "M": {
+       "atS": {
+        "N": "1700000000"
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "N": "1700000000000"
+       },
+       "name": {
+        "S": "Tigers"
+       },
+       "count": {
+        "S": "7"
+       },
+       "id": {
+        "S": "t1"
+       },
+       "secret": {
+        "S": "s3"
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#id_t1"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "id": "t1",
+     "name": "Lions",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#id_t1"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    },
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#et = :et0",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#et": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Player"
+       },
+       ":pk": {
+        "S": "$cascade#v1#player#teamid_t1"
+       }
+      }
+     }
+    },
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$cascade#v1#player"
+       }
+      },
+      "UpdateExpression": "SET #ref = :refData",
+      "ExpressionAttributeNames": {
+       "#ref": "team"
+      },
+      "ExpressionAttributeValues": {
+       ":refData": {
+        "M": {
+         "id": {
+          "S": "t1"
+         },
+         "name": {
+          "S": "Lions"
+         },
+         "secret": {
+          "M": {
+           "~effect/Redacted": {
+            "M": {}
+           }
+          }
+         },
+         "at": {
+          "M": {
+           "epochMilliseconds": {
+            "N": "1700000000000"
+           },
+           "~effect/DateTime": {
+            "S": "~effect/DateTime"
+           },
+           "_tag": {
+            "S": "Utc"
+           }
+          }
+         },
+         "atMs": {
+          "M": {
+           "epochMilliseconds": {
+            "N": "1700000000000"
+           },
+           "~effect/DateTime": {
+            "S": "~effect/DateTime"
+           },
+           "_tag": {
+            "S": "Utc"
+           }
+          }
+         },
+         "atS": {
+          "M": {
+           "epochMilliseconds": {
+            "N": "1700000000000"
+           },
+           "~effect/DateTime": {
+            "S": "~effect/DateTime"
+           },
+           "_tag": {
+            "S": "Utc"
+           }
+          }
+         },
+         "count": {
+          "N": "7"
+         },
+         "big": {
+          "N": "9"
+         },
+         "label": {
+          "S": "L"
+         },
+         "tags": {
+          "M": {
+           "a": {
+            "N": "1"
+           }
+          }
+         },
+         "blob": {
+          "M": {
+           "a": {
+            "N": "2"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "atS": {
+        "M": {
+         "epochMilliseconds": {
+          "N": "1700000000000"
+         },
+         "~effect/DateTime": {
+          "S": "~effect/DateTime"
+         },
+         "_tag": {
+          "S": "Utc"
+         }
+        }
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "M": {
+         "epochMilliseconds": {
+          "N": "1700000000000"
+         },
+         "~effect/DateTime": {
+          "S": "~effect/DateTime"
+         },
+         "_tag": {
+          "S": "Utc"
+         }
+        }
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "M": {
+         "epochMilliseconds": {
+          "N": "1700000000000"
+         },
+         "~effect/DateTime": {
+          "S": "~effect/DateTime"
+         },
+         "_tag": {
+          "S": "Utc"
+         }
+        }
+       },
+       "name": {
+        "S": "Lions"
+       },
+       "count": {
+        "N": "7"
+       },
+       "id": {
+        "S": "t1"
+       },
+       "secret": {
+        "M": {
+         "~effect/Redacted": {
+          "M": {}
+         }
+        }
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#id_t1"
+     }
+    }
+   ],
+   "getAfter": {
+    "died": "Error: Unable to get redacted value"
+   }
+  },
+  "keyed by a string, the ref renamed": {
+   "seeded": {
+    "ok": {
+     "id": "t1",
+     "name": "Tigers",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "put": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "id": "t1",
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "putRequests": [
+    {
+     "command": "GetItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#id_t1"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      }
+     }
+    },
+    {
+     "command": "PutItem",
+     "input": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "p1"
+       },
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "pk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$cascade#v1#player"
+       },
+       "gsi1pk": {
+        "S": "$cascade#v1#player#teamid_t1"
+       },
+       "gsi1sk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "teamData": {
+        "M": {
+         "id": {
+          "S": "t1"
+         },
+         "name": {
+          "S": "Tigers"
+         },
+         "secret": {
+          "S": "s3"
+         },
+         "at": {
+          "S": "2023-11-14T22:13:20.000Z"
+         },
+         "atMs": {
+          "N": "1700000000000"
+         },
+         "atS": {
+          "N": "1700000000"
+         },
+         "count": {
+          "S": "7"
+         },
+         "big": {
+          "N": "9"
+         },
+         "label": {
+          "S": "L"
+         },
+         "tags": {
+          "M": {
+           "a": {
+            "N": "1"
+           }
+          }
+         },
+         "blob": {
+          "M": {
+           "a": {
+            "N": "2"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "id": "t1",
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "teamData": {
+      "M": {
+       "atS": {
+        "N": "1700000000"
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "N": "1700000000000"
+       },
+       "name": {
+        "S": "Tigers"
+       },
+       "count": {
+        "S": "7"
+       },
+       "id": {
+        "S": "t1"
+       },
+       "secret": {
+        "S": "s3"
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#id_t1"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "id": "t1",
+     "name": "Lions",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#id_t1"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    },
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#et = :et0",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#et": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Player"
+       },
+       ":pk": {
+        "S": "$cascade#v1#player#teamid_t1"
+       }
+      }
+     }
+    },
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$cascade#v1#player"
+       }
+      },
+      "UpdateExpression": "SET #ref = :refData",
+      "ExpressionAttributeNames": {
+       "#ref": "team"
+      },
+      "ExpressionAttributeValues": {
+       ":refData": {
+        "M": {
+         "id": {
+          "S": "t1"
+         },
+         "name": {
+          "S": "Lions"
+         },
+         "secret": {
+          "M": {
+           "~effect/Redacted": {
+            "M": {}
+           }
+          }
+         },
+         "at": {
+          "M": {
+           "epochMilliseconds": {
+            "N": "1700000000000"
+           },
+           "~effect/DateTime": {
+            "S": "~effect/DateTime"
+           },
+           "_tag": {
+            "S": "Utc"
+           }
+          }
+         },
+         "atMs": {
+          "M": {
+           "epochMilliseconds": {
+            "N": "1700000000000"
+           },
+           "~effect/DateTime": {
+            "S": "~effect/DateTime"
+           },
+           "_tag": {
+            "S": "Utc"
+           }
+          }
+         },
+         "atS": {
+          "M": {
+           "epochMilliseconds": {
+            "N": "1700000000000"
+           },
+           "~effect/DateTime": {
+            "S": "~effect/DateTime"
+           },
+           "_tag": {
+            "S": "Utc"
+           }
+          }
+         },
+         "count": {
+          "N": "7"
+         },
+         "big": {
+          "N": "9"
+         },
+         "label": {
+          "S": "L"
+         },
+         "tags": {
+          "M": {
+           "a": {
+            "N": "1"
+           }
+          }
+         },
+         "blob": {
+          "M": {
+           "a": {
+            "N": "2"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "teamData": {
+      "M": {
+       "atS": {
+        "N": "1700000000"
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "N": "1700000000000"
+       },
+       "name": {
+        "S": "Tigers"
+       },
+       "count": {
+        "S": "7"
+       },
+       "id": {
+        "S": "t1"
+       },
+       "secret": {
+        "S": "s3"
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "atS": {
+        "M": {
+         "epochMilliseconds": {
+          "N": "1700000000000"
+         },
+         "~effect/DateTime": {
+          "S": "~effect/DateTime"
+         },
+         "_tag": {
+          "S": "Utc"
+         }
+        }
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "M": {
+         "epochMilliseconds": {
+          "N": "1700000000000"
+         },
+         "~effect/DateTime": {
+          "S": "~effect/DateTime"
+         },
+         "_tag": {
+          "S": "Utc"
+         }
+        }
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "M": {
+         "epochMilliseconds": {
+          "N": "1700000000000"
+         },
+         "~effect/DateTime": {
+          "S": "~effect/DateTime"
+         },
+         "_tag": {
+          "S": "Utc"
+         }
+        }
+       },
+       "name": {
+        "S": "Lions"
+       },
+       "count": {
+        "N": "7"
+       },
+       "id": {
+        "S": "t1"
+       },
+       "secret": {
+        "M": {
+         "~effect/Redacted": {
+          "M": {}
+         }
+        }
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#id_t1"
+     }
+    }
+   ],
+   "getAfter": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "id": "t1",
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   }
+  },
+  "keyed by a number": {
+   "seeded": {
+    "ok": {
+     "num": 5,
+     "name": "Tigers",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "put": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "num": 5,
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "putRequests": [
+    {
+     "command": "GetItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#num_0000000000000005"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      }
+     }
+    },
+    {
+     "command": "PutItem",
+     "input": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "p1"
+       },
+       "team": {
+        "M": {
+         "num": {
+          "N": "5"
+         },
+         "name": {
+          "S": "Tigers"
+         },
+         "secret": {
+          "S": "s3"
+         },
+         "at": {
+          "S": "2023-11-14T22:13:20.000Z"
+         },
+         "atMs": {
+          "N": "1700000000000"
+         },
+         "atS": {
+          "N": "1700000000"
+         },
+         "count": {
+          "S": "7"
+         },
+         "big": {
+          "N": "9"
+         },
+         "label": {
+          "S": "L"
+         },
+         "tags": {
+          "M": {
+           "a": {
+            "N": "1"
+           }
+          }
+         },
+         "blob": {
+          "M": {
+           "a": {
+            "N": "2"
+           }
+          }
+         }
+        }
+       },
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "pk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$cascade#v1#player"
+       },
+       "gsi1pk": {
+        "S": "$cascade#v1#player#teamid_0000000000000005"
+       },
+       "gsi1sk": {
+        "S": "$cascade#v1#player#id_p1"
+       }
+      }
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "num": 5,
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_0000000000000005"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "team": {
+      "M": {
+       "atS": {
+        "N": "1700000000"
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "N": "1700000000000"
+       },
+       "num": {
+        "N": "5"
+       },
+       "name": {
+        "S": "Tigers"
+       },
+       "count": {
+        "S": "7"
+       },
+       "secret": {
+        "S": "s3"
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "num": {
+      "N": "5"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#num_0000000000000005"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "num": 5,
+     "name": "Lions",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#num_0000000000000005"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    },
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#et = :et0",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#et": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Player"
+       },
+       ":pk": {
+        "S": "$cascade#v1#player#teamid_5"
+       }
+      }
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_0000000000000005"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "team": {
+      "M": {
+       "atS": {
+        "N": "1700000000"
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "N": "1700000000000"
+       },
+       "num": {
+        "N": "5"
+       },
+       "name": {
+        "S": "Tigers"
+       },
+       "count": {
+        "S": "7"
+       },
+       "secret": {
+        "S": "s3"
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "num": {
+      "N": "5"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#num_0000000000000005"
+     }
+    }
+   ],
+   "getAfter": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "num": 5,
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   }
+  },
+  "keyed by a number, the ref renamed": {
+   "seeded": {
+    "ok": {
+     "num": 5,
+     "name": "Tigers",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "put": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "num": 5,
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "putRequests": [
+    {
+     "command": "GetItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#num_0000000000000005"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      }
+     }
+    },
+    {
+     "command": "PutItem",
+     "input": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "p1"
+       },
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "pk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "sk": {
+        "S": "$cascade#v1#player"
+       },
+       "gsi1pk": {
+        "S": "$cascade#v1#player#teamid_0000000000000005"
+       },
+       "gsi1sk": {
+        "S": "$cascade#v1#player#id_p1"
+       },
+       "teamData": {
+        "M": {
+         "num": {
+          "N": "5"
+         },
+         "name": {
+          "S": "Tigers"
+         },
+         "secret": {
+          "S": "s3"
+         },
+         "at": {
+          "S": "2023-11-14T22:13:20.000Z"
+         },
+         "atMs": {
+          "N": "1700000000000"
+         },
+         "atS": {
+          "N": "1700000000"
+         },
+         "count": {
+          "S": "7"
+         },
+         "big": {
+          "N": "9"
+         },
+         "label": {
+          "S": "L"
+         },
+         "tags": {
+          "M": {
+           "a": {
+            "N": "1"
+           }
+          }
+         },
+         "blob": {
+          "M": {
+           "a": {
+            "N": "2"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "num": 5,
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "teamData": {
+      "M": {
+       "atS": {
+        "N": "1700000000"
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "N": "1700000000000"
+       },
+       "num": {
+        "N": "5"
+       },
+       "name": {
+        "S": "Tigers"
+       },
+       "count": {
+        "S": "7"
+       },
+       "secret": {
+        "S": "s3"
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_0000000000000005"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "num": {
+      "N": "5"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#num_0000000000000005"
+     }
+    }
+   ],
+   "cascade": {
+    "ok": {
+     "num": 5,
+     "name": "Lions",
+     "secret": {
+      "redacted": "s3"
+     },
+     "at": {
+      "date": 1700000000000
+     },
+     "atMs": {
+      "date": 1700000000000
+     },
+     "atS": {
+      "date": 1700000000000
+     },
+     "count": 7,
+     "big": "9n",
+     "label": "L",
+     "tags": {
+      "a": 1
+     },
+     "blob": {
+      "a": 2
+     }
+    }
+   },
+   "cascadeRequests": [
+    {
+     "command": "UpdateItem",
+     "input": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$cascade#v1#team#num_0000000000000005"
+       },
+       "sk": {
+        "S": "$cascade#v1#team"
+       }
+      },
+      "UpdateExpression": "SET #u0 = :u0",
+      "ExpressionAttributeNames": {
+       "#u0": "name",
+       "#exists": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "Lions"
+       }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
+     }
+    },
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#et = :et0",
+      "ExpressionAttributeNames": {
+       "#pk": "gsi1pk",
+       "#et": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Player"
+       },
+       ":pk": {
+        "S": "$cascade#v1#player#teamid_5"
+       }
+      }
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "teamData": {
+      "M": {
+       "atS": {
+        "N": "1700000000"
+       },
+       "big": {
+        "N": "9"
+       },
+       "at": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "blob": {
+        "M": {
+         "a": {
+          "N": "2"
+         }
+        }
+       },
+       "atMs": {
+        "N": "1700000000000"
+       },
+       "num": {
+        "N": "5"
+       },
+       "name": {
+        "S": "Tigers"
+       },
+       "count": {
+        "S": "7"
+       },
+       "secret": {
+        "S": "s3"
+       },
+       "label": {
+        "S": "L"
+       },
+       "tags": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "gsi1sk": {
+      "S": "$cascade#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$cascade#v1#player#teamid_0000000000000005"
+     },
+     "sk": {
+      "S": "$cascade#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$cascade#v1#player#id_p1"
+     }
+    },
+    {
+     "atS": {
+      "N": "1700000000"
+     },
+     "big": {
+      "N": "9"
+     },
+     "teamLabel": {
+      "S": "L"
+     },
+     "num": {
+      "N": "5"
+     },
+     "count": {
+      "S": "7"
+     },
+     "secret": {
+      "S": "s3"
+     },
+     "tags#a": {
+      "N": "1"
+     },
+     "at": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "blob": {
+      "S": "{\"a\":2}"
+     },
+     "atMs": {
+      "N": "1700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     },
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$cascade#v1#team"
+     },
+     "pk": {
+      "S": "$cascade#v1#team#num_0000000000000005"
+     }
+    }
+   ],
+   "getAfter": {
+    "ok": {
+     "id": "p1",
+     "team": {
+      "num": 5,
+      "name": "Tigers",
+      "secret": {
+       "redacted": "s3"
+      },
+      "at": {
+       "date": 1700000000000
+      },
+      "atMs": {
+       "date": 1700000000000
+      },
+      "atS": {
+       "date": 1700000000000
+      },
+      "count": 7,
+      "big": "9n",
+      "label": "L",
+      "tags": {
+       "a": 1
+      },
+      "blob": {
+       "a": 2
+      }
+     }
+    }
+   }
+  }
+ }
+}

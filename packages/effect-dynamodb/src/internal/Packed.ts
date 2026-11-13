@@ -35,6 +35,7 @@ import {
 } from "@effect-dynamodb/schema/Compression.js"
 import type { CompressionCodec, PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import {
   isBase64PackedText,
   type OperationContext,
@@ -183,11 +184,11 @@ export const packItemSync = (
   ctx: ItemContext,
 ): ValidationError | undefined => {
   for (const attribute in packed) {
-    if (!(attribute in item)) continue
+    if (!Object.hasOwn(item, attribute)) continue
     const stored = packValueSync(packed[attribute]!, item[attribute], registry, ctx, attribute)
     if (stored instanceof ValidationError) return stored
     if (stored === undefined) delete item[attribute]
-    else item[attribute] = stored
+    else setOwn(item, attribute, stored)
   }
   return undefined
 }
@@ -249,7 +250,7 @@ export const hasStoredForm = (
   attributes: ReadonlyArray<string>,
 ): boolean => {
   for (let i = 0; i < attributes.length; i++) {
-    const value = raw[attributes[i]!]
+    const value = ownValue(raw, attributes[i]!)
     if (typeof value === "string" || value instanceof Uint8Array) return true
   }
   return false
@@ -267,11 +268,11 @@ export const unpackItemSync = (
   ctx: ItemContext,
 ): ValidationError | undefined => {
   for (const attribute of attributes) {
-    const value = raw[attribute]
+    const value = ownValue(raw, attribute)
     if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
     const wire = unpackStoredSync(value, registry, ctx, attribute)
     if (wire instanceof ValidationError) return wire
-    raw[attribute] = wire
+    setOwn(raw, attribute, wire)
   }
   return undefined
 }
@@ -441,7 +442,7 @@ const normalizeAttributeValueSync = (
       if (normalized instanceof ValidationError) return normalized
       if (normalized !== nested) {
         copy ??= { ...(members as Record<string, AttributeValue>) }
-        copy[name] = normalized
+        setOwn(copy, name, normalized)
       }
     }
     return copy === undefined ? (av as unknown as AttributeValue) : { M: copy }
@@ -510,7 +511,7 @@ export const normalizeImageSync = (
     if (av instanceof ValidationError) return av
     if (av !== value) {
       normalized ??= { ...(source as Record<string, AttributeValue>) }
-      normalized[attribute] = av
+      setOwn(normalized, attribute, av)
     }
   }
   try {
@@ -550,19 +551,19 @@ export const unpackImageItemSync = (
   ctx: ItemContext,
 ): ValidationError | undefined => {
   for (const attribute of attributes) {
-    let value = raw[attribute]
+    let value = ownValue(raw, attribute)
     if (typeof value === "string" && isBase64PackedText(value)) {
       const bytes = toBytesSync(value, ctx, attribute)
       if (bytes instanceof ValidationError) return bytes
       const wire = unpackBytesSync(bytes, registry, ctx, attribute)
       if (wire instanceof ValidationError) return wire
-      raw[attribute] = wire
+      setOwn(raw, attribute, wire)
       continue
     }
     if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
     value = unpackStoredSync(value, registry, ctx, attribute)
     if (value instanceof ValidationError) return value
-    raw[attribute] = value
+    setOwn(raw, attribute, value)
   }
   return undefined
 }

@@ -34,7 +34,8 @@ import {
   serviceOf,
   withConsumedCapacity,
 } from "./helpers/CapacityMock.js"
-import { InMemoryClient, resetStore } from "./helpers/InMemoryTables.js"
+import { indexesOf } from "./helpers/DynamoExpressions.js"
+import { InMemoryClient, resetStore, tableIndexes } from "./helpers/InMemoryTables.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -419,6 +420,11 @@ const cases: ReadonlyArray<Case> = [
   ],
   ["Entity.create", () => Orders.create({ orderId: "o-2", customerId: "c", total: 1 }).asEffect()],
   [
+    "Entity.insert",
+    ({ db }) => db.entities.Orders.insert({ orderId: "o-3", customerId: "c", total: 1 }).asEffect(),
+  ],
+  ["Entity.insert", () => Orders.insert({ orderId: "o-4", customerId: "c", total: 1 }).asEffect()],
+  [
     "Entity.upsert",
     ({ db }) => db.entities.Orders.upsert({ orderId: "o-1", customerId: "c", total: 1 }).asEffect(),
   ],
@@ -633,6 +639,12 @@ const cases: ReadonlyArray<Case> = [
   ]),
 ]
 
+tableIndexes.set("shop-table", {
+  ...indexesOf(Table.definition(MainTable)),
+  // The aggregate's collection index (the aggregate isn't registered on this table, so the table's
+  // definition doesn't hold it) and the stream's index (`EventStore.indexDefinitions` emits it).
+  lsi1: { pk: "pk", sk: "lsi1sk" },
+})
 beforeEach(() => resetStore())
 
 describe("consumed-capacity coverage", () => {

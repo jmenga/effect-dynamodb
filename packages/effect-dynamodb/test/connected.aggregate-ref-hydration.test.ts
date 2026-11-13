@@ -22,7 +22,12 @@
  *   (or set DYNAMODB_ENDPOINT to another port)
  */
 
-import { type AttributeValue, DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb"
+import {
+  type AttributeValue,
+  DynamoDBClient,
+  PutItemCommand,
+  ScanCommand,
+} from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Cause, Config, Effect, Exit, Layer, Option } from "effect"
@@ -88,8 +93,13 @@ const refusal = (create: Exit.Exit<unknown, unknown>) => {
 }
 
 let tables = 0
-/** Seeds the entity's rows on a fresh table, then runs `create` and `get`. */
-const run = (shape: Shape) => {
+/**
+ * Seeds the entity's rows on a fresh table, then runs `create` and `get`. A row keyed by an object
+ * can't be written since 1.41.0 (`EDD-9162`: every such key is `[object Object]`), so where `put`
+ * refuses one, the rows are the ones 1.39.0's `put` wrote (`written`); any other refusal fails the
+ * shape.
+ */
+const run = (shape: Shape, written?: ReadonlyArray<Row>) => {
   const tableName = `ref-hydration-${Date.now()}-${tables++}`
   const Base = Table.make({
     schema: shape.schema ?? schema,
@@ -119,7 +129,24 @@ const run = (shape: Shape) => {
           entities: shape.entities,
           tables: { Base },
         } as never) as Effect.Effect<any>
-        for (const [member, item] of shape.seed) yield* edb.entities[member].put(item).asEffect()
+        for (const [member, item] of shape.seed) {
+          const seeded = yield* Effect.exit(edb.entities[member].put(item).asEffect())
+          if (Exit.isSuccess(seeded)) continue
+          const refused = Cause.squash(seeded.cause) as { readonly cause?: unknown }
+          if (!String(refused?.cause).includes("EDD-9162") || written === undefined) {
+            return yield* Effect.die(refused)
+          }
+          for (const Item of written) {
+            yield* Effect.promise(() =>
+              raw.send(
+                new PutItemCommand({
+                  TableName: tableName,
+                  Item: Item as Record<string, AttributeValue>,
+                }),
+              ),
+            )
+          }
+        }
         const db: any = yield* DynamoClient.make({
           entities: {},
           aggregates: { A },
@@ -268,7 +295,7 @@ describeConnected(
     ] as const) {
       it.effect(`${label}: create fails with ${code}, nothing written`, () =>
         Effect.gen(function* () {
-          const { create, rows } = yield* run(SHAPES[label]!())
+          const { create, rows } = yield* run(SHAPES[label]!(), fixture.shapes[label]!.seeded)
           expect(refusal(create)).toContain(code)
           expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.seeded))
         }),

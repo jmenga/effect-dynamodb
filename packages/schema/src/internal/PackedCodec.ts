@@ -34,10 +34,15 @@
  * {@link CompressionRegistry}.
  */
 
-import { DateTime, Effect, Schema, SchemaAST } from "effect"
+import { Effect, Schema, SchemaAST } from "effect"
 import type { CompressionRegistry } from "../Compression.js"
 import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
+import { type Lost, lostAs, lostRefusal } from "./LostValues.js"
+import { classOf } from "./OwnNames.js"
+import { storedFormOf, ZONE_MARKER, zoneEntriesWritten } from "./StoredForm.js"
+
+export { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./StoredForm.js"
 
 // ---------------------------------------------------------------------------
 // Header layout
@@ -201,11 +206,11 @@ const describe = (value: unknown): string => {
   if (typeof value === "number") return `the non-finite number ${String(value)}`
   if (value instanceof Date) return "a Date"
   if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
-    return `binary data (${(value as object).constructor?.name ?? "ArrayBuffer"})`
+    return `binary data (${classOf(value)?.name ?? "ArrayBuffer"})`
   }
   if (value instanceof Set) return "a Set"
   if (value instanceof Map) return "a Map"
-  const name = (value as object).constructor?.name
+  const name = classOf(value as object)?.name
   return name ? `an instance of ${name}` : "a non-plain object"
 }
 
@@ -213,94 +218,117 @@ class NotJson extends Error {
   constructor(
     readonly path: string,
     readonly what: string,
+    message?: string,
   ) {
     super(
-      `the value at ${path} is ${what}, which JSON cannot represent. Packed storage holds ` +
-        `JSON only: store this field natively, or give it a JSON-shaped schema ` +
-        `(e.g. DateTimeUtcFromString, BigIntFromString, Uint8ArrayFromBase64, an array instead ` +
-        `of a set).`,
+      message ??
+        `the value at ${path} is ${what}, which JSON cannot represent. Packed storage holds ` +
+          `JSON only: store this field natively, or give it a JSON-shaped schema ` +
+          `(e.g. DateTimeUtcFromString, BigIntFromString, Uint8ArrayFromBase64, an array instead ` +
+          `of a set).`,
     )
   }
 }
+
+/** A value DynamoDB doesn't store however it's written, refused as a native write refuses it. */
+const notStored = (path: string, lost: Lost): NotJson =>
+  new NotJson(path, lost.what, lostRefusal(path, lost))
+
+/**
+ * What JSON can't hold whatever it holds: a map, or binary data. Refused as not JSON, ahead of what a
+ * native write would lose of one ({@link lostAs}), which a packed field never stores either way.
+ */
+const isNeverJson = (value: object): boolean =>
+  value instanceof Map ||
+  value instanceof ArrayBuffer ||
+  ArrayBuffer.isView(value) ||
+  (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer)
 
 const isPlainObject = (value: object): boolean => {
   const proto = Object.getPrototypeOf(value)
   return proto === Object.prototype || proto === null
 }
 
-/** The marker a marshalled `DateTime` carries. */
-export const DATE_MARKER = "~effect/DateTime"
-/** The marker it carried on Effect's betas and early rcs. */
-export const BETA_DATE_MARKER = "~effect/time/DateTime"
-export const ZONE_MARKER = "~effect/DateTime/TimeZone"
+/** Each of Effect's instances met in a value, with what it's written as. */
+type Forms = Map<object, unknown>
 
-const isRealDate = (value: unknown): value is DateTime.DateTime =>
-  DateTime.isDateTime(value) && !isPlainObject(value)
+/** A named zone's map, holding `resolvedId`, as it's written ({@link zoneEntriesWritten}). */
+const zoneWritten = (value: object, entries: ReadonlyArray<readonly [string, unknown]>) => {
+  const written = zoneEntriesWritten(
+    entries,
+    Object.hasOwn(value, ZONE_MARKER),
+    (entry) => entry,
+    (name) => name,
+  )
+  return written === entries ? undefined : written
+}
 
 /**
- * What a real date is stored as, packed: the map a native write stores, with its keys in the order
- * DynamoDB Local hands that map back, which is what a date read back from one has always been packed
- * as. `toJSON` would give ISO text, which a date's declaration refuses on read.
+ * What a value is written as: the value itself where it holds nothing to write otherwise, and a copy
+ * where it does, so `JSON.stringify` reads each property this read, once. Refuses what JSON can't
+ * hold. One of Effect's instances is written as the map a native write stores
+ * ({@link storedFormOf}), which is then written as any other value is, so what it still holds that
+ * JSON can't is refused where it is; a named zone's map holding `resolvedId` as 4.1.2 held it
+ * ({@link zoneEntriesWritten}). `forms` holds each instance met, with what it's written as.
  */
-const storedDate = (date: DateTime.DateTime): object => {
-  if (DateTime.isUtc(date)) {
-    return { epochMilliseconds: date.epochMilliseconds, [DATE_MARKER]: DATE_MARKER, _tag: "Utc" }
-  }
-  const zone = date.zone
-  return {
-    [DATE_MARKER]: DATE_MARKER,
-    epochMilliseconds: date.epochMilliseconds,
-    zone:
-      zone._tag === "Named"
-        ? { format: {}, id: zone.id, [ZONE_MARKER]: ZONE_MARKER, _tag: "Named" }
-        : { offset: zone.offset, [ZONE_MARKER]: ZONE_MARKER, _tag: "Offset" },
-    _tag: "Zoned",
-  }
-}
-
-/** `JSON.stringify` has called `toJSON` by the time a replacer sees a value, so this reads the holder. */
-function storingDates(this: Record<string, unknown>, key: string, value: unknown): unknown {
-  const held = this[key]
-  return isRealDate(held) ? storedDate(held) : value
-}
-
-/** Refuses what JSON can't hold, and says whether a real date is in there for {@link storingDates}. */
-const check = (value: unknown, path: string, stack: Set<object>): boolean => {
+const written = (value: unknown, path: string, stack: Set<object>, forms: Forms): unknown => {
   switch (typeof value) {
     case "string":
     case "boolean":
-      return false
+      return value
     case "number":
       if (!Number.isFinite(value)) throw new NotJson(path, describe(value))
-      return false
+      return value
     case "object": {
-      if (value === null) return false
+      if (value === null) return value
       if (stack.has(value)) throw new NotJson(path, "a circular reference")
-      let dates = false
+      // What no storage holds is refused with the words a native write refuses it in (`LostValues`).
+      const lost = isNeverJson(value) ? undefined : lostAs(value)
+      if (lost !== undefined) throw notStored(path, lost)
       if (Array.isArray(value)) {
         stack.add(value)
+        let copy: Array<unknown> | undefined
         for (let i = 0; i < value.length; i++) {
-          const element = value[i]
+          const element: unknown = value[i]
           if (element === undefined) throw new NotJson(`${path}[${i}]`, "undefined")
-          if (check(element, `${path}[${i}]`, stack)) dates = true
+          const write = written(element, `${path}[${i}]`, stack, forms)
+          if (copy === undefined && write !== element) copy = value.slice(0, i)
+          copy?.push(write)
         }
         stack.delete(value)
-        return dates
+        return copy ?? value
       }
-      if (isRealDate(value)) return true
-      if (!isPlainObject(value) || typeof (value as { toJSON?: unknown }).toJSON === "function") {
+      if (!isPlainObject(value)) {
+        if (forms.has(value)) return forms.get(value)
+        const form = storedFormOf(value)
+        if (form === undefined) throw new NotJson(path, describe(value))
+        stack.add(value)
+        const write = written(form, path, stack, forms)
+        stack.delete(value)
+        forms.set(value, write)
+        return write
+      }
+      if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
         throw new NotJson(path, describe(value))
       }
       stack.add(value)
+      const entries: Array<readonly [string, unknown]> = []
+      let changed = false
       for (const key of Object.keys(value)) {
-        const v = (value as Record<string, unknown>)[key]
+        const v: unknown = (value as Record<string, unknown>)[key]
         // Omitted by JSON.stringify, as removeUndefinedValues omits it from a map.
         if (v === undefined) continue
         const at = IDENTIFIER.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`
-        if (check(v, at, stack)) dates = true
+        const write = written(v, at, stack, forms)
+        if (write !== v) changed = true
+        entries.push([key, write])
       }
       stack.delete(value)
-      return dates
+      const zone = zoneWritten(value, entries)
+      if (zone === undefined && !changed) return value
+      const copy: Record<string, unknown> = Object.create(null)
+      for (const [key, write] of zone ?? entries) copy[key] = write
+      return copy
     }
     default:
       throw new NotJson(path, describe(value))
@@ -312,14 +340,17 @@ const check = (value: unknown, path: string, stack: Set<object>): boolean => {
  * bigint, binary (`Uint8Array`, `ArrayBuffer`, typed arrays), `Set`, `Map`,
  * `Date`, any other non-plain object (including one with `toJSON`), non-finite
  * numbers, `undefined` array elements, symbols, functions and cycles.
- * `undefined` object properties are omitted. A real `DateTime` is the exception:
- * it's written in its stored form (see {@link storedDate}), as a date read back
- * from storage has always been.
+ * `undefined` object properties are omitted. One of Effect's own instances that
+ * a native attribute stores as a map is the exception: a `DateTime`, one of the
+ * look-alikes a read rebuilds (a `Duration`, a `BigDecimal`, a zone, a cookie,
+ * an address, ...), an `Option` or a `Result` is written as that map
+ * ({@link storedFormOf}), as the map read back from a native row has always
+ * been. A named zone's map holding `resolvedId` is written as 4.1.2 held it.
  *
  * @throws an `Error` naming the path (rooted at `root`) and the JS type.
  */
 export const stringifyStrict = (value: unknown, root = "value"): string =>
-  check(value, root, new Set()) ? JSON.stringify(value, storingDates) : JSON.stringify(value)
+  JSON.stringify(written(value, root, new Set(), new Map()))
 
 // ---------------------------------------------------------------------------
 // Pack / unpack

@@ -127,6 +127,33 @@ describe("ParamsBuilder", () => {
     })
   })
 
+  describe("Insert", () => {
+    it("should build ExecuteStatementCommand params with no condition", () => {
+      const op: DetectedOperation = {
+        entity: userEntity,
+        type: "insert",
+        arguments: { userId: "u-new", role: "member" },
+      }
+
+      const params = buildParamsOrThrow(op)
+
+      expect(params.command).toBe("ExecuteStatementCommand")
+      expect(params.Item!.pk).toBe("$crud-demo#v1#user#userid_u-new")
+      expect(params.Item!.__edd_e__).toBe("User")
+      expect(params.ConditionExpression).toBeUndefined()
+      expect(params.entityType).toBe("User")
+    })
+
+    it("should use ExecuteTransactionCommand when unique constraints exist", () => {
+      const op: DetectedOperation = {
+        entity: { ...userEntity, unique: { email: { fields: ["email"] } } },
+        type: "insert",
+      }
+
+      expect(buildParamsOrThrow(op).command).toBe("ExecuteTransactionCommand")
+    })
+  })
+
   describe("UpdateItem", () => {
     it("should build UpdateItemCommand params with key and expressions", () => {
       const op: DetectedOperation = {

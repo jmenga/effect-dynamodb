@@ -85,4 +85,98 @@ describe("ClientOptions types", () => {
       requestHandler: { socketTimout: Config.Int("TIMEOUT") },
     })
   })
+
+  // Temporary credentials (an assumed role) come with a session token, which the
+  // layers' credentials left out of their type.
+  it("credentials, with or without a session token", () => {
+    const keys = { accessKeyId: "a", secretAccessKey: "s" }
+    const token = "t" as string | undefined
+    DynamoClient.layer({ region, credentials: keys })
+    DynamoClient.layer({ region, credentials: { accessKeyId: "a", secretAccessKey: "s" } })
+    DynamoClient.layer({
+      region,
+      credentials: { accessKeyId: "a", secretAccessKey: "s", sessionToken: "t" },
+    })
+    DynamoClient.layer({ region, credentials: { ...keys, sessionToken: token } })
+    // A token decoded from a source that holds null for none.
+    const nullable = { ...keys, sessionToken: null as string | null }
+    DynamoClient.layer({ region, credentials: nullable })
+    DynamoClient.layer({ region, credentials: { ...keys, sessionToken: null } })
+    DynamoClient.layer({
+      region,
+      // @ts-expect-error an unknown key must not compile
+      credentials: { accessKeyId: "a", secretAccessKey: "s", sesionToken: "t" },
+    })
+    DynamoClient.layer({
+      region,
+      // @ts-expect-error a token is a string
+      credentials: { accessKeyId: "a", secretAccessKey: "s", sessionToken: 1 },
+    })
+    // @ts-expect-error the secret is required
+    DynamoClient.layer({ region, credentials: { accessKeyId: "a", sessionToken: "t" } })
+
+    DynamoStreamsClient.layer({ region, credentials: keys })
+    DynamoStreamsClient.layer({ region, credentials: { ...keys, sessionToken: token } })
+    DynamoStreamsClient.layer({ region, credentials: nullable })
+    DynamoStreamsClient.layer({
+      region,
+      // @ts-expect-error a token is a string
+      credentials: { accessKeyId: "a", secretAccessKey: "s", sessionToken: 1 },
+    })
+    // @ts-expect-error the secret is required
+    DynamoStreamsClient.layer({ region, credentials: { accessKeyId: "a", sessionToken: "t" } })
+    DynamoStreamsClient.layer({
+      region,
+      credentials: { accessKeyId: "a", secretAccessKey: "s", sessionToken: "t" },
+    })
+    DynamoStreamsClient.layer({
+      region,
+      // @ts-expect-error an unknown key must not compile
+      credentials: { accessKeyId: "a", secretAccessKey: "s", sesionToken: "t" },
+    })
+  })
+
+  it("credentials read through Config, with or without a session token", () => {
+    const keys = { accessKeyId: Config.String("KEY"), secretAccessKey: Config.String("SECRET") }
+    const token = Config.String("TOKEN")
+    DynamoClient.layerConfig({ region: Config.String("REGION"), credentials: Config.all(keys) })
+    DynamoClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token }),
+    })
+    DynamoClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(undefined)) }),
+    })
+    DynamoClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(null)) }),
+    })
+    DynamoClient.layerConfig({
+      region: Config.String("REGION"),
+      // @ts-expect-error a token is a string
+      credentials: Config.all({ ...keys, sessionToken: Config.Int("TOKEN") }),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all(keys),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token }),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(undefined)) }),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
+      credentials: Config.all({ ...keys, sessionToken: token.pipe(Config.withDefault(null)) }),
+    })
+    DynamoStreamsClient.layerConfig({
+      region: Config.String("REGION"),
+      // @ts-expect-error a token is a string
+      credentials: Config.all({ ...keys, sessionToken: Config.Int("TOKEN") }),
+    })
+  })
 })

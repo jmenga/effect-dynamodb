@@ -1,0 +1,5389 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. On DynamoSchema.make({ name: 'rp', version: 1, escapeKeys: true }), entities whose counts: Record<string, number> is configured { storedAs: SparseMap(), field: 'sr' }: Plain, Retained (versioned: { retain: true }), Series (timeSeries { orderBy: 'at', appendInput { id, at, counts } }), Deleted (softDelete: true), Keyed (sort key composite name), Lines (identifier lineId, the target of aggregate Sheets' ref edge line) and Tallies (the read model of a projection of stream Count, folding Counted { key, by } into counts, checkpoint version). Each case puts its row with counts { a: 1 } and leaves the map whole (sr), as entries (a raw SET counts#a = 1 REMOVE sr) or both (a raw SET counts#a = 7 beside sr); rekey's row (name 'x y') is moved by raw writes to the sort key 1.36 composed, unescaped (x y where the head composes x%20y), with its map left in the same three forms. Recorded: the outcome, every request the case sent, whole and in order, every row of the table after it, and what the read back returned; the table's name is <table>, UUIDs and the projection's write token (__edd_wt__) <token>, and timestamps, a tombstone's sort key's included, <time>. Never regenerate it: it is the record of what 1.40.0 did.",
+ "cases": {
+  "timeSeries, the map whole: append({ at: 2, counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "current": {
+      "id": "a",
+      "at": 2,
+      "counts": {
+       "b": 2
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#series#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#series"
+          }
+         },
+         "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+         "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+         "ExpressionAttributeNames": {
+          "#a0": "id",
+          "#a1": "at",
+          "#a2": "sr",
+          "#a3": "__edd_e__",
+          "#_tspk": "pk",
+          "#_tsob": "at"
+         },
+         "ExpressionAttributeValues": {
+          ":a0": {
+           "S": "a"
+          },
+          ":a1": {
+           "N": "2"
+          },
+          ":a2": {
+           "M": {
+            "b": {
+             "N": "2"
+            }
+           }
+          },
+          ":a3": {
+           "S": "Series"
+          },
+          ":_tsNewOb": {
+           "N": "2"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "at": {
+           "N": "2"
+          },
+          "sr": {
+           "M": {
+            "b": {
+             "N": "2"
+            }
+           }
+          },
+          "pk": {
+           "S": "$rp#v1#series#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#series#e#0000000000000002"
+          },
+          "__edd_e__": {
+           "S": "Series"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#series#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#series"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Series"
+     },
+     "at": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#series#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#series"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Series"
+     },
+     "at": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#series#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#series#e#0000000000000002"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "get": {
+      "id": "a",
+      "at": 2,
+      "counts": {
+       "b": 2
+      }
+     },
+     "history": [
+      {
+       "id": "a",
+       "at": 2,
+       "counts": {
+        "b": 2
+       }
+      }
+     ]
+    }
+   }
+  },
+  "timeSeries, the map entries: append({ at: 2, counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "current": {
+      "id": "a",
+      "at": 2,
+      "counts": {
+       "b": 2
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#series#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#series"
+          }
+         },
+         "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+         "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+         "ExpressionAttributeNames": {
+          "#a0": "id",
+          "#a1": "at",
+          "#a2": "sr",
+          "#a3": "__edd_e__",
+          "#_tspk": "pk",
+          "#_tsob": "at"
+         },
+         "ExpressionAttributeValues": {
+          ":a0": {
+           "S": "a"
+          },
+          ":a1": {
+           "N": "2"
+          },
+          ":a2": {
+           "M": {
+            "b": {
+             "N": "2"
+            }
+           }
+          },
+          ":a3": {
+           "S": "Series"
+          },
+          ":_tsNewOb": {
+           "N": "2"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "at": {
+           "N": "2"
+          },
+          "sr": {
+           "M": {
+            "b": {
+             "N": "2"
+            }
+           }
+          },
+          "pk": {
+           "S": "$rp#v1#series#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#series#e#0000000000000002"
+          },
+          "__edd_e__": {
+           "S": "Series"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#series#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#series"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Series"
+     },
+     "at": {
+      "N": "2"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#series#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#series"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Series"
+     },
+     "at": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#series#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#series#e#0000000000000002"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "get": {
+      "id": "a",
+      "at": 2,
+      "counts": {
+       "b": 2
+      }
+     },
+     "history": [
+      {
+       "id": "a",
+       "at": 2,
+       "counts": {
+        "b": 2
+       }
+      }
+     ]
+    }
+   }
+  },
+  "timeSeries, the map both: append({ at: 2, counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "current": {
+      "id": "a",
+      "at": 2,
+      "counts": {
+       "b": 2
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#series#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#series"
+          }
+         },
+         "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+         "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+         "ExpressionAttributeNames": {
+          "#a0": "id",
+          "#a1": "at",
+          "#a2": "sr",
+          "#a3": "__edd_e__",
+          "#_tspk": "pk",
+          "#_tsob": "at"
+         },
+         "ExpressionAttributeValues": {
+          ":a0": {
+           "S": "a"
+          },
+          ":a1": {
+           "N": "2"
+          },
+          ":a2": {
+           "M": {
+            "b": {
+             "N": "2"
+            }
+           }
+          },
+          ":a3": {
+           "S": "Series"
+          },
+          ":_tsNewOb": {
+           "N": "2"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "at": {
+           "N": "2"
+          },
+          "sr": {
+           "M": {
+            "b": {
+             "N": "2"
+            }
+           }
+          },
+          "pk": {
+           "S": "$rp#v1#series#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#series#e#0000000000000002"
+          },
+          "__edd_e__": {
+           "S": "Series"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#series#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#series"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Series"
+     },
+     "at": {
+      "N": "2"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#series#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#series"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Series"
+     },
+     "at": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#series#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#series#e#0000000000000002"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "get": {
+      "id": "a",
+      "at": 2,
+      "counts": {
+       "b": 2
+      }
+     },
+     "history": [
+      {
+       "id": "a",
+       "at": 2,
+       "counts": {
+        "b": 2
+       }
+      }
+     ]
+    }
+   }
+  },
+  "softDelete, the map whole: delete, deleted.get, restore": {
+   "outcome": {
+    "ok": {
+     "tombstone": {
+      "id": "a",
+      "counts": {
+       "a": 1
+      },
+      "deletedAt": "<time>"
+     },
+     "restored": {
+      "id": "a",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#deleted"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#deleted"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#dpk) AND #dg0 = :dg0 AND #dg1 = :dg1 AND #dg2 = :dg2",
+         "ExpressionAttributeNames": {
+          "#dpk": "pk",
+          "#dg0": "id",
+          "#dg1": "__edd_e__",
+          "#dg2": "sr"
+         },
+         "ExpressionAttributeValues": {
+          ":dg0": {
+           "S": "a"
+          },
+          ":dg1": {
+           "S": "Deleted"
+          },
+          ":dg2": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "sk": {
+           "S": "$rp#v1#deleted#deleted#<time>"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "__edd_e__": {
+           "S": "Deleted"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          },
+          "deletedAt": {
+           "S": "<time>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :skPrefix)",
+      "ExpressionAttributeNames": {
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       ":skPrefix": {
+        "S": "$rp#v1#deleted#deleted#"
+       }
+      },
+      "ScanIndexForward": false,
+      "Limit": 1
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :skPrefix)",
+      "ExpressionAttributeNames": {
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       ":skPrefix": {
+        "S": "$rp#v1#deleted#deleted#"
+       }
+      },
+      "ScanIndexForward": false,
+      "Limit": 1
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#deleted#deleted#<time>"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "sk": {
+           "S": "$rp#v1#deleted"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "__edd_e__": {
+           "S": "Deleted"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Deleted"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#deleted#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#deleted"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "softDelete, the map entries: delete, deleted.get, restore": {
+   "outcome": {
+    "ok": {
+     "tombstone": {
+      "id": "a",
+      "counts": {
+       "a": 1
+      },
+      "deletedAt": "<time>"
+     },
+     "restored": {
+      "id": "a",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#deleted"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#deleted"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#dpk) AND #dg0 = :dg0 AND #dg1 = :dg1 AND #dg2 = :dg2 AND attribute_not_exists(#dg3)",
+         "ExpressionAttributeNames": {
+          "#dpk": "pk",
+          "#dg0": "counts#a",
+          "#dg1": "id",
+          "#dg2": "__edd_e__",
+          "#dg3": "sr"
+         },
+         "ExpressionAttributeValues": {
+          ":dg0": {
+           "N": "1"
+          },
+          ":dg1": {
+           "S": "a"
+          },
+          ":dg2": {
+           "S": "Deleted"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "sk": {
+           "S": "$rp#v1#deleted#deleted#<time>"
+          },
+          "counts#a": {
+           "N": "1"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "__edd_e__": {
+           "S": "Deleted"
+          },
+          "deletedAt": {
+           "S": "<time>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :skPrefix)",
+      "ExpressionAttributeNames": {
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       ":skPrefix": {
+        "S": "$rp#v1#deleted#deleted#"
+       }
+      },
+      "ScanIndexForward": false,
+      "Limit": 1
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :skPrefix)",
+      "ExpressionAttributeNames": {
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       ":skPrefix": {
+        "S": "$rp#v1#deleted#deleted#"
+       }
+      },
+      "ScanIndexForward": false,
+      "Limit": 1
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#deleted#deleted#<time>"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "sk": {
+           "S": "$rp#v1#deleted"
+          },
+          "counts#a": {
+           "N": "1"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "__edd_e__": {
+           "S": "Deleted"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Deleted"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#deleted#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#deleted"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "softDelete, the map both: delete, deleted.get, restore": {
+   "outcome": {
+    "ok": {
+     "tombstone": {
+      "id": "a",
+      "counts": {
+       "a": 1
+      },
+      "deletedAt": "<time>"
+     },
+     "restored": {
+      "id": "a",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#deleted"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#deleted"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#dpk) AND #dg0 = :dg0 AND #dg1 = :dg1 AND #dg2 = :dg2 AND #dg3 = :dg3",
+         "ExpressionAttributeNames": {
+          "#dpk": "pk",
+          "#dg0": "counts#a",
+          "#dg1": "id",
+          "#dg2": "__edd_e__",
+          "#dg3": "sr"
+         },
+         "ExpressionAttributeValues": {
+          ":dg0": {
+           "N": "7"
+          },
+          ":dg1": {
+           "S": "a"
+          },
+          ":dg2": {
+           "S": "Deleted"
+          },
+          ":dg3": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "sk": {
+           "S": "$rp#v1#deleted#deleted#<time>"
+          },
+          "counts#a": {
+           "N": "7"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "__edd_e__": {
+           "S": "Deleted"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          },
+          "deletedAt": {
+           "S": "<time>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :skPrefix)",
+      "ExpressionAttributeNames": {
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       ":skPrefix": {
+        "S": "$rp#v1#deleted#deleted#"
+       }
+      },
+      "ScanIndexForward": false,
+      "Limit": 1
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :skPrefix)",
+      "ExpressionAttributeNames": {
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$rp#v1#deleted#id_a"
+       },
+       ":skPrefix": {
+        "S": "$rp#v1#deleted#deleted#"
+       }
+      },
+      "ScanIndexForward": false,
+      "Limit": 1
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#deleted#deleted#<time>"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_e__": {
+           "S": "Deleted"
+          },
+          "sk": {
+           "S": "$rp#v1#deleted"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#deleted#id_a"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Deleted"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#deleted#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#deleted"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Batch.get, the map whole": {
+   "outcome": {
+    "ok": [
+     {
+      "id": "a",
+      "counts": {
+       "a": 1
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "batchGetItem": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$rp#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#plain"
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Batch.write put({ counts: { b: 2 } }), the map whole": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "batchWriteItem": {
+      "RequestItems": {
+       "<table>": [
+        {
+         "PutRequest": {
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Plain"
+           },
+           "pk": {
+            "S": "$rp#v1#plain#id_a"
+           },
+           "sk": {
+            "S": "$rp#v1#plain"
+           },
+           "sr": {
+            "M": {
+             "b": {
+              "N": "2"
+             }
+            }
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     }
+    }
+   }
+  },
+  "Batch.write delete, the map whole": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "batchWriteItem": {
+      "RequestItems": {
+       "<table>": [
+        {
+         "DeleteRequest": {
+          "Key": {
+           "pk": {
+            "S": "$rp#v1#plain#id_a"
+           },
+           "sk": {
+            "S": "$rp#v1#plain"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "rows": [],
+   "read": {
+    "fail": "ItemNotFound",
+    "says": ""
+   }
+  },
+  "Batch.get, the map entries": {
+   "outcome": {
+    "ok": [
+     {
+      "id": "a",
+      "counts": {
+       "a": 1
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "batchGetItem": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$rp#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#plain"
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Batch.write put({ counts: { b: 2 } }), the map entries": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "batchWriteItem": {
+      "RequestItems": {
+       "<table>": [
+        {
+         "PutRequest": {
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Plain"
+           },
+           "pk": {
+            "S": "$rp#v1#plain#id_a"
+           },
+           "sk": {
+            "S": "$rp#v1#plain"
+           },
+           "sr": {
+            "M": {
+             "b": {
+              "N": "2"
+             }
+            }
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     }
+    }
+   }
+  },
+  "Batch.write delete, the map entries": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "batchWriteItem": {
+      "RequestItems": {
+       "<table>": [
+        {
+         "DeleteRequest": {
+          "Key": {
+           "pk": {
+            "S": "$rp#v1#plain#id_a"
+           },
+           "sk": {
+            "S": "$rp#v1#plain"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "rows": [],
+   "read": {
+    "fail": "ItemNotFound",
+    "says": ""
+   }
+  },
+  "Batch.get, the map both": {
+   "outcome": {
+    "ok": [
+     {
+      "id": "a",
+      "counts": {
+       "a": 1
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "batchGetItem": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$rp#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#plain"
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Batch.write put({ counts: { b: 2 } }), the map both": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "batchWriteItem": {
+      "RequestItems": {
+       "<table>": [
+        {
+         "PutRequest": {
+          "Item": {
+           "id": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Plain"
+           },
+           "pk": {
+            "S": "$rp#v1#plain#id_a"
+           },
+           "sk": {
+            "S": "$rp#v1#plain"
+           },
+           "sr": {
+            "M": {
+             "b": {
+              "N": "2"
+             }
+            }
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "b": {
+        "N": "2"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     }
+    }
+   }
+  },
+  "Batch.write delete, the map both": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "batchWriteItem": {
+      "RequestItems": {
+       "<table>": [
+        {
+         "DeleteRequest": {
+          "Key": {
+           "pk": {
+            "S": "$rp#v1#plain#id_a"
+           },
+           "sk": {
+            "S": "$rp#v1#plain"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "rows": [],
+   "read": {
+    "fail": "ItemNotFound",
+    "says": ""
+   }
+  },
+  "aggregate ref, the map whole: create": {
+   "outcome": {
+    "ok": {
+     "id": "s",
+     "line": {
+      "lineId": "l",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "batchGetItem": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$rp#v1#line#lineid_l"
+          },
+          "sk": {
+           "S": "$rp#v1#line"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "s"
+          },
+          "line": {
+           "M": {
+            "lineId": {
+             "S": "l"
+            },
+            "counts": {
+             "M": {
+              "a": {
+               "N": "1"
+              }
+             }
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Sheet"
+          },
+          "pk": {
+           "S": "$rp#v1#sheet#s"
+          },
+          "sk": {
+           "S": "$rp#v1#sheet"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$rp#v1#line#lineid_l"
+     },
+     "sk": {
+      "S": "$rp#v1#line"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Sheet"
+     },
+     "id": {
+      "S": "s"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "counts": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "pk": {
+      "S": "$rp#v1#sheet#s"
+     },
+     "sk": {
+      "S": "$rp#v1#sheet"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "s",
+     "line": {
+      "lineId": "l",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   }
+  },
+  "aggregate ref, the map entries: create": {
+   "outcome": {
+    "ok": {
+     "id": "s",
+     "line": {
+      "lineId": "l",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "batchGetItem": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$rp#v1#line#lineid_l"
+          },
+          "sk": {
+           "S": "$rp#v1#line"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "s"
+          },
+          "line": {
+           "M": {
+            "lineId": {
+             "S": "l"
+            },
+            "counts": {
+             "M": {
+              "a": {
+               "N": "1"
+              }
+             }
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Sheet"
+          },
+          "pk": {
+           "S": "$rp#v1#sheet#s"
+          },
+          "sk": {
+           "S": "$rp#v1#sheet"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Line"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$rp#v1#line#lineid_l"
+     },
+     "sk": {
+      "S": "$rp#v1#line"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Sheet"
+     },
+     "id": {
+      "S": "s"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "counts": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "pk": {
+      "S": "$rp#v1#sheet#s"
+     },
+     "sk": {
+      "S": "$rp#v1#sheet"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "s",
+     "line": {
+      "lineId": "l",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   }
+  },
+  "aggregate ref, the map both: create": {
+   "outcome": {
+    "ok": {
+     "id": "s",
+     "line": {
+      "lineId": "l",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "batchGetItem": {
+      "RequestItems": {
+       "<table>": {
+        "Keys": [
+         {
+          "pk": {
+           "S": "$rp#v1#line#lineid_l"
+          },
+          "sk": {
+           "S": "$rp#v1#line"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "s"
+          },
+          "line": {
+           "M": {
+            "lineId": {
+             "S": "l"
+            },
+            "counts": {
+             "M": {
+              "a": {
+               "N": "1"
+              }
+             }
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Sheet"
+          },
+          "pk": {
+           "S": "$rp#v1#sheet#s"
+          },
+          "sk": {
+           "S": "$rp#v1#sheet"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Line"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$rp#v1#line#lineid_l"
+     },
+     "sk": {
+      "S": "$rp#v1#line"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Sheet"
+     },
+     "id": {
+      "S": "s"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "counts": {
+        "M": {
+         "a": {
+          "N": "1"
+         }
+        }
+       }
+      }
+     },
+     "pk": {
+      "S": "$rp#v1#sheet#s"
+     },
+     "sk": {
+      "S": "$rp#v1#sheet"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "s",
+     "line": {
+      "lineId": "l",
+      "counts": {
+       "a": 1
+      }
+     }
+    }
+   }
+  },
+  "projection, the map whole: applyBatch": {
+   "outcome": {
+    "ok": {
+     "outcomes": [
+      {
+       "_tag": "Applied",
+       "positions": [
+        0,
+        1
+       ],
+       "streamId": "a",
+       "key": {
+        "id": "a"
+       },
+       "applied": [
+        {
+         "streamId": "a",
+         "version": 2,
+         "eventType": "Counted",
+         "data": {
+          "_tag": "Counted",
+          "key": "b",
+          "by": 2
+         },
+         "timestamp": "<time>"
+        }
+       ],
+       "rejected": [],
+       "alreadyApplied": [
+        {
+         "streamId": "a",
+         "version": 1,
+         "eventType": "Counted",
+         "data": {
+          "_tag": "Counted",
+          "key": "z",
+          "by": 1
+         },
+         "timestamp": "<time>"
+        }
+       ],
+       "skipped": [],
+       "state": {
+        "_id": "Option",
+        "_tag": "Some",
+        "value": {
+         "id": "a",
+         "counts": {
+          "a": 1,
+          "b": 2
+         },
+         "version": 2
+        }
+       },
+       "version": 2,
+       "removed": false,
+       "enqueued": 0,
+       "undelivered": {
+        "_id": "Option",
+        "_tag": "None"
+       }
+      }
+     ],
+     "failedPositions": [],
+     "ignored": []
+    }
+   },
+   "sent": [
+    {
+     "putItem": {
+      "TableName": "<table>",
+      "Item": {
+       "pk": {
+        "S": "$rp#v1#count#a"
+       },
+       "sk": {
+        "S": "$rp#v1#count.event_1#0000000001"
+       },
+       "__edd_e__": {
+        "S": "count.event"
+       },
+       "streamId": {
+        "S": "a"
+       },
+       "version": {
+        "N": "1"
+       },
+       "eventType": {
+        "S": "Counted"
+       },
+       "data": {
+        "M": {
+         "_tag": {
+          "S": "Counted"
+         },
+         "key": {
+          "S": "z"
+         },
+         "by": {
+          "N": "1"
+         }
+        }
+       },
+       "timestamp": {
+        "S": "<time>"
+       },
+       "__edd_wt__": {
+        "S": "<token>"
+       }
+      },
+      "ConditionExpression": "attribute_not_exists(pk)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "ConditionCheck": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#count#a"
+          },
+          "sk": {
+           "S": "$rp#v1#count.event_1#0000000001"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk",
+          "#sealed": "__edd_sealed__"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "pk": {
+           "S": "$rp#v1#count#a"
+          },
+          "sk": {
+           "S": "$rp#v1#count.event_1#0000000002"
+          },
+          "__edd_e__": {
+           "S": "count.event"
+          },
+          "streamId": {
+           "S": "a"
+          },
+          "version": {
+           "N": "2"
+          },
+          "eventType": {
+           "S": "Counted"
+          },
+          "data": {
+           "M": {
+            "_tag": {
+             "S": "Counted"
+            },
+            "key": {
+             "S": "b"
+            },
+            "by": {
+             "N": "2"
+            }
+           }
+          },
+          "timestamp": {
+           "S": "<time>"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(pk)",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "count.event"
+       },
+       ":pk": {
+        "S": "$rp#v1#count#a"
+       },
+       ":sk": {
+        "S": "$rp#v1#count.event_1#"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#tally#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#tally"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "putItem": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "a"
+       },
+       "version": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "Tally"
+       },
+       "pk": {
+        "S": "$rp#v1#tally#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#tally"
+       },
+       "sr": {
+        "M": {
+         "a": {
+          "N": "1"
+         },
+         "b": {
+          "N": "2"
+         }
+        }
+       }
+      },
+      "ConditionExpression": "#e0 = :e1",
+      "ExpressionAttributeNames": {
+       "#e0": "version"
+      },
+      "ExpressionAttributeValues": {
+       ":e1": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "count.event"
+     },
+     "__edd_wt__": {
+      "S": "<token>"
+     },
+     "data": {
+      "M": {
+       "key": {
+        "S": "z"
+       },
+       "_tag": {
+        "S": "Counted"
+       },
+       "by": {
+        "N": "1"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Counted"
+     },
+     "pk": {
+      "S": "$rp#v1#count#a"
+     },
+     "sk": {
+      "S": "$rp#v1#count.event_1#0000000001"
+     },
+     "streamId": {
+      "S": "a"
+     },
+     "timestamp": {
+      "S": "<time>"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "count.event"
+     },
+     "data": {
+      "M": {
+       "key": {
+        "S": "b"
+       },
+       "_tag": {
+        "S": "Counted"
+       },
+       "by": {
+        "N": "2"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Counted"
+     },
+     "pk": {
+      "S": "$rp#v1#count#a"
+     },
+     "sk": {
+      "S": "$rp#v1#count.event_1#0000000002"
+     },
+     "streamId": {
+      "S": "a"
+     },
+     "timestamp": {
+      "S": "<time>"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Tally"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#tally#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#tally"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       },
+       "b": {
+        "N": "2"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1,
+      "b": 2
+     },
+     "version": 2
+    }
+   }
+  },
+  "projection, the map entries: applyBatch": {
+   "outcome": {
+    "ok": {
+     "outcomes": [
+      {
+       "_tag": "Applied",
+       "positions": [
+        0,
+        1
+       ],
+       "streamId": "a",
+       "key": {
+        "id": "a"
+       },
+       "applied": [
+        {
+         "streamId": "a",
+         "version": 2,
+         "eventType": "Counted",
+         "data": {
+          "_tag": "Counted",
+          "key": "b",
+          "by": 2
+         },
+         "timestamp": "<time>"
+        }
+       ],
+       "rejected": [],
+       "alreadyApplied": [
+        {
+         "streamId": "a",
+         "version": 1,
+         "eventType": "Counted",
+         "data": {
+          "_tag": "Counted",
+          "key": "z",
+          "by": 1
+         },
+         "timestamp": "<time>"
+        }
+       ],
+       "skipped": [],
+       "state": {
+        "_id": "Option",
+        "_tag": "Some",
+        "value": {
+         "id": "a",
+         "counts": {
+          "a": 1,
+          "b": 2
+         },
+         "version": 2
+        }
+       },
+       "version": 2,
+       "removed": false,
+       "enqueued": 0,
+       "undelivered": {
+        "_id": "Option",
+        "_tag": "None"
+       }
+      }
+     ],
+     "failedPositions": [],
+     "ignored": []
+    }
+   },
+   "sent": [
+    {
+     "putItem": {
+      "TableName": "<table>",
+      "Item": {
+       "pk": {
+        "S": "$rp#v1#count#a"
+       },
+       "sk": {
+        "S": "$rp#v1#count.event_1#0000000001"
+       },
+       "__edd_e__": {
+        "S": "count.event"
+       },
+       "streamId": {
+        "S": "a"
+       },
+       "version": {
+        "N": "1"
+       },
+       "eventType": {
+        "S": "Counted"
+       },
+       "data": {
+        "M": {
+         "_tag": {
+          "S": "Counted"
+         },
+         "key": {
+          "S": "z"
+         },
+         "by": {
+          "N": "1"
+         }
+        }
+       },
+       "timestamp": {
+        "S": "<time>"
+       },
+       "__edd_wt__": {
+        "S": "<token>"
+       }
+      },
+      "ConditionExpression": "attribute_not_exists(pk)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "ConditionCheck": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#count#a"
+          },
+          "sk": {
+           "S": "$rp#v1#count.event_1#0000000001"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk",
+          "#sealed": "__edd_sealed__"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "pk": {
+           "S": "$rp#v1#count#a"
+          },
+          "sk": {
+           "S": "$rp#v1#count.event_1#0000000002"
+          },
+          "__edd_e__": {
+           "S": "count.event"
+          },
+          "streamId": {
+           "S": "a"
+          },
+          "version": {
+           "N": "2"
+          },
+          "eventType": {
+           "S": "Counted"
+          },
+          "data": {
+           "M": {
+            "_tag": {
+             "S": "Counted"
+            },
+            "key": {
+             "S": "b"
+            },
+            "by": {
+             "N": "2"
+            }
+           }
+          },
+          "timestamp": {
+           "S": "<time>"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(pk)",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "count.event"
+       },
+       ":pk": {
+        "S": "$rp#v1#count#a"
+       },
+       ":sk": {
+        "S": "$rp#v1#count.event_1#"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#tally#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#tally"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "putItem": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "a"
+       },
+       "version": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "Tally"
+       },
+       "pk": {
+        "S": "$rp#v1#tally#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#tally"
+       },
+       "sr": {
+        "M": {
+         "a": {
+          "N": "1"
+         },
+         "b": {
+          "N": "2"
+         }
+        }
+       }
+      },
+      "ConditionExpression": "#e0 = :e1",
+      "ExpressionAttributeNames": {
+       "#e0": "version"
+      },
+      "ExpressionAttributeValues": {
+       ":e1": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "count.event"
+     },
+     "__edd_wt__": {
+      "S": "<token>"
+     },
+     "data": {
+      "M": {
+       "key": {
+        "S": "z"
+       },
+       "_tag": {
+        "S": "Counted"
+       },
+       "by": {
+        "N": "1"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Counted"
+     },
+     "pk": {
+      "S": "$rp#v1#count#a"
+     },
+     "sk": {
+      "S": "$rp#v1#count.event_1#0000000001"
+     },
+     "streamId": {
+      "S": "a"
+     },
+     "timestamp": {
+      "S": "<time>"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "count.event"
+     },
+     "data": {
+      "M": {
+       "key": {
+        "S": "b"
+       },
+       "_tag": {
+        "S": "Counted"
+       },
+       "by": {
+        "N": "2"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Counted"
+     },
+     "pk": {
+      "S": "$rp#v1#count#a"
+     },
+     "sk": {
+      "S": "$rp#v1#count.event_1#0000000002"
+     },
+     "streamId": {
+      "S": "a"
+     },
+     "timestamp": {
+      "S": "<time>"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Tally"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#tally#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#tally"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       },
+       "b": {
+        "N": "2"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1,
+      "b": 2
+     },
+     "version": 2
+    }
+   }
+  },
+  "projection, the map both: applyBatch": {
+   "outcome": {
+    "ok": {
+     "outcomes": [
+      {
+       "_tag": "Applied",
+       "positions": [
+        0,
+        1
+       ],
+       "streamId": "a",
+       "key": {
+        "id": "a"
+       },
+       "applied": [
+        {
+         "streamId": "a",
+         "version": 2,
+         "eventType": "Counted",
+         "data": {
+          "_tag": "Counted",
+          "key": "b",
+          "by": 2
+         },
+         "timestamp": "<time>"
+        }
+       ],
+       "rejected": [],
+       "alreadyApplied": [
+        {
+         "streamId": "a",
+         "version": 1,
+         "eventType": "Counted",
+         "data": {
+          "_tag": "Counted",
+          "key": "z",
+          "by": 1
+         },
+         "timestamp": "<time>"
+        }
+       ],
+       "skipped": [],
+       "state": {
+        "_id": "Option",
+        "_tag": "Some",
+        "value": {
+         "id": "a",
+         "counts": {
+          "a": 1,
+          "b": 2
+         },
+         "version": 2
+        }
+       },
+       "version": 2,
+       "removed": false,
+       "enqueued": 0,
+       "undelivered": {
+        "_id": "Option",
+        "_tag": "None"
+       }
+      }
+     ],
+     "failedPositions": [],
+     "ignored": []
+    }
+   },
+   "sent": [
+    {
+     "putItem": {
+      "TableName": "<table>",
+      "Item": {
+       "pk": {
+        "S": "$rp#v1#count#a"
+       },
+       "sk": {
+        "S": "$rp#v1#count.event_1#0000000001"
+       },
+       "__edd_e__": {
+        "S": "count.event"
+       },
+       "streamId": {
+        "S": "a"
+       },
+       "version": {
+        "N": "1"
+       },
+       "eventType": {
+        "S": "Counted"
+       },
+       "data": {
+        "M": {
+         "_tag": {
+          "S": "Counted"
+         },
+         "key": {
+          "S": "z"
+         },
+         "by": {
+          "N": "1"
+         }
+        }
+       },
+       "timestamp": {
+        "S": "<time>"
+       },
+       "__edd_wt__": {
+        "S": "<token>"
+       }
+      },
+      "ConditionExpression": "attribute_not_exists(pk)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "ConditionCheck": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#count#a"
+          },
+          "sk": {
+           "S": "$rp#v1#count.event_1#0000000001"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#pk) AND attribute_not_exists(#sealed)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk",
+          "#sealed": "__edd_sealed__"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "pk": {
+           "S": "$rp#v1#count#a"
+          },
+          "sk": {
+           "S": "$rp#v1#count.event_1#0000000002"
+          },
+          "__edd_e__": {
+           "S": "count.event"
+          },
+          "streamId": {
+           "S": "a"
+          },
+          "version": {
+           "N": "2"
+          },
+          "eventType": {
+           "S": "Counted"
+          },
+          "data": {
+           "M": {
+            "_tag": {
+             "S": "Counted"
+            },
+            "key": {
+             "S": "b"
+            },
+            "by": {
+             "N": "2"
+            }
+           }
+          },
+          "timestamp": {
+           "S": "<time>"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(pk)",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "query": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "pk",
+       "#sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "count.event"
+       },
+       ":pk": {
+        "S": "$rp#v1#count#a"
+       },
+       ":sk": {
+        "S": "$rp#v1#count.event_1#"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#tally#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#tally"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "putItem": {
+      "TableName": "<table>",
+      "Item": {
+       "id": {
+        "S": "a"
+       },
+       "version": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "Tally"
+       },
+       "pk": {
+        "S": "$rp#v1#tally#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#tally"
+       },
+       "sr": {
+        "M": {
+         "a": {
+          "N": "1"
+         },
+         "b": {
+          "N": "2"
+         }
+        }
+       }
+      },
+      "ConditionExpression": "#e0 = :e1",
+      "ExpressionAttributeNames": {
+       "#e0": "version"
+      },
+      "ExpressionAttributeValues": {
+       ":e1": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "count.event"
+     },
+     "__edd_wt__": {
+      "S": "<token>"
+     },
+     "data": {
+      "M": {
+       "key": {
+        "S": "z"
+       },
+       "_tag": {
+        "S": "Counted"
+       },
+       "by": {
+        "N": "1"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Counted"
+     },
+     "pk": {
+      "S": "$rp#v1#count#a"
+     },
+     "sk": {
+      "S": "$rp#v1#count.event_1#0000000001"
+     },
+     "streamId": {
+      "S": "a"
+     },
+     "timestamp": {
+      "S": "<time>"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "count.event"
+     },
+     "data": {
+      "M": {
+       "key": {
+        "S": "b"
+       },
+       "_tag": {
+        "S": "Counted"
+       },
+       "by": {
+        "N": "2"
+       }
+      }
+     },
+     "eventType": {
+      "S": "Counted"
+     },
+     "pk": {
+      "S": "$rp#v1#count#a"
+     },
+     "sk": {
+      "S": "$rp#v1#count.event_1#0000000002"
+     },
+     "streamId": {
+      "S": "a"
+     },
+     "timestamp": {
+      "S": "<time>"
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Tally"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#tally#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#tally"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       },
+       "b": {
+        "N": "2"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1,
+      "b": 2
+     },
+     "version": 2
+    }
+   }
+  },
+  "rekey, the map whole": {
+   "outcome": {
+    "ok": {
+     "dryRun": false,
+     "scanned": 1,
+     "unchanged": 0,
+     "moved": {
+      "item": 1,
+      "snapshot": 0,
+      "tombstone": 0,
+      "outbox": 0,
+      "event": 0,
+      "aggregate": 0,
+      "stream": 0
+     },
+     "indexKeysRewritten": 0,
+     "sentinelsMoved": 0,
+     "indexKeys": {
+      "missing": 0,
+      "truncated": 0,
+      "lagging": 0,
+      "ambiguous": 0,
+      "repaired": 0,
+      "skipped": 0
+     },
+     "conflicts": [],
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 0,
+      "rootNotSeen": 0
+     },
+     "byMember": {
+      "Keyed": {
+       "unchanged": 0,
+       "moved": {
+        "item": 1,
+        "snapshot": 0,
+        "tombstone": 0,
+        "outbox": 0,
+        "event": 0,
+        "aggregate": 0,
+        "stream": 0
+       },
+       "indexKeysRewritten": 0,
+       "sentinelsMoved": 0,
+       "indexKeys": {
+        "missing": 0,
+        "truncated": 0,
+        "lagging": 0,
+        "ambiguous": 0,
+        "repaired": 0,
+        "skipped": 0
+       },
+       "conflicts": 0
+      },
+      "Sheet": {
+       "unchanged": 0,
+       "moved": {
+        "item": 0,
+        "snapshot": 0,
+        "tombstone": 0,
+        "outbox": 0,
+        "event": 0,
+        "aggregate": 0,
+        "stream": 0
+       },
+       "indexKeysRewritten": 0,
+       "sentinelsMoved": 0,
+       "indexKeys": {
+        "missing": 0,
+        "truncated": 0,
+        "lagging": 0,
+        "ambiguous": 0,
+        "repaired": 0,
+        "skipped": 0
+       },
+       "conflicts": 0
+      }
+     },
+     "capacity": {
+      "capacityUnits": 4.5,
+      "readCapacityUnits": 2.5,
+      "writeCapacityUnits": 2,
+      "requests": 4,
+      "unreportedRequests": 0
+     },
+     "resume": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "scan": {
+      "TableName": "<table>",
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#keyed#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#keyed#name_x y"
+       }
+      },
+      "ConsistentRead": true,
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#keyed#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#keyed#name_x%20y"
+       }
+      },
+      "ConsistentRead": true,
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "name": {
+           "S": "x y"
+          },
+          "sk": {
+           "S": "$rp#v1#keyed#name_x%20y"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#keyed#id_a"
+          },
+          "__edd_e__": {
+           "S": "Keyed"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#keyed#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#keyed#name_x y"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#dpk) AND #dg0 = :dg0 AND #dg1 = :dg1 AND #dg2 = :dg2 AND #dg3 = :dg3",
+         "ExpressionAttributeNames": {
+          "#dpk": "pk",
+          "#dg0": "name",
+          "#dg1": "id",
+          "#dg2": "__edd_e__",
+          "#dg3": "sr"
+         },
+         "ExpressionAttributeValues": {
+          ":dg0": {
+           "S": "x y"
+          },
+          ":dg1": {
+           "S": "a"
+          },
+          ":dg2": {
+           "S": "Keyed"
+          },
+          ":dg3": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         }
+        }
+       }
+      ],
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Keyed"
+     },
+     "id": {
+      "S": "a"
+     },
+     "name": {
+      "S": "x y"
+     },
+     "pk": {
+      "S": "$rp#v1#keyed#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#keyed#name_x%20y"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "name": "x y",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "rekey, the map entries": {
+   "outcome": {
+    "ok": {
+     "dryRun": false,
+     "scanned": 1,
+     "unchanged": 0,
+     "moved": {
+      "item": 1,
+      "snapshot": 0,
+      "tombstone": 0,
+      "outbox": 0,
+      "event": 0,
+      "aggregate": 0,
+      "stream": 0
+     },
+     "indexKeysRewritten": 0,
+     "sentinelsMoved": 0,
+     "indexKeys": {
+      "missing": 0,
+      "truncated": 0,
+      "lagging": 0,
+      "ambiguous": 0,
+      "repaired": 0,
+      "skipped": 0
+     },
+     "conflicts": [],
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 0,
+      "rootNotSeen": 0
+     },
+     "byMember": {
+      "Keyed": {
+       "unchanged": 0,
+       "moved": {
+        "item": 1,
+        "snapshot": 0,
+        "tombstone": 0,
+        "outbox": 0,
+        "event": 0,
+        "aggregate": 0,
+        "stream": 0
+       },
+       "indexKeysRewritten": 0,
+       "sentinelsMoved": 0,
+       "indexKeys": {
+        "missing": 0,
+        "truncated": 0,
+        "lagging": 0,
+        "ambiguous": 0,
+        "repaired": 0,
+        "skipped": 0
+       },
+       "conflicts": 0
+      },
+      "Sheet": {
+       "unchanged": 0,
+       "moved": {
+        "item": 0,
+        "snapshot": 0,
+        "tombstone": 0,
+        "outbox": 0,
+        "event": 0,
+        "aggregate": 0,
+        "stream": 0
+       },
+       "indexKeysRewritten": 0,
+       "sentinelsMoved": 0,
+       "indexKeys": {
+        "missing": 0,
+        "truncated": 0,
+        "lagging": 0,
+        "ambiguous": 0,
+        "repaired": 0,
+        "skipped": 0
+       },
+       "conflicts": 0
+      }
+     },
+     "capacity": {
+      "capacityUnits": 4.5,
+      "readCapacityUnits": 2.5,
+      "writeCapacityUnits": 2,
+      "requests": 4,
+      "unreportedRequests": 0
+     },
+     "resume": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "scan": {
+      "TableName": "<table>",
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#keyed#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#keyed#name_x y"
+       }
+      },
+      "ConsistentRead": true,
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#keyed#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#keyed#name_x%20y"
+       }
+      },
+      "ConsistentRead": true,
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "name": {
+           "S": "x y"
+          },
+          "sk": {
+           "S": "$rp#v1#keyed#name_x%20y"
+          },
+          "counts#a": {
+           "N": "1"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#keyed#id_a"
+          },
+          "__edd_e__": {
+           "S": "Keyed"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#keyed#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#keyed#name_x y"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#dpk) AND #dg0 = :dg0 AND #dg1 = :dg1 AND #dg2 = :dg2 AND #dg3 = :dg3 AND attribute_not_exists(#dg4)",
+         "ExpressionAttributeNames": {
+          "#dpk": "pk",
+          "#dg0": "name",
+          "#dg1": "counts#a",
+          "#dg2": "id",
+          "#dg3": "__edd_e__",
+          "#dg4": "sr"
+         },
+         "ExpressionAttributeValues": {
+          ":dg0": {
+           "S": "x y"
+          },
+          ":dg1": {
+           "N": "1"
+          },
+          ":dg2": {
+           "S": "a"
+          },
+          ":dg3": {
+           "S": "Keyed"
+          }
+         }
+        }
+       }
+      ],
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Keyed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "name": {
+      "S": "x y"
+     },
+     "pk": {
+      "S": "$rp#v1#keyed#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#keyed#name_x%20y"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "name": "x y",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "rekey, the map both": {
+   "outcome": {
+    "ok": {
+     "dryRun": false,
+     "scanned": 1,
+     "unchanged": 0,
+     "moved": {
+      "item": 1,
+      "snapshot": 0,
+      "tombstone": 0,
+      "outbox": 0,
+      "event": 0,
+      "aggregate": 0,
+      "stream": 0
+     },
+     "indexKeysRewritten": 0,
+     "sentinelsMoved": 0,
+     "indexKeys": {
+      "missing": 0,
+      "truncated": 0,
+      "lagging": 0,
+      "ambiguous": 0,
+      "repaired": 0,
+      "skipped": 0
+     },
+     "conflicts": [],
+     "skipped": {
+      "notLibrary": 0,
+      "unregistered": 0,
+      "unrecognizedKey": 0,
+      "rootNotSeen": 0
+     },
+     "byMember": {
+      "Keyed": {
+       "unchanged": 0,
+       "moved": {
+        "item": 1,
+        "snapshot": 0,
+        "tombstone": 0,
+        "outbox": 0,
+        "event": 0,
+        "aggregate": 0,
+        "stream": 0
+       },
+       "indexKeysRewritten": 0,
+       "sentinelsMoved": 0,
+       "indexKeys": {
+        "missing": 0,
+        "truncated": 0,
+        "lagging": 0,
+        "ambiguous": 0,
+        "repaired": 0,
+        "skipped": 0
+       },
+       "conflicts": 0
+      },
+      "Sheet": {
+       "unchanged": 0,
+       "moved": {
+        "item": 0,
+        "snapshot": 0,
+        "tombstone": 0,
+        "outbox": 0,
+        "event": 0,
+        "aggregate": 0,
+        "stream": 0
+       },
+       "indexKeysRewritten": 0,
+       "sentinelsMoved": 0,
+       "indexKeys": {
+        "missing": 0,
+        "truncated": 0,
+        "lagging": 0,
+        "ambiguous": 0,
+        "repaired": 0,
+        "skipped": 0
+       },
+       "conflicts": 0
+      }
+     },
+     "capacity": {
+      "capacityUnits": 4.5,
+      "readCapacityUnits": 2.5,
+      "writeCapacityUnits": 2,
+      "requests": 4,
+      "unreportedRequests": 0
+     },
+     "resume": {
+      "_id": "Option",
+      "_tag": "None"
+     }
+    }
+   },
+   "sent": [
+    {
+     "scan": {
+      "TableName": "<table>",
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#keyed#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#keyed#name_x y"
+       }
+      },
+      "ConsistentRead": true,
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#keyed#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#keyed#name_x%20y"
+       }
+      },
+      "ConsistentRead": true,
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "counts#a": {
+           "N": "7"
+          },
+          "__edd_e__": {
+           "S": "Keyed"
+          },
+          "name": {
+           "S": "x y"
+          },
+          "sk": {
+           "S": "$rp#v1#keyed#name_x%20y"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#keyed#id_a"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Delete": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#keyed#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#keyed#name_x y"
+          }
+         },
+         "ConditionExpression": "attribute_exists(#dpk) AND #dg0 = :dg0 AND #dg1 = :dg1 AND #dg2 = :dg2 AND #dg3 = :dg3 AND #dg4 = :dg4",
+         "ExpressionAttributeNames": {
+          "#dpk": "pk",
+          "#dg0": "counts#a",
+          "#dg1": "__edd_e__",
+          "#dg2": "name",
+          "#dg3": "id",
+          "#dg4": "sr"
+         },
+         "ExpressionAttributeValues": {
+          ":dg0": {
+           "N": "7"
+          },
+          ":dg1": {
+           "S": "Keyed"
+          },
+          ":dg2": {
+           "S": "x y"
+          },
+          ":dg3": {
+           "S": "a"
+          },
+          ":dg4": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         }
+        }
+       }
+      ],
+      "ReturnConsumedCapacity": "TOTAL"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Keyed"
+     },
+     "counts#a": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "name": {
+      "S": "x y"
+     },
+     "pk": {
+      "S": "$rp#v1#keyed#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#keyed#name_x%20y"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "name": "x y",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, the map whole: .add({ 'counts#b': 1 }), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#plain"
+          }
+         },
+         "UpdateExpression": "ADD #a0 :a0",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#a0": "counts#b",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":a0": {
+           "N": "1"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Retained, the map whole: .add({ 'counts#b': 1 })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1,
+      "b": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #w0 = :w0, #w1 = :w1",
+         "ConditionExpression": "#ver = :expectedVer AND #inc = :inc",
+         "ExpressionAttributeNames": {
+          "#w0": "version",
+          "#w1": "sr",
+          "#ver": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":w0": {
+           "N": "2"
+          },
+          ":w1": {
+           "M": {
+            "a": {
+             "N": "1"
+            },
+            "b": {
+             "N": "1"
+            }
+           }
+          },
+          ":expectedVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$rp#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       },
+       "b": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1,
+      "b": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map whole: .add({ 'counts#b': 1 }), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #w0 = :w0, #w1 = :w1",
+         "ConditionExpression": "#ver = :expectedVer AND #inc = :inc",
+         "ExpressionAttributeNames": {
+          "#w0": "version",
+          "#w1": "sr",
+          "#ver": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":w0": {
+           "N": "2"
+          },
+          ":w1": {
+           "M": {
+            "a": {
+             "N": "1"
+            },
+            "b": {
+             "N": "1"
+            }
+           }
+          },
+          ":expectedVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$rp#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       },
+       "b": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1,
+      "b": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Plain, the map whole: .add({ 'counts#a': 1 }), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#plain"
+          }
+         },
+         "UpdateExpression": "ADD #a0 :a0",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#a0": "counts#a",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":a0": {
+           "N": "1"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Retained, the map whole: .add({ 'counts#a': 1 })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 2
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #w0 = :w0, #w1 = :w1",
+         "ConditionExpression": "#ver = :expectedVer AND #inc = :inc",
+         "ExpressionAttributeNames": {
+          "#w0": "version",
+          "#w1": "sr",
+          "#ver": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":w0": {
+           "N": "2"
+          },
+          ":w1": {
+           "M": {
+            "a": {
+             "N": "2"
+            }
+           }
+          },
+          ":expectedVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$rp#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "2"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 2
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map whole: .add({ 'counts#a': 1 }), in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #w0 = :w0, #w1 = :w1",
+         "ConditionExpression": "#ver = :expectedVer AND #inc = :inc",
+         "ExpressionAttributeNames": {
+          "#w0": "version",
+          "#w1": "sr",
+          "#ver": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":w0": {
+           "N": "2"
+          },
+          ":w1": {
+           "M": {
+            "a": {
+             "N": "2"
+            }
+           }
+          },
+          ":expectedVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$rp#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "2"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 2
+     },
+     "version": 2
+    }
+   }
+  },
+  "Plain, the map whole: pathAdd of counts.entry('b'), 1, in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#plain#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#plain"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#plain#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#plain"
+          }
+         },
+         "UpdateExpression": "ADD #pad0 :pad1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#pad0": "counts#b",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":pad1": {
+           "N": "1"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Retained, the map whole: pathAdd of counts.entry('b'), 1": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc ADD #pad0 :pad1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#pad0": "counts#b",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":pad1": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$rp#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#b": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  },
+  "Retained, the map whole: pathAdd of counts.entry('b'), 1, in a transaction": {
+   "outcome": {
+    "ok": null
+   },
+   "sent": [
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$rp#v1#retained#id_a"
+       },
+       "sk": {
+        "S": "$rp#v1#retained"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "sk": {
+           "S": "$rp#v1#retained"
+          }
+         },
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc ADD #pad0 :pad1",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#pad0": "counts#b",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":pad1": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
+         },
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "__edd_e__": {
+           "S": "Retained"
+          },
+          "sk": {
+           "S": "$rp#v1#retained#v#0000001"
+          },
+          "id": {
+           "S": "a"
+          },
+          "pk": {
+           "S": "$rp#v1#retained#id_a"
+          },
+          "version": {
+           "N": "1"
+          },
+          "sr": {
+           "M": {
+            "a": {
+             "N": "1"
+            }
+           }
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
+         },
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "counts#b": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "2"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Retained"
+     },
+     "__edd_i__": {
+      "S": "<token>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$rp#v1#retained#id_a"
+     },
+     "sk": {
+      "S": "$rp#v1#retained#v#0000001"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "version": {
+      "N": "1"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "version": 2
+    }
+   }
+  }
+ }
+}

@@ -43,6 +43,8 @@ export interface RepairTable {
   readonly beforeTransact: (
     hook: (input: Record<string, any>) => Effect.Effect<void, unknown>,
   ) => void
+  /** Run before each `PutItem` is sent: another writer landing just before it. */
+  readonly beforePut: (hook: (input: Record<string, any>) => Effect.Effect<void, unknown>) => void
 }
 
 export interface Harness {
@@ -67,7 +69,7 @@ export const harnessOn = (setup: (world: { readonly MainTable: any }) => TableSe
     const { tableName, client, acquire, release } = setup(world)
     const requests: Array<RecordedRequest> = []
     type Hook = (input: Record<string, any>) => Effect.Effect<void, unknown>
-    const hooks: { updateItem?: Hook; transactWriteItems?: Hook } = {}
+    const hooks: { updateItem?: Hook; transactWriteItems?: Hook; putItem?: Hook } = {}
     let raw: any
     const recording = Layer.effect(
       DynamoClient,
@@ -82,7 +84,9 @@ export const harnessOn = (setup: (world: { readonly MainTable: any }) => TableSe
               Effect.suspend(() => {
                 requests.push({ command: property, input })
                 const hook =
-                  property === "updateItem" || property === "transactWriteItems"
+                  property === "updateItem" ||
+                  property === "transactWriteItems" ||
+                  property === "putItem"
                     ? hooks[property]
                     : undefined
                 return hook !== undefined
@@ -121,6 +125,9 @@ export const harnessOn = (setup: (world: { readonly MainTable: any }) => TableSe
       },
       beforeTransact: (next) => {
         hooks.transactWriteItems = next
+      },
+      beforePut: (next) => {
+        hooks.putItem = next
       },
     }
     return Effect.acquireUseRelease(
@@ -223,14 +230,6 @@ const devices = (escapeKeys: boolean) => {
   const MainTable = Table.make({ schema, entities: { Devices } })
   const client = DynamoClient.make({ entities: { Devices }, tables: { MainTable } })
   return { schema, Devices, MainTable, client } as any
-}
-
-/** The secondary indexes a recording table needs to answer the scenarios' queries. */
-export const RECORDING_INDEXES = {
-  ...Object.fromEntries(
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => [`gsi${n}`, { pk: `gsi${n}pk`, sk: `gsi${n}sk` }]),
-  ),
-  lsi1: { pk: "pk", sk: "lsi1sk" },
 }
 
 const seedAll = (table: RepairTable, ids: ReadonlyArray<string> = FIXTURE_IDS) =>
@@ -551,7 +550,11 @@ export const fixtureScenarios: ReadonlyArray<RepairScenario> = [
           segments: 3,
         })
         expect(real.indexKeys).toEqual({ ...damageOf(on), repaired: repairsOf(on) })
-        expect(dry.indexKeys).toEqual(real.indexKeys)
+        // A dry run finds what the run repairs, and repairs nothing (#240).
+        expect(dry.indexKeys).toEqual({ ...real.indexKeys, repaired: 0 })
+        expect(repairsOf(on)).toBe(
+          dry.indexKeys.missing + dry.indexKeys.truncated + dry.indexKeys.lagging,
+        )
         for (const row of yield* table.rows()) expectKeysAsPut(w, row)
       }),
     )
@@ -1407,7 +1410,8 @@ export const stampedScenarios: ReadonlyArray<RepairScenario> = [
             repairIndexKeys: true,
             dryRun: true,
           })
-          expect(dry.indexKeys).toEqual({ ...STAMPED_DAMAGE, repaired: 48 })
+          // What it would repair is what it found; it repaired none (#240).
+          expect(dry.indexKeys).toEqual({ ...STAMPED_DAMAGE, repaired: 0 })
           expect(yield* table.rows()).toEqual(before)
         }),
       )

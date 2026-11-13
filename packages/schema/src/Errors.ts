@@ -1,6 +1,20 @@
 import { Data, type Option } from "effect"
 import type { CompressionCodec } from "./DynamoModel.js"
 
+/**
+ * A tagged error's `toJSON` without one field. Effect prints an error through `toJSON`
+ * (`JSON.stringify`, `inspect`, its loggers), which copies the arguments the error was made with,
+ * so a whole item there reached logs, a `Schema.RedactedFromValue` field in plaintext among them.
+ * The field stays an own, enumerable property: code reads it, and a copy, `Object.keys`, `Equal`
+ * and test equality see it, as they always did.
+ */
+const printedJson = (json: unknown, field: string): unknown => {
+  if (typeof json !== "object" || json === null) return json
+  const printed = { ...(json as Record<string, unknown>) }
+  delete printed[field]
+  return printed
+}
+
 /** Wraps AWS SDK errors from DynamoDB operations */
 export class DynamoError extends Data.TaggedError("DynamoError")<{
   readonly operation: string
@@ -38,6 +52,17 @@ export class ItemNotFound extends Data.TaggedError("ItemNotFound")<{
 }> {}
 
 /**
+ * `Entity.insert()` found an item at its primary key. Nothing was written.
+ *
+ * `key` holds the primary key composites. There is no current item: DynamoDB
+ * returns none when a PartiQL `INSERT` finds the key taken.
+ */
+export class ItemAlreadyExists extends Data.TaggedError("ItemAlreadyExists")<{
+  readonly entityType: string
+  readonly key: Record<string, unknown>
+}> {}
+
+/**
  * PutItem/DeleteItem/UpdateItem conditional check failed.
  *
  * On `Entity.append()` (time-series), this is surfaced when a user-supplied
@@ -45,7 +70,9 @@ export class ItemNotFound extends Data.TaggedError("ItemNotFound")<{
  * `current` is `Option.some(<decoded post-state>)` carrying the live current
  * item snapshot read via the follow-up GetItem. For non-append paths and for
  * append calls that opted out via `.skipFollowUp()`, `current` is omitted /
- * `Option.none()` (no follow-up GetItem was issued).
+ * `Option.none()` (no follow-up GetItem was issued). `current` is read, never
+ * printed: `toJSON`, which `JSON.stringify`, `inspect` and Effect's loggers
+ * print an error through, leaves it out.
  *
  * On the `.skipFollowUp()` path of `.append()`, user-condition failures cannot
  * be distinguished from CAS failures, so they are reported as
@@ -55,7 +82,11 @@ export class ConditionalCheckFailed extends Data.TaggedError("ConditionalCheckFa
   readonly entityType: string
   readonly key: Record<string, unknown>
   readonly current?: Option.Option<unknown>
-}> {}
+}> {
+  override toJSON(): unknown {
+    return printedJson(super.toJSON(), "current")
+  }
+}
 
 /**
  * An update computed part of what it writes from the item it read — a value
@@ -67,14 +98,20 @@ export class ConditionalCheckFailed extends Data.TaggedError("ConditionalCheckFa
  *
  * `attributes` names the inputs that changed; `current` carries the item as
  * stored when the write was rejected (decoded, when it decodes). Retrying the
- * update re-reads the item and recomputes from its new values.
+ * update re-reads the item and recomputes from its new values. `current` is
+ * read, never printed: `toJSON`, which `JSON.stringify`, `inspect` and
+ * Effect's loggers print an error through, leaves it out.
  */
 export class ConcurrentModification extends Data.TaggedError("ConcurrentModification")<{
   readonly entityType: string
   readonly key: Record<string, unknown>
   readonly attributes: ReadonlyArray<string>
   readonly current: Option.Option<unknown>
-}> {}
+}> {
+  override toJSON(): unknown {
+    return printedJson(super.toJSON(), "current")
+  }
+}
 
 /**
  * The update WAS applied — committed at `version` — but the item it wrote could
@@ -94,13 +131,19 @@ export class UpdateAppliedButUnreadable extends Data.TaggedError("UpdateAppliedB
  * The delete WAS applied, but the item it removed — asked for with
  * `returnValues("allOld")` — could not be decoded. `item` is the removed item
  * as stored. Do not retry the delete expecting the item back: it is gone.
+ * `item` is read, never printed: `toJSON`, which `JSON.stringify`, `inspect`
+ * and Effect's loggers print an error through, leaves it out.
  */
 export class DeleteAppliedButUnreadable extends Data.TaggedError("DeleteAppliedButUnreadable")<{
   readonly entityType: string
   readonly key: Record<string, unknown>
   readonly item: Record<string, unknown>
   readonly cause: unknown
-}> {}
+}> {
+  override toJSON(): unknown {
+    return printedJson(super.toJSON(), "item")
+  }
+}
 
 /**
  * `Entity.append()` was rejected because the CAS predicate
@@ -123,13 +166,20 @@ export class DeleteAppliedButUnreadable extends Data.TaggedError("DeleteAppliedB
  * follow-up GetItem ran, so the two cancellation modes are
  * indistinguishable. If you need the disambiguation, do not call
  * `.skipFollowUp()`.
+ *
+ * `current` is read, never printed: `toJSON`, which `JSON.stringify`,
+ * `inspect` and Effect's loggers print an error through, leaves it out.
  */
 export class StaleAppend extends Data.TaggedError("StaleAppend")<{
   readonly entityType: string
   readonly orderByField: string
   readonly attemptedOrderBy: unknown
   readonly current: Option.Option<unknown>
-}> {}
+}> {
+  override toJSON(): unknown {
+    return printedJson(super.toJSON(), "current")
+  }
+}
 
 /** Schema decode/encode validation failed */
 export class ValidationError extends Data.TaggedError("ValidationError")<{
@@ -148,19 +198,36 @@ export class TransactionCancelled extends Data.TaggedError("TransactionCancelled
   readonly cause: unknown
 }> {}
 
-/** Unique constraint violation — field value already exists */
+/**
+ * Unique constraint violation — field value already exists. `fields` holds the
+ * constrained values, by field. It is read, never printed: `toJSON`, which
+ * `JSON.stringify`, `inspect` and Effect's loggers print an error through,
+ * leaves it out, since a value is the caller's and may be a
+ * `Schema.RedactedFromValue` field's plaintext.
+ */
 export class UniqueConstraintViolation extends Data.TaggedError("UniqueConstraintViolation")<{
   readonly entityType: string
   readonly constraint: string
   readonly fields: Record<string, string>
-}> {}
+}> {
+  override toJSON(): unknown {
+    return printedJson(super.toJSON(), "fields")
+  }
+}
 
-/** Optimistic concurrency conflict — item was modified since last read */
+/**
+ * Optimistic concurrency conflict — item was modified since last read.
+ *
+ * `attributes`, when present, names what changed without the version moving: a sparse map whose
+ * stored form another writer changed between this write's read and its write, on every attempt
+ * (#238). Retrying the write re-reads the item.
+ */
 export class OptimisticLockError extends Data.TaggedError("OptimisticLockError")<{
   readonly entityType: string
   readonly key: Record<string, unknown>
   readonly expectedVersion: number
   readonly actualVersion: number
+  readonly attributes?: ReadonlyArray<string>
 }> {}
 
 // ---------------------------------------------------------------------------
@@ -198,6 +265,24 @@ export const isAwsConditionalCheckFailed = (cause: unknown): cause is AwsConditi
   typeof cause === "object" &&
   "name" in cause &&
   (cause as { name: unknown }).name === "ConditionalCheckFailedException"
+
+/** @internal A PartiQL `INSERT` found the key taken. DynamoDB Local names it `DuplicateItem`. */
+export const isAwsDuplicateItem = (cause: unknown): boolean =>
+  cause != null &&
+  typeof cause === "object" &&
+  "name" in cause &&
+  ((cause as { name: unknown }).name === "DuplicateItemException" ||
+    (cause as { name: unknown }).name === "DuplicateItem")
+
+/**
+ * @internal An `INSERT` in a transaction found the key taken. DynamoDB Local
+ * reports it as a `ValidationError` carrying the same message.
+ */
+export const isDuplicateItemReason = (
+  reason: { readonly Code?: string; readonly Message?: string } | undefined,
+): boolean =>
+  reason?.Code === "DuplicateItem" ||
+  (reason?.Code === "ValidationError" && reason.Message === "Duplicate primary key exists in table")
 
 /** @internal */
 export const isAwsThrottling = (cause: unknown): boolean =>
@@ -294,6 +379,12 @@ export type AggregateTransactionOverflowFields = {
    * committed (the root is in the first group), which its `message` says.
    */
   readonly operation?: "create" | "update" | undefined
+  /**
+   * The group's rows under the sort key text published 1.40.0 composed for an `entity:` edge under
+   * `escapeKeys: true`, which the write deletes in its own transaction (#241). Present only when the
+   * group fits without them: `db.tables.<Table>.rekey()` moves them, and the write then fits.
+   */
+  readonly previousKeyText?: number | undefined
   /** DynamoDB's rejection, when the overflow was diagnosed from it. */
   readonly cause?: unknown
 }
@@ -307,14 +398,22 @@ const aggregateTransactionOverflowMessage = (
     `Aggregate "${fields.aggregate}": the transaction of sub-aggregate "${fields.subgraph}" ` +
     `holds ${fields.itemCount} items, over DynamoDB's limit of ${fields.limit} for one ` +
     "transaction, and DynamoDB rejected it."
-  if (committed.length === 0) return `${head} Nothing was written.`
+  const previous =
+    fields.previousKeyText === undefined
+      ? ""
+      : ` The group holds ${fields.previousKeyText} row${fields.previousKeyText === 1 ? "" : "s"} ` +
+        "under the previous key text. The write moves each in the same transaction, a delete " +
+        `beside its write under the new text, so ${fields.previousKeyText} of these ` +
+        `${fields.itemCount} items are those deletes, and without them it fits. Run ` +
+        "`db.tables.<Table>.rekey()` to move them, then write again."
+  if (committed.length === 0) return `${head} Nothing was written.${previous}`
   const already =
     ` Each sub-aggregate is its own transaction, and earlier ones of this write were ` +
     `already committed: ${committed.map((name) => `"${name}"`).join(", ")}.`
   return fields.operation === "create"
     ? `${head}${already} The root may be among them, so a retried create fails its root ` +
         "guard (ConditionalCheckFailed): update or delete the partial aggregate instead."
-    : `${head}${already}`
+    : `${head}${already}${previous}`
 }
 
 /**

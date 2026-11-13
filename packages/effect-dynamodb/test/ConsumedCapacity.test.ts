@@ -42,7 +42,7 @@ import {
   serviceOf,
   withConsumedCapacity,
 } from "./helpers/CapacityMock.js"
-import { InMemoryClient, resetStore } from "./helpers/InMemoryTables.js"
+import { InMemoryClient, resetStore, tableIndexes } from "./helpers/InMemoryTables.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -206,6 +206,10 @@ const pagedQuery = (pages: ReadonlyArray<ReadonlyArray<Record<string, any>>>, fa
   })
 }
 
+tableIndexes.set("shop-table", {
+  gsi1: { pk: "gsi1pk", sk: "gsi1sk" },
+  lsi1: { pk: "pk", sk: "lsi1sk" },
+})
 beforeEach(() => resetStore())
 
 const enabled = (options?: ConsumedCapacity.Options) =>

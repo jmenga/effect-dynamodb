@@ -4,7 +4,9 @@
  * (`fixtures/update-operand-requests-1.39.0.json`, whose requests
  * `test/UpdateOperandRequests.test.ts` compares). An operand 1.39.0 wrote is written and the row
  * reads back; an operand it refused is refused with the same error and the stored row is the row
- * that was there.
+ * that was there. Where 1.39.0 wrote a row that didn't read, at a position the read schema resolves
+ * exactly (#236, `RESOLVED`), the operand is refused and the row is as it was, or stored in the
+ * form its reader reads back, and the row reads.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -21,6 +23,8 @@ import { failureOf, type Outcome, refusedOperand } from "./helpers/Against139.js
 import {
   definitions,
   matrix,
+  nameOf,
+  RESOLVED,
   seed,
   type Variant,
   variants,
@@ -152,6 +156,46 @@ describeConnected("an update with an operand, on DynamoDB Local", () => {
                 if (each.key.includes("a property named as a renamed field")) continue
                 const was = fixture.cases[each.key]!
                 const got = yield* send(db, row, n, transaction, each.apply, each.seeded, world)
+                const since = RESOLVED.get(nameOf(each.key))?.[0]
+                const failure = failureOf(got.exit)
+                // A value written into a sparse map's entry is checked against the map's value
+                // schema (#238), but for a `pathIfNotExists` operand, refused where stored below.
+                const entryChecked =
+                  /(^|: )entry: /.test(each.key) &&
+                  since !== "refused where stored" &&
+                  since !== "kept where present"
+                if (entryChecked) {
+                  // Where 1.39.0 wrote one that left a row no read takes, it's refused with
+                  // nothing written, and the row reads as it was.
+                  if (
+                    failure !== undefined &&
+                    refusedOperand({ ok: false, reads: true, requests: [], failure })
+                  ) {
+                    expect(`${each.key}: ${was.ok && was.reads}`).toBe(`${each.key}: false`)
+                    expect(got.after).toEqual(got.before)
+                    expect(`${each.key}: ${Exit.isSuccess(got.read)}`).toBe(`${each.key}: true`)
+                    continue
+                  }
+                  // Written encoded, where 1.39.0's row didn't read: it reads now.
+                  if (!was.reads && Exit.isSuccess(got.exit) && Exit.isSuccess(got.read)) continue
+                } else if (since !== undefined) {
+                  // A `pathIfNotExists` operand is refused where the row lacks its path, which
+                  // the case's row does: with the error 1.39.0 refused it with.
+                  const refusing =
+                    since === "refuses what wouldn't read" || since === "refused where stored"
+                  expect(`${each.key}: ${Exit.isSuccess(got.exit)}`).toBe(
+                    `${each.key}: ${!refusing}`,
+                  )
+                  expect(`${each.key}: ${Exit.isSuccess(got.read)}`).toBe(`${each.key}: true`)
+                  if (refusing) {
+                    expect(failure).toMatchObject({ error: "ValidationError" })
+                    if (since === "refused where stored" && refusedOperand(was)) {
+                      expect(failure).toEqual(was.failure)
+                    }
+                    expect(got.after).toEqual(got.before)
+                  }
+                  continue
+                }
                 expect(`${each.key}: ${Exit.isSuccess(got.exit)}`).toBe(`${each.key}: ${was.ok}`)
                 expect(`${each.key}: ${Exit.isSuccess(got.read)}`).toBe(`${each.key}: ${was.reads}`)
                 if (refusedOperand(was)) {

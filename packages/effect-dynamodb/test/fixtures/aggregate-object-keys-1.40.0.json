@@ -1,0 +1,385 @@
+{
+  "generatedFrom": "effect-dynamodb@1.40.0",
+  "note": "Captured once from published effect-dynamodb 1.40.0 on DynamoDB Local, effect@4.1.2. Never regenerate it.",
+  "describes": "Each shape is an aggregate keyed partly by an object field, f: Schema.Unknown. Aggregate a was created with f = { a: 1 }, then b with f = { a: 2 } (for discriminator, f is text and the sub-aggregate is bound with discriminator { side: { a: 1 } }). `results` are what that release answered; `rows` are the table after both creates. The aggregates are AggregateObjectKeys.test.ts's.",
+  "shapes": {
+    "partitionKey": {
+      "results": {
+        "createA": "ok",
+        "createB": "ConditionalCheckFailed",
+        "getA": {
+          "id": "a",
+          "f": {
+            "a": 1
+          }
+        },
+        "getB": {
+          "id": "a",
+          "f": {
+            "a": 1
+          }
+        }
+      },
+      "rows": [
+        {
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "note": {
+            "S": "one"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#[object object]"
+          },
+          "f": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        }
+      ]
+    },
+    "listSortKey": {
+      "results": {
+        "createA": "ok",
+        "createB": "ok",
+        "getA": {
+          "id": "a",
+          "f": {
+            "a": 1
+          }
+        },
+        "getB": {
+          "id": "b",
+          "f": {
+            "a": 2
+          }
+        },
+        "list": [
+          "a",
+          "b"
+        ]
+      },
+      "rows": [
+        {
+          "note": {
+            "S": "one"
+          },
+          "gsi1sk": {
+            "S": "$ao#v1#rl#[object object]"
+          },
+          "f": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          },
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "gsi1pk": {
+            "S": "$ao#v1#rl"
+          },
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#a"
+          }
+        },
+        {
+          "note": {
+            "S": "one"
+          },
+          "gsi1sk": {
+            "S": "$ao#v1#rl#[object object]"
+          },
+          "f": {
+            "M": {
+              "a": {
+                "N": "2"
+              }
+            }
+          },
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "gsi1pk": {
+            "S": "$ao#v1#rl"
+          },
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "id": {
+            "S": "b"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#b"
+          }
+        }
+      ]
+    },
+    "listPartitionKey": {
+      "results": {
+        "createA": "ok",
+        "createB": "ok",
+        "getA": {
+          "id": "a",
+          "f": {
+            "a": 1
+          }
+        },
+        "getB": {
+          "id": "b",
+          "f": {
+            "a": 2
+          }
+        },
+        "list": [
+          "a",
+          "b"
+        ]
+      },
+      "rows": [
+        {
+          "note": {
+            "S": "one"
+          },
+          "gsi1sk": {
+            "S": "$ao#v1#rl"
+          },
+          "f": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          },
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "gsi1pk": {
+            "S": "$ao#v1#rl#[object object]"
+          },
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#a"
+          }
+        },
+        {
+          "note": {
+            "S": "one"
+          },
+          "gsi1sk": {
+            "S": "$ao#v1#rl"
+          },
+          "f": {
+            "M": {
+              "a": {
+                "N": "2"
+              }
+            }
+          },
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "gsi1pk": {
+            "S": "$ao#v1#rl#[object object]"
+          },
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "id": {
+            "S": "b"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#b"
+          }
+        }
+      ]
+    },
+    "collectionSortKey": {
+      "results": {
+        "createA": "ok",
+        "createB": "ok",
+        "getA": {
+          "id": "a",
+          "f": {
+            "a": 1
+          }
+        },
+        "getB": {
+          "id": "b",
+          "f": {
+            "a": 2
+          }
+        }
+      },
+      "rows": [
+        {
+          "note": {
+            "S": "one"
+          },
+          "f": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          },
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "lsi1sk": {
+            "S": "$ao#v1#roots#[object object]"
+          },
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#a"
+          }
+        },
+        {
+          "note": {
+            "S": "one"
+          },
+          "f": {
+            "M": {
+              "a": {
+                "N": "2"
+              }
+            }
+          },
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "lsi1sk": {
+            "S": "$ao#v1#roots#[object object]"
+          },
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "id": {
+            "S": "b"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#b"
+          }
+        }
+      ]
+    },
+    "discriminator": {
+      "results": {
+        "createA": "ok",
+        "createB": "ok",
+        "getA": "ValidationError",
+        "getB": "ValidationError"
+      },
+      "rows": [
+        {
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "note": {
+            "S": "one"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#a"
+          },
+          "f": {
+            "S": "a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$ao#v1#side#side#[object object]"
+          },
+          "side": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          },
+          "s": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#a"
+          },
+          "__edd_e__": {
+            "S": "Side"
+          }
+        },
+        {
+          "sk": {
+            "S": "$ao#v1#root"
+          },
+          "note": {
+            "S": "one"
+          },
+          "id": {
+            "S": "b"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#b"
+          },
+          "f": {
+            "S": "b"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$ao#v1#side#side#[object object]"
+          },
+          "side": {
+            "M": {
+              "a": {
+                "N": "1"
+              }
+            }
+          },
+          "s": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ao#v1#roots#b"
+          },
+          "__edd_e__": {
+            "S": "Side"
+          }
+        }
+      ]
+    }
+  }
+}

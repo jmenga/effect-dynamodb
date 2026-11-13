@@ -614,6 +614,77 @@ describe("GeoSearch", () => {
       expect(await Effect.runPromise(nearby(7))).toEqual([])
       expect(mockQuery).toHaveBeenCalled()
     })
+
+    it("a pkFilter in every shape is read as a plain object is; an input is spread, as on 1.40.0 (#239)", async () => {
+      // Up to 1.40.0 both were spread, which copies an object's own properties alone. A pkFilter
+      // is now read by name; `put` still spreads its input (the copy it hands the parser is
+      // 1.40.0's), so an input whose fields aren't its own properties fails as it did.
+      const shapes: Record<string, <T extends object>(record: T) => T> = {
+        plain: (record) => ({ ...record }),
+        "Object.create": (record) => Object.create(record),
+        "class with getters": (record) => {
+          class Given {}
+          for (const [name, value] of Object.entries(record)) {
+            Object.defineProperty(Given.prototype, name, { get: () => value })
+          }
+          return new Given() as never
+        },
+        proxy: (record) =>
+          new Proxy({} as typeof record, {
+            get: (_, name) => Reflect.get(record, name),
+            has: (_, name) => name in record,
+          }),
+      }
+      const layer = Layer.merge(TestDynamoClient, FleetTable.layer({ name: "geo-fleet" }))
+      const seen: Record<string, unknown> = {}
+      const puts: Record<string, unknown> = {}
+      for (const [shape, make] of Object.entries(shapes)) {
+        store = new Map()
+        vi.clearAllMocks()
+        const input = { vehicleId: "v1", depot: 7, ...SF_CENTER, timestamp: NOW }
+        const put = await Effect.runPromise(
+          FleetGeo.put(make(input))
+            .asEffect()
+            .pipe(
+              Effect.as("stored"),
+              Effect.catchTag("ValidationError", (error) =>
+                Effect.succeed(
+                  `${error._tag}: ${String((error.cause as Error | undefined)?.message)}`,
+                ),
+              ),
+              Effect.provide(layer),
+            ),
+        )
+        puts[shape] = { put, sent: mockPutItem.mock.calls.length }
+        if (put !== "stored") {
+          vi.clearAllMocks()
+          await Effect.runPromise(FleetGeo.put(input).asEffect().pipe(Effect.provide(layer)))
+        }
+        const hits = await Effect.runPromise(
+          FleetGeo.nearby({
+            center: SF_CENTER,
+            radius: 1000,
+            unit: "m",
+            timeWindow: { start: NOW, end: NOW + 1000 },
+            pkFilter: make({ depot: 7 }),
+          }).pipe(Effect.provide(layer)),
+        )
+        seen[shape] = {
+          stored: mockPutItem.mock.calls.map(([sent]) => sent.Item),
+          queried: mockQuery.mock.calls.map(([sent]) => sent.ExpressionAttributeValues),
+          found: hits.map((hit: any) => hit.item),
+        }
+      }
+      expect((seen.plain as any).found.map((item: any) => item.vehicleId)).toEqual(["v1"])
+      for (const shape of Object.keys(shapes)) expect(seen[shape]).toEqual(seen.plain)
+      const missing = { put: 'ValidationError: Missing key\n  at ["vehicleId"]', sent: 0 }
+      expect(puts).toEqual({
+        plain: { put: "stored", sent: 1 },
+        "Object.create": missing,
+        "class with getters": missing,
+        proxy: missing,
+      })
+    })
   })
 
   describe("a pkFilter composite whose codec encode takes its own output", () => {
@@ -777,7 +848,7 @@ describe("GeoSearch", () => {
       }
     })
 
-    it("bound enrich is the same as unbound enrich", () => {
+    it("bound enrich is the same as unbound enrich", async () => {
       // enrich is pure — no need to provide layers
       const input: Entity.Input<typeof Vehicles> = {
         vehicleId: "v-bind-enrich",
@@ -789,7 +860,7 @@ describe("GeoSearch", () => {
       // We need to bind to test, but enrich should produce same result
       const unboundEnriched = VehicleGeo.enrich(input)
 
-      Effect.runPromise(
+      await Effect.runPromise(
         Effect.gen(function* () {
           const bound = yield* GeoIndex.bind(VehicleGeo)
           const boundEnriched = bound.enrich(input)

@@ -1,0 +1,6716 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0"
+ ],
+ "note": "Captured from published effect-dynamodb@1.40.0 on DynamoDB Local by running test/helpers/AggregateManagedContext.ts with its modules: each shape created, then ten no-op updates, an update of the root alone and ten no-op updates. Never regenerate: it is what 1.40.0 did.",
+ "1.40.0": {
+  "a sub-aggregate's discriminator": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "side": {
+      "N": "7"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$mgd#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "side": {
+      "N": "7"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#tag#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Tag"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "side": {
+             "N": "7"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "side": {
+             "N": "7"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "a one edge's own discriminator": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "sk": {
+      "S": "$mgd#v1#note#slot#main"
+     },
+     "text": {
+      "S": "n"
+     },
+     "slot": {
+      "S": "main"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "slot": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "slot": {
+             "S": "x"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "slot": {
+             "S": "main"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note#slot#main"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the timestamp updatedAt, declared on the root": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:14.914Z"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     },
+     "sk": {
+      "S": "$mgd#v1#line#k1"
+     },
+     "k": {
+      "S": "k1"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:14.914Z"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "createdAt": {
+      "S": "2026-11-13T02:39:14.914Z"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:14.914Z"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:14.914Z"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     },
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:14.914Z"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:14.959Z"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:14.914Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:14.959Z"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:14.914Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "k": {
+             "S": "k1"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:14.959Z"
+            },
+            "__edd_e__": {
+             "S": "Line"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#line#k1"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:14.914Z"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the timestamp updatedAt, not declared on the root": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.013Z"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     },
+     "sk": {
+      "S": "$mgd#v1#line#k1"
+     },
+     "k": {
+      "S": "k1"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:15.013Z"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.013Z"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:15.013Z"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.013Z"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     },
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:15.013Z"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.013Z"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:15.071Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:15.071Z"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.013Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "k": {
+             "S": "k1"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:15.071Z"
+            },
+            "__edd_e__": {
+             "S": "Line"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#line#k1"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.013Z"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the timestamp createdAt, declared on the root": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.120Z"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     },
+     "sk": {
+      "S": "$mgd#v1#line#k1"
+     },
+     "k": {
+      "S": "k1"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:15.120Z"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.120Z"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:15.120Z"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.120Z"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     },
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "2026-11-13T02:39:15.120Z"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.120Z"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:15.157Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.120Z"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:15.157Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "k": {
+             "S": "k1"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.120Z"
+            },
+            "__edd_e__": {
+             "S": "Line"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#line#k1"
+            },
+            "updatedAt": {
+             "S": "2026-11-13T02:39:15.157Z"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the timestamp a renamed updated stamp": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.205Z"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     },
+     "sk": {
+      "S": "$mgd#v1#line#k1"
+     },
+     "modified": {
+      "S": "2026-11-13T02:39:15.205Z"
+     },
+     "k": {
+      "S": "k1"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "modified": {
+      "S": "2026-11-13T02:39:15.205Z"
+     },
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.205Z"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "2026-11-13T02:39:15.205Z"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     },
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "modified": {
+      "S": "2026-11-13T02:39:15.205Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "modified": {
+             "S": "2026-11-13T02:39:15.241Z"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.205Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "modified": {
+             "S": "2026-11-13T02:39:15.241Z"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.205Z"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "k": {
+             "S": "k1"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "modified": {
+             "S": "2026-11-13T02:39:15.241Z"
+            },
+            "__edd_e__": {
+             "S": "Line"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#line#k1"
+            },
+            "createdAt": {
+             "S": "2026-11-13T02:39:15.205Z"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the key attribute: the sort key attribute sk": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the key attribute: the collection sort key's mirror csk": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "csk": {
+      "S": "$mgd#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "csk": {
+      "S": "$mgd#v1#agg"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            },
+            "csk": {
+             "S": "$mgd#v1#agg"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "csk": {
+             "S": "$mgd#v1#note"
+            },
+            "text": {
+             "S": "n"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "lsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the key attribute: the list partition key attribute status": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "status": {
+      "S": "open"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "gsi1sk": {
+      "S": "$mgd#v1#bystatus#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     },
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "status": {
+      "S": "$mgd#v1#bystatus#open"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "status": {
+             "S": "$mgd#v1#bystatus#$mgd#v1#bystatus#open"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            },
+            "gsi1sk": {
+             "S": "$mgd#v1#bystatus#a"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "status": {
+             "S": "$mgd#v1#bystatus#open"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "a member's own declared field, given the root's value": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "sk": {
+      "S": "$mgd#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "code": {
+             "S": "c"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "text": {
+             "S": "n"
+            },
+            "code": {
+             "S": "c"
+            },
+            "__edd_e__": {
+             "S": "Note"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#note"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "a many edge's key composite, the element's equal to the root's": {
+   "create": {
+    "ok": true
+   },
+   "created": [
+    {
+     "sk": {
+      "S": "$mgd#v1#line#k1"
+     },
+     "k": {
+      "S": "k1"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$mgd#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "k": {
+      "S": "k1"
+     },
+     "pk": {
+      "S": "$mgd#v1#agg#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "steps": [
+    {
+     "step": "no change 1",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 2",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 3",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 4",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 5",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 6",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 7",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 8",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 9",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 10",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "root title",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "a"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "k": {
+             "S": "k1"
+            },
+            "__edd_e__": {
+             "S": "Root"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#root"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "k": {
+             "S": "k1"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "Line"
+            },
+            "pk": {
+             "S": "$mgd#v1#agg#a"
+            },
+            "sk": {
+             "S": "$mgd#v1#line#k1"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 11",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 12",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 13",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 14",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 15",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 16",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 17",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 18",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 19",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "no change 20",
+     "update": {
+      "ok": true
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$mgd#v1#agg#a"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

@@ -38,10 +38,20 @@ import type { ConditionInput, ExpressionResult } from "../Expression.js"
 import { toAttributeMap } from "../Marshaller.js"
 import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import type { BoundUpdateOp, BoundWriteOp } from "./BoundCrud.js"
-import { withGuard } from "./EntityOps.js"
-import { compileExpr, type Expr, emptyPartProblem, isExpr, parseShorthand } from "./Expr.js"
+import { type PutKind, withGuard } from "./EntityOps.js"
 import {
+  compileExpr,
+  type Expr,
+  emptyPartProblem,
+  isExpr,
+  operandsAsStored,
+  parseShorthand,
+  unsentIn,
+} from "./Expr.js"
+import {
+  andRaw,
   composePrimaryKeyOrFail,
+  type RawCondition,
   rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
@@ -186,7 +196,14 @@ const compileOpCondition = (
 ): ExpressionResult | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>)
-  return compileExpr(expr, entity._resolveDbName) as ExpressionResult
+  // Its operands in the form the attribute holds, as the entity's own write sends them (#242), and
+  // an entry of a sparse map a `field:` rename stores whole asked where the row holds it (#238). A
+  // path below its field is named as stored (#238).
+  return compileExpr(
+    entity._entryForms(operandsAsStored(expr, entity._storedFormAt)),
+    entity._resolveDbName,
+    entity._storedBelow,
+  ) as ExpressionResult
 }
 
 /**
@@ -331,7 +348,7 @@ type BuiltPut = Effect.Success<ReturnType<typeof validateAndBuildPutItem>>
 /** One caller op, with everything its items need that takes no read. */
 interface PreparedOp {
   readonly type: "put" | "delete" | "conditionCheck" | "planned"
-  readonly putKind?: "put" | "create" | "upsert" | undefined
+  readonly putKind?: PutKind | undefined
   readonly entity: Entity
   /** Index into the caller's `operations` array — preserved for provenance. */
   readonly opIndex: number
@@ -433,6 +450,18 @@ export const prepareTransactWriteOps = (
             cause: `${operation}: Transaction.check() was given an empty condition. Nothing was sent.`,
           })
         }
+        // `Expression.condition` compiled an operand without its map entry keyed `__proto__`
+        // (`EDD-9165`), as 1.40.0 did, and DynamoDB refused what that left on every path.
+        const unsent = unsentIn(checkOp._condition)
+        if (unsent !== undefined) {
+          return yield* new ValidationError({
+            entityType: checkOp._entity.entityType,
+            operation: `${operation}.check`,
+            cause:
+              `${operation}: Transaction.check()'s condition compares with a value DynamoDB ` +
+              `can't store: ${unsent.describe()} Nothing was sent.`,
+          })
+        }
         ops.push({
           type: "conditionCheck",
           entity: checkOp._entity,
@@ -461,6 +490,9 @@ export const prepareTransactWriteOps = (
         yield* rejectUnsupportedOp(entity, operation, "update", undefined, undefined, {
           updateState,
         })
+        // Its condition, refused here as every op's is, before any op of the transaction reads:
+        // planning compiles it only after the reads (#236).
+        yield* refuseEmptyParts(entity, operation, "update", updateState.condition)
         const encoded = yield* entity._encodeKey(key, `${operation}.update.decodeKey`)
         // What the update decides from its own operands: refused here, and planned from.
         const prepared = yield* entity._prepareUpdate(key, updateState, encoded)
@@ -487,6 +519,7 @@ export const prepareTransactWriteOps = (
           returnValues: deleteRequest.returnValues,
           readsStoredRow: true,
         })
+        yield* refuseEmptyParts(entity, operation, "delete", deleteRequest.condition)
         const encoded = yield* entity._encodeKey(key, `${operation}.delete.decodeKey`)
         ops.push({
           type: "planned",
@@ -736,7 +769,6 @@ export const buildTransactWriteItems = (
             userCondition: op.condition,
             create: op.putKind === "create",
             operation,
-            key: op.input!,
             composeKeys: built.composeKeys,
           })
           guarded.push({ opIndex: op.opIndex, start: items.length, plan })
@@ -754,7 +786,10 @@ export const buildTransactWriteItems = (
         const over =
           op.putKind === "create"
             ? yield* op.entity._overTombstone(built.item)
-            : Option.none<ConditionInput>()
+            : Option.none<{
+                readonly guard: ConditionInput
+                readonly term: RawCondition | undefined
+              }>()
         push(
           {
             Put: {
@@ -762,7 +797,13 @@ export const buildTransactWriteItems = (
               Item: Option.isSome(over) ? toAttributeMap(built.item) : built.marshalled,
               ...conditionFields(
                 Option.isSome(over)
-                  ? compileOpCondition(op.entity, withGuard(over.value, op.callerCondition))
+                  ? andRaw(
+                      compileOpCondition(
+                        op.entity,
+                        withGuard(over.value.guard, op.callerCondition),
+                      ),
+                      over.value.term,
+                    )
                   : op.condition,
               ),
             },

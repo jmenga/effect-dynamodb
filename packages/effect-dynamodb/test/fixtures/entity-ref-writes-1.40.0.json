@@ -1,0 +1,8028 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published package on DynamoDB Local: never regenerate or \"fix\" it. 1.39.0 is the same but for an upsert that writes no index key at all where 1.40.0 writes the partition key half it can compose. keys (helpers/EntityRefWrites.ts): for each key type a Team is keyed by, Teams a and b seeded, Players put naming a, upserted naming b, updated, patched and transactWrite-updated to name the other team, read by a .within() bound on teamId (maxSkips 0), the team b renamed with a cascade to Players, and each Player read. optional: a ref declared required, Schema.optionalKey or Schema.optional, Players put, created and upserted without teamId, the ref removed by .remove([\"team\"]) and .remove([\"teamId\"]), a team set on a row without one, a cascade, and each Player read. Each step is an outcome (ok: the value, a date as its epoch milliseconds, a bigint as \"<n>n\"; or a failure by tag, operation and cause) and the requests it sent, the table name as <table>. rows: the table after the writes; cascadeRows: after the cascade.",
+ "keys": {
+  "String": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "x"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_x#teamid_t1"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p2"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "y"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_y#teamid_t1"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "upsert p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": "t2",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t2"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = :u4, #u5 = :u5",
+        "ExpressionAttributeNames": {
+         "#u0": "id",
+         "#u1": "league",
+         "#u2": "nick",
+         "#u3": "team",
+         "#u4": "gsi2pk",
+         "#u5": "__edd_e__",
+         "#kpk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "p3"
+         },
+         ":u1": {
+          "S": "L"
+         },
+         ":u2": {
+          "S": "z"
+         },
+         ":u3": {
+          "M": {
+           "id": {
+            "S": "t2"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u4": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":u5": {
+          "S": "Player"
+         }
+        },
+        "ConditionExpression": "(attribute_not_exists(#kpk) OR (#u2 = :u2))",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": "t2",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t2"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "S": "t2"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "patch p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": "t2",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t2"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "S": "t2"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$refw#v1#player#id_p2"
+            },
+            "sk": {
+             "S": "$refw#v1#player"
+            }
+           },
+           "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#u0": "team",
+            "#u1": "gsi1sk",
+            "#exists": "pk"
+           },
+           "ExpressionAttributeValues": {
+            ":u0": {
+             "M": {
+              "id": {
+               "S": "t1"
+              },
+              "name": {
+               "S": "Tigers"
+              }
+             }
+            },
+            ":u1": {
+             "S": "$refw#v1#player#id_p2"
+            }
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "within eq": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p2",
+        "league": "L",
+        "nick": "y",
+        "team": {
+         "id": "t1",
+         "name": "Tigers"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p1",
+        "league": "L",
+        "nick": "x",
+        "team": {
+         "id": "t2",
+         "name": "Bears"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": "t2",
+       "name": "Bulls"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t2"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_t2"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": "t2",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": "t2",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_t1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "t2"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_t1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "t2"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t2"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t2"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_t1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "t2"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_t1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "t2"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t2"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t2"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "Number": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": 5,
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000005"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "x"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "N": "5"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_x#teamid_0000000000000005"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_0000000000000005"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": 5,
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000005"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p2"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "y"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "N": "5"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_y#teamid_0000000000000005"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_0000000000000005"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "upsert p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": 6,
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = :u4, #u5 = :u5",
+        "ExpressionAttributeNames": {
+         "#u0": "id",
+         "#u1": "league",
+         "#u2": "nick",
+         "#u3": "team",
+         "#u4": "gsi2pk",
+         "#u5": "__edd_e__",
+         "#kpk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "p3"
+         },
+         ":u1": {
+          "S": "L"
+         },
+         ":u2": {
+          "S": "z"
+         },
+         ":u3": {
+          "M": {
+           "id": {
+            "N": "6"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u4": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":u5": {
+          "S": "Player"
+         }
+        },
+        "ConditionExpression": "(attribute_not_exists(#kpk) OR (#u2 = :u2))",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": 6,
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "N": "6"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "patch p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": 6,
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "N": "6"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000005"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$refw#v1#player#id_p2"
+            },
+            "sk": {
+             "S": "$refw#v1#player"
+            }
+           },
+           "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#u0": "team",
+            "#u1": "gsi1sk",
+            "#exists": "pk"
+           },
+           "ExpressionAttributeValues": {
+            ":u0": {
+             "M": {
+              "id": {
+               "N": "5"
+              },
+              "name": {
+               "S": "Tigers"
+              }
+             }
+            },
+            ":u1": {
+             "S": "$refw#v1#player#id_p2"
+            }
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "within eq": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p2",
+        "league": "L",
+        "nick": "y",
+        "team": {
+         "id": 5,
+         "name": "Tigers"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p1",
+        "league": "L",
+        "nick": "x",
+        "team": {
+         "id": 6,
+         "name": "Bears"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": 6,
+       "name": "Bulls"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_6"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": 6,
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": 5,
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": 6,
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_0000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_0000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "N": "5"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_0000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_0000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "N": "5"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "NumberFromString": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected number\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "put p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected number\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "upsert p3": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected number\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "update p1": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected number\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "patch p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected number\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected number\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "within eq": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": 6,
+       "name": "Bulls"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_0000000000000006"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "BigInt": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": "5n",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000005"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "x"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "N": "5"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_x#teamid_00000000000000000000000000000000000005"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_00000000000000000000000000000000000005"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": "5n",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000005"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p2"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "y"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "N": "5"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_y#teamid_00000000000000000000000000000000000005"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_00000000000000000000000000000000000005"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "upsert p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": "6n",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = :u4, #u5 = :u5",
+        "ExpressionAttributeNames": {
+         "#u0": "id",
+         "#u1": "league",
+         "#u2": "nick",
+         "#u3": "team",
+         "#u4": "gsi2pk",
+         "#u5": "__edd_e__",
+         "#kpk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "p3"
+         },
+         ":u1": {
+          "S": "L"
+         },
+         ":u2": {
+          "S": "z"
+         },
+         ":u3": {
+          "M": {
+           "id": {
+            "N": "6"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u4": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":u5": {
+          "S": "Player"
+         }
+        },
+        "ConditionExpression": "(attribute_not_exists(#kpk) OR (#u2 = :u2))",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": "6n",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "N": "6"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "patch p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": "6n",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "N": "6"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000005"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$refw#v1#player#id_p2"
+            },
+            "sk": {
+             "S": "$refw#v1#player"
+            }
+           },
+           "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#u0": "team",
+            "#u1": "gsi1sk",
+            "#exists": "pk"
+           },
+           "ExpressionAttributeValues": {
+            ":u0": {
+             "M": {
+              "id": {
+               "N": "5"
+              },
+              "name": {
+               "S": "Tigers"
+              }
+             }
+            },
+            ":u1": {
+             "S": "$refw#v1#player#id_p2"
+            }
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "within eq": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p2",
+        "league": "L",
+        "nick": "y",
+        "team": {
+         "id": "5n",
+         "name": "Tigers"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p1",
+        "league": "L",
+        "nick": "x",
+        "team": {
+         "id": "6n",
+         "name": "Bears"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": "6n",
+       "name": "Bulls"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_6"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": "6n",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": "5n",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": "6n",
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_00000000000000000000000000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_00000000000000000000000000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "N": "5"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_00000000000000000000000000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_00000000000000000000000000000000000005"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "N": "5"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "6"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "BigIntFromString": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected bigint\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "put p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected bigint\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "upsert p3": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected bigint\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "update p1": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected bigint\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "patch p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected bigint\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected bigint\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "within eq": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": "6n",
+       "name": "Bulls"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_00000000000000000000000000000000000006"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "6"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_00000000000000000000000000000000000006"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "DateTimeUtc": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": {
+         "date": 1700000000000
+        },
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_2023-11-14t22:13:20.000z"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "x"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_x#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": {
+         "date": 1700000000000
+        },
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_2023-11-14t22:13:20.000z"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p2"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "y"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "2023-11-14T22:13:20.000Z"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_y#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "upsert p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_2027-01-15t08:00:00.000z"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = :u4, #u5 = :u5",
+        "ExpressionAttributeNames": {
+         "#u0": "id",
+         "#u1": "league",
+         "#u2": "nick",
+         "#u3": "team",
+         "#u4": "gsi2pk",
+         "#u5": "__edd_e__",
+         "#kpk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "p3"
+         },
+         ":u1": {
+          "S": "L"
+         },
+         ":u2": {
+          "S": "z"
+         },
+         ":u3": {
+          "M": {
+           "id": {
+            "S": "2027-01-15T08:00:00.000Z"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u4": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":u5": {
+          "S": "Player"
+         }
+        },
+        "ConditionExpression": "(attribute_not_exists(#kpk) OR (#u2 = :u2))",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_2027-01-15t08:00:00.000z"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "S": "2027-01-15T08:00:00.000Z"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "patch p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_2027-01-15t08:00:00.000z"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "S": "2027-01-15T08:00:00.000Z"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_2023-11-14t22:13:20.000z"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$refw#v1#player#id_p2"
+            },
+            "sk": {
+             "S": "$refw#v1#player"
+            }
+           },
+           "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#u0": "team",
+            "#u1": "gsi1sk",
+            "#exists": "pk"
+           },
+           "ExpressionAttributeValues": {
+            ":u0": {
+             "M": {
+              "id": {
+               "S": "2023-11-14T22:13:20.000Z"
+              },
+              "name": {
+               "S": "Tigers"
+              }
+             }
+            },
+            ":u1": {
+             "S": "$refw#v1#player#id_p2"
+            }
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "within eq": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p2",
+        "league": "L",
+        "nick": "y",
+        "team": {
+         "id": {
+          "date": 1700000000000
+         },
+         "name": "Tigers"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": [
+       {
+        "id": "p1",
+        "league": "L",
+        "nick": "x",
+        "team": {
+         "id": {
+          "date": 1800000000000
+         },
+         "name": "Bears"
+        }
+       }
+      ]
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": {
+        "date": 1800000000000
+       },
+       "name": "Bulls"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_2027-01-15t08:00:00.000z"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_2027-01-15t08:00:00.000z"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": {
+         "date": 1700000000000
+        },
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "2027-01-15T08:00:00.000Z"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "2027-01-15T08:00:00.000Z"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "2027-01-15T08:00:00.000Z"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_2027-01-15t08:00:00.000z"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "2027-01-15T08:00:00.000Z"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "S": "2027-01-15T08:00:00.000Z"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "2023-11-14T22:13:20.000Z"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "2027-01-15T08:00:00.000Z"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_2027-01-15t08:00:00.000z"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "DateTimeUtc stored as DateEpochMs": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": {
+         "date": 1700000000000
+        },
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0001700000000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "x"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "N": "1700000000000"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_x#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": {
+         "date": 1700000000000
+        },
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0001700000000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p2"
+         },
+         "league": {
+          "S": "L"
+         },
+         "nick": {
+          "S": "y"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "N": "1700000000000"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi2pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         "gsi2sk": {
+          "S": "$refw#v1#player#nick_y#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "upsert p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0001800000000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = :u4, #u5 = :u5",
+        "ExpressionAttributeNames": {
+         "#u0": "id",
+         "#u1": "league",
+         "#u2": "nick",
+         "#u3": "team",
+         "#u4": "gsi2pk",
+         "#u5": "__edd_e__",
+         "#kpk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "p3"
+         },
+         ":u1": {
+          "S": "L"
+         },
+         ":u2": {
+          "S": "z"
+         },
+         ":u3": {
+          "M": {
+           "id": {
+            "N": "1800000000000"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u4": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":u5": {
+          "S": "Player"
+         }
+        },
+        "ConditionExpression": "(attribute_not_exists(#kpk) OR (#u2 = :u2))",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0001800000000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "N": "1800000000000"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "patch p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0001800000000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "N": "1800000000000"
+           },
+           "name": {
+            "S": "Bears"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0001700000000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "command": "TransactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$refw#v1#player#id_p2"
+            },
+            "sk": {
+             "S": "$refw#v1#player"
+            }
+           },
+           "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#u0": "team",
+            "#u1": "gsi1sk",
+            "#exists": "pk"
+           },
+           "ExpressionAttributeValues": {
+            ":u0": {
+             "M": {
+              "id": {
+               "N": "1700000000000"
+              },
+              "name": {
+               "S": "Tigers"
+              }
+             }
+            },
+            ":u1": {
+             "S": "$refw#v1#player#id_p2"
+            }
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "within eq": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": {
+        "date": 1800000000000
+       },
+       "name": "Bulls"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0001800000000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_1800000000000"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "league": "L",
+       "nick": "x",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "ok": {
+       "id": "p2",
+       "league": "L",
+       "nick": "y",
+       "team": {
+        "id": {
+         "date": 1700000000000
+        },
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "ok": {
+       "id": "p3",
+       "league": "L",
+       "nick": "z",
+       "team": {
+        "id": {
+         "date": 1800000000000
+        },
+        "name": "Bears"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "1800000000000"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "N": "1700000000000"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "1800000000000"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1700000000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0001700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1800000000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0001800000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "x"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_x#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "1800000000000"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "y"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "gsi2sk": {
+      "S": "$refw#v1#player#nick_y#teamid_2023-11-14t22:13:20.000z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_2023-11-14t22:13:20.000z"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p2"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p2"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "N": "1700000000000"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "z"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "league": {
+      "S": "L"
+     },
+     "gsi2pk": {
+      "S": "$refw#v1#player#league_l"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p3"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p3"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Bears"
+       },
+       "id": {
+        "N": "1800000000000"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1700000000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0001700000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1800000000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0001800000000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "DateEpochSeconds": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected DateTime.Utc\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "put p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected DateTime.Utc\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "upsert p3": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected DateTime.Utc\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "update p1": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected DateTime.Utc\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "patch p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected DateTime.Utc\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "transactWrite update p2": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "get.decode",
+      "cause": "Expected DateTime.Utc\n  at [\"id\"]"
+     },
+     "requests": []
+    },
+    "within eq": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "within gte": {
+     "outcome": {
+      "ok": []
+     },
+     "requests": [
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :sk1 AND :sk2",
+        "FilterExpression": "#eddE IN (:et0)",
+        "ExpressionAttributeNames": {
+         "#eddE": "__edd_e__",
+         "#pk": "gsi2pk",
+         "#sk": "gsi2sk"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#league_l"
+         },
+         ":sk1": {
+          "S": "$refw#v1#player#"
+         },
+         ":sk2": {
+          "S": "$refw#v1#player#￿"
+         }
+        },
+        "ScanIndexForward": true
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "died": "Error: [EDD-9050] Composite \"teamId\" could not be put into its key form: \"1800000000\" resolves under neither encode nor decode->encode."
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_0000001800000000"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Bulls"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1700000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000001700000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bears"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1800000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000001800000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1700000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000001700000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    },
+    {
+     "name": {
+      "S": "Bulls"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "N": "1800000000"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_0000001800000000"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  }
+ },
+ "optional": {
+  "required": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "nick": {
+          "S": "n"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "put.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "create p3, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "put.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "upsert p4, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "upsert.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "put p5": {
+     "outcome": {
+      "ok": {
+       "id": "p5",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p5"
+         },
+         "nick": {
+          "S": "n"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p5"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "update p1, set nick": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "m",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "nick",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "m"
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p5, remove team": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "update",
+      "cause": ".remove() of \"team\": \"team\" is a ref, so a row without it could not be read. Reassign it with .set({ teamId }). Nothing was sent."
+     },
+     "requests": []
+    },
+    "update p5, remove teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "update",
+      "cause": ".remove() of \"teamId\": \"teamId\" is the id of the ref \"team\", which a row stores whole as \"team\". Reassign it with .set({ teamId }). Nothing was sent."
+     },
+     "requests": []
+    },
+    "update p2, set teamId": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": "t1",
+       "name": "Lions"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Lions"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #ref = :refData",
+        "ExpressionAttributeNames": {
+         "#ref": "team"
+        },
+        "ExpressionAttributeValues": {
+         ":refData": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Lions"
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #ref = :refData",
+        "ExpressionAttributeNames": {
+         "#ref": "team"
+        },
+        "ExpressionAttributeValues": {
+         ":refData": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Lions"
+           }
+          }
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "m",
+       "team": {
+        "id": "t1",
+        "name": "Lions"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p4": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p4"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p5": {
+     "outcome": {
+      "ok": {
+       "id": "p5",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Lions"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "m"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "n"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p5"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p5"
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "m"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Lions"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "n"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p5"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Lions"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "Schema.optionalKey": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "nick": {
+          "S": "n"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "put.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "create p3, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "put.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "upsert p4, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "upsert.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "put p5": {
+     "outcome": {
+      "ok": {
+       "id": "p5",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p5"
+         },
+         "nick": {
+          "S": "n"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p5"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "update p1, set nick": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "m",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "nick",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "m"
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p5, remove team": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "update",
+      "cause": ".remove() of \"team\": \"team\" is a ref, so a row without it could not be read. Reassign it with .set({ teamId }). Nothing was sent."
+     },
+     "requests": []
+    },
+    "update p5, remove teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "update",
+      "cause": ".remove() of \"teamId\": \"teamId\" is the id of the ref \"team\", which a row stores whole as \"team\". Reassign it with .set({ teamId }). Nothing was sent."
+     },
+     "requests": []
+    },
+    "update p2, set teamId": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": "t1",
+       "name": "Lions"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Lions"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #ref = :refData",
+        "ExpressionAttributeNames": {
+         "#ref": "team"
+        },
+        "ExpressionAttributeValues": {
+         ":refData": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Lions"
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #ref = :refData",
+        "ExpressionAttributeNames": {
+         "#ref": "team"
+        },
+        "ExpressionAttributeValues": {
+         ":refData": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Lions"
+           }
+          }
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "m",
+       "team": {
+        "id": "t1",
+        "name": "Lions"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p4": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p4"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p5": {
+     "outcome": {
+      "ok": {
+       "id": "p5",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Lions"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "m"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "n"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p5"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p5"
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "m"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Lions"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "n"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p5"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Lions"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  },
+  "Schema.optional": {
+   "steps": {
+    "put p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p1"
+         },
+         "nick": {
+          "S": "n"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "put p2, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "put.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "create p3, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "put.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "upsert p4, no teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "upsert.decode",
+      "cause": "Missing key\n  at [\"teamId\"]"
+     },
+     "requests": []
+    },
+    "put p5": {
+     "outcome": {
+      "ok": {
+       "id": "p5",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "PutItem",
+       "input": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "p5"
+         },
+         "nick": {
+          "S": "n"
+         },
+         "team": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Player"
+         },
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         },
+         "gsi1pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         },
+         "gsi1sk": {
+          "S": "$refw#v1#player#id_p5"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "update p1, set nick": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "m",
+       "team": {
+        "id": "t1",
+        "name": "Tigers"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "nick",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "m"
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p1"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "update p5, remove team": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "update",
+      "cause": ".remove() of \"team\": \"team\" is a ref, so a row without it could not be read. Reassign it with .set({ teamId }). Nothing was sent."
+     },
+     "requests": []
+    },
+    "update p5, remove teamId": {
+     "outcome": {
+      "failed": "ValidationError",
+      "operation": "update",
+      "cause": ".remove() of \"teamId\": \"teamId\" is the id of the ref \"team\", which a row stores whole as \"team\". Reassign it with .set({ teamId }). Nothing was sent."
+     },
+     "requests": []
+    },
+    "update p2, set teamId": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+        "ExpressionAttributeNames": {
+         "#u0": "team",
+         "#u1": "gsi1sk",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Tigers"
+           }
+          }
+         },
+         ":u1": {
+          "S": "$refw#v1#player#id_p2"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    "cascade": {
+     "outcome": {
+      "ok": {
+       "id": "t1",
+       "name": "Lions"
+      }
+     },
+     "requests": [
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#team#id_t1"
+         },
+         "sk": {
+          "S": "$refw#v1#team"
+         }
+        },
+        "UpdateExpression": "SET #u0 = :u0",
+        "ExpressionAttributeNames": {
+         "#u0": "name",
+         "#exists": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":u0": {
+          "S": "Lions"
+         }
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      },
+      {
+       "command": "Query",
+       "input": {
+        "TableName": "<table>",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "#pk = :pk",
+        "FilterExpression": "#et = :et0",
+        "ExpressionAttributeNames": {
+         "#pk": "gsi1pk",
+         "#et": "__edd_e__"
+        },
+        "ExpressionAttributeValues": {
+         ":et0": {
+          "S": "Player"
+         },
+         ":pk": {
+          "S": "$refw#v1#player#teamid_t1"
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #ref = :refData",
+        "ExpressionAttributeNames": {
+         "#ref": "team"
+        },
+        "ExpressionAttributeValues": {
+         ":refData": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Lions"
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "command": "UpdateItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        },
+        "UpdateExpression": "SET #ref = :refData",
+        "ExpressionAttributeNames": {
+         "#ref": "team"
+        },
+        "ExpressionAttributeValues": {
+         ":refData": {
+          "M": {
+           "id": {
+            "S": "t1"
+           },
+           "name": {
+            "S": "Lions"
+           }
+          }
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p1": {
+     "outcome": {
+      "ok": {
+       "id": "p1",
+       "nick": "m",
+       "team": {
+        "id": "t1",
+        "name": "Lions"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p1"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p2": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p2"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p3": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p3"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p4": {
+     "outcome": {
+      "failed": "ItemNotFound",
+      "cause": ""
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p4"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "get p5": {
+     "outcome": {
+      "ok": {
+       "id": "p5",
+       "nick": "n",
+       "team": {
+        "id": "t1",
+        "name": "Lions"
+       }
+      }
+     },
+     "requests": [
+      {
+       "command": "GetItem",
+       "input": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$refw#v1#player#id_p5"
+         },
+         "sk": {
+          "S": "$refw#v1#player"
+         }
+        }
+       }
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "nick": {
+      "S": "m"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "n"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p5"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Tigers"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p5"
+     }
+    },
+    {
+     "name": {
+      "S": "Tigers"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ],
+   "cascadeRows": [
+    {
+     "nick": {
+      "S": "m"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p1"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p1"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Lions"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "nick": {
+      "S": "n"
+     },
+     "gsi1sk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "__edd_e__": {
+      "S": "Player"
+     },
+     "gsi1pk": {
+      "S": "$refw#v1#player#teamid_t1"
+     },
+     "sk": {
+      "S": "$refw#v1#player"
+     },
+     "id": {
+      "S": "p5"
+     },
+     "pk": {
+      "S": "$refw#v1#player#id_p5"
+     },
+     "team": {
+      "M": {
+       "name": {
+        "S": "Lions"
+       },
+       "id": {
+        "S": "t1"
+       }
+      }
+     }
+    },
+    {
+     "name": {
+      "S": "Lions"
+     },
+     "sk": {
+      "S": "$refw#v1#team"
+     },
+     "id": {
+      "S": "t1"
+     },
+     "pk": {
+      "S": "$refw#v1#team#id_t1"
+     },
+     "__edd_e__": {
+      "S": "Team"
+     }
+    }
+   ]
+  }
+ }
+}

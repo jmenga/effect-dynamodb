@@ -1060,9 +1060,11 @@ export const sharedPartitionSuite = (backend: Backend) => {
   }
 
   describe("two aggregates that both hold one row", () => {
-    // `Line` is shared, so each moves it as 1.39.0 did: a dry run counts it under each aggregate,
-    // and a real run moves it once, the second finding it already at its current key.
-    it.effect("rekey moves it once, and a dry run counts it under each, as 1.39.0 did", () =>
+    // `Line` is shared: whichever aggregate is judged first moves it, and the other finds it at its
+    // current key, put there by the run, so counts it neither moved nor unchanged. A dry run says
+    // the same (#240). On 1.39.0 a dry run counted it under each aggregate (4 moved) and a run
+    // moved it once, the second counting it unchanged.
+    it.effect("rekey moves it once, and a dry run says so", () =>
       Effect.gen(function* () {
         const w = yield* world(backend, overlapDefine, { name: "ownership" })
         yield* w.run((db) =>
@@ -1095,8 +1097,9 @@ export const sharedPartitionSuite = (backend: Backend) => {
           if (Exit.isFailure(done.exit)) throw new Error(String(done.exit.cause))
           const report: any = done.exit.value
           expect(report.conflicts).toEqual([])
-          expect(moved(report)).toBe(dryRun ? 4 : 3)
-          expect(report.unchanged).toBe(dryRun ? 0 : 1)
+          expect(moved(report)).toBe(3)
+          expect(report.unchanged).toBe(0)
+          expect(report.scanned).toBe(3)
           expect(done.rows).toEqual(
             dryRun
               ? created
@@ -1779,6 +1782,11 @@ export const sharedPartitionSuite = (backend: Backend) => {
         expect(done.requests).toEqual(named(expected.requests))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(done.rows).toContainEqual(created.find(lineOf("a")))
+        // The update returns the state as mutated, as 1.39.0 and 1.40.0 did; a get after it reads
+        // A's row, which stays (a difference DESIGN.md §11 "What `update` returns" lists, not changed).
+        const after = yield* w.step((db) => db.aggregates.A.get({ id: "p" }))
+        expect((after.result as any).ok.lines).toHaveLength(1)
+        expect((done.result as any).ok.lines).toEqual([])
         yield* w.opened.close
       }),
     )
@@ -1818,13 +1826,14 @@ export const sharedPartitionSuite = (backend: Backend) => {
     })
     const lid = (owner: string, rows: ReadonlyArray<Row>) =>
       rows.find((row) => row.owner?.S === owner)?.sk?.S?.split("#line#")[1]
-    // `Line` is shared by the three, so each run is 1.39.0's. A dry run names the one link that
-    // can move. A real run moves it, and, where an aggregate reads the partition after another's
-    // move in the same run, the next link too: rows are handled concurrently, so how many links one
-    // run moves depends on timing, on 1.39.0 as here. Run again until nothing moves: every row is
-    // then under its new key.
+    // `Line` is shared by the three. A key holds an aggregate's row only if the row there holds its
+    // values (#240): another owner's row in its way is judged first, as the scan would judge it, so
+    // one run moves the whole chain whatever order the scan meets the rows in, and a dry run says
+    // so. On 1.39.0 a dry run named the one link that could move, and a real run moved one link or
+    // more depending on timing, so it took up to three runs (the fixture's `fourth` rows are where
+    // they all ended).
     for (const order of ["abc", "acb", "bac", "bca", "cab", "cba"]) {
-      it.effect(`scanned ${order}: runs move the chain link by link, as 1.39.0 did`, () =>
+      it.effect(`scanned ${order}: one run moves the whole chain`, () =>
         Effect.gen(function* () {
           const w = yield* world(backend, chainDefine, {
             name: "chain",
@@ -1833,18 +1842,14 @@ export const sharedPartitionSuite = (backend: Backend) => {
             scanOrder: (row) => order.indexOf(ownerOf(row)),
           })
           const dry = yield* w.step((db) => db.tables.Main.rekey({ dryRun: true }))
-          const expectedDry = atForeign(scenario, `rekey ${order} dry run`)
-          expect(inOrder(reportOf(dry.exit))).toEqual(inOrder(expectedDry.report))
+          const first = { scanned: 6, unchanged: 3, moved: 3, indexKeysRewritten: 0, conflicts: [] }
+          expect(inOrder(reportOf(dry.exit))).toEqual(first)
           expect(dry.rows).toEqual(byKey(created))
 
-          let moved = 0
-          for (let run = 0; run < 4; run++) {
-            const next = yield* w.step((db) => db.tables.Main.rekey({}))
-            const report = reportOf(next.exit)
-            expect(report.moved).toBeGreaterThanOrEqual(run < 3 && moved < 3 ? 1 : 0)
-            moved += report.moved
-          }
-          expect(moved).toBe(3)
+          const run = yield* w.step((db) => db.tables.Main.rekey({}))
+          expect(inOrder(reportOf(run.exit))).toEqual(first)
+          const again = yield* w.step((db) => db.tables.Main.rekey({}))
+          expect(reportOf(again.exit)).toMatchObject({ moved: 0, conflicts: [] })
           const done = byKey(yield* w.opened.rows)
           expect(done).toEqual(byKey(atForeign(scenario, `rekey ${order}`).fourth.rows))
           expect(["a", "b", "c"].map((owner) => lid(owner, done))).toEqual([
@@ -1974,6 +1979,11 @@ export const sharedPartitionSuite = (backend: Backend) => {
           expect(done.requests).toEqual(named(expected.requests))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(done.rows.map((row) => row.sk?.S)).toContain(lineKey)
+          // The update returns the state as mutated, as 1.39.0 and 1.40.0 did; a get after it
+          // reads A's row, which stays (a difference DESIGN.md §11 "What `update` returns" lists, not changed).
+          const after = yield* w.step((db) => db.aggregates.A.get({ id: "p q" }))
+          expect((after.result as any).ok.lines).toHaveLength(1)
+          expect((done.result as any).ok.lines).toEqual([])
           yield* w.opened.close
         }),
       )

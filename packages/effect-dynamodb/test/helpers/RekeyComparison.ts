@@ -80,6 +80,7 @@ const nothingToDo = (db: any, table: StoredRows, lagging = 0) =>
       unregistered: 0,
       unrecognizedKey: 0,
       rootNotSeen: 0,
+      ambiguousOwner: 0,
     })
     // What a write stored is what a `put` of the row's values writes, or a state a write leaves on
     // purpose, which the repair has nothing to say about. A key lagging its values is the one kind

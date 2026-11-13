@@ -16,11 +16,13 @@
  */
 
 import { DateTime, Effect, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
+import { ownValue, setOwn } from "./internal/OwnNames.js"
 import {
   getSchemaFields,
   recordValueAst,
   recordValueAstFromAst,
 } from "./internal/SchemaAccessors.js"
+import { zonedIsoText } from "./internal/StoredForm.js"
 import { parseZonedIso } from "./internal/ZonedIso.js"
 
 // ---------------------------------------------------------------------------
@@ -65,7 +67,7 @@ export const getIdentifierField = (
       if (attr.identifier) {
         const fields = getSchemaFields(configured.model)
         if (fields) {
-          const fieldSchema = fields[name]
+          const fieldSchema = ownValue(fields, name)
           if (fieldSchema) return { name, schema: fieldSchema }
         }
         // Fallback: return with a generic string schema
@@ -142,14 +144,14 @@ export const isRefField = (fieldName: string, model: Schema.Top): boolean => {
   // Check ConfiguredModel attributes
   if (isConfiguredModel(model)) {
     const configured = model as ConfiguredModel<Schema.Top>
-    if (configured.attributes[fieldName]?.ref) return true
+    if (ownValue(configured.attributes, fieldName)?.ref) return true
     // Fall through to check schema-level annotation on the inner model
     return isRefField(fieldName, configured.model)
   }
   // Check schema-level annotation
   const fields = getSchemaFields(model)
   if (fields) {
-    const fieldSchema = fields[fieldName]
+    const fieldSchema = ownValue(fields, fieldName)
     if (fieldSchema) return isRef(fieldSchema)
   }
   return false
@@ -351,7 +353,7 @@ export const DateTimeZoned = Schema.String.pipe(
         return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, s))
       }
     }),
-    encode: SchemaGetter.transform((dt: DateTime.Zoned) => DateTime.formatIsoZoned(dt)),
+    encode: SchemaGetter.transform((dt: DateTime.Zoned) => zonedIsoText(dt)),
   }),
   Schema.annotate({
     [DynamoEncodingKey]: { storage: "string", domain: "DateTime.Zoned" } satisfies DynamoEncoding,
@@ -434,27 +436,39 @@ export const TTL = DateEpochSeconds
  *
  * @example
  * ```typescript
- * // Wire: ISO string, DynamoDB: epoch seconds (for TTL)
- * DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
+ * // A model field: a DateTime.Utc stored as epoch seconds (for TTL)
+ * Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
  *
- * // Wire: epoch ms, DynamoDB: ISO string
- * DynamoModel.DateEpochMs.pipe(DynamoModel.storedAs(DynamoModel.DateString))
+ * // A timestamp's `schema`: wire ISO string, DynamoDB epoch seconds
+ * DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
  * ```
  *
- * Type-safe: incompatible domain types produce a compile error:
+ * A date transform model field (`DynamoModel.DateString`, `Schema.DateTimeUtcFromString`) owns its
+ * wire form: `Entity.make` refuses one whose `storedAs` names the other wire kind, and under
+ * `Schema.optional` the transform's own form is stored (#232). Annotate a self schema instead.
+ *
+ * Type-safe: a storage schema of another domain type is a compile error. No `DateTime.Zoned` is
+ * stored as an epoch, which has no zone: forced through a cast, `Entity.make` refuses this one (a
+ * transform), under `Schema.optional` it keeps its ISO form, and a `Schema.DateTimeZoned` field so
+ * annotated refuses a zoned value at the write.
  * ```typescript
  * // Type error — DateTime.Zoned ≠ DateTime.Utc
  * DynamoModel.DateTimeZoned.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs))
  * ```
+ *
+ * `A` is the domain type, as it always was (`storedAs<DateTime.Utc>(DateEpochSeconds)`). `W`, the
+ * storage schema's encoded type, is inferred from it; the schema returned carries it as
+ * {@link StoredAs} `<W>` (#236). Given `A` alone, or a storage schema typed `Schema.Schema<A>`, `W`
+ * is `unknown` and the schema returned is the field schema's own type.
  */
-export const storedAs = <A>(
-  storageSchema: Schema.Schema<A>,
-): (<S extends Schema.Schema<A>>(fieldSchema: S) => S) => {
+export const storedAs = <A, W = unknown>(
+  storageSchema: Schema.Schema<A> & { readonly Encoded: W },
+): (<S extends Schema.Schema<A>>(fieldSchema: S) => WithStoredAs<S, W>) => {
   const storageEncoding = getEncoding(storageSchema as Schema.Top)
   if (!storageEncoding) {
     throw new Error("storedAs: target schema has no DynamoEncoding annotation")
   }
-  return <S extends Schema.Schema<A>>(fieldSchema: S): S => {
+  return <S extends Schema.Schema<A>>(fieldSchema: S): WithStoredAs<S, W> => {
     const currentEncoding = getEncoding(fieldSchema as Schema.Top)
     return (fieldSchema as Schema.Top).pipe(
       Schema.annotate({
@@ -463,9 +477,25 @@ export const storedAs = <A>(
           domain: currentEncoding?.domain ?? storageEncoding.domain,
         } satisfies DynamoEncoding,
       }),
-    ) as unknown as S
+    ) as unknown as WithStoredAs<S, W>
   }
 }
+
+/**
+ * What the type of a schema {@link storedAs} returns carries: the encoded type of the storage
+ * schema it was given (`number` for `DateEpochSeconds`, `string` for `DateString`). It exists only
+ * in the type, never at run time. The entity types read it to tell a `Schema.optional` date whose
+ * `storedAs` names the other wire kind than its transform's, which is the caller's and never
+ * stamped, from a date the library stamps (#236). The property is optional, so the schema returned
+ * and the field schema are each assignable to the other's type, as they were when `storedAs`
+ * returned the field schema's type.
+ */
+export interface StoredAs<W> {
+  readonly "~effect-dynamodb/storedAs"?: W
+}
+
+/** The type {@link storedAs} returns: `S`, carrying {@link StoredAs} `<W>` when `W` is known. */
+export type WithStoredAs<S, W> = unknown extends W ? S : S & StoredAs<W>
 
 // ---------------------------------------------------------------------------
 // ConfiguredModel
@@ -700,10 +730,11 @@ export const isPackedConfig = (value: unknown): value is PackedConfig =>
 export const getPackedFields = (
   model: Schema.Top | ConfiguredModel<any, any>,
 ): globalThis.Record<string, PackedConfig> => {
-  if (!isConfiguredModel(model)) return {}
-  const out: globalThis.Record<string, PackedConfig> = {}
+  // Null-prototype: a field is looked up by name, and a model field may be named `constructor`.
+  const out: globalThis.Record<string, PackedConfig> = Object.create(null)
+  if (!isConfiguredModel(model)) return out
   for (const [name, attr] of Object.entries(model.attributes)) {
-    if (attr.packed) out[name] = attr.packed
+    if (attr.packed) setOwn(out, name, attr.packed)
   }
   return out
 }
@@ -797,10 +828,13 @@ export const isConfiguredModel = (value: unknown): value is ConfiguredModel<Sche
 export const getSparseFields = (
   model: Schema.Top | ConfiguredModel<any, any>,
 ): globalThis.Record<string, SparseConfig> => {
-  if (!isConfiguredModel(model)) return {}
-  const out: globalThis.Record<string, SparseConfig> = {}
+  // Null-prototype: a field is looked up by name (`field in sparseFields`), and a model field may
+  // be named like an `Object.prototype` member (`valueOf`, `constructor`), which a plain object
+  // reports as a sparse map whose prefix is `undefined` (#238).
+  const out: globalThis.Record<string, SparseConfig> = Object.create(null)
+  if (!isConfiguredModel(model)) return out
   for (const [name, attr] of Object.entries(model.attributes)) {
-    if (attr.sparse) out[name] = attr.sparse
+    if (attr.sparse) setOwn(out, name, attr.sparse)
   }
   return out
 }
@@ -990,7 +1024,7 @@ export const configure = <M extends Schema.Top, const A extends ConfigureAttribu
       }
       entry.encoding = encoding
     }
-    resolved[key] = entry
+    setOwn(resolved, key, entry)
   }
 
   // Validate: no field rename targets collide with existing model field names

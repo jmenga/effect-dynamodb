@@ -9,7 +9,7 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
 import { describe, expect, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
 import {
@@ -33,6 +33,8 @@ import {
   targetsFor,
   transactItemTarget,
 } from "../src/internal/WriteDiagnosis.js"
+import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import {
   awsTransactionCanceled,
   awsValidationException,
@@ -54,11 +56,12 @@ import {
   ddbEmptyTableKey,
   ddbExpressionTooLong,
   ddbMemberOutOfRange,
+  ddbOperandType,
   ddbPayloadTooLarge,
   ddbTooManyInOperands,
   ddbTooManyOperators,
 } from "./helpers/MockDynamoClient.js"
-import { tooLargeFailure } from "./helpers/RecordingTable.js"
+import { makeRecordingTable, tooLargeFailure } from "./helpers/RecordingTable.js"
 
 const tooLargeCause = () => tooLargeFailure("TransactWriteItems").cause
 
@@ -757,6 +760,72 @@ describe("WriteDiagnosis (#144)", () => {
       const other: TransactWriteItem = { Put: { ...a.Put!, TableName: "u" } }
       expect(diagnose(rejected(DDB_REPEATED_ITEM), transaction([a, other]))).toBeUndefined()
     })
+
+    describe("P2a through Transaction.transactWrite on the recording table", () => {
+      // The recording table takes a transaction's items in order, as DynamoDB Local does: an
+      // item whose condition fails is that item's cancellation reason, and the repeat is never
+      // reached (`connected.helper-conformance.test.ts`, "tw: one item: …").
+      const Docs = Entity.make({
+        model: Schema.Struct({ docId: Schema.String, n: Schema.Number }),
+        entityType: "Doc",
+        primaryKey: {
+          pk: { field: "pk", composite: ["docId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      })
+      const Main = Table.make({
+        schema: DynamoSchema.make({ name: "wd", version: 1 }),
+        entities: { Docs },
+      })
+      const run = (stored: boolean, ops: ReadonlyArray<"create" | "put">) =>
+        Effect.gen(function* () {
+          const table = makeRecordingTable()
+          const layer = Layer.merge(table.layer, Main.layer({ name: "t" }))
+          if (stored) yield* Docs.put({ docId: "d", n: 1 }).asEffect().pipe(Effect.provide(layer))
+          table.take()
+          const error = yield* Transaction.transactWrite(
+            ops.map((op, i) =>
+              (op === "create" ? Docs.create : Docs.put)({ docId: "d", n: i + 2 }),
+            ),
+          ).pipe(Effect.flip, Effect.provide(layer))
+          const sent = table.take()
+          return { error, sent, stored: [...table.items.values()] }
+        })
+
+      for (const [label, stored, ops, reasons] of [
+        [
+          "the first item's condition fails",
+          true,
+          ["create", "put"],
+          "[ConditionalCheckFailed, None]",
+        ],
+        [
+          "the second item's condition fails on what the first wrote",
+          false,
+          ["put", "create"],
+          "[None, ConditionalCheckFailed]",
+        ],
+      ] as const) {
+        it.effect(
+          `${label}: the table cancels it; the library names the repeat, sending once`,
+          () =>
+            Effect.gen(function* () {
+              const { error, sent, stored: after } = yield* run(stored, ops)
+              expect(sent.map((request) => request.command)).toEqual(["TransactWriteItems"])
+              expect(error._tag).toBe("ValidationError")
+              const failure = error as ValidationError
+              expect(String(failure.cause)).toContain(
+                "the transaction touches one item more than once — operation 0 (Doc) and operation 1 (Doc)",
+              )
+              // What DynamoDB answered is kept: the cancellation, read in order.
+              expect(String(((failure.cause as Error).cause as DynamoError).cause)).toContain(
+                `Transaction cancelled, please refer cancellation reasons for specific reasons ${reasons}`,
+              )
+              expect(after.map((item) => item.n)).toEqual(stored ? [{ N: "1" }] : [])
+            }),
+        )
+      }
+    })
   })
 
   describe("expression limits (P3 / P4 / P5)", () => {
@@ -1428,6 +1497,114 @@ describe("WriteDiagnosis (#144)", () => {
         input: { FilterExpression: "#e0 = :v", ExpressionAttributeNames: { "#e0": "status" } },
       }
       expect(diagnoseRejection(rejected(ddbEmptyIn("Filter")), read)).toBeUndefined()
+    })
+  })
+
+  describe("a condition comparing a value of a type its operator doesn't take (#242)", () => {
+    const map = { M: { value: { N: "1" } } }
+    const compared = (expression: string, values: Record<string, object>): TransactWriteItem => ({
+      Update: {
+        TableName: "t",
+        Key: { pk: { S: "p#a" }, sk: { S: "s" } },
+        UpdateExpression: "SET #e2 = :n",
+        ConditionExpression: expression,
+        ExpressionAttributeNames: { "#e0": "seq", "#e1": "meta", "#e2": "other" },
+        ExpressionAttributeValues: { ":n": { N: "1" }, ...values } as never,
+      },
+    })
+
+    it("< with a map: the attribute it's compared with, as stored", () => {
+      const d = expectTag(
+        diagnose(
+          rejected(ddbOperandType("<", "M")),
+          transaction([
+            compared("attribute_not_exists(#pk) OR #e1.#e0 < :v", { ":v": map }),
+            put("z"),
+          ]),
+        ),
+        "OperandType",
+      )
+      expect(d.attribute).toBe("meta.seq")
+      expect(d.operator).toBe("<")
+      expect(d.operandType).toBe("M")
+      expect(d.target.source).toBe("operation 0 (Doc)")
+      const text = explainDiagnosis(d, "append")
+      expect(text).toContain('compares "meta.seq" with < to a value stored as a map (M)')
+      expect(text).toContain("Nothing was written.")
+    })
+
+    it("the value on the left, and BETWEEN", () => {
+      expect(
+        expectTag(
+          diagnose(
+            rejected(ddbOperandType(">=", "L")),
+            single(compared(":v >= #e0", { ":v": { L: [] } })),
+          ),
+          "OperandType",
+        ).attribute,
+      ).toBe("seq")
+      expect(
+        expectTag(
+          diagnose(
+            rejected(ddbOperandType("BETWEEN", "BOOL")),
+            single(
+              compared("#e0 BETWEEN :lo AND :hi", { ":lo": { N: "1" }, ":hi": { BOOL: true } }),
+            ),
+          ),
+          "OperandType",
+        ).attribute,
+      ).toBe("seq")
+    })
+
+    it("in a cancellation reason: the entry at that position", () => {
+      const d = expectTag(
+        diagnose(
+          cancelled([undefined, { Code: "ValidationError", Message: ddbOperandType("<", "M") }]),
+          transaction([put("z"), compared("#e0 < :v", { ":v": map })]),
+        ),
+        "OperandType",
+      )
+      expect(d.target.source).toBe("operation 1 (Doc)")
+    })
+
+    it("no such comparison in the request, or the other expression kind: passed through", () => {
+      // DynamoDB names a list; the condition compares a map.
+      expect(
+        diagnose(rejected(ddbOperandType("<", "L")), single(compared("#e0 < :v", { ":v": map }))),
+      ).toBeUndefined()
+      // DynamoDB names `>`; the condition compares with `<`.
+      expect(
+        diagnose(rejected(ddbOperandType(">", "M")), single(compared("#e0 < :v", { ":v": map }))),
+      ).toBeUndefined()
+      expect(
+        diagnose(
+          rejected(ddbOperandType("<", "M", "Update")),
+          single(compared("#e0 < :v", { ":v": map })),
+        ),
+      ).toBeUndefined()
+    })
+
+    it("opt-in: a site that doesn't name it passes DynamoDB's refusal through", async () => {
+      const error = rejected(ddbOperandType("<", "M"))
+      const sent = () => single(compared("#e0 < :v", { ":v": map }))
+      const run = (optIn?: ReadonlyArray<"OperandType">) =>
+        Effect.runPromise(
+          Effect.fail(error).pipe(
+            diagnoseFailure({
+              sent,
+              keys: () => KEYS,
+              ...(optIn !== undefined && { optIn }),
+              rewrite: (diagnosis, original) =>
+                diagnosedValidationError(diagnosis, original, {
+                  operation: "put",
+                  entityType: "Doc",
+                }),
+            }),
+            Effect.flip,
+          ),
+        )
+      expect(await run()).toBe(error)
+      expect((await run(["OperandType"]))._tag).toBe("ValidationError")
     })
   })
 

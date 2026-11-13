@@ -154,7 +154,10 @@ describe("EDD-9109: a value stored in a table key attribute", () => {
     it.effect(`at run time, ${position.name} stored elsewhere keeps the composed key`, () => {
       const Docs = Entity.make({ entityType: "Doc", ...position.accepted } as never) as any
       const MainTable = Table.make({ schema, entities: { Docs } }) as any
-      const table = makeRecordingTable()
+      const keyAttributes = position.accepted.primaryKey as typeof primaryKey
+      const table = makeRecordingTable({
+        keys: { pk: keyAttributes.pk.field, sk: keyAttributes.sk.field },
+      })
       const named = position.name.includes("named as")
       const input = {
         id: "a b",
@@ -164,14 +167,10 @@ describe("EDD-9109: a value stored in a table key attribute", () => {
         const db: any = yield* DynamoClient.make({ entities: { Docs }, tables: { MainTable } })
         yield* db.entities.Docs.put(input).asEffect()
         const [row] = [...table.items.values()] as ReadonlyArray<Record<string, any>>
-        const keyAttributes = position.accepted.primaryKey as typeof primaryKey
         expect(row![keyAttributes.pk.field].S).toBe("$keys#v1#doc#id_a%20b")
         expect(row![keyAttributes.sk.field].S).toBe("$keys#v1#doc")
         expect(row![position.stored]).toBeDefined()
-        // The recorder's table keys on `pk` and `sk`: other names read back on DynamoDB Local.
-        if (keyAttributes.pk.field === "pk") {
-          expect((yield* db.entities.Docs.get({ id: "a b" })).id).toBe("a b")
-        }
+        expect((yield* db.entities.Docs.get({ id: "a b" })).id).toBe("a b")
       }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "keys" })))) as never
     })
   }

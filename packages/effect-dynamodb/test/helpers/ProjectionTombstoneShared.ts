@@ -10,7 +10,12 @@
  * once and must never be regenerated from this repo: the scenarios must send, store and return
  * exactly that, except where `carried` says what `create` over a tombstone now carries that 1.39.0
  * didn't (the attributes of the projection that wrote the tombstone, when it isn't the one with
- * `removal` defined last).
+ * `removal` defined last), and where `since` says what the row token (#237) changes.
+ *
+ * The row token is left out of every outcome (`withoutRowToken`). A scenario `since` names sends
+ * what `fixtures/projection-tombstones-shared-row-token.json` holds, captured from this repo's
+ * source when the token was added, and stores and returns 1.39.0's outcome with `since`'s changes
+ * applied, which that fixture is checked against too.
  *
  * Each scenario takes the library as an argument, so the same code ran against the published
  * 1.39.0 to make the fixture as runs against this repo's source to compare with it.
@@ -50,13 +55,14 @@ export interface Fixture {
   readonly scenarios: Record<string, Outcome>
 }
 
-export const fixture = (): Fixture =>
-  JSON.parse(
-    readFileSync(
-      new URL("../fixtures/projection-tombstones-shared-1.39.0.json", import.meta.url),
-      "utf8",
-    ),
-  ) as Fixture
+const fixtureFile = (name: string): Fixture =>
+  JSON.parse(readFileSync(new URL(`../fixtures/${name}`, import.meta.url), "utf8")) as Fixture
+
+export const fixture = (): Fixture => fixtureFile("projection-tombstones-shared-1.39.0.json")
+
+/** What the scenarios `since` names send, store and return with the row token (#237). */
+export const rowTokenFixture = (): Fixture =>
+  fixtureFile("projection-tombstones-shared-row-token.json")
 
 class Placed extends Schema.TaggedClass<Placed>()("Placed", { amount: Schema.Number }) {}
 class Cancelled extends Schema.TaggedClass<Cancelled>()("Cancelled", {}) {}
@@ -954,6 +960,177 @@ const otherScenarios = (lib: Library): Record<string, Scenario> => {
   return out
 }
 
+/**
+ * What the row token (#237) changes in a scenario's outcome from 1.39.0's, and why: what steps
+ * return, by label, and the stored items' attributes, by partition key (`null`: no longer stored).
+ */
+interface Since {
+  readonly why: string
+  readonly results?: Record<string, unknown>
+  readonly items?: Record<string, Record<string, unknown>>
+}
+
+const absentRead =
+  "A projection's write for a row it read absent proves the key still holds nothing, instead " +
+  "of reading the key again for a tombstone to replace: one GetItem fewer for each new row."
+
+export const since: Record<string, Since> = {
+  "ledger: a shared row the order projection removes": {
+    why:
+      "The order projection's tombstone keeps the invoice projection's checkpoint and revision, " +
+      "and the invoice projection's row over it keeps the order projection's: the redelivered " +
+      "invoice event and the late removal are recognised. 1.39.0 applied the invoice event " +
+      "again, bringing the removed row back, and the late removal removed the row the invoice " +
+      "projection wrote after it.",
+    results: {
+      "invoice redelivered": { removed: true, applied: 0, alreadyApplied: 1 },
+      "order's late removal": { removed: false, applied: 0, alreadyApplied: 1 },
+    },
+    items: {
+      "$shared#v1#ledger#id_x1": {
+        __edd_e__: { S: "Ledger" },
+        __edd_removed__: null,
+        id: { S: "x1" },
+        invoiceVersion: { N: "2" },
+        revision: { N: "2" },
+        total: { N: "7" },
+      },
+    },
+  },
+  "ledger: a shared row removed twice": {
+    why:
+      "The order projection's tombstone keeps the invoice projection's checkpoint and revision: " +
+      "the invoice projection's removal folds its one new event, and the order projection's " +
+      "late removal is recognised. 1.39.0 folded both streams again.",
+    results: {
+      "invoice removes": { removed: true, applied: 1, alreadyApplied: 0 },
+      "order's late removal": { removed: true, applied: 0, alreadyApplied: 1 },
+    },
+    items: {
+      "$shared#v1#ledger#id_x3": { invoiceVersion: { N: "2" }, revision: { N: "2" } },
+    },
+  },
+  "ledger: a shared row with a projection without removal": {
+    why:
+      "The order projection's tombstone keeps the payment projection's checkpoint: its " +
+      "redelivered event is recognised. 1.39.0 applied it again and brought the removed row back.",
+    results: { "payment redelivered": { removed: true, applied: 0, alreadyApplied: 1 } },
+    items: {
+      "$shared#v1#ledger#id_x4": {
+        __edd_e__: { S: "Ledger#tombstone" },
+        __edd_removed__: { S: "1970-01-01T00:00:00.000Z" },
+        id: null,
+        orderRev: { N: "1" },
+        orderVersion: { N: "2" },
+        total: null,
+      },
+    },
+  },
+  "ledger: create over a shared row's tombstone": {
+    why:
+      "The order projection's tombstone keeps the shipment projection's checkpoint map and " +
+      "revision, and `create` over it carries them, the revision raised.",
+    results: {
+      create: {
+        id: "x2",
+        total: 3,
+        orderVersion: 2,
+        orderRev: 2,
+        checkpoints: { "shipment#x2": 1 },
+        revision: 2,
+      },
+    },
+    items: {
+      "$shared#v1#ledger#id_x2": {
+        checkpoints: { M: { "shipment#x2": { N: "1" } } },
+        revision: { N: "2" },
+      },
+    },
+  },
+  "race: create lands between a projection's read of a tombstone and its write": {
+    why:
+      "`create` lands between A's read of B's tombstone and A's write, so A's write fails " +
+      "(retry 0) where 1.39.0's replaced the created row; B's tombstone kept A's checkpoint and " +
+      "revision, which the created row carries.",
+    results: { "A's next event": { failed: "ConcurrentModification" } },
+    items: {
+      "$race#v1#race#id_r1": {
+        a: { N: "1" },
+        b: { N: "1" },
+        ra: { N: "2" },
+        rb: { N: "2" },
+        total: { N: "10" },
+      },
+    },
+  },
+  "race: create lands between a projection's read of a tombstone and its write, in a transaction": {
+    why:
+      "As without a transaction: A's write fails where 1.39.0's replaced the row the " +
+      "transaction created.",
+    results: { "A's next event": { failed: "ConcurrentModification" } },
+    items: {
+      "$race#v1#race#id_r1": {
+        a: { N: "1" },
+        b: { N: "1" },
+        ra: { N: "2" },
+        rb: { N: "2" },
+        total: { N: "10" },
+      },
+    },
+  },
+  "race: another projection removes the row again between a read and a write (retry 0)": {
+    why: "B's tombstone keeps A's checkpoint and revision.",
+    items: { "$race#v1#race#id_r2": { a: { N: "1" }, ra: { N: "1" } } },
+  },
+  "race: another projection removes the row again between a read and a write (retry 2)": {
+    why:
+      "B's tombstone keeps A's checkpoint: A's retry folds its one new event, and B's " +
+      "redelivered removal is recognised. 1.39.0 folded A's stream again, and B's redelivery " +
+      "removed the row A wrote after it.",
+    results: {
+      "A's next event": { removed: false, applied: 1, alreadyApplied: 0 },
+      "B redelivered": { removed: false, applied: 0, alreadyApplied: 1 },
+    },
+    items: {
+      "$race#v1#race#id_r2": {
+        __edd_e__: { S: "Race" },
+        __edd_removed__: null,
+        a: { N: "2" },
+        id: { S: "r2" },
+        ra: { N: "2" },
+        total: { N: "2" },
+      },
+    },
+  },
+  "race: another projection writes a row over the tombstone between a read and a write (retry 0)": {
+    why: "B's row over A's tombstone keeps A's checkpoint and revision.",
+    items: { "$race#v1#race#id_r2": { a: { N: "1" }, ra: { N: "1" } } },
+  },
+  "race: another projection writes a row over the tombstone between a read and a write (retry 2)": {
+    why:
+      "B's row over A's tombstone keeps A's checkpoint: A's retry folds its one new event, " +
+      "and B's redelivered event is recognised. 1.39.0 applied A's removal again, and B's " +
+      "event twice.",
+    results: {
+      "A's next event": { removed: false, applied: 1, alreadyApplied: 0 },
+      "B redelivered": { removed: false, applied: 0, alreadyApplied: 1 },
+    },
+    items: { "$race#v1#race#id_r2": { ra: { N: "2" } } },
+  },
+  "roles: A's data field is B's checkpoint, A's row removed and written again": { why: absentRead },
+  "one projection: a sparse checkpoint map a field-mapped source leaves empty": { why: absentRead },
+  "roles: A's data field is B's checkpoint, create over A's tombstone with its own value": {
+    why: absentRead,
+  },
+  "roles: A's data field is B's revision, A's row removed and written again": { why: absentRead },
+  "roles: create over A's tombstone, A's checkpoint B's revision (B defined first)": {
+    why: absentRead,
+  },
+  "roles: create over A's tombstone, A's checkpoint B's revision (B defined last)": {
+    why: absentRead,
+  },
+}
+
 /** Every scenario, by name, for `lib`. Each defines its own read model, so none reaches another. */
 export const scenarios = (lib: Library): Record<string, Scenario> => ({
   ...ledgerScenarios(lib),
@@ -988,6 +1165,88 @@ const inKeyOrder = (
       const kb = `${b.pk?.S}\u0000${b.sk?.S}`
       return ka < kb ? -1 : ka > kb ? 1 : 0
     })
+
+/** The row token's attribute (#237). */
+const ROW_TOKEN = "__edd_rt__"
+
+/** A condition naming the row token read, after the write's own. */
+/** Whether `text`'s parentheses balance. */
+const balanced = (text: string): boolean => {
+  let depth = 0
+  for (const char of text) {
+    if (char === "(") depth++
+    else if (char === ")" && --depth < 0) return false
+  }
+  return depth === 0
+}
+
+/**
+ * A condition `(guard) AND (term)` split at the term proving the row as read (#237): the row token
+ * read, or, for a row read without one, its absence and the projections' bookkeeping as read
+ * (`#eddTb…`), with the tombstone's (`#eddRm`). The guard, or `undefined` for a condition without
+ * one.
+ */
+const withoutTokenTerm = (condition: string): string | undefined => {
+  const separator = ") AND ("
+  for (let i = condition.indexOf(separator); i >= 0; i = condition.indexOf(separator, i + 1)) {
+    const guard = condition.slice(1, i)
+    const term = condition.slice(i + separator.length, -1)
+    if (
+      condition.startsWith("(") &&
+      condition.endsWith(")") &&
+      balanced(guard) &&
+      balanced(term) &&
+      term.includes("#eddRt") &&
+      !guard.includes("#eddRt")
+    )
+      return guard
+  }
+  return undefined
+}
+
+/**
+ * A `Put`'s item and condition without the row token, and without the request for the item as
+ * stored that a write naming the token makes (to name what changed when it fails).
+ */
+const putWithoutRowToken = (put: Record<string, any> | undefined) => {
+  if (put === undefined) return
+  if (put.Item !== undefined) delete put.Item[ROW_TOKEN]
+  const guard = withoutTokenTerm(put.ConditionExpression ?? "")
+  if (guard === undefined) return
+  const term = (put.ConditionExpression as string).slice(guard.length + 7)
+  put.ConditionExpression = guard
+  delete put.ReturnValuesOnConditionCheckFailure
+  for (const name of Object.keys(put.ExpressionAttributeNames)) {
+    if (term.includes(name) && !guard.includes(name)) delete put.ExpressionAttributeNames[name]
+  }
+  if (put.ExpressionAttributeValues === undefined) return
+  for (const name of Object.keys(put.ExpressionAttributeValues)) {
+    if (term.includes(name) && !guard.includes(name)) delete put.ExpressionAttributeValues[name]
+  }
+  if (Object.keys(put.ExpressionAttributeValues).length === 0) delete put.ExpressionAttributeValues
+}
+
+/**
+ * `outcome` without the row token (#237): 128 random bits, left out of the stored items and the
+ * requests' items, and the term naming the one read (and the request for the item as stored that
+ * comes with it) left out of their conditions. What the token
+ * holds and how a write names it is pinned in `EventStore.projection-row-token.test.ts`.
+ */
+const withoutRowToken = (outcome: Outcome): Outcome => {
+  const out = JSON.parse(JSON.stringify(outcome)) as {
+    requests: Array<{ operation: string; input: any }>
+    items: Array<Record<string, unknown>>
+    results: Outcome["results"]
+  }
+  for (const item of out.items) delete item[ROW_TOKEN]
+  for (const { operation, input } of out.requests) {
+    if (operation === "putItem") putWithoutRowToken(input)
+    if (operation === "transactWriteItems") {
+      for (const item of input.TransactItems) putWithoutRowToken(item.Put)
+    }
+  }
+  return out
+}
 
 /**
  * Run `scenario` on tables named `tables` over `client` (a layer of the library's `DynamoClient`);
@@ -1050,7 +1309,7 @@ export const run = <E, R>(
     if (pending.run !== undefined) return yield* Effect.die(new Error("`between` never ran"))
     const stored = yield* items(tables.read)
     // As JSON, so a step that returned nothing reads as the capture does.
-    return JSON.parse(JSON.stringify({ requests, items: inKeyOrder(stored), results })) as Outcome
+    return withoutRowToken({ requests, items: inKeyOrder(stored), results })
   }).pipe(
     Effect.provide(
       Layer.mergeAll(
@@ -1063,10 +1322,50 @@ export const run = <E, R>(
 }
 
 /**
+ * What `scenario` sends, stores and returns: 1.39.0's outcome with what `since` says, its requests
+ * those of the row-token fixture, which must store and return exactly that.
+ */
+export const expected = (name: string, scenario: Scenario): Outcome => {
+  const was = asCaptured(name, scenario)
+  const change = since[name]
+  if (change === undefined) return was
+  const now = rowTokenFixture().scenarios[name]
+  if (now === undefined) throw new Error(`no row-token capture for "${name}"`)
+  const results = change.results ?? {}
+  for (const label of Object.keys(results)) {
+    if (was.results.filter(([at]) => at === label).length !== 1) {
+      throw new Error(`"${name}" has no single step "${label}"`)
+    }
+  }
+  expect(now.results).toEqual(
+    was.results.map(([label, value]) => [
+      label,
+      Object.hasOwn(results, label) ? results[label] : value,
+    ]),
+  )
+  const items = change.items ?? {}
+  expect(now.items).toEqual(
+    inKeyOrder(
+      was.items.map((item) => {
+        const changed = items[(item.pk as { readonly S: string }).S]
+        if (changed === undefined) return item
+        const out: Record<string, unknown> = { ...item }
+        for (const [attribute, value] of Object.entries(changed)) {
+          if (value === null) delete out[attribute]
+          else out[attribute] = value
+        }
+        return out
+      }),
+    ),
+  )
+  return now
+}
+
+/**
  * What 1.39.0 sent, stored and returned for `scenario`, with what `create` over a tombstone now
  * carries (`carried`) appended to its put's item and to the item stored at its key.
  */
-export const expected = (name: string, scenario: Scenario): Outcome => {
+const asCaptured = (name: string, scenario: Scenario): Outcome => {
   const captured = fixture().scenarios[name]
   if (captured === undefined) throw new Error(`no capture for "${name}"`)
   if (scenario.carried === undefined) return captured

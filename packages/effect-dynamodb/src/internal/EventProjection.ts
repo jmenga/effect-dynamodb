@@ -275,7 +275,9 @@ export const resolveRevision = (
  *
  * Outbox items live in the row's own partition (sort key
  * `<row sk>#outbox#<revision>#<n>`, `__edd_e__` `<entityType>#outbox`) — or
- * in `table` when given (keyed by `keys`, default `pk` / `sk`). In the read
+ * in `table` when given (keyed by `keys`, default `pk` / `sk`). An item whose
+ * key another read model's item holds (row keys of the same text, one
+ * revision) is written beside it, its key followed by `#<tag>` (#237). In the read
  * model's table they show in its change stream and in full-table scans (not
  * in the entity's reads, which filter on `__edd_e__`); a separate table keeps
  * them out of both. `index` (a sparse index whose key attributes only outbox
@@ -885,6 +887,17 @@ export const refuseReadModel = (
   }
   if (readModel.timeSeries) {
     refuse("the read model is a `timeSeries` entity, written by `append`, not `put`.")
+  }
+  // The projection sets and reads each of these fields by name on every row it writes (#239), so
+  // whatever attribute stores it, a row can't hold one named `__proto__`.
+  if (options.fields.includes("__proto__")) {
+    throw new Error(
+      `[EDD-9152] ${label}: a field the projection writes on every row (a checkpoint, a ` +
+        `checkpoint map, an instance field or the revision) is named "__proto__". The projection ` +
+        `sets and reads that field by name on each row, and a JavaScript object can't hold a ` +
+        `property of that name by assignment (assigning it sets the object's prototype), so ` +
+        `whatever attribute stores it, the value would be lost. Name it otherwise.`,
+    )
   }
   const declared = modelFields(readModel.model)
   for (const f of options.fields) {

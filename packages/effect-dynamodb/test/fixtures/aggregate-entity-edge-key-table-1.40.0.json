@@ -1,0 +1,148 @@
+{
+  "generatedFrom": [
+    "effect-dynamodb@1.40.0"
+  ],
+  "note": "Captured from published effect-dynamodb 1.40.0 on DynamoDB Local; never regenerate. For each field type, the sort key one element of a many edge stored, the edge declaring entity: (or not, a plain edge) and sk.composite naming the field (or a path into it), under escapeKeys false (off) and true (on). Models and values: test/helpers/AggregateEntityEdgeKeyTable.ts.",
+  "rows": [
+    {
+      "label": "Schema.NumberFromString",
+      "entity off": "$table#v1#entry#5",
+      "entity on": "$table#v1#entry#5",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "Schema.BigIntFromString",
+      "entity off": "$table#v1#entry#5",
+      "entity on": "$table#v1#entry#5",
+      "plain off": "$table#v1#entry#00000000000000000000000000000000000005",
+      "plain on": "$table#v1#entry#00000000000000000000000000000000000005"
+    },
+    {
+      "label": "DynamoModel.DateEpochMs",
+      "entity off": "$table#v1#entry#0001714979289000",
+      "entity on": "$table#v1#entry#0001714979289000",
+      "plain off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain on": "$table#v1#entry#2024-05-06t07:08:09.000z"
+    },
+    {
+      "label": "storedAs(DynamoModel.DateEpochMs)",
+      "entity off": "$table#v1#entry#0001714979289000",
+      "entity on": "$table#v1#entry#0001714979289000",
+      "plain off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain on": "$table#v1#entry#2024-05-06t07:08:09.000z"
+    },
+    {
+      "label": "DynamoModel.DateEpochSeconds",
+      "entity off": "$table#v1#entry#0000001714979289",
+      "entity on": "$table#v1#entry#0000001714979289",
+      "plain off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain on": "$table#v1#entry#2024-05-06t07:08:09.000z"
+    },
+    {
+      "label": "Schema.DateTimeZonedFromString",
+      "entity off": "$table#v1#entry#2024-05-06t09:08:09.000+02:00[europe/paris]",
+      "entity on": "$table#v1#entry#2024-05-06t09:08:09.000+02:00[europe/paris]",
+      "plain off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain on": "$table#v1#entry#2024-05-06t07:08:09.000z"
+    },
+    {
+      "label": "codec x stored x+space",
+      "entity off": "$table#v1#entry#x ",
+      "entity on": "$table#v1#entry#x%20",
+      "plain off": "$table#v1#entry#x",
+      "plain on": "$table#v1#entry#x"
+    },
+    {
+      "label": "codec A stored 41",
+      "entity off": "$table#v1#entry#41",
+      "entity on": "$table#v1#entry#41",
+      "plain off": "$table#v1#entry#a",
+      "plain on": "$table#v1#entry#a"
+    },
+    {
+      "label": "path into a whole-object codec",
+      "entity off": "$table#v1#entry#5",
+      "entity on": "$table#v1#entry#5",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "path into a Schema.Class with a NumberFromString leaf",
+      "entity off": "$table#v1#entry#5",
+      "entity on": "$table#v1#entry#5",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "Schema.DateTimeUtc",
+      "entity off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "entity on": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain on": "$table#v1#entry#2024-05-06t07:08:09.000z"
+    },
+    {
+      "label": "Schema.DateTimeUtcFromString",
+      "entity off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "entity on": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain off": "$table#v1#entry#2024-05-06t07:08:09.000z",
+      "plain on": "$table#v1#entry#2024-05-06t07:08:09.000z"
+    },
+    {
+      "label": "Schema.Number",
+      "entity off": "$table#v1#entry#0000000000000005",
+      "entity on": "$table#v1#entry#0000000000000005",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "Schema.String",
+      "entity off": "$table#v1#entry#a",
+      "entity on": "$table#v1#entry#a",
+      "plain off": "$table#v1#entry#a",
+      "plain on": "$table#v1#entry#a"
+    },
+    {
+      "label": "path into a struct with a NumberFromString leaf",
+      "entity off": "$table#v1#entry#0000000000000005",
+      "entity on": "$table#v1#entry#0000000000000005",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "path into a Schema.Class with a Number leaf",
+      "entity off": "$table#v1#entry#0000000000000005",
+      "entity on": "$table#v1#entry#0000000000000005",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "a union of NumberFromString and a literal",
+      "entity off": "$table#v1#entry#0000000000000005",
+      "entity on": "$table#v1#entry#0000000000000005",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "Schema.NullOr(Schema.NumberFromString)",
+      "entity off": "$table#v1#entry#0000000000000005",
+      "entity on": "$table#v1#entry#0000000000000005",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "Schema.optionalKey(Schema.NumberFromString)",
+      "entity off": "$table#v1#entry#5",
+      "entity on": "$table#v1#entry#5",
+      "plain off": "$table#v1#entry#0000000000000005",
+      "plain on": "$table#v1#entry#0000000000000005"
+    },
+    {
+      "label": "no declared sort key",
+      "entity off": "$table#v1#entry#l1",
+      "entity on": "$table#v1#entry#l1",
+      "plain off": "$table#v1#entry#l1",
+      "plain on": "$table#v1#entry#l1"
+    }
+  ]
+}

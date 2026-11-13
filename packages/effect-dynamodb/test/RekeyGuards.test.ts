@@ -25,7 +25,7 @@ import { it } from "@effect/vitest"
 import { Effect } from "effect"
 import { describe, expect } from "vitest"
 import * as Lib from "../src/index.js"
-import { CASES, capture, type Outcome } from "./helpers/RekeyGuards.js"
+import { CASES, capture, guardGapsOf, type Outcome } from "./helpers/RekeyGuards.js"
 
 const fixture = JSON.parse(
   readFileSync(new URL("./fixtures/rekey-guards-1.39.0.json", import.meta.url), "utf8"),
@@ -39,6 +39,45 @@ const REQUIRED =
   "aggregate, timestamps, a wide row whose node declares updatedAt a string: an update lands before the move"
 const OPTIONAL =
   "aggregate, timestamps, a wide row whose node declares updatedAt an optional string: an update lands before the move"
+
+describe("rows moved under a guard that can miss a write are reported, writes going on", () => {
+  // A wide row guarded on its `updatedAt`, and a part-moved aggregate or stream finished under the
+  // strongest guard that fits. The rest are guarded whole, or by their version, or left as they are.
+  const counted: Partial<Record<(typeof CASES)[number], { stamp?: number; strongest?: number }>> = {
+    "aggregate, timestamps, a row too wide to guard whole: the move's requests": { stamp: 1 },
+    "wide entity, updatedAt stored as zzTime: an update lands before the move": { stamp: 1 },
+    "aggregate part-moved: an update adds a wide row before the root's move": { strongest: 1 },
+    "aggregate part-moved by a run cut short: an update adds a wide row, and rekey runs again": {
+      strongest: 1,
+    },
+    "stream flipped by a run cut short: a wide event lands under its old key, and rekey runs again":
+      { strongest: 1 },
+  }
+  for (const name of CASES) {
+    it.effect(name, () =>
+      Effect.gen(function* () {
+        const { rows, ...counts } = (yield* guardGapsOf(Lib as never, name)) as {
+          readonly rows: ReadonlyArray<{ readonly gap: string }>
+        }
+        const expected = { stamp: 0, sparse: 0, strongest: 0, ...counted[name] }
+        expect(counts).toEqual(expected)
+        // Each row counted is named, once, with its stored key and the key it moved to.
+        expect(rows.map((row) => row.gap).sort()).toEqual(
+          Object.entries(expected).flatMap(([gap, n]) => Array.from({ length: n }, () => gap)),
+        )
+        for (const row of rows) {
+          expect(row).toEqual({
+            member: expect.any(String),
+            kind: expect.stringMatching(/^(item|aggregate|stream)$/),
+            gap: row.gap,
+            key: { pk: expect.any(String), sk: expect.any(String) },
+            target: { pk: expect.any(String), sk: expect.any(String) },
+          })
+        }
+      }),
+    )
+  }
+})
 
 describe("rekey ends as on 1.39.0", () => {
   for (const name of CASES) {

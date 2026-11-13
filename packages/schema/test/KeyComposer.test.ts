@@ -3787,6 +3787,43 @@ describe("composeKeySpace", () => {
     expect(meet(["shop"], ["shop", "idB"])).toBe(true)
   })
 
+  it("with walkOpen, is every key the composer writes, a value holding the delimiter as any text", () => {
+    const valuesOf = (name: string): KeyComposer.CompositeValues =>
+      name === "at" ? "date" : "open"
+    const space = (pk: ReadonlyArray<string>) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, []), valuesOf, {
+        everyForm: true,
+        walkOpen: true,
+      }).pk
+    const any = { kind: "any" }
+    expect(space(["shop", "at"])).toEqual({
+      text: "$a#v1#ledger#shop_",
+      after: ["#at_", ""],
+      values: [any, { kind: "date", zoned: false }],
+      open: false,
+    })
+    const key = (text: string) => ({ text: `$a#v1#ledger#${text}`, after: [], open: false })
+    const owns = (pk: ReadonlyArray<string>, text: string) =>
+      KeyComposer.keySpacesMeet(space(pk), key(text))
+    // A date's text, after a string holding the delimiter.
+    expect(owns(["shop", "at"], "shop_s#at_2026-11-11t08:00:00.000z")).toBe(true)
+    expect(owns(["shop", "at"], "shop_s#x#at_2026-11-11t08:00:00.000z")).toBe(true)
+    // What no date writes, though a reader would take it as the date's text.
+    expect(owns(["shop", "at"], "shop_s#at_x_q")).toBe(false)
+    expect(owns(["at"], "at_x_q")).toBe(false)
+    // A string reads past the next label: the longer key is the shorter's too.
+    expect(owns(["shop"], "shop_s#branch_b")).toBe(true)
+    // Without walkOpen the walk stops at the string, and anything follows it.
+    expect(
+      KeyComposer.keySpacesMeet(
+        KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop", "at"], []), valuesOf, {
+          everyForm: true,
+        }).pk,
+        key("shop_s#at_x_q"),
+      ),
+    ).toBe(true)
+  })
+
   it("meets another when either could start the other", () => {
     const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>) =>
       KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk))
@@ -3837,6 +3874,31 @@ describe("composeKeySpace", () => {
       expect(meet(space(["n"]), space(["n_e"]))).toBe(false)
     })
 
+    it("a date's text starts with its year, and an instant's holds no letter but T and Z", () => {
+      const space = plain({ at: "date", zoned: "zonedDate" })
+      expect(space(["at"]).values).toEqual([{ kind: "date", zoned: false }])
+      // `at_2026-11-11t08:00:00.000z` and `at_x_q`: a date's text can't start with `x`.
+      expect(meet(space(["at"]), space(["at_x"]))).toBe(false)
+      expect(meet(space(["zoned"]), plain({})(["zoned_x"]))).toBe(false)
+      // As text, it can.
+      expect(meet(plain({})(["at"]), space(["at_x"]))).toBe(true)
+      // A date beside a date, a number (a year's digits) or text: the same keys.
+      expect(meet(space(["at"]), space(["at"]))).toBe(true)
+      expect(meet(space(["at"]), plain({ at: "number" })(["at"]))).toBe(true)
+      expect(meet(space(["zoned"]), plain({})(["zoned"]))).toBe(true)
+      // The sign of a wide year.
+      const whole = (text: string) => ({ text, after: [], open: false })
+      expect(meet(space(["at"]), whole("$a#v1#ledger#at_+275760-09-13t00:00:00.000z"))).toBe(true)
+      expect(meet(space(["at"]), whole("$a#v1#ledger#at_-000001-01-01T00:00:00.000Z"))).toBe(true)
+      // An instant's text holds no other letter; a zoned date's holds its zone's name.
+      const tokyo = "2024-01-01t15:00:00.000+09:00[asia/tokyo]"
+      expect(meet(space(["at"]), whole(`$a#v1#ledger#at_${tokyo}`))).toBe(false)
+      expect(meet(space(["zoned"]), whole(`$a#v1#ledger#zoned_${tokyo}`))).toBe(true)
+      // Never empty, never the delimiter.
+      expect(meet(space(["at"]), whole("$a#v1#ledger#at_"))).toBe(false)
+      expect(meet(space(["zoned"]), whole("$a#v1#ledger#zoned_2024#x"))).toBe(false)
+    })
+
     it("a number's text is never empty", () => {
       const space = plain({ n: "number" })
       const whole = { text: "$a#v1#ledger#n_", after: [], open: false }
@@ -3869,5 +3931,24 @@ describe("composeKeySpace", () => {
         { kind: "oneOf", texts: ["a%20b", "a b"] },
       ])
     })
+  })
+})
+
+describe("hasExactText", () => {
+  it("is true for a value with key text of its own", () => {
+    for (const value of ["a", 1, -0.5, 5n, true, new Date(0), DateTime.makeUnsafe(0)]) {
+      expect(KeyComposer.hasExactText(value), String(value)).toBe(true)
+    }
+  })
+
+  it("is false for a value whose text is only its String form", () => {
+    // A Duration 1.39.0 stored, read back: a map whose text is `[object Object]`.
+    const durationMap = { "~effect/Duration": "~effect/Duration", value: { millis: 5000 } }
+    // A DateTime read back: a map carrying the type id, not a DateTime (#133).
+    const dateTimeMap = { "~effect/DateTime": "~effect/DateTime", epochMillis: 0 }
+    expect(DateTime.isDateTime(dateTimeMap)).toBe(true)
+    for (const value of [durationMap, dateTimeMap, [1], new Set(["a"]), null, undefined]) {
+      expect(KeyComposer.hasExactText(value), JSON.stringify(value)).toBe(false)
+    }
   })
 })

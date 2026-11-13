@@ -236,8 +236,8 @@ importers:
         specifier: ^22.0.0
         version: 22.19.15
       effect:
-        specifier: 4.1.2
-        version: 4.1.2
+        specifier: 4.1.3
+        version: 4.1.3
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
@@ -261,14 +261,14 @@ importers:
         specifier: ^3.1104.0
         version: 3.1111.0
       '@effect/vitest':
-        specifier: 4.1.2
-        version: 4.1.2(effect@4.1.2)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))
+        specifier: 4.1.3
+        version: 4.1.3(effect@4.1.3)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))
       '@types/node':
         specifier: ^25.5.0
         version: 25.5.0
       effect:
-        specifier: 4.1.2
-        version: 4.1.2
+        specifier: 4.1.3
+        version: 4.1.3
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
@@ -286,14 +286,14 @@ importers:
         specifier: ^3.1104.0
         version: 3.1111.0
       '@effect/vitest':
-        specifier: 4.1.2
-        version: 4.1.2(effect@4.1.2)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))
+        specifier: 4.1.3
+        version: 4.1.3(effect@4.1.3)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))
       '@types/node':
         specifier: ^25.0.0
         version: 25.5.0
       effect:
-        specifier: 4.1.2
-        version: 4.1.2
+        specifier: 4.1.3
+        version: 4.1.3
       effect-dynamodb:
         specifier: workspace:*
         version: link:../effect-dynamodb
@@ -319,14 +319,14 @@ importers:
   packages/schema:
     devDependencies:
       '@effect/vitest':
-        specifier: 4.1.2
-        version: 4.1.2(effect@4.1.2)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))
+        specifier: 4.1.3
+        version: 4.1.3(effect@4.1.3)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))
       '@types/node':
         specifier: ^25.5.0
         version: 25.5.0
       effect:
-        specifier: 4.1.2
-        version: 4.1.2
+        specifier: 4.1.3
+        version: 4.1.3
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
@@ -706,10 +706,10 @@ packages:
     resolution: {integrity: sha512-kzyuwOAQnXJNLS9PSyrk0CWk35nWJW/zl/6KvnTBMFK65gm7U1/Z5BqjxeapjZCIhQcM/DsrEmcbRwDyXyXK4A==}
     engines: {node: '>=14'}
 
-  '@effect/vitest@4.1.2':
-    resolution: {integrity: sha512-JJPwAHkJHxvM/woW9mMW/khjasAHcmwWdOMAgMy16rfqsxcVhFDnrRsvN9VI2+kMv8zDCCyBE2q1n5hzZlfE0w==}
+  '@effect/vitest@4.1.3':
+    resolution: {integrity: sha512-HgwaaL0BqPX1/tXWQxa1+AfWjcWdJs/+sgxkOTXVDOJuqYpgqDkvZfVdwh1CJ9iNAS7Xx370ranRcNC4X+3v+A==}
     peerDependencies:
-      effect: ^4.1.2
+      effect: ^4.1.3
       vitest: '>=5.0.0 <6.0.0'
 
   '@emmetio/abbreviation@2.3.3':
@@ -1925,8 +1925,8 @@ packages:
     resolution: {integrity: sha512-2QF/g9/zTaPDc3BjNcVTGoBbXBgYfMTTceLaYcFJ/W9kggFUkhxD/hMEeuLKbugyef9SqAx8cpgwlIP/jinUTA==}
     engines: {node: '>=4'}
 
-  effect@4.1.2:
-    resolution: {integrity: sha512-d3Oah1WyKxFLFh19yWheS5IXIVaITzxZ71JkE1rkUozq/6EcJSU5nPk5bF2QrSygZ3SQoiNQB8TsxFriyMeMaQ==}
+  effect@4.1.3:
+    resolution: {integrity: sha512-QWNEu35groH/78Ejq01lZGt8U0sF1P4nrhbcAZz5WffcS27bUUK9C/db+xWWUwNYUvFD5SrSLE0mFGtwyP0PCQ==}
 
   electron-to-chromium@1.5.313:
     resolution: {integrity: sha512-QBMrTWEf00GXZmJyx2lbYD45jpI3TUFnNIzJ5BBc8piGUDwMPa1GV6HJWTZVvY/eiN3fSopl7NRbgGp9sZ9LTA==}
@@ -4220,9 +4220,9 @@ snapshots:
 
   '@ctrl/tinycolor@4.2.0': {}
 
-  '@effect/vitest@4.1.2(effect@4.1.2)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))':
+  '@effect/vitest@4.1.3(effect@4.1.3)(vitest@5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0)))':
     dependencies:
-      effect: 4.1.2
+      effect: 4.1.3
       vitest: 5.0.3(@types/node@25.5.0)(vite@7.3.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.9.0))
 
   '@emmetio/abbreviation@2.3.3':
@@ -5350,7 +5350,7 @@ snapshots:
 
   dset@3.1.4: {}
 
-  effect@4.1.2: {}
+  effect@4.1.3: {}
 
   electron-to-chromium@1.5.313: {}
 

@@ -1,0 +1,1787 @@
+{
+  "generatedFrom": "effect-dynamodb@1.40.0 (published) on DynamoDB Local, captured once by a scratch script mirroring test/helpers/AppendSparseMaps.ts. Never regenerate: this is what 1.40.0 did.",
+  "cases": {
+    "an append of the unrenamed map's entries, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "zones",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {
+                        "east": {
+                          "S": "y"
+                        }
+                      }
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          },
+          "zones": {
+            "M": {
+              "east": {
+                "S": "y"
+              }
+            }
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    },
+    "an append of the unrenamed map empty, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "zones",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {}
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          },
+          "zones": {
+            "M": {}
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    },
+    "an append of the renamed map's entries, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "nm",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {
+                        "west": {
+                          "S": "w"
+                        }
+                      }
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "nm": {
+                      "M": {
+                        "west": {
+                          "S": "w"
+                        }
+                      }
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "nm": {
+            "M": {
+              "west": {
+                "S": "w"
+              }
+            }
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "nm": {
+            "M": {
+              "west": {
+                "S": "w"
+              }
+            }
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "west": "w"
+        }
+      }
+    },
+    "an append of the renamed map empty, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "nm",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {}
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "nm": {
+                      "M": {}
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "nm": {
+            "M": {}
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "nm": {
+            "M": {}
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {}
+      }
+    },
+    "an append removing the unrenamed map, escapeKeys false": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": ".remove() of \"zones\": \"zones\" is a sparse map, stored as one attribute per entry. Use .removeEntries(\"zones\", [...]) or .clearMap(\"zones\"). Nothing was sent."
+      },
+      "requests": [],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 1,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    },
+    "an append of neither map, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    },
+    "an append of the unrenamed map's entries, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "zones",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {
+                        "east": {
+                          "S": "y"
+                        }
+                      }
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          },
+          "zones": {
+            "M": {
+              "east": {
+                "S": "y"
+              }
+            }
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    },
+    "an append of the unrenamed map empty, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "zones",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {}
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          },
+          "zones": {
+            "M": {}
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    },
+    "an append of the renamed map's entries, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "nm",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {
+                        "west": {
+                          "S": "w"
+                        }
+                      }
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "nm": {
+                      "M": {
+                        "west": {
+                          "S": "w"
+                        }
+                      }
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "nm": {
+            "M": {
+              "west": {
+                "S": "w"
+              }
+            }
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "nm": {
+            "M": {
+              "west": {
+                "S": "w"
+              }
+            }
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "west": "w"
+        }
+      }
+    },
+    "an append of the renamed map empty, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2, #a3 = :a3",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "nm",
+                    "#a3": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "M": {}
+                    },
+                    ":a3": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "nm": {
+                      "M": {}
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "nm": {
+            "M": {}
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "nm": {
+            "M": {}
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {}
+      }
+    },
+    "an append removing the unrenamed map, escapeKeys true": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": ".remove() of \"zones\": \"zones\" is a sparse map, stored as one attribute per entry. Use .removeEntries(\"zones\", [...]) or .clearMap(\"zones\"). Nothing was sent."
+      },
+      "requests": [],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 1,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    },
+    "an append of neither map, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log"
+                    }
+                  },
+                  "UpdateExpression": "SET #a0 = :a0, #a1 = :a1, #a2 = :a2",
+                  "ConditionExpression": "attribute_not_exists(#_tspk) OR #_tsob < :_tsNewOb",
+                  "ExpressionAttributeNames": {
+                    "#a0": "id",
+                    "#a1": "at",
+                    "#a2": "__edd_e__",
+                    "#_tspk": "pk",
+                    "#_tsob": "at"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":a0": {
+                      "S": "h"
+                    },
+                    ":a1": {
+                      "N": "2"
+                    },
+                    ":a2": {
+                      "S": "Log"
+                    },
+                    ":_tsNewOb": {
+                      "N": "2"
+                    }
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "h"
+                    },
+                    "at": {
+                      "N": "2"
+                    },
+                    "pk": {
+                      "S": "$ap#v1#log#id_h"
+                    },
+                    "sk": {
+                      "S": "$ap#v1#log#e#0000000000000002"
+                    },
+                    "__edd_e__": {
+                      "S": "Log"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$ap#v1#log#id_h"
+              },
+              "sk": {
+                "S": "$ap#v1#log"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "n#south": {
+            "S": "s"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log"
+          },
+          "z#east": {
+            "S": "x"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "1"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000001"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Log"
+          },
+          "at": {
+            "N": "2"
+          },
+          "id": {
+            "S": "h"
+          },
+          "pk": {
+            "S": "$ap#v1#log#id_h"
+          },
+          "sk": {
+            "S": "$ap#v1#log#e#0000000000000002"
+          }
+        }
+      ],
+      "read": {
+        "id": "h",
+        "at": 2,
+        "zones": {
+          "east": "x"
+        },
+        "named": {
+          "south": "s"
+        }
+      }
+    }
+  }
+}

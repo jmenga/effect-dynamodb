@@ -18,6 +18,7 @@ import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { indexesOf } from "./helpers/DynamoExpressions.js"
 import { makeRecordingTable, type Request } from "./helpers/RecordingTable.js"
 
 const worldOf = (escapeKeys: boolean) => {
@@ -380,9 +381,9 @@ const captured = (world: World, v: Values) =>
   Effect.gen(function* () {
     const table = makeRecordingTable({
       indexes: {
-        gsi1: { pk: "gsi1pk", sk: "gsi1sk" },
-        gsi2: { pk: "gsi2pk", sk: "gsi2sk" },
-        gsi3: { pk: "gsi3pk", sk: "gsi3sk" },
+        ...indexesOf(Table.definition(world.MainTable)),
+        // The aggregate's collection index: the aggregate isn't registered on this table, so the
+        // table's definition doesn't hold it.
         lsi1: { pk: "pk", sk: "lsi1sk" },
       },
     })

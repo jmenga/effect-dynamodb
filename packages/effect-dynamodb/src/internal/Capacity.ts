@@ -21,6 +21,7 @@ import type {
 } from "@aws-sdk/client-dynamodb"
 import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
+import { isUnreadableName } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import { Cause, Context, Effect, Exit, Stream, Tracer } from "effect"
@@ -47,6 +48,8 @@ export type Command =
   | "TransactGetItems"
   | "TransactWriteItems"
   | "SearchVectors"
+  | "ExecuteStatement"
+  | "ExecuteTransaction"
 
 /** Capacity and request totals, summed over every request of an operation. */
 export interface CapacityTotals {
@@ -524,11 +527,12 @@ const runIn = <A, E, R>(
 /**
  * A value the library refuses to compose into a key, thrown where there's no error channel to fail
  * into: no key text (`[EDD-9096]`), no Z-order level (`[EDD-9092]`), no shard source (`[EDD-9100]`).
+ * Or a caller's object that threw when a name it inherits was read from it (`UnreadableName`, #239).
  * A value DynamoDB can't store is `Marshaller.UnstorableValue`, which every path that marshals a
  * caller's value refuses itself, naming the field (`marshalOrFail`).
  */
 export const isRefusedValue = (u: unknown): boolean =>
-  isKeyValueError(u) || isZOrderValueError(u) || isShardSourceError(u)
+  isKeyValueError(u) || isZOrderValueError(u) || isShardSourceError(u) || isUnreadableName(u)
 
 /** The `ValidationError` for a {@link isRefusedValue} a cause dies of, if it dies of one. */
 const refusalOf = (
@@ -740,6 +744,70 @@ const READ_COMMANDS: ReadonlySet<Command> = new Set([
   "SearchVectors",
 ])
 
+const isSelect = (statement: unknown): boolean =>
+  typeof statement === "string" && /^\s*SELECT\b/i.test(statement)
+
+/**
+ * Whether a request reads: by its command, and for PartiQL by what it says. A transaction holds
+ * reads only or writes only (DynamoDB refuses a mix), so it reads when its statements are `SELECT`s.
+ */
+const isReadRequest = (command: Command, input: Record<string, unknown>): boolean => {
+  if (READ_COMMANDS.has(command)) return true
+  if (command === "ExecuteStatement") return isSelect(input.Statement)
+  if (command === "ExecuteTransaction") {
+    const statements = input.TransactStatements
+    return (
+      Array.isArray(statements) &&
+      statements.length > 0 &&
+      statements.every((entry) =>
+        isSelect((entry as { readonly Statement?: unknown } | null)?.Statement),
+      )
+    )
+  }
+  return false
+}
+
+/** Where the quoted text starting at `start` ends: past its closing quote, a doubled one escaped. */
+const quotedEnd = (text: string, start: number): number => {
+  const quote = text[start]
+  let at = start + 1
+  while (at < text.length) {
+    if (text[at] === quote) {
+      if (text[at + 1] !== quote) return at + 1
+      at += 1
+    }
+    at += 1
+  }
+  return text.length
+}
+
+/**
+ * The table a PartiQL statement names: the identifier after its first `INTO`, `UPDATE` or `FROM`
+ * that isn't inside a string ('...') or a quoted identifier ("..."), quoted or not.
+ */
+const statementTable = (statement: unknown): string | undefined => {
+  if (typeof statement !== "string") return undefined
+  let at = 0
+  while (at < statement.length) {
+    const char = statement[at]
+    if (char === "'" || char === '"') {
+      at = quotedEnd(statement, at)
+      continue
+    }
+    const word = /^\w+/.exec(statement.slice(at, at + 64))?.[0]
+    if (word === undefined) {
+      at += 1
+      continue
+    }
+    at += word.length
+    if (!/^(?:INTO|UPDATE|FROM)$/i.test(word)) continue
+    const rest = statement.slice(at).trimStart()
+    if (rest.startsWith('"')) return rest.slice(1, quotedEnd(rest, 0) - 1).replaceAll('""', '"')
+    return /^\w+/.exec(rest)?.[0]
+  }
+  return undefined
+}
+
 /** Failures of requests that were never sent (a transaction plan's recorded write). */
 const notSentErrors = new WeakSet<object>()
 
@@ -768,6 +836,16 @@ const tablesOf = (command: Command, input: Record<string, unknown>): ReadonlyArr
         }
       }
   }
+  if (command === "ExecuteStatement") {
+    const name = statementTable(input.Statement)
+    if (name !== undefined) names.add(name)
+  }
+  if (command === "ExecuteTransaction" && Array.isArray(input.TransactStatements)) {
+    for (const entry of input.TransactStatements) {
+      const name = statementTable((entry as { readonly Statement?: unknown } | null)?.Statement)
+      if (name !== undefined) names.add(name)
+    }
+  }
   return [...names]
 }
 
@@ -794,13 +872,11 @@ interface Split {
   readonly write: number
 }
 
-const split = (command: Command, c: SdkCapacity | SdkConsumedCapacity): Split => {
+const split = (reads: boolean, c: SdkCapacity | SdkConsumedCapacity): Split => {
   const explicit = c.ReadCapacityUnits !== undefined || c.WriteCapacityUnits !== undefined
   const units = c.CapacityUnits ?? (c.ReadCapacityUnits ?? 0) + (c.WriteCapacityUnits ?? 0)
   if (explicit) return { units, read: c.ReadCapacityUnits ?? 0, write: c.WriteCapacityUnits ?? 0 }
-  return READ_COMMANDS.has(command)
-    ? { units, read: units, write: 0 }
-    : { units, read: 0, write: units }
+  return reads ? { units, read: units, write: 0 } : { units, read: 0, write: units }
 }
 
 const addSplit = (into: MutableIndexCapacity, s: Split): void => {
@@ -811,7 +887,7 @@ const addSplit = (into: MutableIndexCapacity, s: Split): void => {
 
 const addIndexes = (
   existing: Map<string, MutableIndexCapacity> | undefined,
-  command: Command,
+  reads: boolean,
   indexes: Record<string, SdkCapacity> | undefined,
 ): Map<string, MutableIndexCapacity> | undefined => {
   if (indexes === undefined) return existing
@@ -822,7 +898,7 @@ const addIndexes = (
       acc = { capacityUnits: 0, readCapacityUnits: 0, writeCapacityUnits: 0 }
       map.set(name, acc)
     }
-    addSplit(acc, split(command, capacity))
+    addSplit(acc, split(reads, capacity))
   }
   return map
 }
@@ -839,6 +915,8 @@ const tableAccumulator = (scope: OperationScope, name: string): TableAccumulator
 /** What one request contributes, computed once and applied to every enclosing scope. */
 interface RequestRecord {
   readonly command: Command
+  /** Units DynamoDB doesn't split count as reads rather than writes. */
+  readonly reads: boolean
   readonly tables: ReadonlyArray<string>
   readonly capacities: ReadonlyArray<SdkConsumedCapacity>
   readonly reported: boolean
@@ -869,6 +947,7 @@ const describeRequest = (
     const searchBytes = typeof bytes === "number" ? bytes : 0
     return {
       command,
+      reads: true,
       tables,
       capacities: [],
       reported: typeof bytes === "number",
@@ -883,6 +962,7 @@ const describeRequest = (
       writeBytes += v.VectorWriteRequestBytes ?? 0
   return {
     command,
+    reads: isReadRequest(command, input),
     tables,
     capacities,
     reported: capacities.length > 0,
@@ -892,7 +972,7 @@ const describeRequest = (
 }
 
 const applyRequest = (scope: OperationScope, record: RequestRecord): void => {
-  const { command } = record
+  const { command, reads } = record
   scope.totals.requests++
   scope.byCommand[command] = (scope.byCommand[command] ?? 0) + 1
   if (!record.reported) scope.totals.unreportedRequests++
@@ -904,7 +984,7 @@ const applyRequest = (scope: OperationScope, record: RequestRecord): void => {
     if (!record.reported) acc.unreportedRequests++
   }
   for (const c of record.capacities) {
-    const s = split(command, c)
+    const s = split(reads, c)
     scope.totals.capacityUnits += s.units
     scope.totals.readCapacityUnits += s.read
     scope.totals.writeCapacityUnits += s.write
@@ -914,10 +994,10 @@ const applyRequest = (scope: OperationScope, record: RequestRecord): void => {
     addSplit(acc, s)
     if (c.Table !== undefined) {
       acc.table ??= { capacityUnits: 0, readCapacityUnits: 0, writeCapacityUnits: 0 }
-      addSplit(acc.table, split(command, c.Table))
+      addSplit(acc.table, split(reads, c.Table))
     }
-    acc.gsi = addIndexes(acc.gsi, command, c.GlobalSecondaryIndexes)
-    acc.lsi = addIndexes(acc.lsi, command, c.LocalSecondaryIndexes)
+    acc.gsi = addIndexes(acc.gsi, reads, c.GlobalSecondaryIndexes)
+    acc.lsi = addIndexes(acc.lsi, reads, c.LocalSecondaryIndexes)
   }
 }
 
@@ -966,6 +1046,8 @@ export const DATA_PLANE: ReadonlyArray<readonly [keyof DynamoClientService, Comm
   ["transactGetItems", "TransactGetItems"],
   ["transactWriteItems", "TransactWriteItems"],
   ["searchVectors", "SearchVectors"],
+  ["executeStatement", "ExecuteStatement"],
+  ["executeTransaction", "ExecuteTransaction"],
 ]
 
 const InstrumentedTypeId: unique symbol = Symbol.for("effect-dynamodb/Capacity/Instrumented")

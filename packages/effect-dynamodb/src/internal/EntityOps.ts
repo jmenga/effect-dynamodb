@@ -4,15 +4,16 @@
  * Extracted from Entity.ts for decomposition. Not part of the public API.
  */
 
-import type { ReturnValue } from "@aws-sdk/client-dynamodb"
+import type { AttributeValue, ReturnValue } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
-import { type DateTime, Effect, Pipeable, Utils } from "effect"
+import { type DateTime, Effect, Pipeable, type Schema, Utils } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
+import type { RawCondition } from "./TransactableOps.js"
 
 // ---------------------------------------------------------------------------
 // TypeId symbols
@@ -107,9 +108,20 @@ export interface CascadeTarget {
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierField: string
+    readonly keyField: string
     readonly refEntityType: string
+    /** The referenced entity: its `modelSchema` encodes what the ref stores (`refDataOf`). */
+    readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
   }>
+  /** A whole field as a SET writes it: its stored attribute and stored form (`Entity._setOf`). */
+  readonly _setOf: (
+    field: string,
+    wire: unknown,
+    operation: string,
+  ) => Effect.Effect<
+    { readonly attribute: string; readonly value: AttributeValue },
+    ValidationError
+  >
 }
 
 /** @internal */
@@ -298,7 +310,29 @@ export interface EntityGet<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {}
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */
-export interface EntityPut<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {}
+export interface EntityPut<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
+  /** @internal Never `"insert"`: an {@link EntityInsert} is not a put. */
+  readonly _putKind?: Exclude<PutKind, "insert">
+}
+
+/**
+ * Lazy intermediate returned by `Entity.insert()`: one PartiQL `INSERT`, which
+ * a role with only `dynamodb:PartiQLInsert` can run.
+ * `yield*` returns the model type. Pipe to {@link asRecord}, {@link asItem}, or {@link asNative} for alternate decode modes.
+ *
+ * Not accepted by `Entity.condition()`, `Batch.write` or
+ * `Transaction.transactWrite`: a PartiQL `INSERT` has no conditions, and those
+ * paths would send a `PutItem`.
+ *
+ * @typeParam A - Decoded model type
+ * @typeParam Rec - Record type (model + system fields)
+ * @typeParam E - Error channel
+ * @typeParam R - Required services
+ */
+export interface EntityInsert<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
+  /** @internal */
+  readonly _putKind: "insert"
+}
 
 /**
  * Lazy intermediate returned by `Entity.update()`.
@@ -433,19 +467,39 @@ export interface EntityPutOpts {
    * now — an EventStore projection rewriting a row it read keeps the row's.
    */
   readonly createdAt?: DateTime.Utc | undefined
+  /**
+   * @internal An EventStore projection's write (#237): `attributes` set on the stored item
+   * (stored names, stored values: the row token; another projection's bookkeeping is carried in
+   * the value written, so the entity stores it as any value of its field), `condition` ANDed with
+   * the op's (the row token as read, or that the row is still the tombstone read), and
+   * `expectAbsent` when the projection read no row on a read model one of whose projections has
+   * `removal` (its rows may be tombstones), so `create` never takes the place of a tombstone
+   * written since. With `returnOld`, a failed condition asks for the item as stored
+   * (`ReturnValuesOnConditionCheckFailure: "ALL_OLD"`), carried as the failure's `current`, so
+   * the projection names the attribute that changed.
+   */
+  readonly projectionWrite?:
+    | {
+        readonly attributes: Readonly<Record<string, unknown>>
+        readonly condition?: RawCondition | undefined
+        readonly expectAbsent?: boolean | undefined
+        readonly returnOld?: boolean | undefined
+      }
+    | undefined
 }
 
 /**
  * @internal Which `put`-shaped entity operation produced an `EntityPutImpl`.
  *
- * All three share the `EntityPutImpl` carrier and the `_opType: "put"` tag, but
+ * All four share the `EntityPutImpl` carrier and the `_opType: "put"` tag, but
  * they do NOT share write semantics: `upsert` issues an `UpdateItem` whose SET
  * clause uses `if_not_exists` for `createdAt`, immutable fields and the version
  * counter, so a consumer that compiles it as a plain `Put` silently resets
- * `createdAt` and `version`. Consumers that cannot reproduce a kind's semantics
- * must reject it — see `internal/TransactWriteOps.ts` (#100).
+ * `createdAt` and `version`; `insert` is a PartiQL `INSERT`, so a `Put` needs a
+ * permission its role does not have. Consumers that cannot reproduce a kind's
+ * semantics must reject it — see `internal/TransactWriteOps.ts` (#100).
  */
-export type PutKind = "put" | "create" | "upsert"
+export type PutKind = "put" | "create" | "upsert" | "insert"
 
 export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly [EntityOpTypeId]: EntityOpTypeId = EntityOpTypeId as EntityOpTypeId

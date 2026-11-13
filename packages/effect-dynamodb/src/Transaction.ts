@@ -9,6 +9,7 @@
  * transactGet returns a typed tuple inferred per-position.
  */
 
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import {
   type ConcurrentModification,
   type ConditionalCheckFailed,
@@ -29,6 +30,13 @@ import { extractTransactable } from "./Entity.js"
 import type { ExpressionResult } from "./Expression.js"
 import type { AnyGet, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
+import {
+  comparedOperandsOf,
+  markUnsent,
+  operandAsStored,
+  type StoredFormAt,
+  unsentIn,
+} from "./internal/Expr.js"
 import { packedCompiledRefusal } from "./internal/Packed.js"
 import {
   composePrimaryKeyOrFail,
@@ -54,7 +62,7 @@ import {
   transactItemTarget,
   withCause,
 } from "./internal/WriteDiagnosis.js"
-import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
+import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
 
 // ---------------------------------------------------------------------------
@@ -93,10 +101,23 @@ export const check: {
     // Sync API — there is no error channel to fail into, so this stays a throw.
     throw new Error(getRejectReason("Transaction.check"))
   }
+  // A value that is no compiled condition (a string) goes on as given, refused where it's sent,
+  // as on 1.40.0.
+  const stored =
+    typeof condition?.expression === "string"
+      ? storedOperands(
+          info.entity._storedFormAt,
+          condition,
+          storedNames(info.entity._resolveDbName, condition),
+        )
+      : condition
+  // A condition compiled without a `__proto__` entry (`EDD-9165`) stays refused when sent.
+  const unsent = unsentIn(condition)
+  if (unsent !== undefined) markUnsent(stored, unsent)
   // A packed field may be tested only as a whole (`[EDD-9076]`, #147).
   const refused = packedCompiledRefusal(
-    condition.expression,
-    condition.names,
+    stored.expression,
+    stored.names,
     info.entity._packedGuards ?? [],
     "condition check",
   )
@@ -105,9 +126,62 @@ export const check: {
     [ConditionCheckTypeId]: ConditionCheckTypeId,
     _entity: info.entity,
     _key: info.key!,
-    _condition: condition,
+    _condition: stored,
   }
 })
+
+/**
+ * A compiled condition naming the attributes the entity stores (#236). The expression builders
+ * (`Expression.condition`) have no entity, so a name is the one they were given: a model field
+ * stored under another name (`field: "renamed"`) was named as the field, which no row holds.
+ * A name placeholder used only at the start of a document path (an attribute, not a property
+ * below one) whose name is such a field names its stored attribute; every other name is sent as
+ * given, as is a condition holding none.
+ */
+const storedNames = (
+  resolve: (domainName: string) => string,
+  condition: ExpressionResult,
+): ExpressionResult => {
+  const heads = new Set<string>()
+  const below = new Set<string>()
+  for (const match of condition.expression.matchAll(/#[A-Za-z0-9_]+/g)) {
+    const before = condition.expression.slice(0, match.index).trimEnd()
+    ;(before.endsWith(".") ? below : heads).add(match[0])
+  }
+  let names: Record<string, string> | undefined
+  for (const [key, name] of Object.entries(condition.names)) {
+    if (!heads.has(key) || below.has(key)) continue
+    const attribute: unknown = resolve(name)
+    if (typeof attribute !== "string" || attribute === name) continue
+    names ??= { ...condition.names }
+    names[key] = attribute
+  }
+  return names === undefined ? condition : { ...condition, names }
+}
+
+/**
+ * A compiled condition with each operand that is one of Effect's instances (a `DateTime`, a
+ * `BigDecimal`, a `Duration`, an `Option`, a `Redacted`, …) or a `Date` in the form its field
+ * stores it (#236), as a condition on the entity sends it (`operandAsStored`, #242). The builder
+ * has no entity, so it marshalled the instance as its own map, which no row holds. Only a
+ * condition `Expression.condition` built carries its operands (`comparedOperandsOf`); every other
+ * operand, every other condition, and one whose field's stored form the schema doesn't determine
+ * are sent as given.
+ */
+const storedOperands = (
+  storedAt: StoredFormAt,
+  built: ExpressionResult,
+  condition: ExpressionResult,
+): ExpressionResult => {
+  let values: Record<string, AttributeValue> | undefined
+  for (const { placeholder, name, value } of comparedOperandsOf(built) ?? []) {
+    const stored = operandAsStored(storedAt, [name], value, "value")
+    if (Object.is(stored, value)) continue
+    values ??= { ...condition.values }
+    values[placeholder] = toAttributeValue(stored)
+  }
+  return values === undefined ? condition : { ...condition, values }
+}
 
 // ---------------------------------------------------------------------------
 // TransactGet — typed tuple return

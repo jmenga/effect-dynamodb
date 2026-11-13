@@ -1,0 +1,4919 @@
+{
+  "generatedFrom": "effect-dynamodb@1.40.0 (published) on DynamoDB Local, captured once by a scratch script mirroring test/helpers/UnionMemberWrites.ts. Never regenerate: this is what 1.40.0 did.",
+  "cases": {
+    "members renaming their keys crosswise, moved to the other member, standalone, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, standalone, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e"
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, standalone, escapeKeys false": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.x\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) isn"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "a"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, standalone, escapeKeys false": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.e.y\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) i"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f#e",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, standalone, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1[0].#ps2 = :ps3",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kids",
+              "#ps2": "v",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps3": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members renaming their keys crosswise, moved to the other member, transaction, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, transaction, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e"
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, transaction, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "a"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, transaction, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f#e",
+                    "#ps1": "kind",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "b"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, transaction, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1[0].#ps2 = :ps3",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kids",
+                    "#ps2": "v",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps3": {
+                      "N": "2"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members renaming their keys crosswise, moved to the other member, retained, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "y": {
+                          "N": "1"
+                        },
+                        "k": {
+                          "S": "a"
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e",
+          "version": 2
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, retained, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "xa": {
+                          "N": "1"
+                        },
+                        "ka": {
+                          "S": "a"
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "ka": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e",
+          "version": 2
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, retained, escapeKeys false": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.x\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) isn"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "a"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "y": {
+                          "N": "1"
+                        },
+                        "kind": {
+                          "S": "b"
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, retained, escapeKeys false": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.e.y\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) i"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f#e",
+                    "#ps1": "kind",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "f#e": {
+                      "M": {
+                        "x": {
+                          "N": "1"
+                        },
+                        "kind": {
+                          "S": "a"
+                        }
+                      }
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, retained, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[0].#ps2 = :ps3",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kids",
+                    "#ps2": "v",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps3": {
+                      "N": "2"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "kind": {
+                          "S": "node"
+                        },
+                        "kids": {
+                          "L": [
+                            {
+                              "M": {
+                                "kind": {
+                                  "S": "leaf"
+                                },
+                                "v": {
+                                  "N": "1"
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "1"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e",
+          "version": 2
+        }
+      }
+    },
+    "members renaming their keys crosswise, moved to the other member, unique, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, unique, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e"
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, unique, escapeKeys false": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.x\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) isn"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "a"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, unique, escapeKeys false": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.e.y\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) i"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f#e",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, unique, escapeKeys false": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1[0].#ps2 = :ps3",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kids",
+              "#ps2": "v",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps3": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members renaming their keys crosswise, moved to the other member, standalone, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, standalone, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e"
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, standalone, escapeKeys true": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.x\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) isn"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "a"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, standalone, escapeKeys true": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.e.y\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) i"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f#e",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, standalone, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1[0].#ps2 = :ps3",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kids",
+              "#ps2": "v",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps3": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members renaming their keys crosswise, moved to the other member, transaction, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, transaction, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e"
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, transaction, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "a"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, transaction, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f#e",
+                    "#ps1": "kind",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps2": {
+                      "S": "b"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, transaction, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #ps0.#ps1[0].#ps2 = :ps3",
+                  "ConditionExpression": "attribute_exists(#exists)",
+                  "ExpressionAttributeNames": {
+                    "#ps0": "f",
+                    "#ps1": "kids",
+                    "#ps2": "v",
+                    "#exists": "pk"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":ps3": {
+                      "N": "2"
+                    }
+                  },
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members renaming their keys crosswise, moved to the other member, retained, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "y": {
+                          "N": "1"
+                        },
+                        "k": {
+                          "S": "a"
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e",
+          "version": 2
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, retained, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#ps3": "f",
+                    "#ps4": "y",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":ps5": {
+                      "N": "2"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "xa": {
+                          "N": "1"
+                        },
+                        "ka": {
+                          "S": "a"
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "ka": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e",
+          "version": 2
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, retained, escapeKeys true": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.x\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) isn"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kind",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "a"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "y": {
+                          "N": "1"
+                        },
+                        "kind": {
+                          "S": "b"
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, retained, escapeKeys true": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.e.y\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) i"
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f#e",
+                    "#ps1": "kind",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps2": {
+                      "S": "b"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "f#e": {
+                      "M": {
+                        "x": {
+                          "N": "1"
+                        },
+                        "kind": {
+                          "S": "a"
+                        }
+                      }
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, retained, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "transactWriteItems": {
+            "TransactItems": [
+              {
+                "Update": {
+                  "TableName": "<table>",
+                  "Key": {
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc"
+                    }
+                  },
+                  "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[0].#ps2 = :ps3",
+                  "ExpressionAttributeNames": {
+                    "#u0": "version",
+                    "#ps0": "f",
+                    "#ps1": "kids",
+                    "#ps2": "v",
+                    "#retainVer": "version",
+                    "#inc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":vzero": {
+                      "N": "0"
+                    },
+                    ":vinc": {
+                      "N": "1"
+                    },
+                    ":ps3": {
+                      "N": "2"
+                    },
+                    ":retainVer": {
+                      "N": "1"
+                    },
+                    ":inc": {
+                      "S": "<uuid>"
+                    }
+                  },
+                  "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+                  "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "__edd_i__": {
+                      "S": "<uuid>"
+                    },
+                    "f": {
+                      "M": {
+                        "kind": {
+                          "S": "node"
+                        },
+                        "kids": {
+                          "L": [
+                            {
+                              "M": {
+                                "kind": {
+                                  "S": "leaf"
+                                },
+                                "v": {
+                                  "N": "1"
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "__edd_e__": {
+                      "S": "Doc"
+                    },
+                    "sk": {
+                      "S": "$um#v1#doc#v#0000001"
+                    },
+                    "id": {
+                      "S": "a"
+                    },
+                    "pk": {
+                      "S": "$um#v1#doc#id_a"
+                    },
+                    "version": {
+                      "N": "1"
+                    },
+                    "email": {
+                      "S": "e"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+                  "ExpressionAttributeNames": {
+                    "#snap": "pk",
+                    "#snapVer": "version",
+                    "#snapInc": "__edd_i__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":snapVer": {
+                      "N": "1"
+                    },
+                    ":snapInc": {
+                      "S": "<uuid>"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "getItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "__edd_i__": {
+            "S": "<token>"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "1"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc#v#0000001"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e",
+          "version": 2
+        }
+      }
+    },
+    "members renaming their keys crosswise, moved to the other member, unique, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "2"
+              },
+              "kind": {
+                "S": "b"
+              },
+              "k": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 2
+          },
+          "email": "e"
+        }
+      }
+    },
+    "members storing the discriminator under different names, moved to the other member, unique, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2, #ps3.#ps4 = :ps5",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#ps3": "f",
+              "#ps4": "y",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              },
+              ":ps5": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "xa": {
+                "N": "1"
+              },
+              "y": {
+                "N": "2"
+              },
+              "ka": {
+                "S": "a"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "a",
+            "x": 1
+          },
+          "email": "e"
+        }
+      }
+    },
+    "the discriminator alone set to the first member's tag, unique, escapeKeys true": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.x\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) isn"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "a"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "y": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "a"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"x\"])"
+      }
+    },
+    "the discriminator alone set to another member's tag in a sparse map's entry, unique, escapeKeys true": {
+      "outcome": {
+        "fail": "ValidationError",
+        "says": "The update WAS applied, and the stored row no longer matches the model: \"f.e.y\": Missing key. An update that changes a value relative to what's stored (.add, .subtract, .append, the path operations) i"
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+            "ExpressionAttributeNames": {
+              "#ps0": "f#e",
+              "#ps1": "kind",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps2": {
+                "S": "b"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f#e": {
+            "M": {
+              "x": {
+                "N": "1"
+              },
+              "kind": {
+                "S": "b"
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "fail": "ValidationError",
+        "says": "SchemaError(Missing key\n  at [\"f\"][\"e\"][\"y\"])"
+      }
+    },
+    "a value in a recursive union, unique, escapeKeys true": {
+      "outcome": {
+        "ok": true
+      },
+      "requests": [
+        {
+          "updateItem": {
+            "TableName": "<table>",
+            "Key": {
+              "pk": {
+                "S": "$um#v1#doc#id_a"
+              },
+              "sk": {
+                "S": "$um#v1#doc"
+              }
+            },
+            "UpdateExpression": "SET #ps0.#ps1[0].#ps2 = :ps3",
+            "ExpressionAttributeNames": {
+              "#ps0": "f",
+              "#ps1": "kids",
+              "#ps2": "v",
+              "#exists": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":ps3": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_exists(#exists)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            "ReturnValues": "ALL_NEW"
+          }
+        }
+      ],
+      "rows": [
+        {
+          "__edd_e__": {
+            "S": "Doc"
+          },
+          "email": {
+            "S": "e"
+          },
+          "f": {
+            "M": {
+              "kind": {
+                "S": "node"
+              },
+              "kids": {
+                "L": [
+                  {
+                    "M": {
+                      "kind": {
+                        "S": "leaf"
+                      },
+                      "v": {
+                        "N": "2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "sk": {
+            "S": "$um#v1#doc"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Doc._unique.email"
+          },
+          "_entity_pk": {
+            "S": "$um#v1#doc#id_a"
+          },
+          "_entity_sk": {
+            "S": "$um#v1#doc"
+          },
+          "pk": {
+            "S": "$um#v1#doc.email#e"
+          },
+          "sk": {
+            "S": "$um#v1#doc.email"
+          }
+        }
+      ],
+      "read": {
+        "ok": {
+          "id": "a",
+          "f": {
+            "kind": "node",
+            "kids": [
+              {
+                "kind": "leaf",
+                "v": 2
+              }
+            ]
+          },
+          "email": "e"
+        }
+      }
+    }
+  }
+}

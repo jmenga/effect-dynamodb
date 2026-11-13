@@ -91,6 +91,8 @@ export interface GeoEntity<A, P> {
    * `put` wrote them (#111), from the key form of the values `put` stores.
    */
   readonly _domainKeyForm: (record: Record<string, unknown>) => Record<string, unknown>
+  /** `Entity._givenValues`: how a search's `pkFilter` is read (`GeoSearch.givenValues`). */
+  readonly _givenValues?: _GeoSearch.GivesValues["_givenValues"]
   readonly put: (input: A) => P
 }
 

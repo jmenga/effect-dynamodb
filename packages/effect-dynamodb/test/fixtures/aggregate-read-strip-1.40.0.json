@@ -1,0 +1,323 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0",
+  "effect-dynamodb@1.39.0"
+ ],
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @1.39.0 (each with its @effect-dynamodb/schema and effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local: never regenerate or \"fix\" it. How a read takes attributes off a row's value (schema `strip` v1, collection `strip`, root `Root`, partition key composed from `id` under `pk` unless the shape says `pkey`; a sub-aggregate bound with `side: 1`): a `one` edge's value declaring `gsiNote`, a sub-aggregate declaring `skills`, `pkg` or the partition key attribute `pkey`, with and without an edge of its own, and a root declaring `gsi2pk` with no list. Per shape: `create`'s outcome and `get`'s.",
+ "1.40.0": {
+  "one edge declaring gsiNote": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "gsiNote": "g"
+     }
+    }
+   },
+   "get": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"note\"][\"gsiNote\"]"
+   }
+  },
+  "sub-aggregate declaring skills": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "skills": "ts"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "skills": "ts"
+     }
+    }
+   }
+  },
+  "sub-aggregate declaring pkg (optional)": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkg": "x"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkg": "x"
+     }
+    }
+   }
+  },
+  "sub-aggregate with an edge, declaring skills": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "skills": "ts",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "get": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"part\"][\"skills\"]"
+   }
+  },
+  "childless sub-aggregate declaring pkey (optional), keyed under pkey, given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkey": "$strip#v1#strip#a"
+     }
+    }
+   }
+  },
+  "sub-aggregate with an edge declaring pkey (optional), keyed under pkey, given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "sub-aggregate with an edge declaring pkey (optional), keyed under pkey, given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkey": "mine",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "root declaring gsi2pk (optional), no list": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "gsi2pk": "x"
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  }
+ },
+ "1.39.0": {
+  "one edge declaring gsiNote": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "gsiNote": "g"
+     }
+    }
+   },
+   "get": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"note\"][\"gsiNote\"]"
+   }
+  },
+  "sub-aggregate declaring skills": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "skills": "ts"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "skills": "ts"
+     }
+    }
+   }
+  },
+  "sub-aggregate declaring pkg (optional)": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkg": "x"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkg": "x"
+     }
+    }
+   }
+  },
+  "sub-aggregate with an edge, declaring skills": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "skills": "ts",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "get": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"part\"][\"skills\"]"
+   }
+  },
+  "childless sub-aggregate declaring pkey (optional), keyed under pkey, given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkey": "$strip#v1#strip#a"
+     }
+    }
+   }
+  },
+  "sub-aggregate with an edge declaring pkey (optional), keyed under pkey, given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "sub-aggregate with an edge declaring pkey (optional), keyed under pkey, given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pkey": "mine",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "note": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "root declaring gsi2pk (optional), no list": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "gsi2pk": "x"
+    }
+   },
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  }
+ }
+}

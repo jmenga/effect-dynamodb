@@ -1,0 +1,4462 @@
+{
+  "writtenBy": {
+    "effect-dynamodb": "1.40.0 source with the row token (#237)",
+    "effect": "4.1.2"
+  },
+  "captured": "From this repository's source when the row token was added (#237), on DynamoDB Local under TestClock, by the scenarios in test/helpers/ProjectionTombstoneShared.ts that `since` names, the row token left out. Its results and items are checked against the 1.39.0 capture with `since` applied; its requests are what those scenarios send with the token.",
+  "scenarios": {
+    "ledger: a shared row the order projection removes": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x1"
+              },
+              "total": {
+                "N": "5"
+              },
+              "invoiceVersion": {
+                "N": "1"
+              },
+              "revision": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Ledger"
+              },
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              },
+              "__edd_e__": {
+                "S": "Ledger#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "orderRev": {
+                "N": "1"
+              },
+              "orderVersion": {
+                "N": "2"
+              },
+              "invoiceVersion": {
+                "N": "1"
+              },
+              "revision": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "orderRev"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x1"
+              },
+              "total": {
+                "N": "7"
+              },
+              "orderVersion": {
+                "N": "2"
+              },
+              "orderRev": {
+                "N": "1"
+              },
+              "invoiceVersion": {
+                "N": "2"
+              },
+              "revision": {
+                "N": "2"
+              },
+              "__edd_e__": {
+                "S": "Ledger"
+              },
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "revision"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x1"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Ledger"
+          },
+          "id": {
+            "S": "x1"
+          },
+          "invoiceVersion": {
+            "N": "2"
+          },
+          "orderRev": {
+            "N": "1"
+          },
+          "orderVersion": {
+            "N": "2"
+          },
+          "pk": {
+            "S": "$shared#v1#ledger#id_x1"
+          },
+          "revision": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$shared#v1#ledger"
+          },
+          "total": {
+            "N": "7"
+          }
+        }
+      ],
+      "results": [
+        [
+          "invoice applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "order removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "invoice redelivered",
+          {
+            "removed": true,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ],
+        [
+          "invoice's next event",
+          {
+            "removed": false,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "order's late removal",
+          {
+            "removed": false,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ]
+      ]
+    },
+    "ledger: a shared row removed twice": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x3"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x3"
+              },
+              "total": {
+                "N": "5"
+              },
+              "invoiceVersion": {
+                "N": "1"
+              },
+              "revision": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Ledger"
+              },
+              "pk": {
+                "S": "$shared#v1#ledger#id_x3"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x3"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x3"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              },
+              "__edd_e__": {
+                "S": "Ledger#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "orderRev": {
+                "N": "1"
+              },
+              "orderVersion": {
+                "N": "2"
+              },
+              "invoiceVersion": {
+                "N": "1"
+              },
+              "revision": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "orderRev"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x3"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x3"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              },
+              "__edd_e__": {
+                "S": "Ledger#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "revision": {
+                "N": "2"
+              },
+              "invoiceVersion": {
+                "N": "2"
+              },
+              "orderVersion": {
+                "N": "2"
+              },
+              "orderRev": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "#g = :g",
+            "ExpressionAttributeNames": {
+              "#g": "revision"
+            },
+            "ExpressionAttributeValues": {
+              ":g": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x3"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Ledger#tombstone"
+          },
+          "__edd_removed__": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "invoiceVersion": {
+            "N": "2"
+          },
+          "orderRev": {
+            "N": "1"
+          },
+          "orderVersion": {
+            "N": "2"
+          },
+          "pk": {
+            "S": "$shared#v1#ledger#id_x3"
+          },
+          "revision": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$shared#v1#ledger"
+          }
+        }
+      ],
+      "results": [
+        [
+          "invoice applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "order removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "invoice removes",
+          {
+            "removed": true,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "order's late removal",
+          {
+            "removed": true,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ]
+      ]
+    },
+    "ledger: a shared row with a projection without removal": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x4"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x4"
+              },
+              "total": {
+                "N": "5"
+              },
+              "paymentVersion": {
+                "N": "1"
+              },
+              "revision": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Ledger"
+              },
+              "pk": {
+                "S": "$shared#v1#ledger#id_x4"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x4"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x4"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              },
+              "__edd_e__": {
+                "S": "Ledger#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "orderRev": {
+                "N": "1"
+              },
+              "orderVersion": {
+                "N": "2"
+              },
+              "paymentVersion": {
+                "N": "1"
+              },
+              "revision": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "orderRev"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x4"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Ledger#tombstone"
+          },
+          "__edd_removed__": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "orderRev": {
+            "N": "1"
+          },
+          "orderVersion": {
+            "N": "2"
+          },
+          "paymentVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$shared#v1#ledger#id_x4"
+          },
+          "revision": {
+            "N": "1"
+          },
+          "sk": {
+            "S": "$shared#v1#ledger"
+          }
+        }
+      ],
+      "results": [
+        [
+          "payment applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "order removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "payment redelivered",
+          {
+            "removed": true,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ]
+      ]
+    },
+    "ledger: create over a shared row's tombstone": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x2"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x2"
+              },
+              "total": {
+                "N": "2"
+              },
+              "checkpoints": {
+                "M": {
+                  "shipment#x2": {
+                    "N": "1"
+                  }
+                }
+              },
+              "revision": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Ledger"
+              },
+              "pk": {
+                "S": "$shared#v1#ledger#id_x2"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x2"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x2"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              },
+              "__edd_e__": {
+                "S": "Ledger#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "orderRev": {
+                "N": "1"
+              },
+              "orderVersion": {
+                "N": "2"
+              },
+              "checkpoints": {
+                "M": {
+                  "shipment#x2": {
+                    "N": "1"
+                  }
+                }
+              },
+              "revision": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "orderRev"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$shared#v1#ledger#id_x2"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x2"
+              },
+              "total": {
+                "N": "3"
+              },
+              "__edd_e__": {
+                "S": "Ledger"
+              },
+              "pk": {
+                "S": "$shared#v1#ledger#id_x2"
+              },
+              "sk": {
+                "S": "$shared#v1#ledger"
+              },
+              "revision": {
+                "N": "2"
+              },
+              "checkpoints": {
+                "M": {
+                  "shipment#x2": {
+                    "N": "1"
+                  }
+                }
+              },
+              "orderVersion": {
+                "N": "2"
+              },
+              "orderRev": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+            "ExpressionAttributeNames": {
+              "#e0": "__edd_e__",
+              "#e2": "__edd_removed__"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "S": "Ledger#tombstone"
+              },
+              ":e3": {
+                "S": "1970-01-01T00:00:00.000Z"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Ledger"
+          },
+          "checkpoints": {
+            "M": {
+              "shipment#x2": {
+                "N": "1"
+              }
+            }
+          },
+          "id": {
+            "S": "x2"
+          },
+          "orderRev": {
+            "N": "2"
+          },
+          "orderVersion": {
+            "N": "2"
+          },
+          "pk": {
+            "S": "$shared#v1#ledger#id_x2"
+          },
+          "revision": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$shared#v1#ledger"
+          },
+          "total": {
+            "N": "3"
+          }
+        }
+      ],
+      "results": [
+        [
+          "shipment applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "order removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "create",
+          {
+            "id": "x2",
+            "total": 3,
+            "orderVersion": 2,
+            "orderRev": 2,
+            "checkpoints": {
+              "shipment#x2": 1
+            },
+            "revision": 2
+          }
+        ]
+      ]
+    },
+    "race: create lands between a projection's read of a tombstone and its write": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r1"
+              },
+              "total": {
+                "N": "5"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "b": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "rb"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r1"
+              },
+              "total": {
+                "N": "10"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "b": {
+                "N": "1"
+              },
+              "rb": {
+                "N": "2"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+            "ExpressionAttributeNames": {
+              "#e0": "__edd_e__",
+              "#e2": "__edd_removed__"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "S": "Race#tombstone"
+              },
+              ":e3": {
+                "S": "1970-01-01T00:00:00.000Z"
+              }
+            }
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r1"
+              },
+              "total": {
+                "N": "7"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "b": {
+                "N": "1"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Race"
+          },
+          "a": {
+            "N": "1"
+          },
+          "b": {
+            "N": "1"
+          },
+          "id": {
+            "S": "r1"
+          },
+          "pk": {
+            "S": "$race#v1#race#id_r1"
+          },
+          "ra": {
+            "N": "2"
+          },
+          "rb": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$race#v1#race"
+          },
+          "total": {
+            "N": "10"
+          }
+        }
+      ],
+      "results": [
+        [
+          "A applies",
+          {
+            "removed": false,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "B removes",
+          {
+            "removed": true,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "A's next event",
+          {
+            "failed": "ConcurrentModification"
+          }
+        ]
+      ]
+    },
+    "race: create lands between a projection's read of a tombstone and its write, in a transaction": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r1"
+              },
+              "total": {
+                "N": "5"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "b": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "rb"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "transactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "read",
+                  "Item": {
+                    "id": {
+                      "S": "r1"
+                    },
+                    "total": {
+                      "N": "10"
+                    },
+                    "__edd_e__": {
+                      "S": "Race"
+                    },
+                    "pk": {
+                      "S": "$race#v1#race#id_r1"
+                    },
+                    "sk": {
+                      "S": "$race#v1#race"
+                    },
+                    "b": {
+                      "N": "1"
+                    },
+                    "rb": {
+                      "N": "2"
+                    },
+                    "a": {
+                      "N": "1"
+                    },
+                    "ra": {
+                      "N": "2"
+                    }
+                  },
+                  "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+                  "ExpressionAttributeNames": {
+                    "#e0": "__edd_e__",
+                    "#e2": "__edd_removed__"
+                  },
+                  "ExpressionAttributeValues": {
+                    ":e1": {
+                      "S": "Race#tombstone"
+                    },
+                    ":e3": {
+                      "S": "1970-01-01T00:00:00.000Z"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r1"
+              },
+              "total": {
+                "N": "7"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "b": {
+                "N": "1"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r1"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Race"
+          },
+          "a": {
+            "N": "1"
+          },
+          "b": {
+            "N": "1"
+          },
+          "id": {
+            "S": "r1"
+          },
+          "pk": {
+            "S": "$race#v1#race#id_r1"
+          },
+          "ra": {
+            "N": "2"
+          },
+          "rb": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$race#v1#race"
+          },
+          "total": {
+            "N": "10"
+          }
+        }
+      ],
+      "results": [
+        [
+          "A applies",
+          {
+            "removed": false,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "B removes",
+          {
+            "removed": true,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "A's next event",
+          {
+            "failed": "ConcurrentModification"
+          }
+        ]
+      ]
+    },
+    "race: another projection writes a row over the tombstone between a read and a write (retry 0)": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "ra"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "5"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "b": {
+                "N": "1"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#e0)",
+            "ExpressionAttributeNames": {
+              "#e0": "rb"
+            }
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "2"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Race"
+          },
+          "a": {
+            "N": "1"
+          },
+          "b": {
+            "N": "1"
+          },
+          "id": {
+            "S": "r2"
+          },
+          "pk": {
+            "S": "$race#v1#race#id_r2"
+          },
+          "ra": {
+            "N": "1"
+          },
+          "rb": {
+            "N": "1"
+          },
+          "sk": {
+            "S": "$race#v1#race"
+          },
+          "total": {
+            "N": "5"
+          }
+        }
+      ],
+      "results": [
+        [
+          "A removes",
+          {
+            "removed": true,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "A's next event",
+          {
+            "failed": "ConcurrentModification"
+          }
+        ],
+        [
+          "B redelivered",
+          {
+            "removed": false,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ]
+      ]
+    },
+    "race: another projection writes a row over the tombstone between a read and a write (retry 2)": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "ra"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "5"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "b": {
+                "N": "1"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#e0)",
+            "ExpressionAttributeNames": {
+              "#e0": "rb"
+            }
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "2"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "7"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "b": {
+                "N": "1"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Race"
+          },
+          "a": {
+            "N": "2"
+          },
+          "b": {
+            "N": "1"
+          },
+          "id": {
+            "S": "r2"
+          },
+          "pk": {
+            "S": "$race#v1#race#id_r2"
+          },
+          "ra": {
+            "N": "2"
+          },
+          "rb": {
+            "N": "1"
+          },
+          "sk": {
+            "S": "$race#v1#race"
+          },
+          "total": {
+            "N": "7"
+          }
+        }
+      ],
+      "results": [
+        [
+          "A removes",
+          {
+            "removed": true,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "A's next event",
+          {
+            "removed": false,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "B redelivered",
+          {
+            "removed": false,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ]
+      ]
+    },
+    "race: another projection removes the row again between a read and a write (retry 0)": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "ra"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "b": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "rb"
+            }
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "2"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Race#tombstone"
+          },
+          "__edd_removed__": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "a": {
+            "N": "1"
+          },
+          "b": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$race#v1#race#id_r2"
+          },
+          "ra": {
+            "N": "1"
+          },
+          "rb": {
+            "N": "1"
+          },
+          "sk": {
+            "S": "$race#v1#race"
+          }
+        }
+      ],
+      "results": [
+        [
+          "A removes",
+          {
+            "removed": true,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "A's next event",
+          {
+            "failed": "ConcurrentModification"
+          }
+        ],
+        [
+          "B redelivered",
+          {
+            "removed": true,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ]
+      ]
+    },
+    "race: another projection removes the row again between a read and a write (retry 2)": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "ra": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "ra"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              },
+              "__edd_e__": {
+                "S": "Race#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "b": {
+                "N": "1"
+              },
+              "a": {
+                "N": "1"
+              },
+              "ra": {
+                "N": "1"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "rb"
+            }
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "2"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "r2"
+              },
+              "total": {
+                "N": "2"
+              },
+              "a": {
+                "N": "2"
+              },
+              "ra": {
+                "N": "2"
+              },
+              "b": {
+                "N": "1"
+              },
+              "rb": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Race"
+              },
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "ra"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$race#v1#race#id_r2"
+              },
+              "sk": {
+                "S": "$race#v1#race"
+              }
+            },
+            "ConsistentRead": true
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Race"
+          },
+          "a": {
+            "N": "2"
+          },
+          "b": {
+            "N": "1"
+          },
+          "id": {
+            "S": "r2"
+          },
+          "pk": {
+            "S": "$race#v1#race#id_r2"
+          },
+          "ra": {
+            "N": "2"
+          },
+          "rb": {
+            "N": "1"
+          },
+          "sk": {
+            "S": "$race#v1#race"
+          },
+          "total": {
+            "N": "2"
+          }
+        }
+      ],
+      "results": [
+        [
+          "A removes",
+          {
+            "removed": true,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "A's next event",
+          {
+            "removed": false,
+            "applied": 1,
+            "alreadyApplied": 0
+          }
+        ],
+        [
+          "B redelivered",
+          {
+            "removed": false,
+            "applied": 0,
+            "alreadyApplied": 1
+          }
+        ]
+      ]
+    },
+    "roles: create over A's tombstone, A's checkpoint B's revision (B defined last)": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "by"
+              },
+              "total": {
+                "N": "5"
+              },
+              "version": {
+                "N": "1"
+              },
+              "checkpoints": {
+                "M": {
+                  "b#y": {
+                    "N": "1"
+                  }
+                }
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesa#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              },
+              "__edd_e__": {
+                "S": "Read#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rev": {
+                "N": "1"
+              },
+              "version": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "rev"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "10"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              },
+              "version": {
+                "N": "2"
+              },
+              "rev": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+            "ExpressionAttributeNames": {
+              "#e0": "__edd_e__",
+              "#e2": "__edd_removed__"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "S": "Read#tombstone"
+              },
+              ":e3": {
+                "S": "1970-01-01T00:00:00.000Z"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "13"
+              },
+              "version": {
+                "N": "3"
+              },
+              "rev": {
+                "N": "3"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "rev"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "2"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "id": {
+            "S": "ax"
+          },
+          "pk": {
+            "S": "$rolesa#v1#read#id_ax"
+          },
+          "rev": {
+            "N": "3"
+          },
+          "sk": {
+            "S": "$rolesa#v1#read"
+          },
+          "total": {
+            "N": "13"
+          },
+          "version": {
+            "N": "3"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "checkpoints": {
+            "M": {
+              "b#y": {
+                "N": "1"
+              }
+            }
+          },
+          "id": {
+            "S": "by"
+          },
+          "pk": {
+            "S": "$rolesa#v1#read#id_by"
+          },
+          "sk": {
+            "S": "$rolesa#v1#read"
+          },
+          "total": {
+            "N": "5"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "results": [
+        [
+          "B applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "A removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "create",
+          {
+            "id": "ax",
+            "total": 10,
+            "version": 2,
+            "rev": 2
+          }
+        ],
+        [
+          "A's next event",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ]
+      ]
+    },
+    "roles: create over A's tombstone, A's checkpoint B's revision (B defined first)": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "by"
+              },
+              "total": {
+                "N": "5"
+              },
+              "version": {
+                "N": "1"
+              },
+              "checkpoints": {
+                "M": {
+                  "b#y": {
+                    "N": "1"
+                  }
+                }
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesa#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              },
+              "__edd_e__": {
+                "S": "Read#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rev": {
+                "N": "1"
+              },
+              "version": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "attribute_not_exists(#g)",
+            "ExpressionAttributeNames": {
+              "#g": "rev"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "10"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              },
+              "version": {
+                "N": "2"
+              },
+              "rev": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+            "ExpressionAttributeNames": {
+              "#e0": "__edd_e__",
+              "#e2": "__edd_removed__"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "S": "Read#tombstone"
+              },
+              ":e3": {
+                "S": "1970-01-01T00:00:00.000Z"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "13"
+              },
+              "version": {
+                "N": "3"
+              },
+              "rev": {
+                "N": "3"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesa#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesa#v1#read"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "rev"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "2"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "id": {
+            "S": "ax"
+          },
+          "pk": {
+            "S": "$rolesa#v1#read#id_ax"
+          },
+          "rev": {
+            "N": "3"
+          },
+          "sk": {
+            "S": "$rolesa#v1#read"
+          },
+          "total": {
+            "N": "13"
+          },
+          "version": {
+            "N": "3"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "checkpoints": {
+            "M": {
+              "b#y": {
+                "N": "1"
+              }
+            }
+          },
+          "id": {
+            "S": "by"
+          },
+          "pk": {
+            "S": "$rolesa#v1#read#id_by"
+          },
+          "sk": {
+            "S": "$rolesa#v1#read"
+          },
+          "total": {
+            "N": "5"
+          },
+          "version": {
+            "N": "1"
+          }
+        }
+      ],
+      "results": [
+        [
+          "B applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "A removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "create",
+          {
+            "id": "ax",
+            "total": 10,
+            "version": 2,
+            "rev": 2
+          }
+        ],
+        [
+          "A's next event",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ]
+      ]
+    },
+    "roles: A's data field is B's checkpoint, A's row removed and written again": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "by"
+              },
+              "total": {
+                "N": "5"
+              },
+              "n": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesc#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "3"
+              },
+              "n": {
+                "N": "200"
+              },
+              "cp": {
+                "N": "2"
+              },
+              "rev": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              },
+              "__edd_e__": {
+                "S": "Read#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rev": {
+                "N": "2"
+              },
+              "cp": {
+                "N": "3"
+              }
+            },
+            "ConditionExpression": "#g = :g",
+            "ExpressionAttributeNames": {
+              "#g": "rev"
+            },
+            "ExpressionAttributeValues": {
+              ":g": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "3"
+              },
+              "n": {
+                "N": "100"
+              },
+              "cp": {
+                "N": "4"
+              },
+              "rev": {
+                "N": "3"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "rev"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "2"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "cp": {
+            "N": "4"
+          },
+          "id": {
+            "S": "ax"
+          },
+          "n": {
+            "N": "100"
+          },
+          "pk": {
+            "S": "$rolesc#v1#read#id_ax"
+          },
+          "rev": {
+            "N": "3"
+          },
+          "sk": {
+            "S": "$rolesc#v1#read"
+          },
+          "total": {
+            "N": "3"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "id": {
+            "S": "by"
+          },
+          "n": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$rolesc#v1#read#id_by"
+          },
+          "sk": {
+            "S": "$rolesc#v1#read"
+          },
+          "total": {
+            "N": "5"
+          }
+        }
+      ],
+      "results": [
+        [
+          "B applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "A applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "A removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "A applies over its tombstone",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "get",
+          {
+            "id": "ax",
+            "total": 3,
+            "n": 100,
+            "cp": 4,
+            "rev": 3
+          }
+        ]
+      ]
+    },
+    "roles: A's data field is B's revision, A's row removed and written again": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "by"
+              },
+              "total": {
+                "N": "5"
+              },
+              "n": {
+                "N": "1"
+              },
+              "bcp": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesc#v1#read#id_by"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "3"
+              },
+              "n": {
+                "N": "200"
+              },
+              "cp": {
+                "N": "2"
+              },
+              "rev": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              },
+              "__edd_e__": {
+                "S": "Read#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rev": {
+                "N": "2"
+              },
+              "cp": {
+                "N": "3"
+              }
+            },
+            "ConditionExpression": "#g = :g",
+            "ExpressionAttributeNames": {
+              "#g": "rev"
+            },
+            "ExpressionAttributeValues": {
+              ":g": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "3"
+              },
+              "n": {
+                "N": "100"
+              },
+              "cp": {
+                "N": "4"
+              },
+              "rev": {
+                "N": "3"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "rev"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "2"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesc#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesc#v1#read"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "cp": {
+            "N": "4"
+          },
+          "id": {
+            "S": "ax"
+          },
+          "n": {
+            "N": "100"
+          },
+          "pk": {
+            "S": "$rolesc#v1#read#id_ax"
+          },
+          "rev": {
+            "N": "3"
+          },
+          "sk": {
+            "S": "$rolesc#v1#read"
+          },
+          "total": {
+            "N": "3"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "bcp": {
+            "N": "1"
+          },
+          "id": {
+            "S": "by"
+          },
+          "n": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$rolesc#v1#read#id_by"
+          },
+          "sk": {
+            "S": "$rolesc#v1#read"
+          },
+          "total": {
+            "N": "5"
+          }
+        }
+      ],
+      "results": [
+        [
+          "B applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "A applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 2,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "A removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "A applies over its tombstone",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "get",
+          {
+            "id": "ax",
+            "total": 3,
+            "n": 100,
+            "cp": 4,
+            "rev": 3
+          }
+        ]
+      ]
+    },
+    "roles: A's data field is B's checkpoint, create over A's tombstone with its own value": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesd#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesd#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "2"
+              },
+              "n": {
+                "N": "100"
+              },
+              "cp": {
+                "N": "1"
+              },
+              "rev": {
+                "N": "1"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesd#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesd#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesd#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesd#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$rolesd#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesd#v1#read"
+              },
+              "__edd_e__": {
+                "S": "Read#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "rev": {
+                "N": "2"
+              },
+              "cp": {
+                "N": "2"
+              }
+            },
+            "ConditionExpression": "#g = :g",
+            "ExpressionAttributeNames": {
+              "#g": "rev"
+            },
+            "ExpressionAttributeValues": {
+              ":g": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesd#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesd#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "ax"
+              },
+              "total": {
+                "N": "10"
+              },
+              "n": {
+                "N": "7"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$rolesd#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesd#v1#read"
+              },
+              "cp": {
+                "N": "2"
+              },
+              "rev": {
+                "N": "3"
+              }
+            },
+            "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+            "ExpressionAttributeNames": {
+              "#e0": "__edd_e__",
+              "#e2": "__edd_removed__"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "S": "Read#tombstone"
+              },
+              ":e3": {
+                "S": "1970-01-01T00:00:00.000Z"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$rolesd#v1#read#id_ax"
+              },
+              "sk": {
+                "S": "$rolesd#v1#read"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "cp": {
+            "N": "2"
+          },
+          "id": {
+            "S": "ax"
+          },
+          "n": {
+            "N": "7"
+          },
+          "pk": {
+            "S": "$rolesd#v1#read#id_ax"
+          },
+          "rev": {
+            "N": "3"
+          },
+          "sk": {
+            "S": "$rolesd#v1#read"
+          },
+          "total": {
+            "N": "10"
+          }
+        }
+      ],
+      "results": [
+        [
+          "A applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "A removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "applied": 1,
+              "alreadyApplied": 0
+            }
+          ]
+        ],
+        [
+          "create",
+          {
+            "id": "ax",
+            "total": 10,
+            "n": 7,
+            "cp": 2,
+            "rev": 3
+          }
+        ],
+        [
+          "get",
+          {
+            "id": "ax",
+            "total": 10,
+            "n": 7,
+            "cp": 2,
+            "rev": 3
+          }
+        ]
+      ]
+    },
+    "one projection: a sparse checkpoint map a field-mapped source leaves empty": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x"
+              },
+              "total": {
+                "N": "2"
+              },
+              "revision": {
+                "N": "1"
+              },
+              "aV": {
+                "N": "1"
+              },
+              "aOwner": {
+                "S": "x"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              },
+              "__edd_e__": {
+                "S": "Read#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "revision": {
+                "N": "2"
+              },
+              "checkpoints": {
+                "M": {}
+              },
+              "aV": {
+                "N": "2"
+              },
+              "aOwner": {
+                "S": "x"
+              }
+            },
+            "ConditionExpression": "#g = :g",
+            "ExpressionAttributeNames": {
+              "#g": "revision"
+            },
+            "ExpressionAttributeValues": {
+              ":g": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x"
+              },
+              "total": {
+                "N": "10"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              },
+              "aV": {
+                "N": "2"
+              },
+              "aOwner": {
+                "S": "x"
+              },
+              "revision": {
+                "N": "3"
+              }
+            },
+            "ConditionExpression": "((#e0 = :e1) AND (#e2 = :e3)) AND (#eddTb0 = :eddTb0 AND #eddTb1 = :eddTb1 AND #eddTb2 = :eddTb2 AND #eddTb3 = :eddTb3)",
+            "ExpressionAttributeNames": {
+              "#e0": "__edd_e__",
+              "#e2": "__edd_removed__",
+              "#eddTb0": "checkpoints",
+              "#eddTb1": "aV",
+              "#eddTb2": "aOwner",
+              "#eddTb3": "revision"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "S": "Read#tombstone"
+              },
+              ":e3": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              ":eddTb0": {
+                "M": {}
+              },
+              ":eddTb1": {
+                "N": "2"
+              },
+              ":eddTb2": {
+                "S": "x"
+              },
+              ":eddTb3": {
+                "N": "2"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x"
+              },
+              "total": {
+                "N": "13"
+              },
+              "revision": {
+                "N": "4"
+              },
+              "aV": {
+                "N": "3"
+              },
+              "aOwner": {
+                "S": "x"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "revision"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "3"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "aOwner": {
+            "S": "x"
+          },
+          "aV": {
+            "N": "3"
+          },
+          "id": {
+            "S": "x"
+          },
+          "pk": {
+            "S": "$sparsefm#v1#read#id_x"
+          },
+          "revision": {
+            "N": "4"
+          },
+          "sk": {
+            "S": "$sparsefm#v1#read"
+          },
+          "total": {
+            "N": "13"
+          }
+        }
+      ],
+      "results": [
+        [
+          "applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "create",
+          {
+            "id": "x",
+            "total": 10,
+            "checkpoints": {},
+            "revision": 3,
+            "aV": 2,
+            "aOwner": "x"
+          }
+        ],
+        [
+          "late removal",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 0,
+                  "alreadyApplied": 1
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "next event",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "get",
+          {
+            "id": "x",
+            "total": 13,
+            "checkpoints": {},
+            "revision": 4,
+            "aV": 3,
+            "aOwner": "x"
+          }
+        ]
+      ]
+    }
+  }
+}

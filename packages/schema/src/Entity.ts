@@ -38,6 +38,7 @@ import {
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
+import { refIdAttribute, refIdField } from "./internal/AggregateSchemas.js"
 import { bothKindsKeyRefusal, keyFormValueKind } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
@@ -75,6 +76,13 @@ import type {
   PrefixFieldNames,
   VersionFieldName,
 } from "./internal/EntityTypes.js"
+import {
+  hasOwnName,
+  isRequiredStored,
+  ownValue,
+  refuseProtoName,
+  setOwn,
+} from "./internal/OwnNames.js"
 import { refuseUnreadable } from "./internal/SchemaAccessors.js"
 import {
   refuseReadAsSparseEntry,
@@ -115,6 +123,23 @@ import type { DimensionFor } from "./ZOrder.js"
 // ---------------------------------------------------------------------------
 
 export type { IndexDefinition, KeyPart, ZOrderKeyPart }
+
+/** Whether the model field `name` stores something on every write (`isRequiredStored`). */
+const storesUnder = (fields: Readonly<Record<string, Schema.Top>>, name: string): boolean => {
+  const field = ownValue(fields, name)
+  return field !== undefined && isRequiredStored(field.ast)
+}
+
+/**
+ * Whether an index's key half is composed on every write: each composite it names is a model field
+ * that always stores something ({@link storesUnder}). A half whose composites aren't listed (a
+ * Z-order sort key) is not known to be.
+ */
+const composedAlways = (
+  fields: Readonly<Record<string, Schema.Top>>,
+  half: { readonly composite?: ReadonlyArray<string> | undefined },
+): boolean =>
+  Array.isArray(half.composite) && half.composite.every((name) => storesUnder(fields, name))
 
 /**
  * A ref config object: the entity and optional cascade index config.
@@ -509,8 +534,10 @@ export type AppendInputFields<TModel extends Schema.Top, TTimeSeries> = TTimeSer
 interface ResolvedRef {
   readonly fieldName: string
   readonly idFieldName: string
-  readonly identifierField: string
-  readonly identifierSchema: Schema.Top
+  /** The attribute of the referenced entity a `${field}Id` names (`refIdAttribute`). */
+  readonly keyField: string
+  /** The schema a `${field}Id` is taken as: `keyField`'s own field. */
+  readonly keySchema: Schema.Top
   readonly refEntity: EntityDefinition
   readonly refEntityType: string
 }
@@ -651,7 +678,7 @@ export interface EntityDefinition<
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierField: string
+    readonly keyField: string
     readonly refEntityType: string
   }>
 
@@ -829,10 +856,48 @@ export const buildEntityDefinition = (config: {
     configuredAttributes,
     `Entity "${config.entityType}"`,
   )
-
-  // ---------------------------------------------------------------------------
-  // Validate indexes
-  // ---------------------------------------------------------------------------
+  const configuredFields = Object.entries(configuredAttributes) as ReadonlyArray<
+    readonly [string, { readonly field?: string }]
+  >
+  refuseProtoName(
+    config.entityType,
+    modelFields,
+    {
+      renamed: new Set(
+        configuredFields.filter(([, attribute]) => attribute.field !== undefined).map(([n]) => n),
+      ),
+      packed: new Set(Object.keys(getPackedFields(config.model as Schema.Top))),
+    },
+    [
+      // A field's attribute holds something on every write only where the field always stores
+      // something.
+      ...configuredFields.map(([name, attribute]) => ({
+        name: attribute.field,
+        what: `the attribute the field "${name}" is stored under`,
+        always: storesUnder(modelFields, name),
+      })),
+      { name: systemFields.createdAt, what: "the created timestamp" },
+      { name: systemFields.updatedAt, what: "the updated timestamp" },
+      { name: systemFields.version, what: "the version field" },
+      // The table's key attributes are on every item. A put writes an index's two only where it
+      // holds every composite of both halves (a sparse index otherwise), so they are on every
+      // item only where each of those always is; an update or upsert that writes one half alone
+      // is refused when it's sent (`EDD-9165`).
+      ...Object.entries(config.indexes).flatMap(([name, index]) => {
+        const always =
+          name === "primary" ||
+          (composedAlways(modelFields, index.pk) && composedAlways(modelFields, index.sk))
+        return [
+          {
+            name: index.pk.field,
+            what: `the partition key attribute of index "${name}"`,
+            always,
+          },
+          { name: index.sk.field, what: `the sort key attribute of index "${name}"`, always },
+        ]
+      }),
+    ],
+  )
 
   const primaryIndex = config.indexes.primary
   // Z-order sort keys are secondary-index only (#171): the primary key is
@@ -884,9 +949,10 @@ export const buildEntityDefinition = (config: {
   refuseKeysOverMovingValues(config.entityType, config.indexes, systemFields, config.versioned)
   if (
     systemFields.version !== null &&
-    (configuredAttributes as globalThis.Record<string, { readonly field?: string } | undefined>)[
-      systemFields.version
-    ]?.field !== undefined
+    ownValue(
+      configuredAttributes as globalThis.Record<string, { readonly field?: string } | undefined>,
+      systemFields.version,
+    )?.field !== undefined
   ) {
     throw new Error(
       `[EDD-9122] Entity "${config.entityType}": "${systemFields.version}" is where \`versioned\` ` +
@@ -913,7 +979,7 @@ export const buildEntityDefinition = (config: {
     timeSeries: config.timeSeries,
     vectorIndexes: config.vectorIndexes,
     resolveDbName: (name) =>
-      (configuredAttributes as globalThis.Record<string, { readonly field?: string }>)[name]
+      ownValue(configuredAttributes as globalThis.Record<string, { readonly field?: string }>, name)
         ?.field ?? name,
   })
 
@@ -924,7 +990,7 @@ export const buildEntityDefinition = (config: {
   const resolveCompositeSchemaForNullCheck = (
     compositeAttr: string,
   ): { readonly schema: Schema.Top; readonly source: string } | undefined => {
-    if (compositeAttr in modelFields) {
+    if (hasOwnName(modelFields, compositeAttr)) {
       return { schema: modelFields[compositeAttr] as Schema.Top, source: `model field` }
     }
     if (config.refs) {
@@ -1035,7 +1101,7 @@ export const buildEntityDefinition = (config: {
     const ts = config.timeSeries as TimeSeriesConfig<any>
     const orderBy = ts.orderBy
 
-    if (!(orderBy in modelFields)) {
+    if (!hasOwnName(modelFields, orderBy)) {
       throw new Error(
         `[EDD-9010] Entity "${config.entityType}": timeSeries.orderBy "${orderBy}" does not name a model field. ` +
           `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
@@ -1110,13 +1176,13 @@ export const buildEntityDefinition = (config: {
     // composes the other's.
     const appendFields = getSchemaFields(ts.appendInput as Schema.Top) ?? {}
     for (const [attr, where] of composedInto) {
-      const field = appendFields[attr]
+      const field = ownValue(appendFields, attr)
       if (field === undefined) continue
       const owner = `Entity "${config.entityType}"`
       const at = `${where}, through timeSeries.appendInput,`
       const refused = bothKindsKeyRefusal(owner, at, attr, field)
       if (refused !== undefined) throw refused
-      const model = modelFields[attr] as Schema.Top | undefined
+      const model = ownValue(modelFields, attr) as Schema.Top | undefined
       const given = keyFormValueKind(field)
       const read = model === undefined ? undefined : keyFormValueKind(model)
       if (
@@ -1154,7 +1220,7 @@ export const buildEntityDefinition = (config: {
       }
     }
     for (const field of appendInputFields) {
-      if (!(field in modelFields)) {
+      if (!hasOwnName(modelFields, field)) {
         throw new Error(
           `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput field "${field}" is not a ` +
             `model field. .append() writes each appendInput field to the current item. ` +
@@ -1170,7 +1236,7 @@ export const buildEntityDefinition = (config: {
   if (config.unique) {
     for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
       for (const field of resolveUniqueFields(constraintDef)) {
-        if (!(field in modelFields)) {
+        if (!hasOwnName(modelFields, field)) {
           throw new Error(
             `[EDD-9002] Entity "${config.entityType}": unique constraint "${constraintName}" references ` +
               `unknown attribute "${field}". Valid attributes: ${Object.keys(modelFields).sort().join(", ")}`,
@@ -1187,7 +1253,7 @@ export const buildEntityDefinition = (config: {
     const gid = config.generatedId as GeneratedIdConfig
     const field = gid.field
 
-    if (!(field in modelFields)) {
+    if (!hasOwnName(modelFields, field)) {
       throw new Error(
         `[EDD-9008] Entity "${config.entityType}": generatedId.field "${field}" does not name a model field. ` +
           `Valid model fields: ${Object.keys(modelFields).sort().join(", ")}`,
@@ -1214,7 +1280,9 @@ export const buildEntityDefinition = (config: {
     // Encoded-type tag for a model field, resolving homogeneous literal unions
     // (e.g. Schema.Literals(["a", "b"]) → "String") so they qualify as filters.
     const fieldEncodedTag = (field: string): string | undefined => {
-      const fieldSchema = getSchemaFields(rawModel)?.[field] as { ast?: SchemaAST.AST } | undefined
+      const fieldSchema = ownValue(getSchemaFields(rawModel), field) as
+        | { ast?: SchemaAST.AST }
+        | undefined
       if (fieldSchema?.ast === undefined) return undefined
       const resolveTag = (ast: SchemaAST.AST): string => {
         const encoded = SchemaAST.toEncoded(ast)
@@ -1231,7 +1299,7 @@ export const buildEntityDefinition = (config: {
       return resolveTag(fieldSchema.ast)
     }
     for (const [logicalName, vectorConfig] of Object.entries(config.vectorIndexes)) {
-      vectorIndexes[logicalName] = normalizeVectorIndexConfig(vectorConfig)
+      setOwn(vectorIndexes, logicalName, normalizeVectorIndexConfig(vectorConfig))
     }
     // Field-existence validation (EDD-9031..9033, EDD-9070) runs before type derivation
     // so an unknown filter field reports EDD-9031, not a derivation failure.
@@ -1262,7 +1330,7 @@ export const buildEntityDefinition = (config: {
     ? Object.entries(config.refs).map(([fieldName, refValue]) => {
         const refEntity = refValue.entity as EntityDefinition
 
-        const fieldSchema = modelFields[fieldName]
+        const fieldSchema = ownValue(modelFields, fieldName)
         if (!fieldSchema) {
           throw new Error(
             `Entity "${config.entityType}": refs config references field "${fieldName}" which does not exist in the model`,
@@ -1281,11 +1349,18 @@ export const buildEntityDefinition = (config: {
           )
         }
 
+        // An id names the referenced entity's one key composite, as an aggregate edge's id does
+        // (#214, #241): it's fetched, and read back, under that. An entity keyed by more than one
+        // composite has none: its id is fetched, and read back, under its identifier, as up to
+        // 1.40.0, which composes the key wherever the other composites compose without a value
+        // (an encoding default) and fails as it did where they don't.
+        const keyField = refIdAttribute(refEntity)!
         return {
           fieldName,
           idFieldName: `${fieldName}Id`,
-          identifierField: idField.name,
-          identifierSchema: idField.schema,
+          keyField,
+          keySchema:
+            keyField === idField.name ? idField.schema : (refIdField(refEntity) ?? idField.schema),
           refEntity,
           refEntityType: refEntity.entityType,
         }
@@ -1350,6 +1425,10 @@ export const buildEntityDefinition = (config: {
     config.timeSeries,
     fieldEncodings,
     generatedIdField,
+    (ownValue(
+      configuredAttributes as globalThis.Record<string, { readonly field?: string }>,
+      "__proto__",
+    )?.field ?? "__proto__") !== "__proto__",
   )
 
   const entityType = config.entityType
@@ -1365,7 +1444,7 @@ export const buildEntityDefinition = (config: {
   const hasSparseFields = Object.keys(sparseFields).length > 0
   if (hasSparseFields) {
     for (const fieldName of Object.keys(sparseFields)) {
-      const fieldSchema = modelFields[fieldName]
+      const fieldSchema = ownValue(modelFields, fieldName)
       if (!fieldSchema) {
         throw new Error(
           `[EDD-9020] Entity "${config.entityType}": sparse field "${fieldName}" does not exist on the model`,
@@ -1418,7 +1497,7 @@ export const buildEntityDefinition = (config: {
         )
       }
       seenPrefix.set(sparse.prefix, fieldName)
-      if (sparse.prefix !== fieldName && sparse.prefix in modelFields) {
+      if (sparse.prefix !== fieldName && hasOwnName(modelFields, sparse.prefix)) {
         throw new Error(
           `[EDD-9023] Entity "${config.entityType}": sparse field "${fieldName}" prefix "${sparse.prefix}" collides with non-sparse field "${sparse.prefix}".`,
         )
@@ -1456,8 +1535,9 @@ export const buildEntityDefinition = (config: {
     initialIndexes[indexName] = {
       ...indexDef,
       sk: bindZOrderHalf(config.entityType, indexName, indexDef.sk, (field) => ({
-        schema: inputFields[field],
-        encoding: fieldEncodings[field] ?? optionalFieldEncoding(modelFields[field]),
+        schema: ownValue(inputFields, field),
+        encoding:
+          ownValue(fieldEncodings, field) ?? optionalFieldEncoding(ownValue(modelFields, field)),
       })),
     }
   }
@@ -1478,15 +1558,17 @@ export const buildEntityDefinition = (config: {
   // Field renaming: domain name → DynamoDB attribute name (from ConfiguredModel)
   // ---------------------------------------------------------------------------
 
-  const fieldRenames: globalThis.Record<string, string> = {}
+  // Null-prototype: read by a field's name (`fieldRenames[name] ?? name`), and a model field may be
+  // named like an `Object.prototype` member (`valueOf`), which a plain object answers with a function.
+  const fieldRenames: globalThis.Record<string, string> = Object.create(null)
   for (const [domainName, attrConfig] of Object.entries(configuredAttributes)) {
     const field = (attrConfig as { field?: string }).field
-    if (field) fieldRenames[domainName] = field
+    if (field) setOwn(fieldRenames, domainName, field)
   }
   const hasRenames = Object.keys(fieldRenames).length > 0
   const storedAttributes = [
     ...Object.keys(modelFields).map(
-      (name) => [name, fieldRenames[name] ?? name] as readonly [string, string],
+      (name) => [name, ownValue(fieldRenames, name) ?? name] as readonly [string, string],
     ),
     ...[systemFields.createdAt, systemFields.updatedAt, systemFields.version]
       .filter((name) => name !== null)
@@ -1557,8 +1639,8 @@ export const buildEntityDefinition = (config: {
   const renameToDynamo = (item: globalThis.Record<string, unknown>): void => {
     if (!hasRenames) return
     for (const [domain, dynamo] of Object.entries(fieldRenames)) {
-      if (domain in item) {
-        item[dynamo] = item[domain]
+      if (hasOwnName(item, domain)) {
+        setOwn(item, dynamo, item[domain])
         delete item[domain]
       }
     }
@@ -1567,14 +1649,15 @@ export const buildEntityDefinition = (config: {
   const renameFromDynamo = (item: globalThis.Record<string, unknown>): void => {
     if (!hasRenames) return
     for (const [domain, dynamo] of Object.entries(fieldRenames)) {
-      if (dynamo in item) {
-        item[domain] = item[dynamo]
+      if (hasOwnName(item, dynamo)) {
+        setOwn(item, domain, item[dynamo])
         delete item[dynamo]
       }
     }
   }
 
-  const resolveDbName = (domainName: string): string => fieldRenames[domainName] ?? domainName
+  const resolveDbName = (domainName: string): string =>
+    ownValue(fieldRenames, domainName) ?? domainName
 
   return {
     configuredAttributes: configuredAttributes as globalThis.Record<
@@ -1832,7 +1915,7 @@ export const make = <
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {
     for (const [name, gsi] of Object.entries(config.indexes)) {
-      gsiIndexes[name] = normalizeGsiConfig(gsi as unknown as GsiConfig)
+      setOwn(gsiIndexes, name, normalizeGsiConfig(gsi as unknown as GsiConfig))
     }
   }
   const indexes = { primary: config.primaryKey, ...gsiIndexes } as globalThis.Record<
@@ -1885,7 +1968,7 @@ const makeDefinitionImpl = (config: {
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,
       idFieldName: r.idFieldName,
-      identifierField: r.identifierField,
+      keyField: r.keyField,
       refEntityType: r.refEntityType,
     })),
     _attachPrototype: attachPrototype,

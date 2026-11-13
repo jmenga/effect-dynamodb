@@ -603,6 +603,115 @@ describe("the bind check counts each attribute as its row holds it after the las
       primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
     } as any)
 
+  it.effect("an aggregate's index partition named `__edd_rm__`: no mark, as 1.40.0", () =>
+    Effect.gen(function* () {
+      // The outbox items are on the aggregate's table, which registers no member: the aggregate's
+      // rows are on it all the same, so its collection index's partition attribute, `__edd_rm__`,
+      // is a key attribute of the table. The outbox items carry no mark (`outboxMarkInUse`), and
+      // nothing of theirs is under that name, as on 1.40.0.
+      const schema = DynamoSchema.make({ name: "rmo", version: 1 })
+      const Tallies = tally()
+      const Target = Table.make({ schema, entities: {} })
+      const Events = outboxOf(schema, Tallies, { table: Target, pk: "pk", sk: "sk" })
+      const Source = Table.make({ schema, entities: { Tallies } })
+      const Orders = Aggregate.make(Schema.Struct({ id: Schema.String, out: Schema.Array(Line) }), {
+        table: Target,
+        schema,
+        pk: { field: "__edd_rm__", composite: ["id"] },
+        collection: { name: "tally", index: "gsi1", sk: { field: "gsi1sk", composite: [] } },
+        root: { entityType: "Order" },
+        ownsRows: true,
+        edges: { out: Aggregate.many({ entityType: "Tally#outbox", sk: { composite: ["lid"] } }) },
+      } as any)
+      expect(
+        yield* binds(
+          { entities: {}, aggregates: { Orders }, tables: { Source, Target } },
+          Layer.mergeAll(
+            Source.layer({ name: "source" }),
+            Target.layer({ name: "target" }),
+            Events.layer({ name: "events" }),
+          ),
+        ),
+      ).toBe("bound")
+    }),
+  )
+
+  it.effect("the partition key's attribute named `__edd_rm__`: no mark, as 1.40.0", () =>
+    Effect.gen(function* () {
+      // The table's partition attribute is `__edd_rm__`: its name is taken, so the outbox items
+      // carry no mark (`outboxMarkInUse`) and hold there what 1.40.0's did, the row's key.
+      const schema = DynamoSchema.make({ name: "rm", version: 1 })
+      const Tallies = Entity.make({
+        model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
+        entityType: "Tally",
+        primaryKey: {
+          pk: { field: "__edd_rm__", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as any)
+      const Events = outboxOf(schema, Tallies, {})
+      const Main = Table.make({ schema, entities: { Tallies } })
+      const Orders = owner(Main, schema, {
+        pkField: "__edd_rm__",
+        collection: "shared",
+        edgeType: "Tally#outbox",
+      })
+      expect(
+        yield* binds(
+          { entities: { Tallies }, aggregates: { Orders }, tables: { Main } },
+          Layer.merge(Main.layer({ name: "rm" }), Events.layer({ name: "events" })),
+        ),
+      ).toBe("bound")
+    }),
+  )
+
+  it.effect("the partition key's attribute named `__edd_rt__`: no row token, as 1.40.0", () =>
+    Effect.gen(function* () {
+      // The table's partition attribute is `__edd_rt__`: its name is taken (`rowTokenInUse`), so
+      // the rows of a read model two projections write carry no token (#237), and nothing writes
+      // it but the key, as on 1.40.0.
+      const schema = DynamoSchema.make({ name: "rk", version: 1 })
+      const Tallies = Entity.make({
+        model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
+        entityType: "Tally",
+        primaryKey: {
+          pk: { field: "__edd_rt__", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as any)
+      class Added extends Schema.TaggedClass<Added>()("Added", {}) {}
+      const Events = Table.make({ schema, entities: {} })
+      const Main = Table.make({ schema, entities: { Tallies } })
+      const Orders = owner(Main, schema, {
+        pkField: "__edd_rt__",
+        collection: "shared",
+        edgeType: "Tally",
+      })
+      const bind = binds(
+        { entities: { Tallies }, aggregates: { Orders }, tables: { Main } },
+        Layer.merge(Main.layer({ name: "rk" }), Events.layer({ name: "events" })),
+      )
+      const define = (streamName: string, checkpoint: string) =>
+        EventStore.projection({
+          stream: EventStore.makeStream({
+            table: Events,
+            streamName,
+            events: [Added],
+            streamId: { composite: ["id"] },
+          }),
+          readModel: Tallies,
+          key: (id: { readonly id: string }) => id,
+          initial: (id: { readonly id: string }) => ({ ...id, version: 0, rev: 0 }),
+          evolve: (state: any) => Effect.succeed(state),
+          checkpoint,
+        } as any)
+      define("First", "version")
+      expect(yield* bind).toBe("bound")
+      define("Second", "rev")
+      expect(yield* bind).toBe("bound")
+    }),
+  )
+
   it.effect("a projection outbox's index keys, which have no head, are any text", () =>
     Effect.gen(function* () {
       // The outbox index's partition is `Tally#outbox`, under `opk`: the aggregate's partition.
@@ -1193,16 +1302,28 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
 
   it.effect("cleanup goes up to 100 Deletes to a request", () =>
     Effect.gen(function* () {
-      const hidden = Array.from({ length: 150 }, (_, i) => ({
-        lid: `h${String(i).padStart(3, "0")}`,
-        note: "hidden",
-      }))
-      const { table, run, rows } = world()
+      const { table, run, rows, seed } = world()
       succeed(
         yield* run((db) =>
-          db.aggregates.Orders.create(created([{ lid: "x y", note: "shown" }, ...hidden])),
+          db.aggregates.Orders.create(
+            created([
+              { lid: "x y", note: "shown" },
+              { lid: "h000", note: "hidden" },
+            ]),
+          ),
         ),
       )
+      // 150 hidden lines: one create can't write them (a transaction holds at most 100 items), so
+      // the rest are copies of the one it wrote.
+      const first = rows().find((row) => row.note?.S === "hidden")!
+      expect(first.sk?.S?.endsWith("h000")).toBe(true)
+      seed(
+        Array.from({ length: 149 }, (_, i) => {
+          const lid = `h${String(i + 1).padStart(3, "0")}`
+          return { ...first, lid: { S: lid }, sk: { S: `${first.sk!.S!.slice(0, -4)}${lid}` } }
+        }),
+      )
+      expect(rows().filter((row) => row.note?.S === "hidden")).toHaveLength(150)
       table.requests.length = 0
       succeed(
         yield* run((db) =>

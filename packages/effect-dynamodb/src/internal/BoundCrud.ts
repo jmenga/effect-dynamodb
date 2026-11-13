@@ -46,6 +46,7 @@ import type {
   CascadeTarget,
   EntityDelete,
   EntityGet,
+  EntityInsert,
   EntityPut,
   EntityUpdate,
   PathAddOp,
@@ -208,6 +209,63 @@ export class BoundPutImpl<Model, A, E, VN extends string = string>
     return this._config.provide(
       (this._op as unknown as { _exec: (m: string) => Effect.Effect<A, E, any> })._exec("record"),
     )
+  }
+
+  [Symbol.iterator]() {
+    return new Utils.SingleShotGen(this.asEffect()) as any
+  }
+
+  pipe() {
+    return Pipeable.pipeArguments(this, arguments)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BoundInsert — insert: a PartiQL INSERT, so no condition and no multi-item path
+// ---------------------------------------------------------------------------
+
+/**
+ * Fluent builder for `insert`.
+ *
+ * ```ts
+ * yield* db.entities.AuditLog.insert(input)
+ * ```
+ *
+ * There is no `.condition()`, because a PartiQL `INSERT` has no conditions. Its
+ * `_boundOpType` keeps it out of `Batch.write` and `Transaction.transactWrite`.
+ */
+export interface BoundInsert<A, E, VN extends string = string> extends Pipeable.Pipeable {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "insert"
+  /**
+   * Supply a pre-computed embedding for a named vector index, skipping the
+   * `Embedder` for that index on this write. `name` is the LOGICAL vector index
+   * name declared on `Entity.make({ vectorIndexes })`.
+   */
+  readonly withVector: (name: VN, vector: ReadonlyArray<number>) => BoundInsert<A, E, VN>
+  /** Convert to an executable Effect for Effect combinator interop. */
+  readonly asEffect: () => Effect.Effect<A, E, never>
+  /** Yield support for `Effect.gen`. */
+  readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, never>, A>
+}
+
+/** @internal */
+export class BoundInsertImpl<Model, A, E, VN extends string = string>
+  implements BoundInsert<A, E, VN>
+{
+  readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
+  readonly _boundOpType = "insert" as const
+  constructor(
+    readonly _op: EntityInsert<A, any, E, any>,
+    readonly _config: BoundCrudConfig<Model>,
+  ) {}
+
+  withVector(name: VN, vector: ReadonlyArray<number>): BoundInsertImpl<Model, A, E, VN> {
+    return new BoundInsertImpl(withVectorCombinator(this._op, name, vector), this._config)
+  }
+
+  asEffect(): Effect.Effect<A, E, never> {
+    return this._config.provide(this._op._exec("record") as Effect.Effect<A, E, any>)
   }
 
   [Symbol.iterator]() {
@@ -694,6 +752,12 @@ export const makeBoundPut = <Model, A, E, VN extends string = string>(
   op: EntityPut<A, any, E, any>,
   config: BoundCrudConfig<Model>,
 ): BoundPut<Model, A, E, VN> => new BoundPutImpl<Model, A, E, VN>(op, config)
+
+/** @internal */
+export const makeBoundInsert = <Model, A, E, VN extends string = string>(
+  op: EntityInsert<A, any, E, any>,
+  config: BoundCrudConfig<Model>,
+): BoundInsert<A, E, VN> => new BoundInsertImpl<Model, A, E, VN>(op, config)
 
 /** @internal */
 export const makeBoundDelete = <Model, E>(

@@ -20,6 +20,7 @@ import {
   EntityDeleteTypeId,
   type EntityGet,
   EntityGetImpl,
+  type EntityInsert,
   type EntityOp,
   EntityOpTypeId,
   type EntityPut,
@@ -350,7 +351,10 @@ export const condition: {
 })
 
 /** @internal Operations that accept a pre-computed embedding. */
-type WithVectorTarget = EntityPut<any, any, any, any> | EntityUpdate<any, any, any, any, any>
+type WithVectorTarget =
+  | EntityPut<any, any, any, any>
+  | EntityInsert<any, any, any, any>
+  | EntityUpdate<any, any, any, any, any>
 
 /**
  * Supply a pre-computed embedding for a named vector index, skipping the

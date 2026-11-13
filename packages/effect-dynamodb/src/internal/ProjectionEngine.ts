@@ -16,7 +16,11 @@
  */
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
-import { isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
+import {
+  type DynamoEncoding,
+  getEncoding,
+  isConfiguredModel,
+} from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   ConcurrentModification,
@@ -31,11 +35,16 @@ import {
   keyFormValueKind,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import {
+  isSelfDateSchema,
+  optionalField,
   readingStreamValues,
+  resolveFieldEncoding,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { fnv1a64 } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
@@ -44,6 +53,7 @@ import {
   Duration as Dur,
   type Duration,
   Effect,
+  Equal,
   Option,
   Random,
   Result,
@@ -55,27 +65,44 @@ import { decodeMarshalledItem } from "../Entity.js"
 import type { StreamEvent } from "../EventStore.js"
 import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
 import type * as Query from "../Query.js"
-import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
+import { type RekeyAmbiguity, resolveTtlAttributeName, type TableConfig } from "../Table.js"
+import { attributeValueEquals } from "./AttributeValueEquals.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
-import { handlerOf } from "./Rekey.js"
+import { handlerOf, type RekeyMember, type RekeyTally } from "./Rekey.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
   addProjectionLayout,
+  andRaw,
+  asReadTerm,
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
+  freshRowToken,
+  hasProjectionTombstones,
   KEY_TEXT,
+  layoutTag,
   marshalOrFail,
+  OUTBOX_READ_MODEL,
+  outboxMarkInUse,
+  type ProjectionLayout,
   type ProjectionRole,
+  projectionLayoutsOf,
   projectionTtlChecked,
   projectionTtlConflict,
+  type RawCondition,
   OUTBOX_ROW_PK as ROW_PK,
   OUTBOX_ROW_SK as ROW_SK,
+  ROW_TOKEN,
+  rowTokened,
+  rowTokenInUse,
+  rowTokenTerm,
+  rowWriters,
   serializeSparseOrFail,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
+import { withCause } from "./WriteDiagnosis.js"
 
 // ---------------------------------------------------------------------------
 // Removal (#154)
@@ -133,6 +160,16 @@ export const outboxMarker = (entityType: string): string => `${entityType}#outbo
 
 /** Attribute names the engine owns on tombstones and outbox items. */
 export const REMOVED_AT = "__edd_removed__"
+
+/**
+ * The term a projection keeping no revision adds to a write over a tombstone it read: the row is
+ * still a tombstone (#237).
+ */
+const tombstoneTerm: RawCondition = {
+  expression: "attribute_exists(#eddRm)",
+  names: { "#eddRm": REMOVED_AT },
+  values: {},
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -305,17 +342,25 @@ export interface RowResult {
 
 /** The engine's own lost-race signal. */
 class LostRace {
-  constructor(readonly key: unknown) {}
+  /** `attributes`: the attributes whose change failed the write's condition (#237). */
+  constructor(
+    readonly key: unknown,
+    readonly attributes: ReadonlyArray<string>,
+  ) {}
 }
 
 // ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
 
-/** A key's identity: its fields, sorted, as JSON. */
+/**
+ * A key's identity: its fields, sorted, as JSON. JSON has no bigint, so one is written as an
+ * object holding its digits, which no number or string is; any other key's text is unchanged.
+ */
 export const keyId = (key: unknown): string =>
   JSON.stringify(
     Object.entries(key as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    (_name, value) => (typeof value === "bigint" ? { bigint: value.toString() } : value),
   )
 
 /** `K | Option<K>` → `Option<K>`. */
@@ -341,6 +386,45 @@ interface Row {
   readonly values: Record<string, unknown>
   readonly tombstone: boolean
   readonly createdAt: unknown
+  /** The item as read: another projection's bookkeeping as stored (#237). */
+  readonly item: Record<string, AttributeValue>
+  /**
+   * The row token as read (#237): `undefined` when the row holds none, or where the token's name
+   * isn't free on the read model's rows (`rowTokenInUse`), where an attribute of that name is the
+   * user's.
+   */
+  readonly token: AttributeValue | undefined
+}
+
+/**
+ * Two decoded values alike: primitives by `Object.is`, arrays and plain records entry by entry,
+ * anything else by `Equal.equals`.
+ */
+const sameValue = (a: unknown, b: unknown): boolean => {
+  if (Object.is(a, b)) return true
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return (
+      Array.isArray(a) &&
+      Array.isArray(b) &&
+      a.length === b.length &&
+      a.every((v, i) => sameValue(v, b[i]))
+    )
+  }
+  const plain = (v: object) => {
+    const proto = Object.getPrototypeOf(v)
+    return proto === Object.prototype || proto === null
+  }
+  if (plain(a) && plain(b)) {
+    const x = a as Record<string, unknown>
+    const y = b as Record<string, unknown>
+    const keys = Object.keys(x)
+    return (
+      keys.length === Object.keys(y).length &&
+      keys.every((k) => Object.hasOwn(y, k) && sameValue(x[k], y[k]))
+    )
+  }
+  return Equal.equals(a, b)
 }
 
 /** A table's service, as an entity or an outbox names it. */
@@ -370,26 +454,58 @@ export const physicalTableName = (tag: TableTag): Effect.Effect<string | undefin
   )
 
 /**
- * What a composite of `model` can be in a key (`KeyComposer.CompositeValues`), by its schema, as
- * one side sees it:
- *
- * - `"written"`, the keys its rows are written under: the key text of its literals (a literal
- *   union), of `true` and `false` (a boolean), or a number's or bigint's key text; any other field
- *   (a string, a field the model doesn't declare) may hold any text, `#` included.
- * - `"read"`, the keys `rekey`'s reader takes as its rows' (`KeyText136.readIndexKeys`): a number,
- *   a bigint or a boolean only as text its value composes again, and a literal composite as any
- *   text, which it reads as a string.
+ * The date encoding a composite field is stored under, when the library writes its text: a
+ * `DynamoModel` date schema's own, or, for an Effect date schema the entity stores by its own
+ * encoding (`Schema.DateTimeUtc`, `Schema.Date`, `Schema.DateTimeZoned`), the default or its
+ * `storedAs` override; for an optional field, its value's. `undefined` for a field that is no date,
+ * and for a date with a codec of its own (a transform to a date, `Schema.DateTimeUtcFromString`
+ * included), whose text the library doesn't know: it may hold any text, as 1.40.0 took it.
+ */
+const dateEncodingOf = (
+  field: Schema.Top,
+  override: DynamoEncoding | undefined,
+): DynamoEncoding | undefined => {
+  const known = (schema: Schema.Top) =>
+    getEncoding(schema) !== undefined || isSelfDateSchema(schema)
+  if (known(field)) return resolveFieldEncoding(field, override) ?? undefined
+  const inner = optionalField(field)?.inner
+  if (inner === undefined || !known(inner)) return undefined
+  return resolveFieldEncoding(inner, override) ?? undefined
+}
+
+/**
+ * What a composite of `model` can be in the keys its rows are written under
+ * (`KeyComposer.CompositeValues`), by its schema: the key text of its literals (a literal union), of
+ * `true` and `false` (a boolean), a number's or bigint's key text, or, with `dates`, a date's the
+ * library encodes (`dateEncodingOf`: an epoch's number, or ISO text); any other field (a string, a
+ * date with a codec of its own, a field the model doesn't declare) may hold any text, `#` included.
  */
 const compositeValues =
-  (model: unknown, side: "written" | "read") =>
+  (model: unknown, dates = true) =>
   (composite: string): KeyComposer.CompositeValues => {
     if (model === undefined || model === null) return "open"
     const schema = isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top)
     const fields = getSchemaFields(schema)
     if (fields === undefined || !Object.hasOwn(fields, composite)) return "open"
     const field = fields[composite]!
+    if (dates) {
+      const configured = isConfiguredModel(model) ? model.attributes : undefined
+      const date = dateEncodingOf(
+        field,
+        configured !== undefined && Object.hasOwn(configured, composite)
+          ? configured[composite]!.encoding
+          : undefined,
+      )
+      if (date !== undefined) {
+        return date.storage !== "string"
+          ? "number"
+          : date.domain === "DateTime.Zoned"
+            ? "zonedDate"
+            : "date"
+      }
+    }
     const literals = keyFormLiterals(field)
-    if (side === "written" && literals !== undefined) return { values: literals }
+    if (literals !== undefined) return { values: literals }
     const kind = keyFormValueKind(field)
     if (kind === "number" || kind === "bigint") return "number"
     if (kind === "boolean") return { values: [true, false] }
@@ -407,13 +523,17 @@ type KeySpace = { readonly pk: KeyComposer.KeySpace; readonly sk: KeyComposer.Ke
  * composite's name. Each value is what its type can compose (`compositeValues`), by `view`:
  *
  * - `"plain"`, the keys its rows are written under with values that hold no `#`: every composite is
- *   walked, to the end of the key, under the schema's setting.
- * - `"written"` and `"read"`, the keys `rekey` meets on its table, under any setting: the walk
- *   stops at the first composite whose value may hold `#` (`"open"`), and anything follows it.
+ *   walked, to the end of the key, under the schema's setting. `"plain140"` is the same, a date
+ *   taken as any text without `#`, as 1.40.0 took it.
+ * - `"owned"`, exactly the keys its rows can be written under, under any setting: every composite
+ *   is walked, to the end of the key, a value that may hold `#` as any text.
  *
  * `undefined` for an entity on no table.
  */
-const keySpaceOf = (entity: unknown, view: "plain" | "written" | "read"): KeySpace | undefined => {
+const keySpaceOf = (
+  entity: unknown,
+  view: "plain" | "plain140" | "owned",
+): KeySpace | undefined => {
   const member = entity as {
     readonly entityType?: string
     readonly _entityVersion?: number
@@ -425,20 +545,21 @@ const keySpaceOf = (entity: unknown, view: "plain" | "written" | "read"): KeySpa
   if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
     return undefined
   }
-  const values = compositeValues(member.model, view === "read" ? "read" : "written")
+  const values = compositeValues(member.model, view !== "plain140")
+  const plain = view === "plain" || view === "plain140"
   try {
     return KeyComposer.composeKeySpace(
       member._schema,
       member.entityType,
       member._entityVersion ?? 1,
       primary,
-      view === "plain"
+      plain
         ? (composite) => {
             const of = values(composite)
             return of === "open" ? "text" : of
           }
         : values,
-      { everyForm: view !== "plain" },
+      { everyForm: !plain, walkOpen: !plain },
     )
   } catch {
     return undefined
@@ -467,27 +588,32 @@ const spacesMeet = (a: KeySpace, b: KeySpace): boolean =>
   KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
 
 /**
- * Whether the outbox items of one entity can be read by `rekey` as the other's, either way round:
- * the keys one's are written under (`"written"`) against the keys the other's reader takes
- * (`"read"`).
+ * Whether two read models' outbox items can overwrite each other, as `DynamoClient.make` and
+ * `processBatch` ask (`"plain"`): a key of one can be a key of the other with values that hold no
+ * `#`. A date's key text is its own (`"plain"`), so a date beside a label it can't spell is apart,
+ * where 1.40.0 took a date as any text (`"plain140"`) and refused them. Such a pair is apart only
+ * when no key one writes can be a key the other writes at all (`"owned"`), `#` included: a drainer
+ * tells its own items from the other's by that (`drainPending`), so each delivers exactly its own.
+ * Otherwise they're refused, as on 1.40.0.
  */
-const readAsEachOther = (a: unknown, b: unknown): boolean => {
-  const meet = (writer: unknown, reader: unknown) => {
-    const written = keySpaceOf(writer, "written")
-    const read = keySpaceOf(reader, "read")
-    return (
-      written !== undefined &&
-      read !== undefined &&
-      spacesMeet(outboxSpaceOf(written), outboxSpaceOf(read))
-    )
+const overwriteEachOther = (a: unknown, b: unknown): boolean => {
+  const meet = (view: "plain" | "plain140" | "owned") => {
+    const x = keySpaceOf(a, view)
+    const y = keySpaceOf(b, view)
+    return x !== undefined && y !== undefined && spacesMeet(outboxSpaceOf(x), outboxSpaceOf(y))
   }
-  return meet(a, b) || meet(b, a)
+  if (meet("plain")) return true
+  return meet("plain140") && meet("owned")
 }
 
 /**
  * Whether two entities compose every key the same way: one schema (name, version, casing,
  * `escapeKeys`), entity type and version, primary key composites, casing and collection, and each
- * composite of one type. Then either one's reader moves a row as the other's would.
+ * composite of one kind of key text (a string, a number, a bigint or a boolean), whether or not one
+ * of them is limited to literals: a reader reads a literal composite as any value of its kind, and
+ * its key form composes that value as one of its kind (a literal union beside a string moves an
+ * item where the string's would, as on 1.39.0). A composite of no one kind takes the same type on
+ * both. Then either one's reader moves a row as the other's would.
  */
 const sameKeys = (a: unknown, b: unknown): boolean => {
   type Member = {
@@ -515,7 +641,8 @@ const sameKeys = (a: unknown, b: unknown): boolean => {
   const typeOf = (fields: ReturnType<typeof getSchemaFields>, composite: string) => {
     if (fields === undefined || !Object.hasOwn(fields, composite)) return undefined
     const field = fields[composite]!
-    return JSON.stringify([keyFormValueKind(field), keyFormLiterals(field)])
+    const kind = keyFormValueKind(field)
+    return kind !== undefined ? kind : JSON.stringify([kind, keyFormLiterals(field)])
   }
   const same = (u: ReadonlyArray<string>, v: ReadonlyArray<string>) =>
     u.length === v.length && u.every((name, i) => name === v[i])
@@ -544,28 +671,31 @@ const sameKeys = (a: unknown, b: unknown): boolean => {
  * has its outbox too. Tables are compared by the physical name the context resolves (two handles
  * on one table are one table), and by service when one isn't provided. The problem, or `undefined`.
  *
- * Two questions, by `scope`:
+ * One question ({@link overwriteEachOther}): can a key of one be a key of the other with values
+ * that hold no `#`, each value what its type can compose? Then their items overwrite each other
+ * whenever their values match, in normal operation, and no one can tell whose an item is. Read
+ * models whose keys meet only through a value holding `#` bind and run, as on 1.39.0, as do two
+ * whose keys part where a value of one can't hold the other's text (a number beside a label):
+ * `drainPending` and `rekey` tell their items apart item by item ({@link outboxOwnership},
+ * {@link rekeyOutboxMember}). It is asked where, by `scope`:
  *
- * - `"plain"` (where read models are bound: `DynamoClient.make`, `EventStore.processBatch`): can a
- *   key of one be a key of the other with values that hold no `#`, each value what its type can
- *   compose? Then their items overwrite each other whenever their values match, in normal
- *   operation. Read models whose keys meet only through a value holding `#` bind and run, as on
- *   1.39.0, as do two whose keys part where a value of one can't hold the other's text (a number
- *   beside a label).
- * - a table (`rekey` of it): can `rekey` read an item of one as the other's at all, a string value
- *   holding `#` included, and a literal composite read as any text, as its reader reads it? Then it
- *   couldn't tell whose an item on that table is. Only outboxes on that table are looked at. The
- *   table's own members (`scope.members`) are looked at too: an entity claims the outbox items of
- *   its entity type on its table (its own projections' outbox there), so one that can read a read
- *   model's items as its own would move them by its key. One whose keys are composed exactly as
+ * - `"plain"`: where read models are bound (`DynamoClient.make`, `EventStore.processBatch`).
+ * - a table (`rekey` of it), for projections defined since the client was made, whose outboxes
+ *   are recorded only when they are: only outboxes on that table are looked at. The table's own
+ *   members (`scope.members`) are looked at too: an entity claims the outbox items of its entity
+ *   type on its table (its own projections' outbox there). One whose keys are composed exactly as
  *   the read model's (`sameKeys`) moves them where the read model would, and isn't refused.
  *
+ * 1.40.0 asked `rekey` more: whether its reader could read an item of one as the other's at all, a
+ * value holding `#` included. Those pairs aren't refused from 1.41.0: `rekey` decides each item.
+ *
  * Read models that never meet at a site that sees several at once can't be checked: their key
- * spaces must be kept apart by whoever defines them.
+ * spaces must be kept apart by whoever defines them. Neither can a member that is no read model (a
+ * projection object built by hand, carrying its routes but no read model): it runs as on 1.39.0.
  */
 export const sharedOutboxKeySpace = (
   site: string,
-  members: ReadonlyArray<readonly [name: string, entity: unknown]>,
+  given: ReadonlyArray<readonly [name: string, entity: unknown]>,
   scope:
     | "plain"
     | {
@@ -577,6 +707,7 @@ export const sharedOutboxKeySpace = (
 ): Effect.Effect<string | undefined> =>
   Effect.gen(function* () {
     const plain = scope === "plain"
+    const members = given.filter(([, entity]) => typeof entity === "object" && entity !== null)
     // Every table a member's outbox is on, by its physical name.
     const names = new Map<string, string | undefined>()
     for (const [, entity] of members) {
@@ -595,7 +726,7 @@ export const sharedOutboxKeySpace = (
       `(partition keys starting "${space.pk.text}", sort keys starting "${space.sk.text}": the ` +
       "same schema name and version, primary collection, entity type and first composite)"
     for (const [name, entity] of members) {
-      const space = keySpaceOf(entity, plain ? "plain" : "written")
+      const space = keySpaceOf(entity, "plain")
       if (space === undefined) continue
       for (const outbox of remoteOutboxesOf(entity)) {
         const into = outbox.table.Tag
@@ -604,24 +735,13 @@ export const sharedOutboxKeySpace = (
         for (const [otherName, other] of members) {
           if (other === entity) continue
           if (!remoteOutboxesOf(other).some((o) => oneTable(o.table.Tag, into))) continue
-          if (plain) {
-            const otherSpace = keySpaceOf(other, "plain")
-            if (
-              otherSpace === undefined ||
-              !spacesMeet(outboxSpaceOf(space), outboxSpaceOf(otherSpace))
-            ) {
-              continue
-            }
-          } else if (!readAsEachOther(entity, other)) continue
+          if (!overwriteEachOther(entity, other)) continue
           return (
             `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
             `table${physical === undefined ? "" : ` ("${physical}")`}, where ${otherName} ` +
             `writes its own under the same key space ${startOf(space)}. ` +
-            (plain
-              ? "Their items would overwrite each other whenever their keys match, and rekey " +
-                "couldn't tell whose an item is. "
-              : "rekey reads an item's key back by its key space, and couldn't tell whose an " +
-                "item on this table is. ") +
+            "Their items would overwrite each other whenever their keys match, and rekey " +
+            "couldn't tell whose an item is. " +
             "Give one of them its own entity type, collection, schema or key composites."
           )
         }
@@ -630,16 +750,16 @@ export const sharedOutboxKeySpace = (
         for (const [memberName, member] of scope.members) {
           if (member === entity) continue
           const claims = handlerOf(member)?.types.includes(`${readModelType(entity)}#outbox`)
-          if (claims !== true || sameKeys(member, entity) || !readAsEachOther(entity, member)) {
+          if (claims !== true || sameKeys(member, entity) || !overwriteEachOther(entity, member)) {
             continue
           }
           return (
             `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
             `table${physical === undefined ? "" : ` ("${physical}")`}, whose member ` +
-            `${memberName} claims the outbox items of its entity type there under the same key ` +
-            `space ${startOf(space)}, and composes its keys differently. rekey reads an item's ` +
-            "key back by its key space, and couldn't tell whose an item on this table is. Give " +
-            "one of them its own entity type, collection, schema or key composites."
+            `${memberName} writes the outbox items of its entity type there under the same key ` +
+            `space ${startOf(space)}, and composes its keys differently. Their items would ` +
+            "overwrite each other whenever their keys match, and rekey couldn't tell whose an " +
+            "item is. Give one of them its own entity type, collection, schema or key composites."
           )
         }
       }
@@ -650,6 +770,318 @@ export const sharedOutboxKeySpace = (
 /** An entity's type, as its rows' `__edd_e__` names it. */
 const readModelType = (entity: unknown): string | undefined =>
   (entity as { readonly entityType?: string }).entityType
+
+/**
+ * @internal The tag a read model's outbox items carry (`OUTBOX_READ_MODEL`, #237): a hash of what
+ * its rows' keys are composed from: the schema's name and version, the entity type and its
+ * version, the primary collection and the primary key's composites. Not the key text's setting
+ * (`escapeKeys`, casing), which `rekey` moves items across, nor a composite's type, which can
+ * change with the key text staying. `undefined` for an entity on no table.
+ */
+export const readModelTag = (entity: unknown): string | undefined => {
+  const member = entity as {
+    readonly entityType?: string
+    readonly _entityVersion?: number
+    readonly indexes?: { readonly primary?: IndexDefinition }
+    readonly _schema?: DynamoSchema.DynamoSchema
+  }
+  const primary = member.indexes?.primary
+  if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
+    return undefined
+  }
+  let hash = 0x811c9dc5
+  const text = JSON.stringify([
+    member._schema.name,
+    member._schema.version,
+    member.entityType,
+    member._entityVersion ?? 1,
+    primary.collection ?? null,
+    primary.pk.composite,
+    primary.sk.composite,
+  ])
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(36)
+}
+
+/**
+ * @internal The mark an outbox item carries (`OUTBOX_READ_MODEL`, #237): the read model's tag
+ * (`readModelTag`), then the effect's, a 64-bit FNV-1a hash of the projection (`layoutTag`) and
+ * the event (its source, stream id and version). An item's `Put` replaces only an item carrying
+ * the same mark (`writeRow`): a redelivery or retry of the same effect. Any other item at its key,
+ * another projection's of the read model, another event's of the projection (its revision started
+ * again after its row was lost), or another read model's, is kept, and the item written beside it.
+ */
+export const outboxMark = (
+  readModel: string,
+  projection: string,
+  event: { readonly source: string; readonly streamId: unknown; readonly version: number },
+): string =>
+  `${readModel}.${fnv1a64(
+    new TextEncoder().encode(
+      JSON.stringify([projection, event.source, String(event.streamId), event.version]),
+    ),
+  ).toString(36)}`
+
+/** The read model an outbox item's mark names: its text before the first `.` (`outboxMark`). */
+const markedReadModel = (mark: string): string => {
+  const dot = mark.indexOf(".")
+  return dot < 0 ? mark : mark.slice(0, dot)
+}
+
+/**
+ * Read models whose projections write outbox items, by the service key of the table they write
+ * them to, and each read model's projections with an outbox (`layoutTag`), as they are defined.
+ */
+const outboxWriters = new Map<string, Set<object>>()
+const outboxProjections = new WeakMap<object, Set<string>>()
+
+/** The service keys of the tables a read model's projections write outbox items to. */
+const outboxTablesOf = (readModel: object): ReadonlyArray<string | undefined> => {
+  const member = readModel as {
+    readonly _tableTag?: { readonly key?: string }
+    readonly _projectionOutboxes?: ReadonlyArray<{
+      readonly table: { readonly Tag: { readonly key?: string } } | undefined
+    }>
+  }
+  return (member._projectionOutboxes ?? []).map(
+    (outbox) => (outbox.table?.Tag ?? member._tableTag)?.key,
+  )
+}
+
+/**
+ * @internal Whether no other read model defined writes outbox items whose keys can be this read
+ * model's (#237), decided from the definitions: on each table its outboxes are on, every other
+ * read model with an outbox there (another key template, `readModelTag`) composes keys that can
+ * never be this one's (`keySpaceOf`, `"owned"`: any value, `#` included). Then an item without a
+ * mark at a key this read model writes was written by this read model before 1.41.0, and a `Put`
+ * of the same event replaces it, as 1.40.0's did (`writeRow`). `false` where a key space can't be
+ * composed or a table isn't known.
+ */
+export const outboxKeysApart = (readModel: object): boolean => {
+  const own = keySpaceOf(readModel, "owned")
+  const tag = readModelTag(readModel)
+  if (own === undefined || tag === undefined) return false
+  const mine = outboxSpaceOf(own)
+  for (const table of outboxTablesOf(readModel)) {
+    if (table === undefined) return false
+    for (const other of outboxWriters.get(table) ?? []) {
+      if (other === readModel || readModelTag(other) === tag) continue
+      const space = keySpaceOf(other, "owned")
+      if (space === undefined || spacesMeet(mine, outboxSpaceOf(space))) return false
+    }
+  }
+  return true
+}
+
+/** Whose an outbox item is, as one read model sees it ({@link outboxOwnership}). */
+export type OutboxOwnership = "mine" | "foreign" | "unmarked"
+
+const ownershipOf = new WeakMap<object, (item: Record<string, AttributeValue>) => OutboxOwnership>()
+
+/**
+ * @internal Whose an outbox item is, as `readModel` sees it (#237): the one decision `drainPending`
+ * and the outbox table's `rekey` make. The row it names (`__edd_row_pk__`, `__edd_row_sk__`) must
+ * have a key the read model's composer writes, under any setting, for values of its composites'
+ * kinds (`keySpaceOf`, `"owned"`: a date the library encodes as its text, a number's key text, a
+ * literal's, a string as any text, `#` included): what its reader would take (a date or a literal
+ * as any text) isn't enough. Then:
+ *
+ * - `"mine"`: the item names this read model (`OUTBOX_READ_MODEL`, from 1.41.0).
+ * - `"foreign"`: it names another, or its row's key is no key this read model writes.
+ * - `"unmarked"`: written before 1.41.0, at a key this read model writes, which another read model
+ *   may write too (`[shop]` with `north#branch_b1` beside `[shop, branch]`). `drainPending` drains
+ *   it, as 1.40.0 did; `rekey` asks the other read models on the table.
+ *
+ * Every key is taken as the read model's when its key space can't be composed.
+ */
+export const outboxOwnership = (
+  readModel: object,
+): ((item: Record<string, AttributeValue>) => OutboxOwnership) => {
+  const known = ownershipOf.get(readModel)
+  if (known !== undefined) return known
+  const tag = readModelTag(readModel)
+  const space = keySpaceOf(readModel, "owned")
+  const whole = (text: string): KeyComposer.KeySpace => ({ text, after: [], open: false })
+  const decide = (item: Record<string, AttributeValue>): OutboxOwnership => {
+    const pk = item[ROW_PK]?.S
+    const sk = item[ROW_SK]?.S
+    if (space !== undefined) {
+      if (pk === undefined || sk === undefined) return "foreign"
+      if (!spacesMeet(space, { pk: whole(pk), sk: whole(sk) })) return "foreign"
+    }
+    // A read model whose items carry no mark reads none (`outboxMarkInUse`): `__edd_rm__` is
+    // something else's there.
+    const marked = outboxMarkInUse(readModel) ? item[OUTBOX_READ_MODEL]?.S : undefined
+    if (marked === undefined) return "unmarked"
+    return markedReadModel(marked) === tag ? "mine" : "foreign"
+  }
+  ownershipOf.set(readModel, decide)
+  return decide
+}
+
+/**
+ * @internal A read model `rekey` asks about the outbox items of its entity type on the table it
+ * runs on: one whose projection's outbox is there, or a member of the table (its own projections'
+ * outbox items, on its own table).
+ */
+export interface OutboxCandidate {
+  readonly readModel: {
+    readonly entityType: string
+    readonly _tableTag: TableTag
+    readonly indexes: { readonly primary?: IndexDefinition | undefined }
+    readonly _rekeyProjectionRow: (
+      row: Record<string, AttributeValue>,
+      ctx: Parameters<RekeyMember["row"]>[1],
+      keys?: { readonly pk: string; readonly sk: string } | undefined,
+    ) => ReturnType<RekeyMember["row"]>
+    readonly _valuelessMove: (
+      row: Record<string, AttributeValue>,
+      keys: { readonly pk: string; readonly sk: string },
+    ) =>
+      | "current"
+      | {
+          readonly to: Record<string, string>
+          readonly rowTo: { readonly pk: string; readonly sk: string }
+        }
+      | undefined
+    readonly _ownsRow: (row: Record<string, AttributeValue>) => boolean
+  }
+  /** The item's table key attributes: those of the layout whose attributes it holds. */
+  readonly keys: (row: Record<string, AttributeValue>) => {
+    readonly pk: string
+    readonly sk: string
+  }
+}
+
+/**
+ * @internal `rekey`'s one member for the outbox items of `entityType` on a table (#237): it decides
+ * whose an item is among `candidates` (registration order), and that read model moves it.
+ *
+ * - The item names its read model (`OUTBOX_READ_MODEL`), or its row's key is a key only some of
+ *   them write: {@link outboxOwnership}, the one decision `drainPending` makes too. Those that can
+ *   have written it and read its key back are its possible owners. None: `unregistered` when it
+ *   names a read model none of them is, else `unrecognizedKey`.
+ * - One, or several moving it to one key (or each finding it current): the first moves it, with
+ *   no extra read.
+ * - Otherwise, an item written before 1.41.0 at a key more than one writes, which they'd move
+ *   apart: the row it names is read from each one's table (strongly consistent), at that key and
+ *   at the key that read model would move it to. It is the read model's whose own row is there
+ *   (`_ownsRow`: its values compose that key) when exactly one finds one and none finds a row
+ *   tombstone. Otherwise it's left where it is, `ambiguousOwner` with the reason
+ *   ({@link RekeyAmbiguity}), and a rerun reads and leaves it again.
+ */
+export const rekeyOutboxMember = (
+  entityType: string,
+  candidates: ReadonlyArray<OutboxCandidate>,
+): RekeyMember => ({
+  name: entityType,
+  types: [`${entityType}#outbox`],
+  exclusive: true,
+  row: (row, ctx) =>
+    Effect.gen(function* () {
+      const marked = row[OUTBOX_READ_MODEL]?.S
+      const owners = candidates.flatMap((candidate) => {
+        if (outboxOwnership(candidate.readModel)(row) === "foreign") return []
+        const keys = candidate.keys(row)
+        const plan = candidate.readModel._valuelessMove(row, keys)
+        return plan === undefined ? [] : [{ candidate, keys, plan }]
+      })
+      if (owners.length === 0) {
+        const named =
+          marked !== undefined &&
+          !candidates.some((c) => readModelTag(c.readModel) === markedReadModel(marked))
+        return { skipped: { [named ? "unregistered" : "unrecognizedKey"]: 1 } } as RekeyTally
+      }
+      const first = owners[0]!
+      const where = (plan: (typeof owners)[number]["plan"]) =>
+        plan === "current" ? "current" : JSON.stringify(plan.to)
+      if (owners.every((owner) => where(owner.plan) === where(first.plan))) {
+        return yield* first.candidate.readModel._rekeyProjectionRow(row, ctx, first.keys)
+      }
+      // Written before 1.41.0 at a key more than one of them writes, and they'd move it apart.
+      const stored = {
+        [first.keys.pk]: row[first.keys.pk]?.S,
+        [first.keys.sk]: row[first.keys.sk]?.S,
+      }
+      const rowAt = { pk: row[ROW_PK]?.S ?? "", sk: row[ROW_SK]?.S ?? "" }
+      const client = yield* Capacity.client
+      const reads = new Map<string, Record<string, AttributeValue> | undefined>()
+      const found: Array<"own" | "tombstone" | "none" | "unprovided"> = []
+      for (const { candidate, plan } of owners) {
+        const { readModel } = candidate
+        const primary = readModel.indexes.primary
+        const tableName = yield* physicalTableName(readModel._tableTag)
+        if (tableName === undefined || primary === undefined) {
+          found.push("unprovided")
+          continue
+        }
+        // Where the row is, then where it would be: a move of it in between is seen at the second.
+        const at =
+          plan !== "current" && (plan.rowTo.pk !== rowAt.pk || plan.rowTo.sk !== rowAt.sk)
+            ? [rowAt, plan.rowTo]
+            : [rowAt]
+        let result: "own" | "tombstone" | "none" = "none"
+        for (const key of at) {
+          const id = JSON.stringify([tableName, primary.pk.field, key.pk, primary.sk.field, key.sk])
+          if (!reads.has(id)) {
+            const { Item } = yield* client.getItem({
+              TableName: tableName,
+              Key: toAttributeMap({ [primary.pk.field]: key.pk, [primary.sk.field]: key.sk }),
+              ConsistentRead: true,
+            })
+            reads.set(id, Item)
+          }
+          const there = reads.get(id)
+          const type = there?.__edd_e__?.S
+          if (there === undefined) continue
+          if (type === `${entityType}#tombstone`) result = "tombstone"
+          else if (type === entityType && readModel._ownsRow(there) && result === "none") {
+            result = "own"
+          }
+        }
+        found.push(result)
+      }
+      const own = found.flatMap((result, i) => (result === "own" ? [owners[i]!] : []))
+      if (found.every((result) => result !== "tombstone" && result !== "unprovided")) {
+        if (own.length === 1) {
+          const { candidate, keys } = own[0]!
+          return yield* candidate.readModel._rekeyProjectionRow(row, ctx, keys)
+        }
+      }
+      const targets = [
+        ...new Map(
+          owners.map(({ plan }) => {
+            const target = plan === "current" ? stored : plan.to
+            return [JSON.stringify(target), target] as const
+          }),
+        ).values(),
+      ]
+      const rowText = `the row it names (${JSON.stringify(rowAt.pk)}, ${JSON.stringify(rowAt.sk)})`
+      const gone = own.length === 0 && found.every((result) => result === "none")
+      const ambiguity: RekeyAmbiguity = {
+        member: entityType,
+        key: stored,
+        targets,
+        reason: gone ? "rowGone" : "unsettled",
+        message:
+          `${owners.length} read models of entity type "${entityType}" whose outboxes share this ` +
+          "table can each have written it, and would move it to different keys; it was written " +
+          "before 1.41.0, so it doesn't name its read model. " +
+          (gone
+            ? `None of them has ${rowText}, at that key or where it would move it.`
+            : found.includes("unprovided")
+              ? `The table of one of them isn't provided where rekey runs, so ${rowText} can't be read there.`
+              : found.includes("tombstone")
+                ? `A row tombstone is at ${rowText}: it holds no values to say whose it is.`
+                : `More than one of them has a row of its own at ${rowText}.`) +
+          " It's left where it is.",
+      }
+      return { skipped: { ambiguousOwner: 1 }, ambiguous: [ambiguity] } as RekeyTally
+    }),
+})
 
 /**
  * @internal `[EDD-9134]` ({@link sharedOutboxKeySpace}) as a defect, from the sites that define
@@ -719,12 +1151,24 @@ export const makeEngine = (config: EngineConfig) => {
   // `removal`, for the checks of `[EDD-9133]`. Rows may be tombstones (#154) when one has
   // `removal`: the entity's `create` takes one's place, keeping the checkpoints of the projection
   // with `removal` that wrote it, with its revision one higher (`overTombstone`).
-  addProjectionLayout(readModel, {
+  const ownLayout: ProjectionLayout = {
     label: config.label,
     roles,
     removal: config.removal !== undefined,
     ttl: config.removal?.ttl !== undefined,
-  })
+  }
+  addProjectionLayout(readModel, ownLayout)
+  /**
+   * This projection's tag (`layoutTag`), in its outbox items' marks (`outboxMark`) and in a row
+   * token.
+   */
+  const ownTag = layoutTag(ownLayout)
+  /** This projection's roles, by stored name. */
+  const ownRoles = new Map<string, Set<ProjectionRole>>()
+  for (const [field, role] of roles) {
+    const name = dbName(field)
+    ownRoles.set(name, (ownRoles.get(name) ?? new Set()).add(role))
+  }
 
   // Every projection's outbox, kept on the read model, one entry per distinct layout, the one defined
   // last at the end: a second projection doesn't hide the first's, which stays callable, and one
@@ -751,10 +1195,32 @@ export const makeEngine = (config: EngineConfig) => {
       ...(holder._projectionOutboxes ?? []).filter((other) => !same(other)),
       layout,
     ]
+    // Where its items are, beside the other read models', for `outboxKeysApart`; and that the
+    // read model has this projection with an outbox.
+    const into = ((config.outbox.table?.Tag ?? readModel._tableTag) as { key?: string } | undefined)
+      ?.key
+    if (into !== undefined) {
+      const writers = outboxWriters.get(into) ?? new Set<object>()
+      writers.add(readModel)
+      outboxWriters.set(into, writers)
+    }
+    const projections = outboxProjections.get(readModel) ?? new Set<string>()
+    projections.add(ownTag)
+    outboxProjections.set(readModel, projections)
   }
 
   const tableName = Effect.suspend(() =>
     Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => tc.name),
+  )
+
+  /**
+   * Whether the read model's rows may carry the row token (`rowTokenInUse`, #237): decided from
+   * the definitions and the table's TTL attribute, never from a stored row.
+   */
+  const tokenInUse = Effect.suspend(() =>
+    Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) =>
+      rowTokenInUse(readModel, resolveTtlAttributeName(tc)),
+    ),
   )
 
   /** The row, read strongly consistent — raw, so a tombstone reads as one. */
@@ -762,20 +1228,22 @@ export const makeEngine = (config: EngineConfig) => {
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
+      const inUse = yield* tokenInUse
       const { Item: item } = yield* client.getItem({
         TableName,
         Key: toAttributeMap(composePrimaryKey(readModel as any, key as Record<string, unknown>)),
         ConsistentRead: true,
       })
       if (item === undefined) return Option.none<Row>()
+      const token = inUse && Object.hasOwn(item, ROW_TOKEN) ? item[ROW_TOKEN] : undefined
       if (item.__edd_e__?.S === tombstoneMarker(entityType)) {
         const raw = fromAttributeMap(item) as Record<string, unknown>
         const values: Record<string, unknown> = {}
         for (const f of keptFields) {
-          const v = raw[dbName(f)]
+          const v = ownValue(raw, dbName(f))
           if (v !== undefined) values[f] = v
         }
-        return Option.some<Row>({ values, tombstone: true, createdAt: undefined })
+        return Option.some<Row>({ values, tombstone: true, createdAt: undefined, item, token })
       }
       const decoded = (yield* decodeMarshalledItem(readModel as any, item)) as Record<
         string,
@@ -784,12 +1252,15 @@ export const makeEngine = (config: EngineConfig) => {
       let values: Record<string, unknown> = decoded
       if (fields !== undefined) {
         values = {}
-        for (const f of fields) if (decoded[f] !== undefined) values[f] = decoded[f]
+        for (const f of fields)
+          if (ownValue(decoded, f) !== undefined) values[f] = ownValue(decoded, f)
       }
       return Option.some<Row>({
         values: readModel._attachPrototype?.(values) ?? values,
         tombstone: false,
-        createdAt: createdAtField === null ? undefined : decoded[createdAtField],
+        createdAt: createdAtField === null ? undefined : ownValue(decoded, createdAtField),
+        item,
+        token,
       })
     })
 
@@ -821,19 +1292,19 @@ export const makeEngine = (config: EngineConfig) => {
     const values = Option.isSome(row) ? row.value.values : undefined
     const layout = config.checkpoints
     if (layout.kind === "scalar") {
-      const v = values?.[layout.field]
+      const v = ownValue(values, layout.field)
       return { kind: "scalar", at: v === undefined ? 0 : Number(v) - layout.offset }
     }
     const mapped = layout.fields[source]
     const fromMap = (): Slot => {
-      const map = (values?.[layout.map!] ?? {}) as Record<string, number>
+      const map = (ownValue(values, layout.map!) ?? {}) as Record<string, number>
       const v = map[instanceKey(source, streamIdStr)]
       return { kind: "map", at: v === undefined ? 0 : Number(v) }
     }
     if (mapped === undefined) return fromMap()
-    const stored = values?.[mapped.instanceField]
+    const stored = ownValue(values, mapped.instanceField)
     const owner = claimed.get(source) ?? (stored === null || stored === "" ? undefined : stored)
-    const scalar = values?.[mapped.field]
+    const scalar = ownValue(values, mapped.field)
     const at = scalar === undefined ? 0 : Number(scalar) - mapped.offset
     // No owner recorded: a new row, or a legacy one — adopted by this instance.
     if (owner === undefined && !adopt) return { kind: "field", at }
@@ -853,7 +1324,7 @@ export const makeEngine = (config: EngineConfig) => {
   /** The row's revision, when the projection keeps one. */
   const revisionOf = (row: Option.Option<Row>): number | undefined => {
     if (config.revision === undefined || Option.isNone(row)) return undefined
-    const v = row.value.values[config.revision.field]
+    const v = ownValue(row.value.values, config.revision.field)
     return v === undefined ? undefined : Number(v)
   }
 
@@ -881,16 +1352,19 @@ export const makeEngine = (config: EngineConfig) => {
     } else {
       // Carry every field the layout owns over from the row, then advance.
       for (const f of Object.values(layout.fields)) {
-        if (target[f.field] === undefined && previous?.[f.field] !== undefined)
-          target[f.field] = previous[f.field]
-        if (target[f.instanceField] === undefined && previous?.[f.instanceField] !== undefined) {
-          target[f.instanceField] = previous[f.instanceField]
+        if (ownValue(target, f.field) === undefined && ownValue(previous, f.field) !== undefined)
+          target[f.field] = ownValue(previous, f.field)
+        if (
+          ownValue(target, f.instanceField) === undefined &&
+          ownValue(previous, f.instanceField) !== undefined
+        ) {
+          target[f.instanceField] = ownValue(previous, f.instanceField)
         }
       }
       const map: Record<string, number> =
         layout.map === undefined
           ? {}
-          : { ...((previous?.[layout.map] ?? {}) as Record<string, number>) }
+          : { ...((ownValue(previous, layout.map) ?? {}) as Record<string, number>) }
       for (const a of advanced) {
         if (a.slot.kind === "field") {
           const mapped = layout.fields[a.source]!
@@ -901,7 +1375,7 @@ export const makeEngine = (config: EngineConfig) => {
       // An empty map stays absent on a row that had none.
       if (
         layout.map !== undefined &&
-        (Object.keys(map).length > 0 || previous?.[layout.map] !== undefined)
+        (Object.keys(map).length > 0 || ownValue(previous, layout.map) !== undefined)
       )
         target[layout.map] = map
     }
@@ -940,7 +1414,7 @@ export const makeEngine = (config: EngineConfig) => {
         },
       }
     }
-    const stored = row.value.values[layout.field]
+    const stored = ownValue(row.value.values, layout.field)
     // A row written before the projection: no checkpoint yet.
     if (stored === undefined) {
       return {
@@ -992,11 +1466,45 @@ export const makeEngine = (config: EngineConfig) => {
       ? undefined
       : readBackOf(config.outbox.schema, () => readingStreamValues(config.outbox!.schema))
 
+  /** The tag of this read model's key template (`readModelTag`), its items' marks begin with. */
+  const outboxTag = readModelTag(readModel)
+
+  /**
+   * How an outbox item's `Put` stands toward what is at its key, tried in turn as the write is
+   * cancelled there (`outboxStages`):
+   *
+   * - `"none"`: no mark, no condition: the item replaces what's there, as on 1.40.0.
+   * - `"plain"`: the key holds nothing, or this effect's item (`outboxMark`).
+   * - `"sameEvent"`: that, or an item without a mark (written before 1.41.0) of the same event.
+   * - `"beside"`: at the key followed by `#<mark>`, which only this effect writes.
+   */
+  type OutboxStage = "none" | "plain" | "sameEvent" | "beside"
+
+  /**
+   * The stages of this read model's outbox items, decided from the definitions (#237). Its items
+   * carry no mark where the name is something else's (`outboxMarkInUse`). An item without a mark
+   * at its key (written before 1.41.0) is its own only where no other read model's keys can be its
+   * own (`outboxKeysApart`) and no other projection of it writes outbox items (an item records
+   * its event, not its projection): then the same event's is replaced, as on 1.40.0, after the
+   * plain `Put` is cancelled. Anywhere else it is kept, and the item written beside it.
+   */
+  const outboxStages = (): ReadonlyArray<OutboxStage> => {
+    if (outboxTag === undefined || !outboxMarkInUse(readModel)) return ["none"]
+    return outboxKeysApart(readModel) && (outboxProjections.get(readModel)?.size ?? 0) <= 1
+      ? ["plain", "sameEvent", "beside"]
+      : ["plain", "beside"]
+  }
+
+  /**
+   * The outbox items to write with the row, each at `<row sk>#outbox#<revision>#<n>`, or, at the
+   * stage `"beside"`, at that key followed by `#<mark>` ({@link writeRow}).
+   */
   const outboxItems = (
     rowKey: Record<string, unknown>,
     revision: number,
     enqueued: ReadonlyArray<Enqueued>,
     mark: 2 | undefined,
+    stageOf: (i: number) => OutboxStage,
   ): Effect.Effect<ReadonlyArray<Record<string, AttributeValue>>, ValidationError> =>
     Effect.forEach(enqueued, (e, i) =>
       Effect.gen(function* () {
@@ -1019,13 +1527,24 @@ export const makeEngine = (config: EngineConfig) => {
         const keys = outboxKeys()
         const rowPk = String(rowKey[primary.pk.field])
         const rowSk = String(rowKey[primary.sk.field])
-        const sk = `${rowSk}#outbox#${pad(revision, 12)}#${pad(i, 4)}`
+        const stage = stageOf(i)
+        const marked =
+          stage === "none"
+            ? undefined
+            : outboxMark(outboxTag!, ownTag, {
+                source: e.source,
+                streamId: e.event.streamId,
+                version: e.event.version,
+              })
+        const at = `${rowSk}#outbox#${pad(revision, 12)}#${pad(i, 4)}`
+        const sk = stage === "beside" ? `${at}#${marked}` : at
         const item: Record<string, unknown> = {
           [keys.pk]: rowPk,
           [keys.sk]: sk,
           __edd_e__: outboxMarker(entityType),
           [ROW_PK]: rowPk,
           [ROW_SK]: rowSk,
+          ...(marked !== undefined && { [OUTBOX_READ_MODEL]: marked }),
           effect: encoded,
           source: e.source,
           streamId: e.event.streamId,
@@ -1043,14 +1562,159 @@ export const makeEngine = (config: EngineConfig) => {
       }),
     )
 
-  /** A lost race, from a single write's or a transaction's failure: the row's Put cancelled. */
-  const lostRaceOf = (error: unknown, transaction: boolean): boolean => {
-    const cause = (error as { readonly cause?: unknown })?.cause
-    if (!transaction) return isAwsConditionalCheckFailed(cause)
-    return (
-      isAwsTransactionCancelled(cause) &&
-      (cause.CancellationReasons ?? []).some((reason) => reason?.Code === "ConditionalCheckFailed")
+  /** The guard's attribute, as a lost race has named it since 1.39.0: the field, by its name. */
+  const guardLabel = config.revision?.field ?? (config.checkpoints as { field: string }).field
+
+  /**
+   * The item as stored when the row's write failed its condition, from a write that asked for it
+   * (`ReturnValuesOnConditionCheckFailure: "ALL_OLD"`): none when the row is gone.
+   */
+  const storedOf = (error: unknown, transaction: boolean): Option.Option<unknown> => {
+    const cause = (error as { readonly cause?: any })?.cause
+    return Option.fromNullishOr(
+      transaction ? cause?.CancellationReasons?.[0]?.Item : (cause as { Item?: unknown })?.Item,
     )
+  }
+
+  /**
+   * The attributes whose change failed a write's condition (#237): the guard (the revision or
+   * checkpoint read, named by its field), the row token read, that the row is still the tombstone
+   * read. Told apart
+   * from `current`, the item as stored when it failed (none: the row is gone); without it (a
+   * write that didn't ask, sending what 1.40.0 did), every part that could have failed.
+   */
+  const changedOf = (
+    guardRaw: RawCondition,
+    token: AttributeValue | undefined,
+    tokenTerm: RawCondition | undefined,
+    held: ReadonlyArray<readonly [field: string, stored: string]>,
+    readItem: Record<string, AttributeValue> | undefined,
+    overRead: RawCondition | undefined,
+    current: Option.Option<unknown> | undefined,
+  ): ReadonlyArray<string> => {
+    const name = guardRaw.names["#g"]!
+    const parts: Array<
+      readonly [string, (item: Record<string, AttributeValue> | undefined) => boolean]
+    > = [
+      [
+        guardLabel,
+        (item) =>
+          guardRaw.values[":g"] === undefined
+            ? item?.[name] === undefined
+            : item?.[name] !== undefined &&
+              attributeValueEquals(item[name], guardRaw.values[":g"]!),
+      ],
+    ]
+    if (tokenTerm !== undefined) {
+      parts.push([
+        ROW_TOKEN,
+        (item) =>
+          token === undefined
+            ? item?.[ROW_TOKEN] === undefined
+            : item?.[ROW_TOKEN] !== undefined && attributeValueEquals(item[ROW_TOKEN], token),
+      ])
+    }
+    for (const [field, stored] of held) {
+      const was =
+        readItem !== undefined && Object.hasOwn(readItem, stored) ? readItem[stored] : undefined
+      parts.push([
+        field,
+        (item) =>
+          was === undefined
+            ? item?.[stored] === undefined
+            : item?.[stored] !== undefined && attributeValueEquals(item[stored], was),
+      ])
+    }
+    if (overRead !== undefined) parts.push([REMOVED_AT, (item) => item?.[REMOVED_AT] !== undefined])
+    if (current === undefined) return parts.map(([part]) => part)
+    const item = Option.getOrUndefined(current) as Record<string, AttributeValue> | undefined
+    const changed = parts.filter(([, holds]) => !holds(item)).map(([part]) => part)
+    return changed.length > 0 ? changed : parts.map(([part]) => part)
+  }
+
+  /** A lost race, from a single write's failure: the row's Put cancelled. */
+  const lostRaceOf = (error: unknown): boolean =>
+    isAwsConditionalCheckFailed((error as { readonly cause?: unknown })?.cause)
+
+  /**
+   * The condition an outbox item's `Put` carries at `stage` (#237, `outboxStages`): nothing at its
+   * key, or the item of the same effect (`outboxMark`); at `"sameEvent"`, also an item without a
+   * mark of the same event (its `source`, `streamId` and `version`, as 1.40.0 stored them). None
+   * at `"none"`. Another item cancels the write instead of being replaced ({@link writeRow}).
+   */
+  const outboxGuard = (pk: string, Item: Record<string, AttributeValue>, stage: OutboxStage) => {
+    if (stage === "none") return {}
+    const rm = Item[OUTBOX_READ_MODEL]!
+    if (stage !== "sameEvent") {
+      return {
+        ConditionExpression: "attribute_not_exists(#pk) OR #rm = :rm",
+        ExpressionAttributeNames: { "#pk": pk, "#rm": OUTBOX_READ_MODEL },
+        ExpressionAttributeValues: { ":rm": rm },
+      }
+    }
+    return {
+      ConditionExpression:
+        "attribute_not_exists(#pk) OR #rm = :rm OR " +
+        "(attribute_not_exists(#rm) AND #es = :es AND #ei = :ei AND #ev = :ev)",
+      ExpressionAttributeNames: {
+        "#pk": pk,
+        "#rm": OUTBOX_READ_MODEL,
+        "#es": "source",
+        "#ei": "streamId",
+        "#ev": "version",
+      },
+      ExpressionAttributeValues: {
+        ":rm": rm,
+        ":es": Item.source!,
+        ":ei": Item.streamId!,
+        ":ev": Item.version!,
+      },
+    }
+  }
+
+  /**
+   * The projections a row token records after a write storing `written` (domain fields) over a
+   * row whose token was `read` (#237): this one, each other that had written it and whose
+   * bookkeeping the write still holds, and those this program doesn't define, kept as they are. A
+   * write that drops a projection's bookkeeping (a rebuild, a write that drops another's data)
+   * drops its tag, so the token describes the row as it is.
+   */
+  const writersAfter = (
+    read: AttributeValue | undefined,
+    written: Record<string, unknown>,
+  ): ReadonlyArray<string> => {
+    const known = new Map<string, ProjectionLayout>()
+    for (const layout of projectionLayoutsOf(readModel) ?? []) known.set(layoutTag(layout), layout)
+    const out = [ownTag]
+    for (const tag of rowWriters(read)) {
+      if (tag === ownTag) continue
+      const layout = known.get(tag)
+      if (layout === undefined || layout.roles.some(([field]) => written[field] !== undefined)) {
+        out.push(tag)
+      }
+    }
+    return out
+  }
+
+  /**
+   * Every projection's bookkeeping attribute on the read model (each field and its stored name,
+   * once), but the one `guardRaw` already names: what proves a row read without a row token is
+   * as read (`asReadTerm`, #237).
+   */
+  const heldBookkeeping = (
+    guardRaw: RawCondition,
+  ): ReadonlyArray<readonly [field: string, stored: string]> => {
+    const seen = new Set<string>([guardRaw.names["#g"]!])
+    const out: Array<readonly [string, string]> = []
+    for (const layout of projectionLayoutsOf(readModel) ?? []) {
+      for (const [field] of layout.roles) {
+        const stored = dbName(field)
+        if (seen.has(stored)) continue
+        seen.add(stored)
+        out.push([field, stored])
+      }
+    }
+    return out
   }
 
   /** The row (or tombstone) and any outbox items, written as one conditional unit. */
@@ -1061,12 +1725,70 @@ export const makeEngine = (config: EngineConfig) => {
     row: Option.Option<Row>,
     enqueued: ReadonlyArray<Enqueued>,
     revision: number | undefined,
+    carried: Record<string, unknown> = {},
   ): Effect.Effect<Option.Option<unknown>, any, any> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
       const rowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
       const condition = guard(row)
+      // On a read model whose rows carry the row token (#237), or on a row that holds one (a
+      // program defining only this projection writes it too, so it never replaces another's write
+      // landed since its read), a fresh one recording the projections whose bookkeeping the row
+      // holds after this write (`writersAfter`), and the term naming the one read. Where the
+      // token's name is taken (`rowTokenInUse`), none: the write sends what 1.40.0 did.
+      const read = Option.isSome(row) ? row.value.token : undefined
+      const tokened = (yield* tokenInUse) && (rowTokened(readModel) || read !== undefined)
+      const token = tokened
+        ? yield* freshRowToken(
+            writersAfter(read, Option.isSome(target) ? target.value : { ...kept, ...carried }),
+          )
+        : undefined
+      // A row read without a token, where rows carry one, was last written by a process still on
+      // 1.40.0 (which writes none) or before the token: the term names every projection's
+      // bookkeeping as read too (`asReadTerm`), which each of their writes changes, so this write
+      // never replaces one landed since its read, whichever library made it (#237).
+      const held: ReadonlyArray<readonly [string, string]> =
+        tokened && read === undefined && Option.isSome(row) ? heldBookkeeping(condition.raw) : []
+      const tokenTerm = !tokened
+        ? undefined
+        : Option.isSome(row)
+          ? asReadTerm(
+              readModel,
+              row.value.item,
+              held.map(([, stored]) => stored),
+              true,
+            )
+          : rowTokenTerm(undefined)
+      // A row read without a token, a tombstone, names it: `create` over it keeps the checkpoints,
+      // which alone would let this write replace the row the `create` wrote (#237). With one
+      // projection keeping a revision, `create` changes it, and the write sends what 1.40.0 did.
+      const overRead =
+        Option.isSome(row) &&
+        row.value.tombstone &&
+        read === undefined &&
+        (tokened || config.revision === undefined)
+          ? tombstoneTerm
+          : undefined
+      const term = andRaw(tokenTerm, overRead)
+      // A write naming the row token asks for the item as stored when its condition fails
+      // (`returnOld`), so the failure names what changed; a write without one sends what 1.40.0
+      // did (#237).
+      const returnOld = tokenTerm !== undefined
+      const failed = (current: Option.Option<unknown> | undefined) =>
+        changedOf(
+          condition.raw,
+          read,
+          tokenTerm,
+          held,
+          Option.isSome(row) ? row.value.item : undefined,
+          overRead,
+          current,
+        )
+      // A write for a row read absent, on a read model whose rows may be tombstones, proves the
+      // key still holds nothing, as the transaction's put does: `create` never takes the place
+      // of a tombstone written since, which 1.39.0 and 1.40.0 replaced, the removal lost (#237).
+      const absent = Option.isNone(row) && hasProjectionTombstones(readModel)
       const createdAt = Option.isSome(row) ? row.value.createdAt : undefined
       // A tombstone or outbox item holds no values, so its key alone says which text it is for
       // `rekey` (`KEY_TEXT`): one under the text of `escapeKeys: true`, where that isn't off's, is
@@ -1094,6 +1816,10 @@ export const makeEngine = (config: EngineConfig) => {
         // A sparse-map key is refused as the row's own write refuses it. The check flattens a
         // copy: what's stored is the tombstone as 1.39.0 stored it, an empty map whole.
         yield* serializeSparseOrFail(readModel, { ...tomb }, `${config.label}.write`)
+        // The other projections' bookkeeping, stored as the tombstone stores its own (natively,
+        // a map whole), where `readRow` reads it.
+        for (const [f, v] of Object.entries(carried)) tomb[dbName(f)] = v
+        if (token !== undefined) tomb[ROW_TOKEN] = token
         rowItem = yield* marshalOrFail(entityType, `${config.label}.write`, () =>
           toAttributeMap(tomb),
         )
@@ -1104,6 +1830,7 @@ export const makeEngine = (config: EngineConfig) => {
           `${config.label}.write`,
           { createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined },
         )
+        if (token !== undefined) built.item[ROW_TOKEN] = token
         rowItem = toAttributeMap(built.item)
       }
 
@@ -1118,51 +1845,139 @@ export const makeEngine = (config: EngineConfig) => {
                 readModel.put(value),
                 condition.input as never,
               ) as unknown as EntityPutImpl<any, any, any, any>)
+        // With a row token the entity writes it, and adds the token's term (without one, the
+        // tombstone's); a `create` for a row read absent never takes a tombstone's place.
         const run =
-          condition.input === undefined
+          condition.input === undefined && token === undefined && overRead === undefined && !absent
             ? (op.asEffect() as Effect.Effect<unknown, any, any>)
             : (op as EntityPutImpl<any, any, any, any>)._builder("model", {
                 condition: (op as EntityPutImpl<any, any, any, any>)._condition,
                 withVectors: (op as EntityPutImpl<any, any, any, any>)._withVectors,
                 putKind: (op as EntityPutImpl<any, any, any, any>)._putKind,
                 createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined,
+                ...((token !== undefined || overRead !== undefined || absent) && {
+                  projectionWrite: {
+                    attributes: token === undefined ? {} : { [ROW_TOKEN]: token },
+                    condition: Option.isSome(row) ? term : undefined,
+                    expectAbsent: Option.isNone(row),
+                    returnOld: returnOld && Option.isSome(row),
+                  },
+                }),
               })
         const written = yield* (run as Effect.Effect<unknown, any, any>).pipe(
-          Effect.catchTag("ConditionalCheckFailed", () => Effect.fail(new LostRace(key))),
+          Effect.catchTag("ConditionalCheckFailed", (error: { readonly current?: unknown }) =>
+            Effect.fail(
+              new LostRace(
+                key,
+                // A `create` for a row read absent: the condition is that it still is.
+                Option.isNone(row)
+                  ? [guardLabel]
+                  : failed(error.current as Option.Option<unknown> | undefined),
+              ),
+            ),
+          ),
         )
         return Option.some(written)
       }
 
-      const lostRace = (error: unknown, transaction: boolean) =>
-        Effect.fail(lostRaceOf(error, transaction) ? new LostRace(key) : error)
+      const lostRace = (error: unknown) =>
+        Effect.fail(
+          lostRaceOf(error)
+            ? new LostRace(key, failed(returnOld ? storedOf(error, false) : undefined))
+            : error,
+        )
+      const raw = andRaw(condition.raw, term)!
       const rowPut = {
         Put: {
           TableName,
           Item: rowItem,
-          ConditionExpression: condition.raw.expression,
-          ExpressionAttributeNames: condition.raw.names,
-          ...(Object.keys(condition.raw.values).length > 0
-            ? { ExpressionAttributeValues: condition.raw.values }
-            : {}),
+          ConditionExpression: raw.expression,
+          ExpressionAttributeNames: raw.names,
+          ...(Object.keys(raw.values).length > 0 ? { ExpressionAttributeValues: raw.values } : {}),
+          ...(returnOld && { ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const }),
         },
       } satisfies TransactWriteItem
       if (enqueued.length === 0) {
-        yield* client.putItem(rowPut.Put).pipe(Effect.catch((error) => lostRace(error, false)))
-      } else {
-        const OutboxTable = yield* outboxTable
-        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, mark)
-        yield* client
+        yield* client.putItem(rowPut.Put).pipe(Effect.catch((error) => lostRace(error)))
+        return target
+      }
+      // The row and its outbox items in one transaction, read by position (#237): the row's Put
+      // cancelled is a lost race, whatever else was; an item's alone is a key holding another
+      // effect's item (`outboxGuard`). The whole transaction is sent again, those items at their
+      // next stage (`outboxStages`): an item without a mark of the same event replaced, then the
+      // item beside it, at its key followed by `#<mark>` (`outboxItems`), so both effects are
+      // delivered, in order: the key sorts right after the other's and before the next
+      // position's. Nothing is read first, and an item at a free key is written where 1.40.0
+      // wrote it. One held beside too is reported, naming what holds it.
+      const OutboxTable = yield* outboxTable
+      const keys = outboxKeys()
+      const stages = outboxStages()
+      const reached = new Map<number, number>()
+      const stageOf = (i: number) => stages[reached.get(i) ?? 0]!
+      while (true) {
+        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, mark, stageOf)
+        const sent = yield* client
           .transactWriteItems({
             TransactItems: [
               rowPut,
               ...items.map(
-                (Item) => ({ Put: { TableName: OutboxTable, Item } }) satisfies TransactWriteItem,
+                (Item, i) =>
+                  ({
+                    Put: {
+                      TableName: OutboxTable,
+                      Item,
+                      ...outboxGuard(keys.pk, Item, stageOf(i)),
+                      ...(stageOf(i) === "beside" && {
+                        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                      }),
+                    },
+                  }) satisfies TransactWriteItem,
               ),
             ],
           })
-          .pipe(Effect.catch((error) => lostRace(error, true)))
+          .pipe(Effect.result)
+        if (Result.isSuccess(sent)) return target
+        const cause = (sent.failure as { readonly cause?: unknown })?.cause
+        if (!isAwsTransactionCancelled(cause)) return yield* Effect.fail(sent.failure)
+        const reasons = cause.CancellationReasons ?? []
+        const cancelled = (i: number) => reasons[i]?.Code === "ConditionalCheckFailed"
+        if (cancelled(0)) {
+          return yield* Effect.fail(
+            new LostRace(key, failed(returnOld ? storedOf(sent.failure, true) : undefined)),
+          )
+        }
+        const held = items.flatMap((_, i) => (cancelled(i + 1) && stageOf(i) !== "none" ? [i] : []))
+        if (held.length === 0) return yield* Effect.fail(sent.failure)
+        const again = held.find((i) => stageOf(i) === "beside")
+        if (again !== undefined) {
+          const holder = reasons[again + 1]?.Item as Record<string, AttributeValue> | undefined
+          const other = holder?.[OUTBOX_READ_MODEL]?.S
+          return yield* new ValidationError({
+            entityType,
+            operation: `${config.label}.outbox`,
+            cause: withCause(
+              `[EDD-9145] ${config.label}: read model ${JSON.stringify(entityType)} ` +
+                `(${JSON.stringify(outboxTag)}) found another effect's item at the key of its ` +
+                `outbox item ${again} for revision ${revision ?? 0} of row ` +
+                `(${JSON.stringify(String(rowKey[primary.pk.field]))}, ` +
+                `${JSON.stringify(String(rowKey[primary.sk.field]))}), and the key it writes ` +
+                `beside it, ${JSON.stringify(items[again]![keys.sk]?.S)}, which only this ` +
+                `effect writes (${JSON.stringify(items[again]![OUTBOX_READ_MODEL]?.S)}), is held ` +
+                "too, by " +
+                (holder === undefined
+                  ? "an item"
+                  : `an item of ${JSON.stringify(holder.__edd_e__?.S ?? "no entity type")}` +
+                    (other === undefined
+                      ? " carrying no mark"
+                      : ` marked ${JSON.stringify(other)}`)) +
+                ". Nothing was written. The library writes nothing else at that key: was the " +
+                "item written outside the projection?",
+              sent.failure,
+            ),
+          })
+        }
+        for (const i of held) reached.set(i, (reached.get(i) ?? 0) + 1)
       }
-      return target
     })
 
   // -------------------------------------------------------------------------
@@ -1230,9 +2045,7 @@ export const makeEngine = (config: EngineConfig) => {
           ? new ConcurrentModification({
               entityType,
               key: error.key as Record<string, unknown>,
-              attributes: [
-                config.revision?.field ?? (config.checkpoints as { field: string }).field,
-              ],
+              attributes: error.attributes,
               current: Option.none(),
             })
           : error,
@@ -1305,6 +2118,13 @@ export const makeEngine = (config: EngineConfig) => {
     const fromScratch = options?.fromScratch === true
     const attempt = Effect.gen(function* () {
       const row = yield* readRow(key)
+      // An attribute this projection keeps that another, which has written the row, keeps in
+      // another role, present on the row, would be read in the wrong one (`[EDD-9144]`). A
+      // rebuild reads none of its old values from the row, so it misreads nothing.
+      const misread = fromScratch ? undefined : sharedMeaning(row)
+      if (misread !== undefined) {
+        return yield* new ValidationError({ entityType, operation: config.label, cause: misread })
+      }
       type Plan = {
         readonly work: InstanceWork
         readonly slot: Slot
@@ -1530,7 +2350,12 @@ export const makeEngine = (config: EngineConfig) => {
       }
       // Every instance failed: the row fails, with the first failure.
       if (active.length === 0 && failed.length > 0) return yield* Effect.fail(failed[0]!.error)
-      const { state, removed, enqueued, results } = folded
+      const { state, removed, results } = folded
+      // A rebuild enqueues nothing (#237): it re-derives the row, and never replays side effects.
+      // `effects` still runs in its fold, so the row comes out as the fold that applied the events
+      // made it; what it returns is not written. Without effects the row is written alone, as any
+      // write that enqueues nothing is (`writeRow`).
+      const enqueued = fromScratch ? [] : folded.enqueued
 
       const instances = (version: (i: number) => number): Array<InstanceResult> =>
         active.map((plan, i) => ({
@@ -1576,11 +2401,22 @@ export const makeEngine = (config: EngineConfig) => {
         target[config.revision.field] = nextRevisionOf(row)
       }
       const nextRevision =
-        config.revision === undefined ? undefined : (target[config.revision.field] as number)
+        config.revision === undefined
+          ? undefined
+          : (ownValue(target, config.revision.field) as number)
       let written: Option.Option<unknown>
       if (Option.isNone(state)) {
-        // A tombstone keeps exactly the layout's fields.
-        written = yield* writeRow(key, Option.none(), pick(target), row, enqueued, nextRevision)
+        // A tombstone keeps the layout's fields, and the bookkeeping of the other projections that
+        // have written the row (`carriedOf`), so they still recognise what they applied.
+        written = yield* writeRow(
+          key,
+          Option.none(),
+          pick(target),
+          row,
+          enqueued,
+          nextRevision,
+          carriedOf(row),
+        )
       } else {
         const mapped =
           config.toItem === undefined
@@ -1591,7 +2427,36 @@ export const makeEngine = (config: EngineConfig) => {
                 )),
                 ...pick(target),
               }
-        written = yield* writeRow(key, Option.some(mapped), {}, row, enqueued, nextRevision)
+        // The bookkeeping of the other projections that have written the row (`carriedOf`), each
+        // value as the entity stores it on a row. Over a tombstone it replaces what `initial` gave
+        // it. Over a live row a change to it is refused (`[EDD-9144]`), and it fills what the write
+        // left out only when the write, with it, stores every attribute the row holds under the
+        // name the row holds it by (`keepsData`): one that drops one drops the others'
+        // checkpoints with it, as 1.40.0 did, so they fold their streams again and put their data
+        // back. A rebuild over a live row carries none: it drops the other projections'
+        // contributions to the state, so they lose their checkpoints too and apply again.
+        let item: Record<string, unknown> = mapped
+        if (Option.isSome(row) && row.value.tombstone) {
+          item = { ...mapped, ...onRow(carriedOf(row)) }
+        } else if (Option.isSome(row) && !fromScratch) {
+          const changed = sharedMeaning(row, mapped)
+          if (changed !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: config.label,
+              cause: changed,
+            })
+          }
+          const carried = onRow(carriedOf(row))
+          if (Object.keys(carried).length > 0) {
+            const candidate: Record<string, unknown> = { ...mapped }
+            for (const [field, value] of Object.entries(carried)) {
+              if (candidate[field] === undefined) candidate[field] = value
+            }
+            if (yield* keepsData(row.value, candidate)) item = candidate
+          }
+        }
+        written = yield* writeRow(key, Option.some(item), {}, row, enqueued, nextRevision)
       }
       const versions = new Map(
         advanced.map((a) => [`${a.source}\u0000${a.streamIdStr}`, a.version]),
@@ -1613,10 +2478,165 @@ export const makeEngine = (config: EngineConfig) => {
     return Effect.andThen(preflight("apply"), withRetry(attempt))
   }
 
+  /**
+   * The bookkeeping of the read model's other projections that have written `row`, as its row
+   * token records them (`rowWriters`, #237), each value present on the row as it reads it: a live
+   * row's decoded, a tombstone's as stored (a tombstone keeps every value natively). None for a
+   * row without a token (written before, or by a program that defines only this projection) or of
+   * a projection this program doesn't define: its names can't be told from another's data. A
+   * writer whose attributes the row no longer holds has nothing here.
+   */
+  const writtenBy = (
+    row: Option.Option<Row>,
+  ): ReadonlyArray<{
+    readonly layout: ProjectionLayout
+    readonly field: string
+    readonly role: ProjectionRole
+    readonly stored: string
+    readonly value: unknown
+  }> => {
+    if (Option.isNone(row)) return []
+    const writers = new Set(rowWriters(row.value.token))
+    writers.delete(ownTag)
+    if (writers.size === 0) return []
+    const values = row.value.tombstone
+      ? (fromAttributeMap(row.value.item) as Record<string, unknown>)
+      : row.value.values
+    const out: Array<{
+      readonly layout: ProjectionLayout
+      readonly field: string
+      readonly role: ProjectionRole
+      readonly stored: string
+      readonly value: unknown
+    }> = []
+    for (const layout of projectionLayoutsOf(readModel) ?? []) {
+      if (!writers.has(layoutTag(layout))) continue
+      for (const [field, role] of layout.roles) {
+        const stored = dbName(field)
+        const at = row.value.tombstone ? stored : field
+        const value = Object.hasOwn(values, at) ? values[at] : undefined
+        if (value !== undefined) out.push({ layout, field, role, stored, value })
+      }
+    }
+    return out
+  }
+
+  /**
+   * `[EDD-9144]` (#237): an attribute holding two meanings on `row`. Another projection that has
+   * written the row (`writtenBy`) keeps it as bookkeeping, and it's on the row, and this
+   * projection keeps it in another role, so each would read the other's value as its own; or,
+   * given `item` (what a write over the live row stores), this write gives it another value than
+   * the row holds without keeping it in that role. The problem, or `undefined`. On rows only one
+   * of them writes nothing is refused: projections writing disjoint rows may give one name
+   * different meanings.
+   */
+  const sharedMeaning = (
+    row: Option.Option<Row>,
+    item?: Record<string, unknown>,
+  ): string | undefined => {
+    for (const { layout, field, role, stored, value: held } of writtenBy(row)) {
+      const mine = ownRoles.get(stored)
+      if (mine?.has(role)) continue
+      if (mine !== undefined) {
+        return (
+          `[EDD-9144] ${config.label}: on read model "${entityType}", "${field}" is ` +
+          `${layout.label}'s ${role} on a row ${layout.label} has written, and this ` +
+          `projection's ${[...mine].join(" and ")}. An attribute holds one meaning on a row two ` +
+          "projections write: give each meaning its own field."
+        )
+      }
+      if (item === undefined || Option.isNone(row) || row.value.tombstone) continue
+      const value = item[field]
+      if (value === undefined || sameValue(value, held)) continue
+      return (
+        `[EDD-9144] ${config.label}: on read model "${entityType}", this write changes ` +
+        `"${field}", which is ${layout.label}'s ${role}, on a row ${layout.label} has written. ` +
+        "An attribute holds one meaning on a row two projections write: give each meaning its " +
+        "own field."
+      )
+    }
+    return undefined
+  }
+
+  /**
+   * The bookkeeping a write over `row` carries for the other projections that have written it
+   * (`writtenBy`), by field: each attribute once, none this projection keeps, each value as the
+   * row reads it. The one function every site carries through: a tombstone stores it as it stores
+   * its own (`writeRow`), natively; a row as the entity stores any value of the field (`onRow`),
+   * renamed, packed or as sparse entries; and each reads back what it wrote.
+   */
+  const carriedOf = (row: Option.Option<Row>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    const seen = new Set<string>()
+    for (const { field, stored, value } of writtenBy(row)) {
+      if (ownRoles.has(stored) || seen.has(stored)) continue
+      seen.add(stored)
+      out[field] = value
+    }
+    return out
+  }
+
+  /**
+   * Carried bookkeeping as a row can hold it: a sparse map without the entries whose keys sparse
+   * storage can't hold (a 1.39.0 tombstone's map holding a key with `#`), which are left off.
+   */
+  const onRow = (carried: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    const holds = (name: string, value: unknown) => {
+      try {
+        readModel._serializeSparseFields({ [name]: value })
+        return true
+      } catch {
+        return false
+      }
+    }
+    for (const [field, value] of Object.entries(carried)) {
+      const name = dbName(field)
+      if (holds(name, value)) {
+        out[field] = value
+        continue
+      }
+      if (typeof value !== "object" || value === null) continue
+      const entries: Record<string, unknown> = {}
+      for (const [entry, v] of Object.entries(value)) {
+        if (holds(name, { [entry]: v })) entries[entry] = v
+      }
+      out[field] = entries
+    }
+    return out
+  }
+
+  /**
+   * Whether a write over the live `row` storing `item` keeps every attribute the row holds (#237),
+   * judged on two stored things alone: the row's attribute map as read, and the attribute map the
+   * write's request carries (`validateAndBuildPutItem`, the transaction's own: encoded, renamed, as
+   * sparse entries, packed, then marshalled). Every attribute of the row but its row token must be
+   * there under the same name; its value, and its type, may change. No definition says which
+   * attributes are data: a field another program renames, stores in a sparse map under another
+   * prefix, or doesn't define, is an attribute the write drops. `item` carries the other
+   * projections' bookkeeping (`carriedOf`), so theirs counts as kept only where it lands under the
+   * name the row holds it by. A value that stores nothing drops its attributes, whatever drops it:
+   * an `Option.none()`, an emptied sparse map, an empty set (the marshaller stores none). An item
+   * the entity or the marshaller refuses keeps nothing: the write then fails as it would have. A
+   * projection's row write is always a whole `Put`: nothing is left in place or removed by name.
+   */
+  const keepsData = (row: Row, item: Record<string, unknown>): Effect.Effect<boolean, never, any> =>
+    Effect.gen(function* () {
+      const built = yield* Effect.option(
+        validateAndBuildPutItem(readModel as any, item, `${config.label}.write`),
+      )
+      if (Option.isNone(built)) return false
+      const written = built.value.marshalled
+      return Object.keys(row.item).every(
+        (name) => Object.hasOwn(written, name) || (name === ROW_TOKEN && row.token !== undefined),
+      )
+    })
+
   /** The fields the library owns, re-applied after `toItem`. */
   const pick = (target: Record<string, unknown>): Record<string, unknown> => {
     const out: Record<string, unknown> = {}
-    for (const f of keptFields) if (target[f] !== undefined) out[f] = target[f]
+    for (const f of keptFields)
+      if (ownValue(target, f) !== undefined) setOwn(out, f, ownValue(target, f))
     return out
   }
 
@@ -1634,6 +2654,11 @@ export const makeEngine = (config: EngineConfig) => {
    * Deliver a row's pending effects in order: claim the head item, deliver it,
    * delete it, repeat. A claim another drainer holds stops the drain; a crash
    * leaves a claim that expires, so the effect is delivered again.
+   *
+   * Each item is judged as it comes to the head (`outboxOwnership`, #237): another read model's
+   * item at this row key (one keyed by `[shop]` with `north#branch_b1` beside one keyed by
+   * `[shop, branch]`) is passed over, unclaimed, for its own drainer, and the query goes on after
+   * it. A row holding only this read model's items sends the requests 1.40.0 sent.
    */
   const drainRaw = <E, R>(
     rowPk: string,
@@ -1645,7 +2670,10 @@ export const makeEngine = (config: EngineConfig) => {
       const client = yield* Capacity.client
       const TableName = yield* outboxTable
       const keys = outboxKeys()
+      const whose = outboxOwnership(readModel)
       let delivered = 0
+      // The last item passed over as another read model's: the query goes on after it.
+      let after: Record<string, AttributeValue> | undefined
       while (true) {
         const page = yield* client.query({
           TableName,
@@ -1654,9 +2682,14 @@ export const makeEngine = (config: EngineConfig) => {
           ExpressionAttributeValues: toAttributeMap({ ":pk": rowPk, ":sk": `${rowSk}#outbox#` }),
           ConsistentRead: true,
           Limit: 1,
+          ...(after === undefined ? {} : { ExclusiveStartKey: after }),
         })
         const head = page.Items?.[0]
         if (head === undefined) return { delivered, undelivered: Option.none() }
+        if (whose(head) === "foreign") {
+          after = { [keys.pk]: head[keys.pk]!, [keys.sk]: head[keys.sk]! }
+          continue
+        }
         const raw = fromAttributeMap(head) as Record<string, unknown>
         const now = DateTime.toEpochMillis(yield* DateTime.now)
         const token = `${now}-${Math.floor((yield* Random.next) * 1e9)}`
@@ -1738,7 +2771,12 @@ export const makeEngine = (config: EngineConfig) => {
     return drainRaw(String(rowKey[primary.pk.field]), String(rowKey[primary.sk.field]), deliver)
   }
 
-  /** Every row with pending effects, through the outbox's sparse index, drained. */
+  /**
+   * Every row of this read model with pending effects, through the outbox's sparse index, drained.
+   * The items another read model's are (`outboxOwnership`) are left to its drainer, here and at a
+   * row key both write (`drainRaw`); an item written before 1.41.0 at a key both write is drained,
+   * as 1.40.0 did.
+   */
   const drainPending = <E, R>(
     deliver: (effect: any, meta: OutboxMeta) => Effect.Effect<void, E, R>,
   ) =>
@@ -1753,6 +2791,7 @@ export const makeEngine = (config: EngineConfig) => {
       }
       const client = yield* Capacity.client
       const TableName = yield* outboxTable
+      const whose = outboxOwnership(readModel)
       const rows = new Map<string, readonly [string, string]>()
       let start: Record<string, AttributeValue> | undefined
       do {
@@ -1765,6 +2804,7 @@ export const makeEngine = (config: EngineConfig) => {
           ...(start === undefined ? {} : { ExclusiveStartKey: start }),
         })
         for (const item of page.Items ?? []) {
+          if (whose(item) === "foreign") continue
           const raw = fromAttributeMap(item) as Record<string, unknown>
           const pk = String(raw[ROW_PK])
           const sk = String(raw[ROW_SK])
@@ -1816,13 +2856,6 @@ export interface DrainResult<E> {
   readonly delivered: number
   /** The effect `deliver` failed on — it stays pending, at the head. */
   readonly undelivered: Option.Option<{ readonly meta: OutboxMeta; readonly error: E }>
-}
-
-/** A raw condition for a `Put` the engine writes itself. */
-interface RawCondition {
-  readonly expression: string
-  readonly names: Record<string, string>
-  readonly values: Record<string, AttributeValue>
 }
 
 /**

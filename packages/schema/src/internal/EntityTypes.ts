@@ -5,6 +5,7 @@
  */
 
 import type { DateTime, Schema } from "effect"
+import type { StoredAs } from "../DynamoModel.js"
 import type { EmbeddingError, RefNotFound } from "../Errors.js"
 
 // ---------------------------------------------------------------------------
@@ -93,14 +94,17 @@ type StoredWithoutForm<S> = S extends { readonly Encoded: infer E }
 
 /**
  * The names `.remove()` takes: model fields a row can lack, less what no update
- * may clear: primary-key composites, refs, library-managed fields, and the
- * fields configured immutable or stored as a sparse map (`TUnremovable`). A
- * timestamp is the library's when it's a date; one of another type is the caller's.
+ * may clear: primary-key composites, library-managed fields, and the fields
+ * configured immutable or stored as a sparse map (`TUnremovable`). A timestamp
+ * is the library's when it's a date; one of another type is the caller's, and so
+ * is one {@link StoredAsOtherKindDates} names. A ref the model declares optional
+ * is one a row can lack, so it's removable (#241); up to 1.40.0 every ref was left
+ * out (`_TRefs` is kept so the arity is). A ref's `${ref}Id` is no model field.
  */
 export type RemovableFields<
   TModel extends Schema.Top,
   TIndexes,
-  TRefs,
+  _TRefs,
   TTimestamps,
   TVersioned,
   TUnremovable extends string,
@@ -110,11 +114,13 @@ export type RemovableFields<
     : Exclude<
         ClearableFields<TModel>,
         | (string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>)
-        | (keyof TRefs & string)
         | TUnremovable
         | ManagedDateField<
             ModelType<TModel>,
-            CreatedAtFieldName<TTimestamps> | UpdatedAtFieldName<TTimestamps>
+            Exclude<
+              CreatedAtFieldName<TTimestamps> | UpdatedAtFieldName<TTimestamps>,
+              StoredAsOtherKindDates<TModel>
+            >
           >
         | VersionFieldName<TVersioned>
       >
@@ -217,6 +223,38 @@ export type ManagedDateField<T, K> = {
 }[K & keyof T]
 
 /**
+ * The model fields `Schema.optional` over a date transform whose {@link StoredAs} names the other
+ * wire kind (`DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))`):
+ * the transform stores its own form, so a stamp could never be read back, and the field is the
+ * caller's (`storedAsOverTransform`, #232). Nothing stamps it, and an update may set or clear it,
+ * as the run time has it (#236). Outside `Schema.optional`, `Entity.make` refuses such a field.
+ */
+export type StoredAsOtherKindDates<TModel> = [DeclaredFields<TModel>] extends [never]
+  ? never
+  : {
+      [K in keyof DeclaredFields<TModel>]: DeclaredFields<TModel>[K] extends Schema.optional<
+        infer S
+      >
+        ? OtherWireKind<S> extends true
+          ? K
+          : never
+        : never
+    }[keyof DeclaredFields<TModel>]
+
+/** Whether `S` encodes to a string and is stored as a number, or the other way round. */
+type OtherWireKind<S> = S extends StoredAs<infer W> & { readonly Encoded: infer E }
+  ? [E] extends [string]
+    ? [W] extends [number]
+      ? true
+      : false
+    : [E] extends [number]
+      ? [W] extends [string]
+        ? true
+        : false
+      : false
+  : false
+
+/**
  * Apply system-field collision adjustments to an input/create type:
  *   - A colliding date `createdAt`/`updatedAt` becomes optional (caller may
  *     supply or let the library auto-generate). One of any other type is the
@@ -249,10 +287,11 @@ export type WithSystemCollisions<T, TTimestamps, TVersioned, TTimeSeries = undef
 
 /**
  * Apply system-field collision adjustments to an update type. `createdAt` is
- * treated as immutable (stripped entirely); `updatedAt` stays optional (it
- * already is, via `Partial`); `version` is stripped.
+ * treated as immutable (stripped entirely) unless it's one of `TModel`'s
+ * {@link StoredAsOtherKindDates}; `updatedAt` stays optional (it already is,
+ * via `Partial`); `version` is stripped.
  */
-export type WithSystemCollisionsForUpdate<T, TTimestamps, TVersioned> =
+export type WithSystemCollisionsForUpdate<T, TTimestamps, TVersioned, TModel = never> =
   IsAny<T> extends true
     ? T
     : IsAny<TTimestamps> extends true
@@ -262,7 +301,10 @@ export type WithSystemCollisionsForUpdate<T, TTimestamps, TVersioned> =
         : Simplify<
             Omit<
               T,
-              | ManagedDateField<T, CreatedAtFieldName<TTimestamps>>
+              | ManagedDateField<
+                  T,
+                  Exclude<CreatedAtFieldName<TTimestamps>, StoredAsOtherKindDates<TModel>>
+                >
               | (VersionFieldName<TVersioned> & keyof T)
             >
           >
@@ -316,11 +358,18 @@ export type WithGeneratedId<T, TGeneratedId> = [TGeneratedId] extends [undefined
       : T
     : T
 
-/** Entity key type: Pick model fields by primary key composites */
-export type EntityKeyType<TModel extends Schema.Top, TIndexes> = Pick<
-  ModelType<TModel>,
-  PrimaryKeyComposites<TIndexes> & keyof ModelType<TModel>
->
+/**
+ * Entity key type: the primary key composites, each a model field or a ref's id (`projectId` for
+ * `project`), which a key takes as the input does.
+ */
+export type EntityKeyType<TModel extends Schema.Top, TIndexes, TRefs = undefined> = [
+  TRefs,
+] extends [undefined]
+  ? Pick<ModelType<TModel>, PrimaryKeyComposites<TIndexes> & keyof ModelType<TModel>>
+  : Pick<
+      CompositeFields<TModel, TRefs>,
+      PrimaryKeyComposites<TIndexes> & keyof CompositeFields<TModel, TRefs>
+    >
 
 /** Entity record type: model fields + system fields */
 export type EntityRecordType<
@@ -374,7 +423,8 @@ export type EntityUpdateType<
 > = WithSystemCollisionsForUpdate<
   UpdateFields<TModel, Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>>,
   TTimestamps,
-  TVersioned
+  TVersioned,
+  TModel
 >
 
 /**
@@ -447,6 +497,27 @@ export type RefEntityIdentifierValue<E> = E extends {
  *  For an entity with `pk: { composite: ["id"] }` and `id: TeamId`, yields `TeamId`. */
 type EntityIdentifierValue<E> = RefEntityIdentifierValue<ExtractRefEntity<E>>
 
+/** The keys of `T` a value may leave out. */
+type OptionalKeysOf<T> = { [K in keyof T]-?: {} extends Pick<T, K> ? K : never }[keyof T]
+
+/**
+ * The `${ref}Id` fields a `put` / `create` input takes (#241): required where the model requires
+ * the ref, optional where it declares the ref optional (`Schema.optionalKey`, and `Schema.optional`,
+ * which takes `undefined` too), so an optional ref can be left out. Up to 1.40.0 every id was
+ * required.
+ */
+type RefIdInputFields<TModel extends Schema.Top, TRefs> = {
+  readonly [K in keyof TRefs & string as K extends OptionalKeysOf<ModelType<TModel>>
+    ? never
+    : `${K}Id`]: EntityIdentifierValue<TRefs[K]>
+} & {
+  readonly [K in keyof TRefs & string as K extends OptionalKeysOf<ModelType<TModel>>
+    ? `${K}Id`
+    : never]?:
+    | EntityIdentifierValue<TRefs[K]>
+    | Extract<ModelType<TModel>[K & keyof ModelType<TModel>], undefined>
+}
+
 /** Entity ref input type: when refs present, replace ref fields with branded ID fields */
 export type EntityRefInputType<
   TModel extends Schema.Top,
@@ -457,9 +528,7 @@ export type EntityRefInputType<
 > = [TRefs] extends [undefined]
   ? EntityInputType<TModel, TTimestamps, TVersioned, TTimeSeries>
   : WithSystemCollisions<
-      Omit<ModelType<TModel>, keyof TRefs & string> & {
-        readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
-      },
+      Omit<ModelType<TModel>, keyof TRefs & string> & RefIdInputFields<TModel, TRefs>,
       TTimestamps,
       TVersioned,
       TTimeSeries
@@ -479,15 +548,11 @@ export type EntityRefCreateType<
   : WithSystemCollisions<
       [TIdentifier] extends [string]
         ? Omit<
-            Omit<ModelType<TModel>, keyof TRefs & string> & {
-              readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
-            },
+            Omit<ModelType<TModel>, keyof TRefs & string> & RefIdInputFields<TModel, TRefs>,
             TIdentifier
           >
         : Omit<
-            Omit<ModelType<TModel>, keyof TRefs & string> & {
-              readonly [K in keyof TRefs & string as `${K}Id`]: EntityIdentifierValue<TRefs[K]>
-            },
+            Omit<ModelType<TModel>, keyof TRefs & string> & RefIdInputFields<TModel, TRefs>,
             PrimaryKeyComposites<TIndexes>
           >,
       TTimestamps,
@@ -509,10 +574,15 @@ export type EntityRefUpdateType<
         TModel,
         Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes> | (keyof TRefs & string)>
       > & {
-        readonly [K in keyof TRefs & string as `${K}Id`]?: EntityIdentifierValue<TRefs[K]>
+        // A ref's id that is a primary key composite is part of the key, which no update changes.
+        readonly [K in keyof TRefs & string as Exclude<
+          `${K}Id`,
+          string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>
+        >]?: EntityIdentifierValue<TRefs[K]>
       },
       TTimestamps,
-      TVersioned
+      TVersioned,
+      TModel
     >
 
 /** Error type contribution from refs — never when no refs, RefNotFound when refs present */

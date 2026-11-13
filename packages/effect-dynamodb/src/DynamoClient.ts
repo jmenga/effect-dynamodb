@@ -32,6 +32,10 @@ import type {
   DescribeTableCommandOutput,
   DescribeTimeToLiveCommandInput,
   DescribeTimeToLiveCommandOutput,
+  ExecuteStatementCommandInput,
+  ExecuteStatementCommandOutput,
+  ExecuteTransactionCommandInput,
+  ExecuteTransactionCommandOutput,
   ExportTableToPointInTimeCommandInput,
   ExportTableToPointInTimeCommandOutput,
   GetItemCommandInput,
@@ -84,6 +88,8 @@ import {
   DescribeTableCommand,
   DescribeTimeToLiveCommand,
   DynamoDBClient,
+  ExecuteStatementCommand,
+  ExecuteTransactionCommand,
   ExportTableToPointInTimeCommand,
   GetItemCommand,
   ListBackupsCommand,
@@ -144,6 +150,7 @@ import type {
   IndexZOrderDimensions,
   IndexZOrderPrefix,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
+import { given, ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -168,7 +175,11 @@ import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind, ownershipConflict } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
-import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
+import {
+  bind as entityBind,
+  fromDefinition as entityFromDefinition,
+  storedRefIdOf,
+} from "./Entity.js"
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
@@ -176,6 +187,7 @@ import {
   entityNaming,
   type RawSortKeyCondition,
   type WithinOptions,
+  wholeRowsOf,
 } from "./internal/BoundQuery.js"
 import {
   type BoundVectorQuery,
@@ -187,10 +199,13 @@ import {
   acquireSdkClient,
   type ClientOptions,
   type ClientOptionsFromConfig,
+  type Credentials,
   readClientOptions,
+  readCredentials,
+  sdkCredentials,
 } from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
-import { createConditionOps, type Expr, ExprTag } from "./internal/Expr.js"
+import { createConditionOps, type Expr, ExprTag, type StoredFormAt } from "./internal/Expr.js"
 import {
   codecRequirements,
   collectionPackedQueryOptions,
@@ -198,10 +213,12 @@ import {
   type PackedAttributeGuard,
   unregisteredCodecError,
 } from "./internal/Packed.js"
-import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
+import { type PathModel, pathBuilderOf, type StoredBelow } from "./internal/PathBuilder.js"
 import {
+  type OutboxCandidate,
   physicalTableName,
   refuseSharedOutboxKeySpace,
+  rekeyOutboxMember,
   remoteOutboxesOf,
   sharedOutboxKeySpace,
 } from "./internal/ProjectionEngine.js"
@@ -216,6 +233,7 @@ import {
   zorderPlanner,
 } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
+import { hideReturnedItems } from "./internal/ReturnedItem.js"
 import {
   diagnoseFailure,
   explainDiagnosis,
@@ -484,12 +502,19 @@ const BOUND_OPERATORS: ReadonlySet<string> = new Set(["eq", "between", "gt", "gt
  * inside the stored ref, which is the value the key was composed from —
  * through the accessor's encoder for a numeric field stored as a string, so a
  * stored `"950000"` reads as `950000`. `undefined` when the row lacks it.
+ *
+ * A stored ref holds its id in the referenced entity's stored form, which is
+ * not always the form the key was composed from (a date key stored as epoch
+ * milliseconds, keyed as its ISO text): read as a value of that entity's key
+ * (`storedRefIdOf`), then keyed as a caller's value is (#241). Up to 1.40.0 it
+ * was compared as stored, and a bound on such an id matched no row.
  */
 const storedKeyForm = (
   args: {
     readonly entityLike: EntityLike
     readonly encoderSource: Schema.Top
     readonly compositeKeyForm: CompositeKeyForm
+    readonly domainKeyForm: CompositeKeyForm
   },
   field: string,
 ): {
@@ -499,15 +524,24 @@ const storedKeyForm = (
   const resolve = args.entityLike._resolveDbName ?? ((name: string) => name)
   const ref = args.entityLike._resolvedRefs?.find((r) => r.idFieldName === field)
   const attribute = resolve(ref?.fieldName ?? field)
-  const schema = getSchemaFields(args.encoderSource)?.[field]
+  const schema = ownValue(getSchemaFields(args.encoderSource), field)
   const wantsBigInt = schema !== undefined && SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
   const typeNumeric = compositeKeyFormKind(args.encoderSource, field) === "type-numeric"
   return {
     attribute,
     read: (row) => {
-      const value = ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.identifierField]
+      const value =
+        ref === undefined
+          ? ownValue(row, attribute)
+          : ownValue(ownValue(row, attribute)?.M, ref.keyField)
       if (value === undefined) return undefined
       const stored = value.S ?? value.N
+      if (ref !== undefined && stored !== undefined) {
+        const held =
+          value.S ?? (wantsBigInt ? BigInt(value.N as string) : Number(value.N as string))
+        const id = storedRefIdOf(ref, held)
+        if (Option.isSome(id)) return args.domainKeyForm(field, id.value)
+      }
       if (typeNumeric && stored !== undefined) return args.compositeKeyForm(field, stored)
       if (value.S !== undefined) return value.S
       if (value.N !== undefined) return wantsBigInt ? BigInt(value.N) : Number(value.N)
@@ -586,7 +620,7 @@ const planCompositeWithin = <A>(args: {
   const { entityLike, accessor, indexDef, domainKeyForm, pinnedKeyForm } = args
   const sk = indexDef.sk.composite
   const n = sk.length
-  const p = sk.findIndex((attr) => pinnedKeyForm[attr] === undefined)
+  const p = sk.findIndex((attr) => given(pinnedKeyForm, attr) === undefined)
   const pinnedCount = p === -1 ? n : p
   const refuse = (why: string): never => {
     throw new Error(
@@ -603,7 +637,7 @@ const planCompositeWithin = <A>(args: {
     entityLike._resolvedRefs?.find((ref) => ref.idFieldName === field)
   /** The kind of value a composite's key form is, when its schema says (EDD-9093's type check). */
   const kindOf = (field: string): KeyFormValueKind | undefined => {
-    const schema = fields?.[field]
+    const schema = ownValue(fields, field)
     return schema === undefined ? undefined : keyFormValueKind(schema)
   }
 
@@ -1040,7 +1074,7 @@ const planZOrderWithin = <A>(args: {
   /** `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type. */
   const keyForm = (field: string, value: unknown): unknown => {
     const converted = domainKeyForm(field, value)
-    const schema = fields?.[field]
+    const schema = ownValue(fields, field)
     const expected = schema === undefined ? undefined : keyFormValueKind(schema)
     if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
       return refuse(
@@ -1354,7 +1388,13 @@ const planZOrderWithin = <A>(args: {
     (part) => part.hash === undefined && prefixValues.has(part.field),
   )
 
-  const renameExpr = entityNaming(entityLike._resolveDbName).renameExpr ?? ((expr: Expr) => expr)
+  const renameExpr =
+    entityNaming(
+      entityLike._resolveDbName,
+      undefined,
+      wholeRowsOf(entityLike),
+      entityLike._storedBelow,
+    ).renameExpr ?? ((expr: Expr) => expr)
   const filter =
     filters.length === 0
       ? undefined
@@ -1414,6 +1454,7 @@ const planZOrderWithin = <A>(args: {
 const entityDomainKeyForm = (
   entityLike: { readonly model?: unknown; readonly schemas?: { readonly inputSchema?: unknown } },
   record: Record<string, unknown>,
+  needs: ReadonlyArray<string>,
 ): Record<string, unknown> => {
   const source = (entityLike.schemas?.inputSchema ?? entityLike.model) as Schema.Top | undefined
   if (source === undefined) return record
@@ -1424,7 +1465,7 @@ const entityDomainKeyForm = (
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
     )
   })
-  return toCompositeKeyRecord(form, record)
+  return toCompositeKeyRecord(form, record, needs)
 }
 
 /**
@@ -1557,6 +1598,16 @@ export interface DynamoClientService {
     input: TransactWriteItemsCommandInput,
   ) => Effect.Effect<TransactWriteItemsCommandOutput, DynamoClientError>
 
+  /** Run one PartiQL statement. `Statement` is limited to 8,192 characters. */
+  readonly executeStatement: (
+    input: ExecuteStatementCommandInput,
+  ) => Effect.Effect<ExecuteStatementCommandOutput, DynamoClientError>
+
+  /** Atomically run up to 100 PartiQL statements (2x WCU cost for writes). */
+  readonly executeTransaction: (
+    input: ExecuteTransactionCommandInput,
+  ) => Effect.Effect<ExecuteTransactionCommandOutput, DynamoClientError>
+
   // --- Table management ---
 
   /** Update table settings (provisioned throughput, GSIs, etc.). */
@@ -1654,18 +1705,14 @@ export interface DynamoClientService {
 type ClientConfig = ClientOptions & {
   readonly region: string
   readonly endpoint?: string | undefined
-  readonly credentials?:
-    | { readonly accessKeyId: string; readonly secretAccessKey: string }
-    | undefined
+  readonly credentials?: Credentials | undefined
 }
 
 /** Config-provider client configuration accepted by {@link DynamoClient.layerConfig}. */
 type ClientConfigFromConfig = ClientOptionsFromConfig & {
   readonly region: Config.Config<string>
   readonly endpoint?: Config.Config<string> | undefined
-  readonly credentials?:
-    | Config.Config<{ readonly accessKeyId: string; readonly secretAccessKey: string }>
-    | undefined
+  readonly credentials?: Config.Config<Credentials> | undefined
 }
 
 /**
@@ -1700,7 +1747,8 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    *
    * @param config.region - AWS region
    * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
-   * @param config.credentials - Optional static credentials
+   * @param config.credentials - Optional static credentials, with a
+   *   `sessionToken` when they are temporary (an assumed role)
    * @param config.requestHandler - Optional HTTP handler, or the options of the
    *   runtime's handler (`{ socketTimeout: 5000 }`), passed to the SDK client.
    *   None is set by default, so without one a connection that stays open and
@@ -1751,7 +1799,15 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    *
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
-   * @param config.credentials - Optional Config for static credentials
+   * @param config.credentials - Optional Config for static credentials, with a
+   *   `sessionToken` when they are temporary (an assumed role). With none of
+   *   them in the provider, the SDK's default credential chain applies. With
+   *   one of them there and another missing (an empty value counts as
+   *   missing), the layer fails with the `Config`'s error for what is missing;
+   *   a token that may be absent is read with `Config.withDefault(undefined)`.
+   *   Both must be shown to be parts of the credentials: a value given, or
+   *   one missing, that is a mode, a flag or another setting, or a part the
+   *   `Config` turns into other text, leaves the default chain, as before.
    * @param config.requestHandler - Optional Config for each of the handler's
    *   timeouts (`connectionTimeout`, `socketTimeout`, `requestTimeout`,
    *   `throwOnRequestTimeout`), which an operator tunes per environment, or an
@@ -1785,14 +1841,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
         Effect.gen(function* () {
           const region = yield* config.region
           const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
-          const credentials = config.credentials
-            ? yield* Config.option(config.credentials)
-            : undefined
+          const credentials = yield* readCredentials(config.credentials)
           const options = yield* readClientOptions(config)
           return yield* buildService(
             region,
             endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
-            credentials && credentials._tag === "Some" ? credentials.value : undefined,
+            credentials,
             options,
           )
         }),
@@ -2035,7 +2089,7 @@ export type TypedClient<
       infer Un
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
+          BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               PathModel<Schema.Schema.Type<M>, P>,
@@ -2062,7 +2116,7 @@ export type TypedClient<
             infer Un
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
+            BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 PathModel<Schema.Schema.Type<M>, P>,
@@ -2121,8 +2175,8 @@ type Resolve<T> = { [K in keyof T]: T[K] }
 
 /** Resolve EntityKeyType into a plain object type for clean hover display.
  * Uses conditional type to force eager evaluation by TypeScript. */
-type ResolveKey<M extends Schema.Top, I> =
-  EntityKeyType<M, I> extends infer K ? { [P in keyof K]: K[P] } : never
+type ResolveKey<M extends Schema.Top, I, R> =
+  EntityKeyType<M, I, R> extends infer K ? { [P in keyof K]: K[P] } : never
 
 /**
  * Force eager resolution of remaining SK fields for clean hover display.
@@ -2256,7 +2310,9 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
          *
          * DynamoDB never recomputes a vector — this is the migration path when the
          * embedding model or the declared `source.fields` change. Returns the
-         * number of items whose vector was rewritten.
+         * number of items whose vector was rewritten. An item a write changed
+         * between the scan and the rewrite (a source field or a partition
+         * composite) is skipped: that write wrote its own vector.
          */
         readonly reembed: (options?: {
           readonly concurrency?: number | undefined
@@ -2396,6 +2452,17 @@ interface EntityLike {
   readonly _vectorIndexes?: Record<string, VectorIndexDefinition> | undefined
   /** Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
   readonly _resolveDbName?: ((domainName: string) => string) | undefined
+  /** What a write of a value at a path stores: a filter's operand is sent in it (#242). */
+  readonly _storedFormAt?: StoredFormAt | undefined
+  /** The fields stored as sparse maps, which a `.select()` naming one reads whole rows for (#238). */
+  readonly _sparseFieldNames?: ReadonlyArray<string> | undefined
+  /** A stored row as every read sees it: sparse maps rebuilt, renamed fields under their names. */
+  readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
+  /** The sparse map a read takes a stored attribute for, if any (#238). */
+  readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
+  readonly _entryForms?: ((expr: Expr) => Expr) | undefined
+  /** The segments below a path's first as they're stored (#238). */
+  readonly _storedBelow?: StoredBelow | undefined
   /**
    * The entity's refs: a `${ref}Id` composite is not stored on the item, but
    * the ref it names is, as a map holding the referenced identifier.
@@ -2404,7 +2471,8 @@ interface EntityLike {
     | ReadonlyArray<{
         readonly fieldName: string
         readonly idFieldName: string
-        readonly identifierField: string
+        readonly keyField: string
+        readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
       }>
     | undefined
   readonly _schema: DynamoSchema.DynamoSchema
@@ -2434,6 +2502,14 @@ interface EntityLike {
     readonly inputSchema?: Schema.Top | undefined
   }
 }
+
+/**
+ * A query's path builder over the members' models (`pathBuilderOf`): `.entry(key)` on each sparse
+ * map field, baked with the first member's prefix where members declare one field with different
+ * ones (a collection names each member's entry by its own prefix: `collectionNaming`).
+ */
+const queryPathBuilder = (entities: ReadonlyArray<EntityLike>) =>
+  pathBuilderOf(entities.map((entityLike) => entityLike.model))
 
 /** An entity's domain field names (its record's), when its schema exposes them. */
 const domainFieldsOf = (entityLike: EntityLike): ReadonlySet<string> | undefined => {
@@ -2586,7 +2662,7 @@ const makeFromConfig = (config: {
 
       // 1. All PK composites must be present
       for (const attr of pkAttrs) {
-        if (composites[attr] === undefined) {
+        if (given(composites, attr) === undefined) {
           throw new Error(
             `[EDD-9002] Missing required partition key attribute "${attr}" for index "${indexName}"`,
           )
@@ -2596,7 +2672,7 @@ const makeFromConfig = (config: {
       // 2. SK composites must follow prefix ordering
       let lastProvided = -1
       for (let i = 0; i < skAttrs.length; i++) {
-        if (composites[skAttrs[i]!] !== undefined) {
+        if (given(composites, skAttrs[i]!) !== undefined) {
           if (i !== lastProvided + 1) {
             const missing = skAttrs.slice(lastProvided + 1, i).join(", ")
             throw new Error(
@@ -2671,7 +2747,7 @@ const makeFromConfig = (config: {
       const accessor = (rawComposites: Record<string, unknown>) => {
         if (zorder) {
           const misplaced = indexDef.sk.composite.filter(
-            (attr) => rawComposites[attr] !== undefined,
+            (attr) => given(rawComposites, attr) !== undefined,
           )
           if (misplaced.length > 0) {
             throw new Error(
@@ -2683,7 +2759,12 @@ const makeFromConfig = (config: {
           }
         }
         validateQueryComposites(_indexName, accessorDef, rawComposites)
-        const compositesKeyForm = toCompositeKeyRecord(domainKeyForm, rawComposites)
+        const compositesKeyForm = toCompositeKeyRecord(
+          domainKeyForm,
+          rawComposites,
+          indexDef.pk.composite,
+          indexDef.sk.composite,
+        )
         // One partition, or a sharded index's several (#183).
         const read = KeyComposer.composeReadPartitions(
           entityLike._schema,
@@ -2728,7 +2809,7 @@ const makeFromConfig = (config: {
         // `name: "a"` also matches "ab".
         const hasSkComposites =
           !zorder &&
-          indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
+          indexDef.sk.composite.some((attr: string) => given(compositesKeyForm, attr) !== undefined)
         const pinnedQuery = hasSkComposites
           ? Query.whereUnderPins(
               query,
@@ -2742,7 +2823,7 @@ const makeFromConfig = (config: {
             )
           : query
 
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder([entityLike])
         const conditionOps = createConditionOps()
 
         // composeSkCondition — compose the user's `.where()` operand into a full
@@ -2774,7 +2855,7 @@ const makeFromConfig = (config: {
           // the index of the first composite still open to a condition.
           const pinnedCount = (() => {
             const i = skComposites.findIndex(
-              (attr: string) => compositesKeyForm[attr] === undefined,
+              (attr: string) => given(compositesKeyForm, attr) === undefined,
             )
             return i === -1 ? skComposites.length : i
           })()
@@ -2798,7 +2879,7 @@ const makeFromConfig = (config: {
           const rejectPinned = (attr: string): never => {
             throw new Error(
               `[EDD-9053] Sort key composite "${attr}" for index "${_indexName}" is already ` +
-                `pinned to ${JSON.stringify(String(compositesKeyForm[attr]))} by the accessor, ` +
+                `pinned to ${JSON.stringify(String(given(compositesKeyForm, attr)))} by the accessor, ` +
                 `so .where() cannot also constrain it: DynamoDB allows one sort key condition, ` +
                 `and this one would REPLACE the accessor's own prefix rather than narrow it — ` +
                 `returning rows outside the pinned value. Drop "${attr}" from the accessor call ` +
@@ -2829,7 +2910,7 @@ const makeFromConfig = (config: {
           // silently compare against the wrong prefix.
           const missing = skComposites
             .slice(0, targetIndex)
-            .filter((attr: string) => compositesKeyForm[attr] === undefined)
+            .filter((attr: string) => given(compositesKeyForm, attr) === undefined)
           if (missing.length > 0) {
             throw new Error(
               `[EDD-9004] Sort key condition on "${targetAttr}" for index "${_indexName}" ` +
@@ -2843,7 +2924,7 @@ const makeFromConfig = (config: {
           // follows them, so the shared delimiter rule always applies).
           const pinnedKeyForm: Record<string, unknown> = {}
           for (let i = 0; i < targetIndex; i++) {
-            pinnedKeyForm[skComposites[i]!] = compositesKeyForm[skComposites[i]!]
+            pinnedKeyForm[skComposites[i]!] = given(compositesKeyForm, skComposites[i]!)
           }
           const prefixText = KeyComposer.composeSortKeyBeginsWith(
             entityLike._schema,
@@ -2919,7 +3000,12 @@ const makeFromConfig = (config: {
                   }),
               }),
           skFields: accessorDef.sk.composite,
-          ...entityNaming(entityLike._resolveDbName),
+          ...entityNaming(
+            entityLike._resolveDbName,
+            entityLike._storedFormAt,
+            wholeRowsOf(entityLike),
+            entityLike._storedBelow,
+          ),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
         return new BoundQueryImpl(pinnedQuery, bqConfig)
@@ -2936,10 +3022,15 @@ const makeFromConfig = (config: {
           () => accessor(rawComposites) as BoundQueryImpl<unknown, unknown, unknown>,
           (refusal) =>
             new BoundQueryImpl(Query.refused(indexDef.index, refusal), {
-              pathBuilder: createPathBuilder(),
+              pathBuilder: queryPathBuilder([entityLike]),
               conditionOps: createConditionOps(),
               provide,
-              ...entityNaming(entityLike._resolveDbName),
+              ...entityNaming(
+                entityLike._resolveDbName,
+                entityLike._storedFormAt,
+                wholeRowsOf(entityLike),
+                entityLike._storedBelow,
+              ),
               operation,
             }),
         )
@@ -2981,7 +3072,7 @@ const makeFromConfig = (config: {
       for (const [indexName, indexDef] of Object.entries(entityLike.indexes)) {
         if (!indexDef) continue
 
-        accessors[indexName] = buildEntityQueryAccessor(entityLike, indexName, indexDef)
+        setOwn(accessors, indexName, buildEntityQueryAccessor(entityLike, indexName, indexDef))
 
         // Track collection membership for auto-discovery
         if (indexDef.collection) {
@@ -3003,7 +3094,7 @@ const makeFromConfig = (config: {
         // named after an existing index accessor (or `scan` / `reembed`) would
         // silently replace it and take the other feature offline, so make the
         // collision a construction-time failure instead.
-        if (logicalName in accessors || RESERVED_ACCESSOR_NAMES.has(logicalName)) {
+        if (Object.hasOwn(accessors, logicalName) || RESERVED_ACCESSOR_NAMES.has(logicalName)) {
           throw new Error(
             `[EDD-9038] Entity "${key}": vector index "${logicalName}" collides with an existing ` +
               `accessor of the same name. Vector index names share a namespace with GSI query ` +
@@ -3011,7 +3102,8 @@ const makeFromConfig = (config: {
           )
         }
         const vqConfig: BoundVectorQueryConfig = {
-          keyForm: (record: Record<string, unknown>) => entityDomainKeyForm(entityLike, record),
+          keyForm: (record: Record<string, unknown>) =>
+            entityDomainKeyForm(entityLike, record, definition.partition ?? []),
           entityType: entityLike.entityType,
           logicalName,
           definition,
@@ -3022,6 +3114,7 @@ const makeFromConfig = (config: {
           unpackAttributes: entityLike._dispatchAttributes,
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
+          storedAt: entityLike._storedFormAt,
         }
         accessors[logicalName] = (query: string | ReadonlyArray<number>) =>
           makeBoundVectorQuery(vqConfig, query)
@@ -3039,13 +3132,18 @@ const makeFromConfig = (config: {
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
           liveRows: entityLike._liveRows?.(),
         })
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder([entityLike])
         const conditionOps = createConditionOps()
         const bqConfig: BoundQueryConfig<unknown> = {
           pathBuilder,
           conditionOps,
           provide,
-          ...entityNaming(entityLike._resolveDbName),
+          ...entityNaming(
+            entityLike._resolveDbName,
+            entityLike._storedFormAt,
+            wholeRowsOf(entityLike),
+            entityLike._storedBelow,
+          ),
           operation: { name: "Entity.scan", target: entityLike.entityType },
         }
         return new BoundQueryImpl(scanQuery, bqConfig)
@@ -3121,7 +3219,7 @@ const makeFromConfig = (config: {
           firstMember.entityLike._schema,
           firstMember.entityLike.entityType,
           indexDef,
-          entityDomainKeyForm(firstMember.entityLike, composites),
+          entityDomainKeyForm(firstMember.entityLike, composites, indexDef.pk.composite),
           { prune: false },
         )
 
@@ -3168,7 +3266,7 @@ const makeFromConfig = (config: {
         }
 
         // Wrap in BoundQuery that groups results by entity key
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder(members.map((m) => m.entityLike))
         const conditionOps = createConditionOps()
         const collectionProvide = <X, E>(eff: Effect.Effect<X, E, any>) =>
           Effect.provide(eff, ctx) as Effect.Effect<X, E, never>
@@ -3203,6 +3301,9 @@ const makeFromConfig = (config: {
               entityKey: m.entityKey,
               resolve: m.entityLike._resolveDbName ?? ((name: string) => name),
               fields: domainFieldsOf(m.entityLike),
+              storedAt: m.entityLike._storedFormAt,
+              wholeRows: wholeRowsOf(m.entityLike),
+              below: m.entityLike._storedBelow,
             })),
           ),
           operation: { name: "Collection.query", target: collName },
@@ -3217,7 +3318,7 @@ const makeFromConfig = (config: {
           () => collectionAccessor(composites) as BoundQueryImpl<unknown, unknown, unknown>,
           (refusal) =>
             new BoundQueryImpl(Query.refused(members[0]!.indexDef.index, refusal), {
-              pathBuilder: createPathBuilder(),
+              pathBuilder: queryPathBuilder(members.map((m) => m.entityLike)),
               conditionOps: createConditionOps(),
               provide,
               operation,
@@ -3334,12 +3435,12 @@ const makeFromConfig = (config: {
               if (handler !== undefined) handlers.add(handler)
             }
             // The read models whose outboxes are on this table are checked before anything is
-            // sent: `rekey` reads an item's key back by its key space, so two whose keys could be
-            // read as each other's are refused here, where `DynamoClient.make` refuses only those
-            // whose items would overwrite each other in normal operation, and so is a member of
-            // this table that would read a read model's items as its own. Projections are defined
-            // when the program runs them, so one defined after the client was made has its outbox
-            // recorded only now. A run's refusal is the run's `ValidationError`.
+            // sent, as `DynamoClient.make` checks them: two whose items would overwrite each other
+            // in normal operation are refused, and so is a member of this table claiming a read
+            // model's items whose own would. Projections are defined when the program runs them,
+            // so one defined after the client was made has its outbox recorded only now. Whose an
+            // item is otherwise is decided item by item (`rekeyOutboxMember`). A run's refusal is
+            // the run's `ValidationError`.
             const shared = yield* sharedOutboxKeySpace("rekey", named, {
               key: tagKey,
               name: tableName,
@@ -3359,16 +3460,46 @@ const makeFromConfig = (config: {
                 cause: shared,
               })
             }
-            // The outboxes on this table of a read model on another (#171): every projection's, so
-            // a second projection of one read model doesn't hide the first's items, named by this
-            // table's service or by another handle on the same physical table. A read model's
-            // projections may have one each, on tables of their own.
-            const outboxOf = new Set<unknown>()
-            for (const entity of [...registered, ...visibleEntities]) {
-              if (outboxOf.has(entity)) continue
-              outboxOf.add(entity)
-              // Their key attributes, once each.
-              const layouts = new Map<string, { readonly pk: string; readonly sk: string }>()
+            // The outbox items on this table, by entity type, are judged by one member each, which
+            // asks every read model of that type that can have written them (#237): the table's
+            // members (their own projections' outbox items), then each read model whose
+            // projection's outbox is on this table (#171) — every projection's, so a second
+            // projection of one read model doesn't hide the first's items, named by this table's
+            // service or by another handle on the same physical table. A read model's projections
+            // may have one each, on tables of their own.
+            const outboxCandidates = new Map<
+              string,
+              Map<unknown, Array<{ readonly pk: string; readonly sk: string }>>
+            >()
+            const addCandidate = (
+              entity: unknown,
+              key: { readonly pk: string; readonly sk: string },
+            ) => {
+              const type = (entity as { readonly entityType: string }).entityType
+              const byEntity =
+                outboxCandidates.get(type) ??
+                new Map<unknown, Array<{ readonly pk: string; readonly sk: string }>>()
+              outboxCandidates.set(type, byEntity)
+              const keys = byEntity.get(entity) ?? []
+              byEntity.set(entity, keys)
+              if (!keys.some((k) => k.pk === key.pk && k.sk === key.sk)) keys.push(key)
+            }
+            for (const member of new Set(tableMembers)) {
+              const type = (member as { readonly entityType?: string }).entityType
+              const primary = (
+                member as { readonly indexes?: { readonly primary?: IndexDefinition } }
+              ).indexes?.primary
+              if (
+                type === undefined ||
+                primary === undefined ||
+                (member as { readonly _valuelessMove?: unknown })._valuelessMove === undefined ||
+                Rekey.handlerOf(member)?.types.includes(`${type}#outbox`) !== true
+              ) {
+                continue
+              }
+              addCandidate(member, { pk: primary.pk.field, sk: primary.sk.field })
+            }
+            for (const entity of new Set([...registered, ...visibleEntities])) {
               for (const outbox of remoteOutboxesOf(entity)) {
                 if (
                   outbox.table.Tag.key !== tagKey &&
@@ -3376,27 +3507,26 @@ const makeFromConfig = (config: {
                 ) {
                   continue
                 }
-                layouts.set(`${outbox.pk}\u0000${outbox.sk}`, { pk: outbox.pk, sk: outbox.sk })
+                addCandidate(entity, { pk: outbox.pk, sk: outbox.sk })
               }
-              if (layouts.size === 0) continue
-              const keys = [...layouts.values()]
-              const readModel = entity as unknown as Pick<
-                EntityType,
-                "entityType" | "_rekeyProjectionRow"
-              >
+            }
+            for (const [type, byEntity] of outboxCandidates) {
+              // A read model with one layout on this table names the table's key attributes.
+              const layout = [...byEntity.values()].find((keys) => keys.length === 1)?.[0]
               handlers.add({
-                name: readModel.entityType,
-                types: [`${readModel.entityType}#outbox`],
-                // A table has one key schema, so its items are under the layout whose attributes
-                // they hold.
-                row: (row, ctx) =>
-                  readModel._rekeyProjectionRow(
-                    row,
-                    ctx,
-                    keys.find(
-                      (key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined,
-                    ) ?? keys[0]!,
-                  ),
+                ...rekeyOutboxMember(
+                  type,
+                  [...byEntity].map(([entity, keys]) => ({
+                    readModel: entity as OutboxCandidate["readModel"],
+                    // A table has one key schema, so its items are under the layout whose
+                    // attributes they hold.
+                    keys: (row) =>
+                      keys.find(
+                        (key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined,
+                      ) ?? keys[0]!,
+                  })),
+                ),
+                ...(layout !== undefined && { key: layout }),
               })
             }
             return yield* Rekey.run({ tableName, members: [...handlers], options })
@@ -3817,7 +3947,7 @@ const waitForVectorIndexReady = (
 export const classifyError =
   (operation: string) =>
   (thrown: unknown): DynamoClientError => {
-    const cause = redactCredentialRefusal(thrown)
+    const cause = hideReturnedItems(redactCredentialRefusal(thrown))
     if (isAwsThrottling(cause)) return new ThrottlingError({ operation, cause })
     if (isAwsValidationError(cause)) return new DynamoValidationError({ operation, cause })
     if (isAwsInternalServerError(cause)) return new InternalServerError({ operation, cause })
@@ -3829,13 +3959,13 @@ export const classifyError =
 const buildService = (
   region: string,
   endpoint: string | undefined,
-  credentials: { readonly accessKeyId: string; readonly secretAccessKey: string } | undefined,
+  credentials: Credentials | undefined,
   options: ClientOptions,
 ) =>
   Effect.gen(function* () {
     const clientConfig: ConstructorParameters<typeof DynamoDBClient>[0] = { region }
     if (endpoint !== undefined) clientConfig.endpoint = endpoint
-    if (credentials !== undefined) clientConfig.credentials = credentials
+    if (credentials !== undefined) clientConfig.credentials = sdkCredentials(credentials)
     if (options.requestHandler !== undefined) clientConfig.requestHandler = options.requestHandler
     if (options.maxAttempts !== undefined) clientConfig.maxAttempts = options.maxAttempts
     const client = yield* acquireSdkClient(() => new DynamoDBClient(clientConfig))
@@ -3910,6 +4040,17 @@ const buildService = (
           try: (signal) =>
             client.send(new TransactWriteItemsCommand(input), { abortSignal: signal }),
           catch: classifyError("TransactWriteItems"),
+        }),
+      executeStatement: (input) =>
+        Effect.tryPromise({
+          try: (signal) => client.send(new ExecuteStatementCommand(input), { abortSignal: signal }),
+          catch: classifyError("ExecuteStatement"),
+        }),
+      executeTransaction: (input) =>
+        Effect.tryPromise({
+          try: (signal) =>
+            client.send(new ExecuteTransactionCommand(input), { abortSignal: signal }),
+          catch: classifyError("ExecuteTransaction"),
         }),
       // --- Table management ---
       updateTable: (input) =>

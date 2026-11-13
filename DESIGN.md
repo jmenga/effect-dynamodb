@@ -208,6 +208,18 @@ const UserModel = DynamoModel.configure(User, {
 
 The Entity reads the `immutable` flag from the configured model's attributes and excludes that field from `Entity.Update<E>`.
 
+### Field Names `Object.prototype` Holds, and the Caller's Objects (#239)
+
+**The library requires `effect@4.1.3`. Under it, a field whose name is also an `Object.prototype` member (`toString`, `constructor`, `valueOf`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toLocaleString`, `__proto__` …) is read from a payload only when it is the payload's own property. Given through a prototype (`Object.create`), a class getter or a proxy without own-key traps, it is not seen: an optional field is left out, and a required one fails with `Missing key`. On Effect 4.1.2 it was read.** Effect's struct parser decides this (`requiresOwnProperty`), at any depth; every other declared name it reads where the payload holds it or answers `in` for it. The library hands the parser each payload as given, but on four paths, where it adds to the payload first and hands the parser a copy made exactly as 1.40.0 made it (the same construct, reading the same properties as often, in the same order): a write filling a decoding default an index key needs (`{ ...payload, ...defaults }`: `put`, `create`, `upsert`, a transaction's or a batch's put, a time-series `put`, and an `append` whose `.remove()` names such a field), an aggregate's stamped dates (`{ ...object, ...stamps }` at each object stamped), an aggregate's `create` fetching ids (a copy of the whole input's own enumerable properties, the fetched items and renamed lists put into it), and a `GeoIndex`'s `put` and `enrich` (`{ ...input, cells }`). A spread copies own properties alone, so on those paths an input given by `Object.create`, a class with getters or a proxy loses its fields there, as on 1.40.0. `test/connected.copy-paths.test.ts` and geo's `connected.inherited-shapes.test.ts` hold each to 1.40.0 on Effect 4.1.3 under counting getters, getters that throw on a second read, a proxy recording its traps in order, a proxy whose `has` trap throws, and an object inheriting each name the library fills from a throwing getter, at every depth.
+
+A declared own getter that throws while the parser reads it is a defect, as it was on 1.40.0. Where the library asks whether a payload gives a name before filling it (a default, a date) and the payload answers for it by inheritance with a getter that throws, the write fails with a `ValidationError` saying so, as reading such a name fails on every other path (1.40.0 died with a defect there).
+
+The library's own maps (definition maps, encoded payloads, rows read back, a schema's fields) are read with `Object.hasOwn` (`ownValue`, `hasOwnName`) and written with `setOwn`, so a name a definition gives (a field, a path segment, a key composite, a unique constraint's field, an edge, a timestamp, the version, a time-series `orderBy`, a Z-order dimension, a projection's checkpoint, revision, checkpoint map or instance field, an aggregate's context field) is looked up as an ordinary name is, never found as the inherited member. `test/connected.inherited-names.test.ts` holds each such position, under every `Object.prototype` name, to what the same definition does under an ordinary name, and to what published 1.40.0 did (`fixtures/inherited-names-1.40.0.json`): the same requests and rows wherever 1.40.0 handled the name as an ordinary one.
+
+The caller's objects are read as 1.40.0 read them. A record argument (a condition's, a filter's or an update operand's record, `.within()` bounds, an aggregate `list`'s filter) is read by its own enumerable entries, as on 1.40.0, so one whose fields aren't its own properties (`Object.create`, a class with getters, a proxy) still gives none; that limitation is 1.40.0's, kept. A key is read by its own entries too (`keyEntries`), and by name only for each composite they lack, where 1.40.0 died ("Missing composite attribute"). Where the library reads a caller's object by name (`given`: a key's composites, the key composites `.set()` is checked for, a unique constraint's fields, an aggregate's nodes, ids and edges) it reads `value[name]` once, as 1.40.0 read it: a getter, a class property, a prototype or a proxy answers, and what it finds is a value, a function included, but for the member every object inherits under the name, judged by identity alone: `Object.prototype[name]` under every name but `__proto__` (`Object.prototype.toString` under `toString`), and under `__proto__`, where `Object.prototype["__proto__"]` is `null`, `Object.prototype` itself (what a plain object's `__proto__` reads), which 1.40.0 took for a value (composed its text into a key, reserved a sentinel under it, sent it): that reads as absent. Only then is the object asked once more (`Object.hasOwn`), whether it holds that member itself, and where it does it is a value. A class's own method or `constructor` under such a name is a value, as on 1.40.0, and so is a function the object holds itself: a key composite composes its text, a condition, a filter or an update operand sends what 1.40.0 sent (`test/connected.own-functions.test.ts`). Where 1.40.0 took no function for a value (an aggregate's ids, `many` lists and sub-aggregates) or read nothing at all (a key composite the key's own entries lack), a function is no value (`givenData`). A read that throws for a name the object doesn't hold (a strict proxy) is no value. `test/connected.read-parity.test.ts` (and geo's) holds these entry points to 1.40.0 trap by trap (`fixtures/read-parity-1.40.0.json`): an entity's `put`, `create`, `upsert`, `get`, `update` and `patch` (`.set()`, a condition met and not met, `.add()`, `.subtract()`, `.append()`, `.deleteFromSet()`, `.remove()`), a conditioned `put` and `delete`, an index accessor (with its sort key, `.filter()`, `.select()`, `.within()`), a filtered scan, a collection (filtered or not), `Batch.get`, `Transaction.transactGet`, `Transaction.transactWrite`, `Batch.write`, `deleteIfExists`, `delete`, a retained `put`, `update` and `delete`, `getVersion` and `versions`, a unique `put` and `update`, a soft delete, `deleted.get`, `restore`, `purge`, a time-series `put`, `append` and `history`, an event stream's `append` and `read` of tagged and struct events, an aggregate's `create` (by ids and whole), `get`, `update` and `delete`, and geo's `put`, `enrich` (then a transaction's put) and `nearby`. Not held trap by trap: an aggregate `list`'s filter and the state `update` hands its callback, snapshots, a nested `appendOp`, `commandHandler`, projection keys and an entity's unbound operations. Over those, a proxy over an object holding its fields as its own properties, and over each object nested in it, receives the same traps, of the same names, as many times, in the same order, under ordinary names and under `Object.prototype`'s names alike. The library asks more only where 1.40.0 failed or took the inherited member for a value: where a key's own entries lack a composite, after a read throws, and where the value read is `Object.prototype`'s member itself. An argument that is no object (`undefined`, `null`, a string, a number, an array) is read as 1.40.0 read it.
+
+A unique constraint's field so named, left out of a write, was read by 1.40.0 as the inherited function, so it reserved a sentinel keyed by the function's text (`function tostring() { [native code] }` under `toString`). This release composes no sentinel for a field the row doesn't hold, so it never reads, moves or releases those (`rekey` included): `test/connected.unique-sentinels-1.40.0.test.ts` seeds the rows 1.40.0 wrote and holds that every write, delete, restore and purge of them works and leaves the sentinels as they were. Each is deleted by its key.
+
 ---
 
 ## 4. Application Namespace (DynamoSchema)
@@ -920,7 +932,9 @@ has no rows under other text, and there two values never share a key: `test/Alia
 key, a number whose text they changed, or a time-series event of a string-encoded numeric `orderBy`
 needs `rekey`, under the default or with the flag set. From 1.39.0 or earlier, an entity
 with a key composite whose codec's `encode` takes its own output needs `rekey`, whatever `escapeKeys`
-says.
+says. From 1.40.0 or earlier with `escapeKeys: true`, an aggregate's `entity:` edge keyed by a field
+its entity's model encodes moves its rows on each group's next changed write, and only a group whose
+rows and rows to move exceed 100 needs `rekey` first (§11 "An `entity:` edge's sort key").
 
 `KeyText136` composes exactly the bytes 1.36 wrote for every key kind (`serializeValue136`
 through the same structural composers, and the time-series event sort key from the encoded
@@ -932,7 +946,12 @@ and retained history. None of these is ever regenerated from this repo.
 
 **Rows holding no values.** A projection's row tombstone or outbox item says which text its key is
 by `__edd_kt__` (`KeyText136.formOfMark`, `markOf`): none is off's, `1` that of 1.37.0 and 1.38.0, `2`
-that of `escapeKeys: true` when it differs from off's. `rekey` reads the key back by the mark.
+that of `escapeKeys: true` when it differs from off's. `rekey` reads the key back by the mark. An
+outbox item written from 1.41.0 also carries a mark, `__edd_rm__`, naming its read model and its
+effect (`outboxMark`, #237), part of no key, which `drainPending` and the outbox table's `rekey`
+read first (`outboxOwnership`); `rekey` moves an item as it is, mark and all, and adds none to an
+item written before. An item written beside another effect's (its key followed by `#<mark>`, §
+"The outbox") keeps that ending: `rekey` keeps whatever follows the row's sort key.
 
 #### `rekey`
 
@@ -984,48 +1003,269 @@ meet when a key of one can be a key of the other (an outbox item's sort key adds
 character against character. A value is what its type can compose: a number's
 or a bigint's key text (digits and `-+.:;)*`, and of letters only `e` and those
 of `Infinity`, starting with a digit, `-`, `:` or `;`), the key text of a
-literal union's members or of `true` and `false`, or, for anything else (a
-string, a date, a field the model doesn't declare), any text. Two read models whose
-projections' outboxes are on one table are refused (`EDD-9134`) at two places,
-by two questions. Where they're bound, when the client is made and by
-`EventStore.processBatch`: can a key of one be a key of the other with values
-that hold no `#`, each composite walked to the end of the key with the values
-its type can compose? Then their items overwrite each other whenever their
-values match, and both are defects. Read models whose keys meet only through a
-value holding `#` (`ida_x` and `ida_x#idb_y`) bind and run, as on 1.39.0, as do
-two whose keys part where one's value can't spell the other's text (`n_7`, a
-number, beside `n_x_q`). By the outbox table's `rekey`, before it sends
-anything: can `rekey` read an item of one as the other's at all? Its reader
-(`KeyText136.readIndexKeys`) takes a number, a bigint or a boolean only as text
-its value composes again, but a literal composite as any text, as it takes a
-string, so the keys an item is written under (a literal one of its members'
-text) are compared with the keys the other's reader takes (a literal any text),
-each way round, under every setting a row can have been written under. The walk
-stops at the first value that may hold `#`, a string's or (on the reader's side)
-a literal's, and anything follows it: read models whose leading composites
-differ are apart, those whose leading composites are the same are one space
-whatever follows, and past a number, a bigint or a boolean the next labels must
-still differ (`n_7#ida_` and `n_7#idb_` are apart; `kind_a#ida_` and
-`kind_a#idb_`, `kind` a literal, are not). The table's own members are compared
-too: an entity claims the outbox items of its entity type on its table (its own
-projections' outbox there), so one that can read a read model's items as its own
-would move them by its own key, to a key that isn't theirs. A member is refused
-unless it composes its keys exactly as the read model does (the same schema,
-entity type and version, primary key composites, casing, collection and
-composite types), when it moves an item where the read model would. `rekey`
-couldn't tell whose an item is, and the run fails with a `ValidationError`; this
-also covers projections defined after the client was made. `rekey` of the
-client's other tables runs. Tables are compared by the physical name the
-context gives them (two handles on one table are one table), or by handle when
-it gives none. Read models that never meet at one of those sites, bound
-separately or in different programs, can't be checked: key spaces must be
-distinct per outbox table, and that is the application's to keep. A unit that moves together (an aggregate, a
-stream, a moved row's target) is claimed once per run (`claim`, `once`), so it is
-moved and counted once whichever of its rows the scan reaches first, and a row
-reached after it moved — by this run, or by an application write between the
-scan and the move — is `unchanged`: `moved` counts what the run moved. After the
-scan each member's `finish` runs (`RekeyMember.finish`): an aggregate judges the rows
+literal union's members or of `true` and `false`, a date's (an epoch's number;
+for a date stored as a string, its ISO text, starting with a digit or the sign
+of a wide year, an instant's going on in digits and `-+:.TZ`, a zoned date's in
+any text without `#`, its zone's name included), or, for anything else (a
+string, a field the model doesn't declare), any text. A date's text is modelled
+only where the library writes it, on the side of the keys a read model writes: a
+`DynamoModel` date schema's encoding, or for an Effect date schema the entity
+stores by its own encoding (`Schema.DateTimeUtc`, `Schema.Date`,
+`Schema.DateTimeZoned`) the default or its `storedAs`. A date with a codec of its
+own (a transform to a date, `Schema.DateTimeUtcFromString` included) writes text
+the library doesn't know (`x_<ISO>`, a week label), so it's any text, as 1.40.0
+took it; `rekey`'s reader still takes a date as any text. Two read models whose
+projections' outboxes are on one table are refused (`EDD-9134`) by one
+question: can a key of one be a key of the other with values that hold no `#`,
+each composite walked to the end of the key with the values its type can
+compose? Then their items overwrite each other whenever their values match, and
+no one can tell whose an item is. Where they're bound, when the client is made
+and by `EventStore.processBatch`, that's a defect; by the outbox table's
+`rekey`, before it sends anything, a `ValidationError`, for projections defined
+since the client was made, and for a member of that table claiming the outbox
+items of a read model's entity type (an entity claims those of its entity type
+on its table, its own projections' outbox there) unless it composes its keys
+exactly as the read model does (the same schema, entity type and version,
+primary key composites, casing and collection, and each composite of the same
+kind of key text, a literal union taken as its kind: `sameKeys`). Read models
+whose keys meet only through a value holding `#` (`ida_x` and `ida_x#idb_y`)
+bind and run, as on 1.39.0, as do two whose keys part where one's value can't
+spell the other's text (`n_7`, a number, beside `n_x_q`;
+`at_2026-11-11t08:00:00.000z`, a date, beside `at_x_q`, which 1.40.0 refused).
+A pair apart only because a date's text is modelled (1.40.0 took a date as any
+text without `#`) is admitted only when no key one writes can be a key the other
+writes at all, a string holding `#` included, so each drainer can tell its items
+from the other's (`drainPending`): `at` beside `at_x`, but not `shop` then `at`
+beside `shop` then `at_x`, which stays refused, as on 1.40.0, nor a zoned date
+(whose text goes on in any text) beside `at_1`.
+
+1.40.0's `rekey` asked more: could its reader read an item of one as the
+other's at all, a value holding `#` included and a literal composite read as any
+text? It refused every such pair, and a member that could read a read model's
+items as its own. From 1.41.0 those aren't refused: the outbox items of each
+entity type on the table are judged by one member (`rekeyOutboxMember`,
+exclusive in `Rekey.run`), which asks every read model of that type that can
+have written them, in registration order: the table's members, then the read
+models whose projections' outbox is there. An item it can't place is left where
+it is and counted, never a refusal of the whole table:
+
+- **Who can have written it** is `outboxOwnership`, the one decision
+  `drainPending` makes too: an item naming its read model (`__edd_rm__`, from
+  1.41.0) is that read model's, and one naming none (written before) is any of
+  those whose keys its row's key can be. Those whose reader reads its key back
+  are its possible owners. None: `unregistered` when it names a read model none
+  of them is, else `unrecognizedKey`.
+- **One, or several moving it to one key** (each finding it current, or each
+  moving it to the same key: a key whose text is the same under every reading):
+  the first moves it, with no read beyond the move's own.
+- **Otherwise**, an item written before 1.41.0 at a key more than one writes,
+  which they would move apart (`shop_north#branch_b1`, read as `shop` =
+  `north#branch_b1` and moved to `shop_north%23branch_b1`, or read as `north`
+  and `b1` and left): the row it names (`__edd_row_pk__`, `__edd_row_sk__`) is
+  read, strongly consistent, from each one's table, at that key and then at the
+  key that read model would move it to (a move of the row in between is seen at
+  the second). It is the read model's whose own row is there (`_ownsRow`: an
+  item whose values compose its stored key under some key text), when exactly
+  one finds one and none finds a row tombstone. Otherwise it's left and counted
+  in `skipped.ambiguousOwner`, listed in `ambiguous` with the reason: `rowGone`
+  (no read model has the row) or `unsettled` (a row tombstone is there, which
+  holds no values; more than one has a row of its own; or a read model's table
+  isn't provided where `rekey` runs). A rerun reads and leaves it again: a
+  second run changes nothing.
+
+The rows read are the only extra requests, and only for those items: outbox
+items are short-lived, so they drain away after an upgrade. A row's values say
+only whose row is there now: an item a read model wrote before another's row
+replaced the first's at one key (their items overwrite each other only through
+a value holding `#`) goes with the row. What stays refused is the pair whose
+items overwrite each other with ordinary values: no item can be told apart
+there, by tag or by row, since each write replaces the other's. An ownership
+mapping supplied by the application (item key to read model) wasn't taken: it
+would have to be built from the same rows `rekey` reads, by hand, for a
+population that drains away by itself. Tables are
+compared by the physical name the context gives them (two handles on one table
+are one table), or by handle when it gives none. Read models that never meet at
+one of those sites, bound separately or in different programs, can't be
+checked: key spaces must be distinct per outbox table, and that is the
+application's to keep. Pinned on DynamoDB Local over the items, rows and row
+tombstones the published 1.39.0 and 1.40.0 wrote
+(`test/connected.rekey-outbox-owners.test.ts`, both directions of `escapeKeys`,
+dry run, a run resumed from its token, and a second run). `rekey` of the
+client's other tables runs. A unit that moves together (an aggregate, a
+stream) is judged once per run, so it is moved and counted once whichever of its
+rows the scan reaches first; a row an application write moved between the scan
+and the move is `unchanged`: `moved` counts what the run moved. After the scan
+each member's `finish` runs (`RekeyMember.finish`): an aggregate judges the rows
 it found below a root it never saw there.
+
+**One outcome whatever the order (#240).** Over a table nothing else writes to,
+the report and the rows a run leaves don't depend on the order the scan returns
+rows in, its segment count or its `concurrency`; `test/RekeyVisitOrder.test.ts`
+runs every scenario over shuffled visit orders and several segment counts and
+compares the report and the rows, dry run and real. Up to 1.40.0 they did: the
+scan and a move needing a row out of its way both judged that row, so it could
+be reported twice, two ways, or counted as `unchanged` after the run moved it.
+
+- **One verdict per unit.** A stored row (`Rekey.rowUnit`, by its key), an
+  aggregate partition and an event stream are each a unit judged once a run
+  (`RekeyRowContext.judge`): the first visit judges it (the scan's, or a move's
+  that needs it out of the way), a visit meanwhile waits for that verdict, and a
+  later one finds it settled. A unique sentinel's reservation is a unit of its
+  own (`Rekey.reservationUnit`), apart from the move that carries it with a
+  tombstone. A wait that would close a loop (a row in the way of a row in the
+  way of it, through the units each waits on) isn't taken: every unit on the
+  loop is told `loop`, and each reports `contended` (`LOOP_MESSAGE`), so every
+  wait that is taken ends.
+- **A row in the way is judged as its own unit first.** A move whose target
+  holds another value's old row moves that row first (`clearTarget`). One that
+  belongs to a unit moving together (another aggregate sharing the partition,
+  another stream) is judged as the scan would judge that unit (`yieldTo`, the
+  member's `holder`), reading nothing more: the asker's rows show what it is.
+  What stays there is `taken`. An aggregate whose row is in the way under both
+  keys of the chain tells its rows from another's by the values a row's sort
+  key is composed from (`otherElement`), never by key alone.
+- **The run doesn't meet its own writes** (`Journal`). Every write on the
+  table is noted by key as it's answered. The scan passes a row the run put
+  (its fingerprint, the `digest` of `canonicalItem`, is one the run left there),
+  and a row the run took that a page read before the take still returned.
+  Anything else at such a key, a row someone wrote there since, is a new row,
+  counted and judged.
+- **`scanned` counts each row stored when the run met it, once**: when the scan
+  returns it, or when the run takes it (moves it away, or writes over it as read)
+  before the scan reaches it. Rows the run put aren't counted, so over a table
+  nothing else writes to, `scanned` of a run over the whole table is the number
+  of rows stored when the run started, in a dry run and a real run alike. A row
+  the run moved isn't `unchanged`, whichever member meets it after. Counts are
+  per run: a run started from a `resume` token starts with an empty journal, so a
+  row an earlier slice moved to a key the later slice's scan reaches is a row
+  stored when the later one started, counted by both (`moved` by the first,
+  `unchanged` by the second). Summed over the slices, `scanned` can exceed the
+  rows the table holds. Carrying the journal in the token would make the token
+  as large as the journal.
+- **A dry run plans the writes a real run sends** (`RekeyRowContext.plan`): it
+  sends none, but notes what each would do if it succeeded as far as the run
+  knows (no row the plan placed where it asks for none, none the plan took where
+  it asks for one), and its reads (gets, queries, the scan's pages) see the plan.
+  So a later decision sees what an earlier one would have done: a dry run's
+  report is the run's, chains included, but for `indexKeys.repaired` (a dry run
+  writes no key and counts none).
+- **What depends on where a row ends up is counted at the end** (`RekeyRowContext.atEnd`,
+  run after every segment's scan and before each member's `finish`). Without
+  `reservations`, a unique sentinel whose back-pointer names no row that holds it,
+  in a run with nothing judging reservations, is `unrecognizedKey`, as 1.40.0
+  counted it; but under `preserveUnique` a move of a tombstone of that item can
+  take the same sentinel along, so counting it when the scan met it gave one
+  report when the scan met it before the tombstone's move and another after
+  (random tables, `RekeyRandomOrder.test.ts`). It's counted once the scan is
+  over, unless by then a row's pass took it (`vacated`) or put it (`placed`) or
+  a transaction re-pointed it in place (`sendRekeyTransaction` claims
+  `repointed` for each sentinel `Update` it sent; `sentinelTaken`). Nothing more
+  is read, so a quiet table sends what 1.40.0 sent. The deferral takes a journal
+  entry; past the capacity it's counted at once, as before (`skipped` is in
+  `journal.inexact`).
+- **Nor on how its fibers interleave.** A run's segments, and the rows of a page
+  handled at once, meet each other's writes between two reads. A moving row
+  whose sentinel's current key holds another item's sentinel naming a row that
+  is gone reads the key again before refusing (`stillThere`): a move of the run
+  may just have taken that row with its sentinel. Having moved such a sentinel
+  out of its way, it reads the key again unless the journal shows it empty, and
+  so does a row whose current key holds another value's row under other key text
+  that, judged, didn't leave as far as the journal knows (`clearTarget`'s
+  `reread`): another run may have moved it first. Over 960 random cases of two
+  and three runs at once, the runs reported 558 conflicts that one run alone over
+  the same table doesn't (459 rows and 97 sentinel keys `taken`), and with these
+  reads 9 (3 sentinel keys `taken`, 4 `bothKeys`, 2 `contended`); the rows end as
+  one run alone leaves them either way. `RekeyConcurrentRuns.test.ts` forces both
+  orders.
+  And a pass moving a sentinel out of another's way, whose sentinel its own row's
+  move took meanwhile, has nothing left to do (`movedMeanwhile`). Each costs a
+  read, only on the way to refusing. Before them, about one random table in four
+  could end with a row reported `taken` under some interleaving, and a run on
+  DynamoDB Local did;
+  `RekeyInterleavings.test.ts` delays each request at random (`jittered`) and
+  compares report and rows, dry run and real, with the run without delays. An
+  item whose sentinel another unit moves out of the way (`sentinelOut`) can read
+  the sentinel's current key before that move's put lands and its old key after
+  the move's delete: neither read finds it, and the item counted `unchanged` or
+  not by which came first (the chain scenarios with each request delayed 0 to
+  30 ms, on DynamoDB Local: two of their 24 runs, in both of two runs of the
+  file; random delays reach that order only now and then, so
+  `RekeyInterleaving.test.ts` and `connected.rekey-latency.test.ts` force it, the
+  move's answer held until the pass has judged). A sentinel found under no key is
+  read again at its current key when the run has put, or is putting, a row there
+  (`RekeyRowContext.putting`: the journal keeps a put's fingerprint from when it's
+  sent, before its answer), and the run's put found there is the run's work for
+  the item (`worked`), answered or not. The read is never sent over a table the
+  run writes nothing to.
+- **Conflicts are reported one per row** (member, kind, key): the first by
+  precedence (`failed`, `unguarded`, `uncomposable`, `bothKeys`, `contended`,
+  `taken`), in a fixed order (member, kind, key, reason, target, message).
+
+**What a run remembers is bounded** (`RekeyOptions.journalCapacity`, default
+1,000,000 entries; `RekeyReport.journal`). One `Budget` is shared by the
+journal's keys, the settled units, the claims, the counts left to the end of the
+run (`atEnd`) and an aggregate's known roots and rootless rows, and every entry
+is a 128-bit digest (`internal/Digest.ts`: SHA-256 of the text's UTF-16 code
+units, synchronous and runtime-agnostic) with a few flags, never key text and
+never a row: about 145 bytes an entry, so about 138 MiB at the default when full
+(measured: with the journal full, 161 MiB more heap after GC than before the
+run, about 23 MiB of it the page in flight). A row the run doesn't move, write or report
+costs nothing: the scan counts it, and a take while its visit runs (`inFlight`)
+is of a row already counted. A visit that leaves its row for another unit to
+take after it — a sentinel its owner moves, an aggregate's row its root moves —
+says so (`RekeyRowContext.awaitsMove`), and the row is kept as counted; so an
+aggregate's rows cost an entry each, moved or not, as does a sentinel under
+`preserveUnique` whose owner's value has other key text (a tombstone of the item
+may hold it under that text, which no read of the visit's tells), and one no row
+its pointer names holds. A real run keeps no image
+(only the last `RECENT_IMAGES` rows it put, to follow its own updates of them);
+a dry run keeps each row it plans to put, which its reads see, at an entry per
+256 bytes. Moving a row costs about five entries (its old and new keys, its
+verdict, its two claims), so the default counts exactly up to about 200,000
+moved rows. Past the capacity the run carries on: what it has no room for it
+doesn't keep, its writes are as guarded as ever, and the report names the counts
+that may be off (`journal.inexact`): a real run meets a row it put as a row
+stored there (`scanned`, `unchanged`, `indexKeys`, as 1.40.0 counted every such
+row), judges again a unit reached again (`unchanged`, `reservations`), may count
+a row stored under two old key texts as two moves (`moved`), may report a row in
+another's way that a run with room moves after it (`conflicts`: `vacated` can't
+see the take), and doesn't report rootless rows it couldn't keep (`skipped`); a
+dry run's reads no longer see the whole plan, so any count may be off. Writes
+never depend on the journal: each is conditioned on what it read. Past the
+capacity a decision the journal informs (`vacated`, `placed`) can only leave a
+row for a rerun or count it differently: a reservation whose named row is
+missing is `undecided` once the journal is full (`journalFull`), since the run
+can't tell whether it moved that row, so no release is sent that a run with
+room wouldn't send. A sentinel no row holds, counted at the end of the run unless
+a row's pass took or re-pointed it (above), may be counted `unrecognizedKey` though
+one did, when the run had no room to note the re-point (`skipped`); and a real
+run may report a sentinel in another's way `taken`, left for a rerun, where a run
+with room moves both (`sentinelsMoved`, beside `conflicts`).
+
+**A digest stands for its text; a hit is not checked against it.** Every key,
+unit, claim and fingerprint the run keeps is the 128-bit digest of its whole
+text (`identity`: each part JSON-quoted, a key attribute as its type and value;
+`canonicalItem` for a row), and two texts are told apart by digest alone. Of the
+two ways to keep a collision from losing a move, this takes the first, a
+cryptographic digest over the whole text: SHA-256 truncated to 128 bits,
+written out in `internal/Digest.ts` because it must be synchronous and run on
+every runtime (Web Crypto's `digest` returns a promise; `node:crypto` is Node's),
+with no new dependency. The other, keeping enough to check a hit against the row,
+would cost the memory the digest saves. Two keys of a table share a digest only
+as a SHA-256 collision on 128 bits. None is known; finding any colliding pair
+takes about 2^64 SHA-256 evaluations, finding a text colliding with a given key
+about 2^128, and the chance that any two of a billion keys collide by accident is
+about 10^-21. A collision would not misplace or overwrite a row (every write is
+conditioned on what it read): the run would take one of the two for the other,
+passing or settling it, so one row would stay under its old key, unreported,
+until a run with no collision on it. `Digest.test.ts` checks the digest against
+`node:crypto`'s SHA-256 and that texts differing in one code unit anywhere, lone
+surrogates included, have different digests.
+
+The journal reads and writes nothing: over a table with nothing to
+move, a run without `reservations` sends exactly the requests 1.40.0 sent
+(`test/fixtures/rekey-requests-1.40.0.json` and `rekey-requests-reservations-1.40.0.json`,
+from the published package; `RekeyQuietRequests.test.ts` and its connected twin).
 
 **Idempotence.** A row moves only when it is stored under a key its values
 composed under another form and that key differs from the one they compose now. The scan is
@@ -1034,10 +1274,66 @@ finds every moved row current and moves nothing.
 
 **The chain, in either direction.** Keys spell each other's: under `escapeKeys: true` `foo bar`
 belongs where `foo%20bar` was stored. So a row in the way that is another value's old row moves
-first (`clearTarget`, up to `DISPLACE_DEPTH` deep), whichever the scan reached first: `foo%20bar`'s
-old row to `foo%2520bar`, then `foo bar`'s to `foo%20bar`. With the flag off it's the reverse. Nothing
-is overwritten or merged. A row whose holder can't move stops retrying and reports `taken`
-(`cantMoveHolder`), and `RekeyReport.conflicts` lists a row once per run.
+first (`clearTarget`, judging the holder as its own unit through `RekeyRowContext.judge`, however
+long the chain), whichever the scan reached first: `foo%20bar`'s old row to `foo%2520bar`, then
+`foo bar`'s to `foo%20bar`. With the flag off it's the reverse. Nothing is overwritten or merged. A
+row whose holder can't move stops retrying and reports `taken` (`cantMoveHolder`), or `contended`
+when the holder waits on it in a loop, and `RekeyReport.conflicts` lists a row once per run. Up to
+1.40.0 a chain went `DISPLACE_DEPTH` (4) rows deep and the rest were left for the next run.
+
+**Runs at once (#240).** Two or three default runs started together over the same table (nothing
+else writing) must leave no live row's unique sentinel naming a key its row left. Up to 1.40.0
+about one random table in 240 was left so (`fixtures/rekey-two-runs-1.40.0.json` is one, written
+by 1.40.0). The cause was read skew in `sentinelRekeys`: a move read the sentinel at its current
+key and at its old key, wrote only one of them, and held nothing about the other, so another run
+could move or re-point that one in between, and both transactions stood. Each re-point now stands
+only while the owner is where this run read or placed it, or it fails and is judged again from a
+fresh read:
+
+- **A move holds every sentinel key it read and doesn't write** (`sentinelAsRead`): a
+  `ConditionCheck` that the key is still empty, or its sentinel still names the row it named (or
+  still names none). A sentinel brought there in between fails the move, which reads again, so a
+  row never moves away from a sentinel naming it.
+- **Sentinels brought to a row that stays where it is hold that row** (`rekeySentinels`): each of
+  their transactions carries a `ConditionCheck` on the row, as this pass read it (`ownerCheck`:
+  its `__edd_e__`, the stored attributes of every unique field and `__edd_d__`, as read or
+  absent). A row moved, deleted or changed since fails it, and the pass, reading the row again
+  and finding it gone or changed (`sameOwnerValues`), stops: the write that moved or changed it
+  carried its sentinels. An update giving the row another value is one such write, from the
+  application or another run: it releases the sentinel under the current key text, which isn't
+  there yet, so the one under the old key text stays where it is, rather than being brought to
+  the current key naming a row that no longer holds its value, where it would refuse the value to
+  every new item.
+- **A run repairs what an earlier one left.** A sentinel whose named row is absent while a row of
+  its entity under another text of that key holds its value (`danglingHolder`: the values read
+  back from the named key's text compose the keys of the other forms, one read each) is
+  re-pointed to that row (`toItsRow`), not judged orphaned; with `reservations` it's `held`, or
+  `undecided` when more than one row could be the holder. A row's own pass takes a sentinel
+  naming a key it left as its own (`Adopt`: `"held"` for one under its current sentinel key,
+  `"all"` for one under other key text too) and holds the key it names absent or as read
+  (`ownerCheck`), so a row arriving there in between fails it. A sentinel the sentinel's own visit
+  brings to its row is claimed (`broughtForRow`), so the row's pass doesn't count it as its work.
+
+These checks go only on transactions that move or re-point something. A table with nothing to
+move gets exactly 1.40.0's requests (4,636 runs over 1,200 random tables, four option sets,
+compared request for request). On a table with rows to move, a row that doesn't move is sent
+nothing 1.40.0 didn't send it: over 300 random tables and three option sets, the requests naming
+only such rows were 1.40.0's, less 42 consistent reads of an unmoved aggregate's root that a run no
+longer sends. The rows that move cost fewer requests and some more `ConditionCheck` items: over
+120 random tables, single default runs, 6,354 requests against 8,259, 1,536 transactions against
+1,475 and 393 `ConditionCheck` items against 308. A moving stream's flip, and its check on the
+stream's head, also name the stream (`streamId`, below).
+
+`RekeyConcurrentRuns.test.ts` runs two and three default runs at once over 40 random tables and
+checks, before any later run could repair one, that no sentinel names a key its row left; then one
+run alone, a `releaseOrphanedReservations` run, and a put of each value a row holds (refused). It
+runs the same way the eight tables where runs at once left a sentinel behind without these checks
+(found over 120 random tables in each direction, two and three runs, every request yielding first
+or a random number of times: 8 of 960 cases without either check, 0 with them); all eight fail
+without `sentinelAsRead` alone. It races an update giving a row another value against a sentinel brought to that row
+(the old value can be taken again afterwards, the new one can't), which fails without the row's
+`ConditionCheck`. And it runs one default run over the 1.40.0 fixture: it re-points the dangling
+sentinel and leaves the rows one run over the original table leaves.
 
 **Resume token.** `rk1.` + base64url JSON `{ t: tableName, s: positions }`, one
 position per segment: `0` not started, `1` done, or the segment's
@@ -1157,8 +1453,9 @@ run counts the result in `report.indexKeys` and per member, for no read: `missin
 conditioned on the row existing and on each key it writes and each composite those keys come from, as read or
 absent (`repairRequest`), so a writer changing any of them wins. On a failed condition it reads once
 consistently, judges again and tries once more, then counts the keys in `skipped`; `repaired` counts the keys
-written. A key DynamoDB refuses is a `failed` conflict. A dry run makes no write and counts `repaired` as what
-it would write, judging what the move would leave for a row that moves.
+written. A key DynamoDB refuses is a `failed` conflict. A dry run makes no write and counts no `repaired`: its
+`missing`, `truncated` and `lagging` are what a run would write, judged on what the move would leave for a row
+that moves.
 
 | Composites on the row | Stored key | `sparse` | `preserve` |
 |---|---|---|---|
@@ -1190,9 +1487,10 @@ compares bytes and never truncates. For the same reason a move keeps a half abse
 Aggregates compose their own rows and never called the gate; sentinels and history rows have no index keys.
 
 **A dry run agrees with the real run.** It judges the row the move would write (`movedRowOf`), and
-follows a chain: what holds a row's current key is judged by its own handler (`Rekey.displace`,
-counting nothing and claiming nothing, since the scan counts it when it reaches it), and what would
-stop it is reported, for it and for the row it holds up. Rootless aggregate rows are
+follows a chain: what holds a row's current key is judged first as its own unit
+(`RekeyRowContext.yieldTo`, through its member's `holder`, or the handler's own unit for it), once per
+run (`RekeyRowContext.judge`) and counted under its member when it settles, so the scan finds it settled
+when it reaches it; and what would stop it is reported, for it and for the row it holds up. Rootless aggregate rows are
 judged after the scan, so a dry run agrees with the real run whichever order the scan met them; a run
 that didn't read the whole table reports them as `rootNotSeen`, since a later page could bring the root in.
 
@@ -1218,9 +1516,13 @@ for byte (`updatedAt` first; a drainer's claim still absent), followed by each
 absent attribute; with none it is the request 1.39.0 sent. An aggregate row's
 are its node's fields, the context fields and discriminators a row beneath the
 root carries, the index keys, the timestamps and `__edd_e__`
-(`writableAttributes`); a stream row's and a projection row's, none more. A
-versioned entity's item is guarded on its version and incarnation, as 1.39.0
-guarded it.
+(`writableAttributes`); a node whose value exposes no `.fields` (an annotated
+class, a union's members) names every property its schema can store, on its type
+and encoded sides (`storedFieldNames`); a stream row's and a projection row's,
+none more. A versioned entity's item is guarded on its version and incarnation,
+as 1.39.0 guarded it, and with vector indexes on its vector attributes as read
+too, where they fit (`vectorsAsRead`, through `deleteGuard`'s whole-row guard):
+`reembed` sets them alone, bumping no version.
 
 A row too wide for its whole guard (DynamoDB's limits on one expression) is
 guarded, when its member stamps an `updatedAt`, on that stamp, held or still
@@ -1237,15 +1539,55 @@ the attributes it was read with, and the request is 1.39.0's.
 A guard sees a write only through its terms. The move puts the row back as it
 read it, so a write it doesn't see is lost, as on 1.39.0:
 
-- a write that only adds an attribute the library can't enumerate: one no
-  declaration names (written outside the library), a sparse map's entry, or a
-  field of an aggregate node the walk doesn't read (an annotated class, a
-  union's members);
-- on a row guarded by its stamp (a versioned item, or a wide row guarded on its
-  `updatedAt`), a write that leaves the stamp as it was: `reembed`, which sets
-  the vector alone; one landing within the stamp's resolution (the same
-  millisecond, or the same second for an `updatedAt` stored as epoch seconds);
-  and one from outside the library.
+- a write that only adds an attribute the guard doesn't hold absent: on an
+  entity's item or an aggregate's row, one no declaration names (written
+  outside the library), or a sparse map's entry; on an event stream's row, any
+  (written outside the library); on a projection's row tombstone or outbox
+  item, any but a drainer's claim (likewise);
+- on a wide row guarded on its `updatedAt`, a write that leaves the stamp as it
+  was and changes an attribute the guard leaves out: one landing within the
+  stamp's resolution (the same millisecond, or the same second for an
+  `updatedAt` stored as epoch seconds), a `reembed` (which stamps nothing), and
+  one from outside the library;
+- on a versioned item's row (live, snapshot or tombstone), a write from outside
+  the library that leaves the version, the incarnation token and the vector
+  attributes as they were;
+- on a unique sentinel (guarded on the row it names), a write from outside the
+  library that leaves that as it was.
+
+Up to 1.40.0 two more were lost (#240), each now a term of the guard the move
+already sends: a `reembed` landing on a versioned item (its vector attributes
+are held as read beside the version), and a write adding a field of an
+aggregate node whose value exposes no `.fields` (the names its schema can store
+are held absent). `test/helpers/RekeyUnseenWrites.ts` races each, on a
+recording table and on DynamoDB Local.
+
+The rest can't be closed by a condition on the write `rekey` sends, so with
+writes going on each row moved under a guard that can miss one is counted in
+`report.guardGaps` and each member's (`RekeyGuardGaps`, `Rekey.guardGap`):
+`stamp`, a wide row guarded on its `updatedAt`, held or absent; `sparse`, a
+row of an entity with a sparse map guarded whole (`deleteGuard`'s `by`, `row`:
+a library write adding an entry is unseen unless it changes a stamp the guard
+holds, so with timestamps only one within the stamp's resolution); `strongest`,
+a row of a part-moved aggregate or stream finished under the strongest guard
+that fits. A row is counted only where a library write can be missed, and every
+move counts the gap of its guard (`moveGap`), a history row's as an item's
+(#240): a tombstone is guarded on what was read like every other row (its whole
+stored item when that fits), not on its timestamp, since a soft delete of the
+item put again within the stamp's resolution replaces it at its key with the
+same `updatedAt`; and a time-series event can be replaced by an `append` made
+after its current item was deleted (the append's condition holds when there is
+no current item, and its event `Put` has none). A versioned entity's history
+row is guarded on its version and incarnation, which a re-put changes. A
+write from outside the library, which can land on any row, isn't counted for.
+`test/RekeyTombstoneGuard.test.ts` races the replaced tombstone: guarded whole,
+the move is cancelled and moves the new one; too wide, it's counted and named.
+`report.guardGaps.rows` names the rows counted
+(`RekeyGuardGapRow`: member, kind, count, stored key, target), at most 100,
+the first by member, kind and key, so the list is the same whatever order the
+run meets them in; the counts stay exact. `Rekey.guardGap` takes the row, so a
+new path that counts a gap names it. With `writesStopped: true` nothing is
+counted: stopping writes closes every case. Counting reads and writes nothing.
 
 A wide row with no version and no `updatedAt` the library stamps on it, and a
 stream row or a projection's row tombstone or outbox item too wide to guard
@@ -1293,11 +1635,11 @@ substitutions.
 |---|---|
 | Item under other text | `moveItem`: a consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the old item under `deleteGuard`, unique sentinels moved or re-pointed (`sentinelRekeys`). Another value's old row at the target moves first (`clearTarget`). The same item already at the target is `bothKeys` only if it is still at its old key when read again. A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys`. After the move, a half it couldn't recompose (a truncated sort key before a gap a later composite fills, which `preserve` keeps) is rewritten as for an item at its current key, in the same run (`rekeyAfterMove`, reading the item only when the predicted move, `movedRowOf`, leaves one); a dry run counts it from that prediction |
 | Item at its current key | GSI halves and vector partitions whose stored text is exactly another form's text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites the row holds as read (`indexKeysRewritten`). A sharded index's partition key is the exception: it is composed and compared whatever it holds, which is what moves rows into the layout, and one whose values can't compose it is left, the conflict `uncomposable` unless it is already in the current layout. A Z-order sort half keeps its address, one the index policy left behind its values, one kept for a value since cleared, and a table key attribute are not touched. Unique sentinels whose text changed are put at the current key and the old one released (`rekeySentinels`, `sentinelsMoved`) |
-| Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
+| Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. A moving row whose sentinel's current key holds another item's sentinel under other key text moves that sentinel out first by itself, as a unit of its own, naming its row where the row is (`sentinelOut`); the row's own move re-points it later. So a sentinel waits only on sentinels, whose chains end, and an item only on items and sentinels: no two units wait on each other. Up to 1.40.0 the sentinel moved out with its row, and when that row's key was held by the moving row (or by a row waiting on it), the two waited on each other and were reported `contended` or `taken` on every run: about one table in ten of dense random tables (`RekeyDenseChains.test.ts`) never finished. The cost is the re-point: one more `Update` in the holder row's move, and one more transaction, only in such a chain. Under `preserveUnique` the row named can be the item's live row while the sentinel is one of its tombstones': the row holding it is the one whose values compose it (`sentinelHolderRow`, reading the item's tombstones only when the live row doesn't). A tombstone without `preserveUnique` never re-points a sentinel at its current key that another item's live row holds (the key it names can be the tombstone's item's under other key text and that live row's under the current text; `liveRowHolds`, one read, only then). One no row holds is, with the `reservations` option, an orphaned reservation, and one nothing can judge is `undecided` (both in `report.reservations`, below); without it, `unrecognizedKey`, as 1.40.0 counted it, for the requests 1.40.0 sent. Reading it back costs one or two reads per sentinel on every run. A sentinel of a constraint the entity doesn't declare, or not under the schema's own key prefix, is `unrecognizedKey`. A move holds each sentinel key it read and doesn't write as read, sentinels brought to a row that stays hold that row, and a sentinel naming a key its row left is brought to the row (**Runs at once**, above) |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
-| Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, whole, `wholeRowGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned the same way); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
-| Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read, whole (`wholeRowGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
+| Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves. The live row and every tombstone of one item name the same key, so a sentinel naming it can be any of theirs, and their values' keys can chain across the settings (a tombstone of `a%20b` holds `a%20b` raw, where the live row's `a b` escapes to). Each row's sentinel is under its current key or under another, so when a row finds one naming the item under both its keys, the first key along the chain holding none says which way each row went (`sameItemHolder`): a gap on the old side means the row's is at its current key (nothing to do), otherwise the one at its current key is the next row's, under its other text, and moves out first. Read only then. A tombstone without `preserveUnique` holds none: a sentinel under its other key text that the item's live row holds is the live row's (`liveRowHolds`, one read, only when such a tombstone finds a sentinel), never moved by the tombstone. 1.40.0 moved it to the tombstone's value, so the live value could be taken again, and in a chain the outcome depended on the scan's order. A sentinel the scan meets that a tombstone of its item may still move (one its live row composes under the current text too, under `preserveUnique`, or one no row its back-pointer names holds) is kept as counted, an entry each, so the move doesn't count it again |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, whole, `wholeRowGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned the same way); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. The rows under the old partition are the aggregate's only while its root is there (a root whose values compose the same current key): once a run started at the same time has moved the root away, an aggregate whose current key is that old partition can move its rows in, and they are read as its own, not this one's; the aggregate is then read from its current partition alone. Through 1.40.0 they were taken as this aggregate's, and moved into its partition or refused as two elements at one sort key (#240). An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
+| Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`, and `#<tag>` for one written beside another read model's), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read, whole (`wholeRowGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
 **Stream move.** A stream row's keys come from its `streamId` text: every way
@@ -1313,10 +1655,15 @@ every row the current key lacks (`attribute_not_exists`, or over a row whose TTL
 snapshot over an older one (`asOfVersion <`) — never the other way (`__edd_moved__`
 stripped; a GSI stream index attribute holding the old partition rewritten). A
 copy that loses to a write copies again. FLIP is one transaction: Update of
-event 1 `SET __edd_moved__` (`attribute_not_exists`, and the seal state when the
-head is event 1), a ConditionCheck that event N+1 is absent, one that the
-head's seal state is as copied (N > 1), and one that the snapshot's
-`asOfVersion` and `timestamp` are as copied (or that it is absent). A cancelled
+event 1 `SET __edd_moved__` (`attribute_not_exists`, its `streamId` the stream's, and the seal
+state when the head is event 1), a ConditionCheck that event N+1 is absent, one that the
+head's `streamId` is the stream's and its seal state as copied (N > 1), and one that the snapshot's
+`asOfVersion` and `timestamp` are as copied (or that it is absent). Event 1 and the head name the
+stream because the old partition can hold another stream's rows by then: a run started at the same
+time moves this stream away, and a stream whose current key is this one's old key moves in, with
+events at the same sort keys. Through 1.40.0 the flip could mark that stream's event 1, which then
+held `__edd_moved__` under its current key and differed from its copy, so every later run reported
+it `bothKeys` (#240). A cancelled
 flip copies again, up to `STREAM_MOVE_ATTEMPTS` (8) attempts in all, then `contended`. DELETE
 (also the whole move, for rows left under the old key once event 1 there is
 moved or gone — a run that stopped after the flip, a write beside it) reads
@@ -1342,8 +1689,8 @@ rows are gone since the scan read them (moved or deleted by a write) is
 nothing. A `DynamoClientError` fails the run.
 
 **What it can't move.** Each is counted on every run and left. `skipped.unrecognizedKey`: a table key
-that is no form's text for its row's values; a sentinel with no row behind it, or whose row's values
-compose no such sentinel; an aggregate's rows below no root in their partition, including what a 1.37.0
+that is no form's text for its row's values; a sentinel of a constraint its entity doesn't declare, or not
+under the schema's own key prefix; an aggregate's rows below no root in their partition, including what a 1.37.0
 or 1.38.0 run cut short left (root at the current key, edges at the old partition); an aggregate root
 under no text; a projection tombstone or outbox item whose key reads as more than one set of values.
 `conflicts`, `failed`: a row whose Z-order value no
@@ -1352,6 +1699,55 @@ row whose own key holds `NaN` under `escapeKeys: true`, or one of whose key comp
 rows below no root, met by a run that didn't read the whole table (`maxPages`, `resume`). Such a run can't
 say the root isn't there, since a root at its old key on a page it didn't read could claim them, so a run
 over the whole table judges them; only that run counts them `unrecognizedKey`.
+
+**Orphaned reservations: `reservations` and `releaseOrphanedReservations`.** With `reservations: true`
+(off by default), a unique sentinel of a declared constraint,
+under the schema's own key prefix (its sort key is the constraint's under some form, and its partition key
+starts with it), is held when the row its back-pointer (`_entity_pk` / `_entity_sk`) names is of its entity and
+composes the sentinel's key under some form (`holdsSentinel`), or, with `preserveUnique`, when a tombstone of
+that row does (`tombstonesOf`: every tombstone in the partition whose values compose that row's live key). Without
+`preserveUnique` a soft delete releases its reservations, so a tombstone holds none. Anything else is orphaned:
+the row is gone, or it holds another value or none. That is exactly what a correct delete, update or soft delete
+releases, which is what a `Schema.BigInt` unique field on 1.39 and earlier didn't (a delete composed the
+sentinel from the number DynamoDB handed back, and a soft delete without `preserveUnique` kept it).
+`undecided`: no back-pointer, a row of another type behind it, or values that compose no sentinel key under some
+form, so nothing says what they'd give. A row of another type whose attributes compose the sentinel's key under
+some form is taken to hold it, as 1.40.0 took it (the sentinel moves, or stays, with nothing judged), so only one
+that doesn't is `undecided`. Such a run counts both in `report.reservations` and per member, with an
+entry per sentinel (member, constraint, key, back-pointer, outcome, why): under `preserveUnique` a sentinel whose
+row is gone or holds another value costs a query for that row's tombstones, and one that looks orphaned is read
+again consistently and judged again first, since a move of its row takes it along. Without the option nothing is
+judged, and a run sends exactly what 1.40.0 sent (`RekeyQuietRequests.test.ts`, over
+`fixtures/rekey-requests-reservations-1.40.0.json`: keys used again after each kind of delete, and the rows 1.39.0
+left): a sentinel no row holds is `unrecognizedKey`, and one a tombstone names is left to the tombstone, as in
+1.40.0. Reporting is opt-in because judging reads more than 1.40.0 did on exactly the tables that have such
+sentinels.
+
+A sentinel is judged once a run, as its own unit (`Rekey.reservationUnit`, apart from the `rowUnit` that moves
+it), by whatever meets it first, so the report doesn't depend on the order: the scan; a tombstone without
+`preserveUnique` moving it (`orphanedByTombstone`), which moves it as 1.40.0 did, the value staying reserved,
+unless it was released; or, with `releaseOrphanedReservations`, a move whose current sentinel key it holds.
+Without that option the move is `taken`, as in 1.40.0, and the sentinel is reported.
+
+`rekey({ releaseOrphanedReservations: true, writesStopped: true })`, off by default, implies `reservations`
+and deletes the orphans. It is a maintenance step: without `writesStopped: true` the run fails with a
+`ValidationError` (`EDD-9098`) before anything is read, since a value is only safely free with every writer
+stopped, a second run releasing reservations included. Each release is one `TransactWriteItems`: the
+sentinel's `Delete` conditioned on the back-pointer and the TTL attribute as read (or absent), so a claim in
+between by another row, or a TTL'd reservation expired and taken again, is never deleted, and a
+`ConditionCheck` on the row it names: absent, or its `__edd_e__`, the constraint's stored attributes (renames
+honoured) and `__edd_d__` as read or absent (`ownerCheck`), so a write making that row hold the value wins.
+These don't make the release safe with writes going on, which is why it needs the promise: the same item can
+release the value and claim it again in between, with the same back-pointer and the same TTL attribute, and
+leave it held by something the guards don't read (put again, then soft-deleted under `preserveUnique`: its
+tombstone holds the value and its live row is absent again), and the release then deletes a reservation in
+use. On a
+cancelled transaction it reads the sentinel once, judges again and tries once more, then counts it `skipped`;
+one held or deleted by then is left and counted `raced`, not `orphaned`: as it is now, no row is missing it.
+`orphaned` counts every one found and still orphaned when released or left, `released` and `skipped` included. A
+dry run plans the release as it plans a move, counts it `released` and writes nothing; a move whose key it frees
+is planned after it. A sentinel of an undeclared constraint, or under another prefix (another schema's, or
+another application's on a shared table), is never judged.
 
 **Capacity.** The run is one `Table.rekey` operation measured whatever the
 `ConsumedCapacity` setting (`Capacity.measured`): every request asks for its
@@ -1505,10 +1901,39 @@ reads it, decoded through the field and encoded again
 (`storedFormOfDeclaration`, in the key form and in `storedFormOfRead`), before
 its text is composed, and composes `some(5)` again. An object is judged by that
 text alone: one whose field decodes the map to the value written is stored, as
-on 1.39.0, and one whose field takes the map as it is (`Schema.Duration`,
-`[object Object]` for `1000 millis`) is refused. 1.39.0 composed the map's own
-text: a `restore` put the item back under `[object object]`, where `get` didn't
-find it, and a delete left its unique-constraint sentinel behind. A list or
+on 1.39.0, and one whose field takes the map as it is composes `[object Object]`
+and is refused. Effect's look-alike declarations (`Schema.Duration`,
+`Schema.BigDecimal`, the time zones, `Schema.UrlParams`, `Schema.SemVer` /
+`Schema.SemVerRange`, the network and DNS record types, a `DateTime` in a
+`Schema.Option` or a `Schema.Result`; "Effect's look-alike declarations on a
+read") take the map as it is, so 1.40.0 refused them all; since 1.41.0 the read
+decode of a key composite rebuilds them as a read does (`readingKeyInstances`,
+`internal/InstanceReads.ts`), so the text composed from a row is `put`'s,
+`1000 millis` for `1000 millis`, and they are stored, under the text 1.39.0
+composed from the value given (`fixtures/lookalike-keys-1.39.0.json`). A
+`BigDecimal` is keyed by `BigDecimal(1.5)`, where 1.39.0 died composing it.
+`Schema.Cookie` and `Schema.Cookies` stay the map in a key and stay refused: a
+cookie's key text is its whole printed form, options and all. 1.39.0 composed
+the map's own text: a `restore` put the item back under `[object object]`,
+where `get` didn't find it, and a delete left its unique-constraint sentinel
+behind. `rekey` moves an item 1.39.0's (or 1.40.0's) `restore` left under
+`[object object]` to the key `put` wrote, its index keys with it: a reading of
+the row for `rekey` alone (`restoredObjectReading`,
+`internal/RestoredKeyText.ts`) gives each composite stored as a map the key form
+makes an instance of its map's text, the text that `restore` composed, so the
+key is an earlier position of the row, moved from under the usual guards, in a
+dry run counted only; it is combined with the other earlier readings composite by
+composite (`keyReadings`, "Readings combined composite by composite"), so a key that
+also holds a zone under its given name is found. Nothing else composes that text for a
+write (`EDD-9162`).
+The sentinel that `restore` wrote under `[object object]` names the key the item
+left: `rekey` leaves it and counts it as `unrecognizedKey`. The value stays
+reserved by the sentinel `put` wrote, which that `restore`'s soft delete didn't
+release. It names the item's key under the text `put` composed, which the item
+moves to, so with `escapeKeys` off it is already in place. With `escapeKeys`
+turned on, a moving item takes as its own a sentinel naming any of its keys under
+other text (`isLive`), not only the key it's stored under, so that sentinel moves
+with it (`fixtures/restored-unique-1.39.0.json`). A list or
 struct of `Schema.BigInt` beneath a step (a decoding default, a transformation)
 comes back holding numbers, `[5]` for `[5n]`, which the field refuses; every
 entity read lifts them back (`legacyReads`), and the key form does the same
@@ -1527,6 +1952,61 @@ integer was restored, updated and listed under the `number`'s key, and a delete
 left its sentinel behind. A field once declared both and now one kind keeps rows
 under the other kind's text, and `rekey` moves them ("Rows under the other
 numeric kind's text", under `rekey`).
+
+**An object composed into a key for a write (`EDD-9162`, 1.41.0).** An object nothing
+gives other text to (a struct, a `Data` class, an instance of a class of one's own
+without a `toString`) composes `[object Object]`, the same for every such value, so up
+to 1.40.0 items written with different values shared one key and overwrote each other,
+and a unique constraint on one rejected every second value. `defaultObjectText`
+(`internal/ObjectKeyText.ts`, schema package) is the one decision: the key-form value is
+an object and its text is its `Object.prototype.toString` tag (`[object Object]`,
+`[object Map]`, ...). It's made **where a key is composed**, by the composer
+(`KeyComposer.siteCompositeText`, for every composite of every key: `extractKeyComposites`,
+a Z-order prefix, a time-series event's sort key, a unique sentinel), under the schema a
+write composes its own keys under (`ownSchema` in `Entity.ts`: `DynamoSchema.objectKeys`,
+internal, which names what composes the composite, or says it isn't the write's own). So
+only a key actually composed for the write refuses: an index or a unique constraint missing
+a value (sparse), a half an update skips, leaves out or drops, composes nothing and refuses
+nothing, and the item is stored as 1.40.0 stored it. The refusal names the field and what
+composed it (the primary key, an index, a unique constraint, a vector partition, a
+time-series `orderBy`), with nothing written: `put`, `create`, `upsert`, an update
+recomposing an index key from its payload (its key record and the row it read compose the
+key the row is stored under, as a read does, so only the payload's values are its own), a
+time-series `append`, and a transaction's and a batch's put. A put's unique sentinels and
+vector partitions are composed once more where every key is (`composeAllKeys`), so the
+refusal comes before the read or embedding that precedes their own composition. Only models
+with a key composite whose stored side can hold an object get a schema of their own
+(`storesObject`), so a model keyed by text and numbers pays nothing. **The asymmetry:** a
+key-taking read or delete (`get`, `delete`, a query accessor, an update's own key record,
+`restore`) composes `[object object]` as it always did, so a row an earlier release wrote
+under it is still reached, read, updated and deleted; only a new write is refused. A value
+with a key form is untouched: a look-alike the key form makes an instance of
+(`1500 millis`), a list (`x,y`), a class with a `toString` of its own. Pinned on both
+sides in `ObjectKeyComposites.test.ts`.
+
+An aggregate's write is refused by the same decision and the same words, where its keys are
+composed (`ownKeys`, `Aggregate.ts`: `create`'s partition key, and `buildDynamoItems`), naming
+the field (`Field "f" of "Root" is composed
+into its list sort key`) or the discriminator: `create` composing its partition key, its
+collection sort key, its list keys (sparse, as they're composed) or a row's static
+discriminator from such an object, and `update` composing any of them but the partition
+key, which `update` composes from the key it's given, as a read does. Up to 1.40.0 a second
+aggregate with another object as its partition composite failed `create` as already there,
+and `get` given its value returned the first; aggregates with different list composites
+shared one list key, so a `list` given one value returned them all; and a sub-aggregate
+bound to an object discriminator was written under `[object object]` and never read back.
+An `update` refuses only a value it changes: a root composite equal to the one the root read
+holds is the key that row is stored under (compared by the aggregate's own `deepEqual`), as
+an entity update's own key record is, so an aggregate 1.40.0 wrote can still be updated. A
+`get`, `list` and `delete` compose the text as before. A `many` element's sort key already
+refused every object ("non-scalar", `AggregateDecompositionError`), as did two bindings whose
+object discriminators compose one sort key; both still do. No object with a `toString` of
+its own round-tripped as an aggregate key composite on 1.40.0: a `Schema.Class`'s key form is
+its encoded struct, which composed `[object Object]` and is refused now; a class instance in
+a `Schema.Unknown` field reads back as a map and stays refused with `EDD-9128`; a
+discriminator holding one composed its own text and its rows were never read back, as
+before. Pinned in `AggregateObjectKeys.test.ts` and its connected twin against
+`fixtures/aggregate-object-keys-1.40.0.json`, captured from published 1.40.0.
 
 **A codec whose `encode` takes its own output keys its stored text.** A prefix
 codec (`x:` prepended by `encode`, stripped by `decode`), `Schema.StringFromBase64`,
@@ -1721,7 +2201,12 @@ history: the sort key composed from its own stored composites
 (`liveSkOf(toDomainView(composites))`, only those attributes unmarshalled) is not
 its stored sort key, or they don't compose, AND the sort key has a history
 layout — `#v#[…#]<7+ digits>` (retain), `#deleted#[…#]<ISO timestamp>`
-(softDelete), or `#e#` after the live key less its composites (timeSeries). A
+(softDelete), or `#e#` after the live key less its composites (timeSeries). The
+`…` item segment is any text, a line break included (`isSnapshotSkRest`,
+`isTombstoneSkRest`, also what `rekey` reads a row's kind by): a string composite
+can hold one, and a `UrlParams` composite's text always does. Up to 1.40.0 the
+layout test stopped at a line break, so such a snapshot or tombstone was read as
+an item and `rekey` skipped it as `unrecognizedKey`. A
 live row composes its own key, whatever its values or collection names hold
 (`#e#`, `deleted`, `v`); a row the current composer can't reproduce (an unpadded
 number composite written by 1.15, a row missing a composite) isn't history-shaped
@@ -2030,7 +2515,7 @@ So the ordinary upsert stays one write, no read and no condition. A rejected wri
 
 A time-series `append` has no `updatedAt` (`orderBy` is its clock), and it does the same over `createdAt`: every half holding it is `if_not_exists`, and the CAS also requires the key and that the half's other values are the ones written (`keptValues`). A rejection returns the row. If the key can't stay, the append composes from the row and sends again, guarded on the `orderBy` it was handed (`appendOverRead`); otherwise the rejection was the CAS or the caller's condition, as it always was, and the row saves that follow-up read. With `skipFollowUp` an append over `createdAt` sends no read at all.
 
-**Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Except a `Schema.optional` date transform carrying a `storedAs` of the other wire kind (`DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))`): outside `Schema.optional`, `Entity.make` refuses one as a stamp (`validateNoTransformOverride`), since the transform stores its own form and no stamp in the annotation's could be read back. Under it the field isn't unwrapped (`storedAsOverTransform`, the one test both read) and stays the caller's on every write path, as on 1.39.0 (`test/fixtures/entity-optional-transform-1.39.0.json`). Any other is the caller's (rule b, above), and that includes `Schema.UndefinedOr` of a date with no `storedAs`: it's a union, a required key whose value may be empty, so nothing stamps it and clearing it is the caller's to do (`Marshaller`'s absent attribute, "Values with no stored form"). The types agree: `ManagedDateField` names a managed date, `WithSystemCollisions` makes only one optional, and `RemovableFields` leaves only one out. A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
+**Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Except a `Schema.optional` date transform carrying a `storedAs` of the other wire kind (`DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))`): outside `Schema.optional`, `Entity.make` refuses one as a stamp (`validateNoTransformOverride`), since the transform stores its own form and no stamp in the annotation's could be read back. Under it the field isn't unwrapped (`storedAsOverTransform`, the one test both read) and stays the caller's on every write path, as on 1.39.0 (`test/fixtures/entity-optional-transform-1.39.0.json`). Any other is the caller's (rule b, above), and that includes `Schema.UndefinedOr` of a date with no `storedAs`: it's a union, a required key whose value may be empty, so nothing stamps it and clearing it is the caller's to do (`Marshaller`'s absent attribute, "Values with no stored form"). The types agree: `ManagedDateField` names a managed date, `WithSystemCollisions` makes only one optional, and `RemovableFields` leaves only one out. A type can't see an annotation, so `storedAs` carries its storage schema's encoded type in the type it returns (`DynamoModel.StoredAs<W>`, never at run time), and `StoredAsOtherKindDates` names each `Schema.optional` field whose transform encodes to a string stored as a number, or the other way round: the update and `.remove` types leave those the caller's, as the run time does (#236; through 1.40.0 `.set({ createdAt })` and `.remove(["createdAt"])` didn't compile, though both ran). A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
 
 **Aggregates.** See "Aggregate System Timestamps" (§11). An aggregate's list key and collection sort key compose from the same stamps as the root row (`buildDynamoItems`), so the key and the attribute agree. A partition key over a stamped `updatedAt` and a `many` edge's sort key over one are refused (`EDD-9121`), by the pure `Aggregate.make` in `@effect-dynamodb/schema` and the operational one alike (`refuseManySortKeysOverMovingValue`): both name rows, and neither can move.
 
@@ -2158,13 +2643,15 @@ The `#` delimiter matches the rest of the library's key-composition convention. 
 
 **The writer's check and the reader's predicate** (`internal/SparseKey.ts`, schema package):
 
-- A write that flattens a whole item runs `validateSparseKey`: a non-empty key without `#`, and an attribute name of 1–255 bytes. That is `put` / `create` (and `Batch.write` / `Transaction.transactWrite` puts), and an update that reads the row and writes it whole (`refusesPutKeys`: a `versioned: { retain: true }` entity's, and one that touches a unique field or a computed index composite). Such an update checks the payload's keys, before it reads anything (`refusedSparseKey`: before the read of the row, and before the reads that hydrate a payload's refs, on update, patch, a transaction's update, put, create and upsert), and writes the row's own entries back under the attributes it read them from, whatever their keys: an entry named by its attribute under `x#y` no longer stops every later update of a retained row. A key is refused before the reads only where the operation is refused whatever the row holds (`everyRowWrites`). An immutable map's value is written by an upsert only into a row that isn't there and by an update never, so with the row present an upsert carrying a key a put refuses succeeds, as on 1.39.0, and with the row missing it is refused where the put it becomes refuses it (`test/fixtures/sparse-entry-ops-1.39.0.json`). An upsert that reads the row first (`guardedUpsert`) writes a row that isn't there as a put and one that is as the update of the upserted fields, which refuses a put's keys only where it is such an update (`refusesPutKeys`), and otherwise an empty key and one holding `#`. It refuses a key before the read only where both writes refuse it, in the put's words, and any other after the read, where the write the read leads to refuses it: a key over 255 bytes given over a row that is there is written where that update writes it, as on 1.39.0, and an empty key or one holding `#` is refused before the read, where 1.39.0 refused it after (`test/fixtures/upsert-entry-keys-1.39.0.json`). The byte limit is the library's own. DynamoDB takes an attribute name of up to 64 KB, and 255 bytes only for an index key or an attribute an index projects by name. The other writes check what they checked on 1.39.0, and send the requests they sent: an update's `.set()` and `upsert` refuse an empty key and one holding `#` (`update.sparse`, `upsert.sparse`; an update's, before it reads anything, so before a transaction's reads too), and a record or path operation naming an entry's attribute (`pathSet`, `pathAdd` or `.add()` of `data#x#y`) checks nothing, so it writes the entry the reader reads under `x#y`. Applying the writer's check to them refused writes that stored and read back (an entry under a 256-byte name; `data#x#y`). No write-time check guards a key attribute: `EDD-9140` refuses, at load, any attribute the entity writes that the reader would take as an entry. A record operation names a model field, and its stored attribute decides what it writes: `.add({ "data#x#y": 3 })` on a field named `data#x#y` and stored as `counter` adds to `counter` (`test/fixtures/sparse-entry-writes-1.39.0.json`).
-- A stored row is read in one order everywhere: sparse entries leave the attribute-keyed row first (`deserializeSparseFields`), then names are mapped (`renameFromDynamo`). `decodeRecord` and the history and tombstone readers did; the update that reads a row to write it whole, the read for a vector's source text, and `toDomainView` (key, unique-sentinel and vector-partition composition from a stored row: put, update, delete, restore, purge, `rekey`) mapped names first or only. So a field named as an entry (`data#x`, stored as `counter`) landed on the entry's attribute: a retained entity's `.set()`, `.add()` or `.remove()` of any field wrote the field's value over the entry `x` and dropped `counter`, on 1.39.0 too, and a unique field the row lacked was read from the entry of its name. The same update applied a record operation naming an entry by its attribute (`.add({ "data#views": 1 })`, `.subtract`, `.append`, `.deleteFromSet`) to a key of its own beside the map, which the flattened entry then overwrote: it reported success and changed nothing, on 1.39.0 too. It now reaches the entry, as the operation sent as an expression does, and a set it shrinks is a copy, so the snapshot of the row before the update keeps the whole set. An entry's key, like any name a caller supplies, is read and written as its holder's own property: the map is looked up with `Object.hasOwn` and built with no prototype (`slot`, and `decodeSparseFields`' buckets), so `data#constructor` on an empty map is absent and not `Object`'s constructor, and an entry keyed `__proto__` is kept and read back, where assigning it on a plain object dropped it.
+- A write that flattens a whole item runs `validateSparseKey`: a non-empty key without `#`, and an attribute name of 1–255 bytes. That is `put` / `create` (and `Batch.write` / `Transaction.transactWrite` puts), and an update that reads the row and writes it whole (`refusesPutKeys`: a `versioned: { retain: true }` entity's, and one that touches a unique field or a computed index composite). Such an update checks the payload's keys, before it reads anything (`refusedSparseKey`: before the read of the row, and before the reads that hydrate a payload's refs, on update, patch, a transaction's update, put, create and upsert), and writes the row's own entries back under the attributes it read them from, whatever their keys: an entry named by its attribute under `x#y` no longer stops every later update of a retained row. A key is refused before the reads only where the operation is refused whatever the row holds (`everyRowWrites`). An immutable map's value is written by an upsert only into a row that isn't there and by an update never, so with the row present an upsert carrying a key a put refuses succeeds, as on 1.39.0, and with the row missing it is refused where the put it becomes refuses it (`test/fixtures/sparse-entry-ops-1.39.0.json`). An upsert that reads the row first (`guardedUpsert`) writes a row that isn't there as a put and one that is as the update of the upserted fields, which refuses a put's keys only where it is such an update (`refusesPutKeys`), and otherwise an empty key and one holding `#`. It refuses a key before the read only where both writes refuse it, in the put's words, and any other after the read, where the write the read leads to refuses it: a key over 255 bytes given over a row that is there is written where that update writes it, as on 1.39.0, and an empty key or one holding `#` is refused before the read, where 1.39.0 refused it after (`test/fixtures/upsert-entry-keys-1.39.0.json`). The byte limit is the library's own. DynamoDB takes an attribute name of up to 64 KB, and 255 bytes only for an index key or an attribute an index projects by name. The other writes check what they checked on 1.39.0, and send the requests they sent: an update's `.set()` and `upsert` refuse an empty key and one holding `#` (`update.sparse`, `upsert.sparse`; an update's, before it reads anything, so before a transaction's reads too), and a record or path operation naming an entry's attribute (`pathSet`, `pathAdd` or `.add()` of `data#x#y`) checks nothing, so it writes the entry the reader reads under `x#y`. Applying the writer's check to them refused writes that stored and read back (an entry under a 256-byte name; `data#x#y`). No write-time check guards a key attribute: `EDD-9140` refuses, at load, any attribute the entity writes that the reader would take as an entry. A record operation names a model field, and its stored attribute decides what it writes: `.add({ "data#x#y": 3 })` on a field named `data#x#y` and stored as `counter` adds to `counter` (`test/fixtures/sparse-entry-writes-1.39.0.json`). A path operation does the same since #238 (`pathAdd` or `pathRemove` of `["data#x#y"]` names `counter`), where through 1.40.0 it took a first segment holding `#` as the attribute's own name, so it wrote or removed the entry `x#y` (1.40.0 refused the removal as an entry's); `.removeEntries("data", ["x#y"])` removes that entry.
+- A stored row is read in one order everywhere: sparse entries leave the attribute-keyed row first (`deserializeSparseFields`), then names are mapped (`renameFromDynamo`). `decodeRecord` and the history and tombstone readers did; the update that reads a row to write it whole, the read for a vector's source text, and `toDomainView` (key, unique-sentinel and vector-partition composition from a stored row: put, update, delete, restore, purge, `rekey`) mapped names first or only. So a field named as an entry (`data#x`, stored as `counter`) landed on the entry's attribute: a retained entity's `.set()`, `.add()` or `.remove()` of any field wrote the field's value over the entry `x` and dropped `counter`, on 1.39.0 too, and a unique field the row lacked was read from the entry of its name. The same update applied a record operation naming an entry by its attribute (`.add({ "data#views": 1 })`, `.subtract`, `.append`, `.deleteFromSet`) to a key of its own beside the map, which the flattened entry then overwrote: it reported success and changed nothing, on 1.39.0 too. It now reaches the entry, as the operation sent as an expression does, and a set it shrinks is a copy, so the snapshot of the row before the update keeps the whole set. An entry's key, like any name a caller supplies, is read and written as its holder's own property: the map is looked up with `Object.hasOwn` (`ownValue`), and `decodeSparseFields` builds each bucket as an ordinary object and defines each entry on it as its own property, so `data#constructor` on an empty map is absent and not `Object`'s constructor, and an entry keyed `__proto__` is kept and read back, where assigning it on a plain object dropped it.
 - Which stored attributes are entries is the reader's to say (`sparseReader`): an attribute is an entry of the field whose `<prefix>#` begins it (the longest such prefix winning) when a key follows the `#`. `<prefix>#` itself is no entry. The row's reader, `clearMap`, `removeEntries`, the refusal of `.remove` / `pathRemove` of an entry, a time-series event item's strip and `EDD-9140` all ask it. So `clearMap` never removes `<prefix>#` (which can be a key attribute), and `removeEntries` takes any key the reader reads, one holding `#` included.
 
 #### Reads — transparent
 
 `get`, `query`, `scan`, batch, and stream paths all rebuild the domain `Record<K, V>` from flattened attributes by walking the marshalled item once and grouping the attributes the reader takes as entries. Domain consumers see the field as a normal Record.
+
+A `.select()` naming a sparse map field whole reads whole rows (#238). A `ProjectionExpression` can't name attributes by prefix, so through 1.40.0 the select projected the field's own name, which no row holds, and the map came back absent, on an entity's queries and scans, its `versions`, `deleted.list` and `history`, and a collection alike. Such a select now sends its request without a projection (the request is otherwise the one it sent). Each row is first cut to what a projection of the other selected paths would return (`Query.projectRow`: each path under the maps and lists holding it, a list keeping the selected positions in order, nothing for a path the row doesn't hold), and that goes through exactly what a projected row goes through (`Query.selectWhole`: the packed-storage hook, run only where a projection of those paths would run it), so nothing the select doesn't name is unpacked, decompressed or checked, and each path comes back under the name it was selected by, a stored name (`nt`, an entry's `m#k`) or a key attribute included. The map itself is rebuilt from the row's attributes for that map alone (its entries, and the attribute a `field:` rename stores it under), as a read rebuilds it, and trimmed to the paths below it. In a collection, each row is cut by its own member, whose other paths are taken by domain name as 1.40.0 took them. A select of one entry doesn't read whole rows: `t.f.entry("k")` (and `.entry()` with a path below it), or the map's field with a key below it (`t.f.k`), projects the attribute the entry is stored under (`<prefix>#k`, `Entity._sparseEntryAttribute`), with the segments below it as stored, and the map is rebuilt from what it holds, trimmed to the entry: `{ f: { k: 5 } }`. For a map a `field:` rename stores whole it also projects that attribute whole (`Entity._sparseWholeAttribute`): the map is rebuilt by the read's own function (`toDomainView`), which takes the whole attribute when the row holds it, so the select returns what a read returns, a row holding both forms included (`sr: {}` beside `counts#a: 5` gives no entry, as a read gives `{}`). Projecting `sr.k` instead would lose whether the row holds `sr` where `sr` lacks the key. The cost is the whole map's attribute on each row, not the row; a map without a rename projects only its entries. What DynamoDB projected is never projected again by position: a projection of `<prefix>#k[2]` returns the element alone, its list closed up (`[30]` for `[10, 20, 30]`), so a map rebuilt from entries is trimmed only to the selected keys, and only one rebuilt from the whole attribute, which the projection names whole, is trimmed by the paths below them (`fromWholeRow`'s `entriesProjected`; `test/fixtures/entry-selects-1.40.0.json`, `helpers/EntrySelects.ts`). Through 1.40.0 `t.f.k.at(2)` of a renamed map projected `sr.k[2]`, right on a row holding `sr` and nothing on one holding entries, and of a map without a rename `f.k[2]`, which no row holds. Through 1.40.0 `t.f.k` projected `f.k`, which no row holds, and `.entry()` threw in every query callback (`helpers/EntryInQueries.ts`). In a collection each member projects its own entry attributes (members may store one map under different prefixes), a member that holds the map whole by its field (no `storedAs`) projects `<field>.k`, and a member without the map gets nothing for it. One function decides it (`readsWholeRows` in `internal/BoundQuery.ts`): only a path naming a sparse map field with no key below it reads whole rows, and a select naming no sparse map field sends the projection it always sent (`test/fixtures/select-sparse-maps-1.39.0.json`, `helpers/SelectSparseMaps.ts`; beside other paths, `test/fixtures/select-beside-sparse-maps-1.40.0.json`, `helpers/SelectBesideSparseMaps.ts`). Two paths that overlap (`tags[0]` twice) are a projection DynamoDB refuses; beside a whole map nothing is projected, so the position comes back once. What each costs: DynamoDB charges a read by the size of the items it reads, not what it returns, and a page's 1 MB limit counts the items before any projection, so a whole-row select consumes the same capacity and pages as a projected one. What it adds is the bytes sent back and taken apart on the client: every attribute of every row, where a projection sends only what it names. An entry select sends what its projection names. Two whole-map selects cost more than they did: one of a map a `field:` rename stores whole projected its attribute (`sr`) through 1.40.0, which returned the map from a row `put` wrote and nothing from one an update wrote, and now reads whole rows, returning either form; and in a collection, one member's whole-map select reads every member's rows whole, since a request has one projection. A client-side predicate after either is refused as after any select (`EDD-9054`).
 
 #### Writes — record-style (whole-bucket replace)
 
@@ -2186,16 +2673,16 @@ Compiles to **one `SET` per bucket**. The above produces `SET #m_2026_01 = :map`
 ```ts
 // Counter — bucket attribute IS the scalar; works on a fresh item with no parent ceremony.
 db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.totals.entry('2026-01'), 1)
+  .pathAdd({ segments: ['totals#2026-01'], value: 1 })
   // → ADD totals#2026-01 :1
 
 // Inner-field update on a struct bucket — uses native DynamoDB nested-Map syntax.
 db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.metrics.entry('2026-01').views, 1)
+  .pathAdd({ segments: ['metrics#2026-01', 'views'], value: 1 })
   // → ADD metrics#2026-01.views :1
 ```
 
-`PathBuilder<Model>` exposes `.entry(key)` on sparse Record fields, returning a path typed by the inner value schema. The path compiles to `<prefix>#<key>` for the bucket itself, and `<prefix>#<key>.<field>` for nested-Map field access using DynamoDB's native nested-map syntax. `ExpressionAttributeNames` aliasing handles the `#` literal.
+A path operation names an entry by its attribute's segment (`<prefix>#<key>`). In a condition, a filter or a select, `PathBuilder<Model>` exposes `.entry(key)` on sparse Record fields, returning a path typed by the inner value schema. The path compiles to `<prefix>#<key>` for the bucket itself, and `<prefix>#<key>.<field>` for nested-Map field access using DynamoDB's native nested-map syntax. `ExpressionAttributeNames` aliasing handles the `#` literal.
 
 **Caveat.** Nested-Map operations on inner fields (`metrics#2026-01.views`) require the bucket attribute to exist. Use record-style for new buckets, path-style for buckets known to exist. This mirrors DynamoDB's native semantics — the library does not paper over it.
 
@@ -2231,6 +2718,8 @@ db.entities.Pages.update({ pageId: 'p1' })
 // → 1 GetItem + 1 UpdateItem (REMOVE metrics#... + SET status, with version condition)
 ```
 
+**The clear comes first** (#238). `.clearMap("metrics").set({ metrics: { b } })` leaves `{ b }`. One function decides what every other write to a map the update clears does (`clearedOverlap` in `Entity.ts`), for an entry the clear's read found as its own attribute and one a renamed map's attribute held whole (`sr.a`) alike: the entry is gone when the rest of the update runs, and the request names no path twice and no name or value it doesn't use. A `SET` of an entry's whole value replaces it, so the clear leaves it out; a `pathIfNotExists()` of one finds nothing, and is sent as that `SET`; an `ADD` to one (`.add()`, `pathAdd()`, a set's members) starts from nothing, sent as `SET <entry> = <value>` where the clear removes the attribute; a `.removeEntries()` of one is the clear's own `REMOVE`, and a `REMOVE` below one (`pathRemove(["lists#a", 0])`) or a `DELETE` from one (`.deleteFromSet()`) is left out, nothing being left to remove. A write that reads the entry's value or writes below it (`.subtract()`, `pathSubtract()`, `.append()`, a `SET`, `ADD` or `DELETE` below it) has nothing left to work on, and is refused before the write with a `ValidationError` (`EDD-9151`), after the clear's read. One on an entry the row doesn't hold is sent, and DynamoDB answers it as before (named, left as 1.40.0 behaves: `.clearMap("counts").pathSubtract({ segments: ["counts#missing"], value: 1 })` is refused by DynamoDB with a `DynamoValidationError` and nothing is written, as through 1.40.0, not with `EDD-9151` before sending; `helpers/ClearBesideAbsentEntry.ts`, `fixtures/clear-beside-absent-entry-1.40.0.json`); a copy out of a cleared entry (`pathSet` with `isPath`) reads the row as it was, as every operand in a request does. A retained entity's record operations (`.set()`, `.add()`, `.subtract()`, `.append()`, `.deleteFromSet()`) apply to the map in memory after the clear and write it whole, as through 1.40.0, so a `.subtract()` or an `.append()` there starts from nothing; its path operations go through the same function. Through 1.40.0 each of these was sent: an entry the read found was named twice in one request (a `REMOVE` beside its `SET` or `ADD`), which DynamoDB refused, so a clear with a `.set()` of an existing key failed; on a row holding `sr` the clear removed nothing a read takes, and an operation reading an entry inside it named an attribute the row lacks, which DynamoDB refused; and a retained entity's in-memory update applied the `.set()` before the clear, storing `{}` (`test/fixtures/clear-writes-1.40.0.json`, `test/fixtures/clear-every-op-1.40.0.json`, `helpers/ClearWrites.ts`). A map a `field:` rename stores whole is cleared of the attribute it's stored under too, and written as entries, unguarded: the row ends holding it as entries whatever it held (§7 "A map a `field:` rename stores whole").
+
 **Race window.** Between read and update, a concurrent writer may add a new bucket. The new bucket survives the clear.
 
 - For `versioned: { retain: true }` entities, the existing optimistic-lock CAS closes the race automatically — clear fails on stale version, retry resolves.
@@ -2248,12 +2737,57 @@ db.entities.Pages.update({ pageId: 'p1' })
   .set({ status: 'updated' })
 ```
 
+#### A map a `field:` rename stores whole
+
+`DynamoModel.configure(model, { counts: { storedAs: SparseMap(), field: "sr" } })` gives one map two stored forms. `put`, `create`, `Batch.write` and a transaction's put store it whole, as one map attribute `sr`; an update's entries and a plain entity's `upsert` store it as one attribute per entry (`counts#<key>`); a retained or unique entity's `upsert`, which reads the row and writes it whole, stores `sr`. A read takes `sr` whenever the row holds it and the entries otherwise (`renameFromDynamo` after `deserializeSparseFields`), so a row holding both reads as `sr`. 1.39.0 and 1.40.0 wrote an update's entries as their own attributes whatever the row held: on a row holding `sr`, every entry write reported success and changed nothing a read sees, and a `.subtract()` failed with a `DynamoValidationError` naming no attribute; a condition on an entry `.entry()` built (`counts#a`) failed where it held, and on a row holding entries a condition or a filter on `t.counts.a` (`sr.a`) failed where it held (`test/fixtures/renamed-sparse-map-1.40.0.json`, `helpers/RenamedSparseMap.ts`). Since #238 (decision 1):
+
+- `put`, `create`, a retained or unique entity's `upsert`, `.append()`, `Batch.write` and a transaction's put send what they sent, and write the form they wrote.
+- A plain entity's `upsert` writes the entries as their own attributes without reading the row, as before, beside `attribute_not_exists(sr)` joined to its own condition: one `UpdateItem` still, so the guard costs no request. 1.40.0 reported success on a row holding `sr` and wrote entries no read sees (and, where the caller's condition held, the rest of the write). The guard holds on a row holding entries and on no row, which the upsert creates as before; on a row holding `sr` the stored item the refusal returns (`ReturnValuesOnConditionCheckFailure: ALL_OLD`, sent only when a guard is) tells it apart from the caller's condition, as an update's does: a `ValidationError` (`EDD-9150`), nothing written. An upsert writing no entry (`counts: {}`) carries no guard (`test/fixtures/renamed-sparse-map-upserts-1.40.0.json`, `helpers/RenamedSparseMapWrites.ts`).
+- An update that holds the row (it read it: a retained entity's, one returning both images, `clearMap`'s, a packed immutable's; or a transaction's plan, which reads it and plans the op again holding it) writes an entry where the row holds the map: inside `sr` when the row holds `sr` (`SET sr.b = :v`, `ADD sr.a :v`, `SET sr.a = sr.a - :v`, `REMOVE sr.a`), as `counts#<key>` otherwise. `ADD` takes a document path, and starts an absent entry from nothing as it does an attribute, so an increment inside `sr` stays an `ADD` (`test/connected.document-paths.test.ts`). An update that reads the row and writes it whole (a retained entity's record operations, a unique field's change) merges the entries into the map in memory and writes `sr`, as it did. Its `.removeEntries()` removes from a copy of the map: through 1.40.0 it removed from the read row's own map, which a retained entity's version snapshot is written from, so the snapshot of the version replaced lost the entries too (`test/fixtures/retained-entry-removals-1.40.0.json`). `clearMap` removes `sr` beside the entries its read found, and the update writes the map's entries as their own attributes, without a form guard: the row ends holding the map as entries whatever form it held, and a `.set()` beside the clear lands where a read takes it (`.clearMap("counts").set({ counts: { b: 2 } })` on a row holding `sr` sends `SET counts#b = :v REMOVE sr`, one request). Through 1.40.0 a clear on a row holding `sr` reported success and changed nothing a read sees, and its `.set()` wrote an entry beside `sr`.
+- An update that doesn't read the row writes the entries as their own attributes, as before, beside `attribute_not_exists(sr)` joined to its own guard. On a row holding `sr` DynamoDB refuses it before evaluating the update (so a `.subtract()` of an entry that isn't there is refused by the guard first), and the stored item the refusal returns tells it apart: a `ValidationError` (`EDD-9150`) saying the row stores the map whole under `sr`, and that a transaction (which reads the row) or a `put` writes it. The rest of the condition (the caller's `.condition()`, `expectedVersion`, an upsert's key guards) is judged against that item first, by `internal/ConditionHolds.ts` (DynamoDB's condition grammar, its answers checked case by case against DynamoDB Local in `test/connected.condition-holds.test.ts`): where it doesn't hold, the write fails as it did through 1.40.0 (`ConditionalCheckFailed`, `OptimisticLockError`, an upsert's write from the row), and `EDD-9150` answers only where it's known to hold, the write 1.40.0 reported as a success and lost. Where the evaluator can't tell (below), the caller's verdict answers: only DynamoDB can judge the condition, and a write that doesn't read the row has no row to send it again from. A condition on an entry is the exception 1.40.0 shows: it named `counts#a`, which a row holding `sr` lacks, so 1.40.0 failed it with `ConditionalCheckFailed` where the value a read takes met it; it now asks the row where it holds the map (below), holds, and the write is refused with `EDD-9150` (`test/fixtures/renamed-sparse-map-verdicts-1.40.0.json`). A held row's form is guarded the same way (`attribute_exists(sr)` for an entry written inside it): a row whose form changed since the read is read again and written again (a transaction plans again), and never a `ValidationException` (`SET sr.b` on a row without `sr` is refused whole). Which verdict each refusal gets is below.
+- A condition or a filter on an entry (`t.counts.a`, `t.counts.entry("a")`, or the entry's attribute) asks the row where it holds the map: `(attribute_exists(sr) AND sr.a = :v) OR (attribute_not_exists(sr) AND counts#a = :v)` (`splitByForms`, through `Entity._entryForms`, on every condition, a transaction's op conditions, an entity's and a collection's filter and a Z-order plan's). A row holds one form, so this is the condition the caller wrote, and `not()` of it its negation. A condition naming the map whole (`exists(t.counts)`) names `sr`, as before. A map stored only as entries, and every condition naming none of a renamed map's entries, compile as they did.
+- A copy's source (`pathSet` / `pathSubtract` with `isPath`) writes nothing, so it carries no form guard and is never refused for the form. Spelled as the entry's attribute (`["counts#a"]`), it names that attribute, as 1.40.0 did. Spelled through the map (`counts.entry("a")`, `["counts", "a"]`), it reads where a read takes the entry when the update holds the row (a retained entity's read; a transaction's plan, which reads the row of every op on an entity with such a map and plans it again holding it, sending nothing more): inside `sr` on a row holding it, as `counts#a` otherwise. Without the row there's no expression that reads where a read does (`if_not_exists(sr.a, counts#a)` reads a stale entry beside a map without the key), so it's named as 1.40.0 named it: `.entry("a")` as `counts#a`, `["counts", "a"]` as `sr.a` (`test/fixtures/renamed-sparse-map-copies-1.40.0.json`, `helpers/RenamedSparseMapWrites.ts`). Through 1.40.0 a held copy failed where its spelling named the form the row didn't hold, and `.entry("a")` copied an entry the read shadows on a row holding both.
+- One function says which paths name such an entry (`renamedEntryAt`), for writes and conditions alike, and one which form a write takes (`entryForm`, from the held row).
+
+**Not done: a read merging `sr` with the entries.** A read could take every entry beside `sr`, so a write that never reads the row could always write entries. That changes what rows already stored read as: a row holding both (an update or a plain entity's `upsert` over a row `put` wrote, through 1.40.0) reads today as `sr` alone, and would gain entries every read has ignored, some of them stale (an entry 1.40.0 wrote beside `sr` holds that write's value, not the one a later update gave the key inside `sr`). Writing isn't the difficulty: a `put` replaces the whole item in one `PutItem`, entries and all, without naming them. It would also make every read decide between two values for one key. Rows keep reading as they read; the stored form changes instead, in the next major: a renamed sparse map is stored as entries everywhere (the rename naming its prefix), with the rows already stored whole moved by that major's migration, and `EDD-9150` retired.
+
+##### Which verdict a refused write gets
+
+A write carrying a form guard is refused by DynamoDB with one verdict for its whole condition: the form guard, the caller's `.condition()`, the version, an upsert's key guards. One function says which of them refused it, for every write that sends the guard (`rejectedBy` in `internal/FormGuard.ts`: an update read or not, a retained update, a plain or versioned entity's `upsert`, a transaction's plan). It judges the condition's other parts on the stored item the refusal returned (`ALL_OLD`) with `internal/ConditionHolds.ts`, and answers:
+
+- **the rest**, where every form guard holds on that item, or the rest is false on it: the verdict the write gave through 1.40.0, which never sent the guard;
+- **the form, known**, where a form guard fails and the rest holds (or there's no rest);
+- **the form, unsure**, where a form guard fails and the rest is one the evaluator can't tell.
+
+Each write first asks what it asked through 1.40.0, in 1.40.0's order: a write guarded on the version it read (a retained update, a read-first update of a versioned entity, a stale `expectedVersion`) answers a moved version with `OptimisticLockError` whatever else the item shows, and a transaction's plan compares the version and the condition's attributes it read, planning again where they moved and the caller's condition held, as 1.40.0's did. Then, on `rejectedBy`'s answer:
+
+- **A write that doesn't read the row** (an update without a read, a plain or versioned entity's `upsert`): the form, known → `EDD-9150`; the form, unsure → the caller's verdict (`ConditionalCheckFailed`): only DynamoDB can judge the condition, and the write has no row to send it again from, so it never reports `EDD-9150` for a condition that may be false; the rest → as 1.40.0. Only the form the row holds when the write arrives counts.
+- **A write that holds the row** (a transaction's plan, a retained update, any other read-first update): the form, known or unsure → read again and written again (a transaction plans again), up to three attempts (`GUARDED_PUT_ATTEMPTS`), so DynamoDB judges an unsure condition on the next write; where it's false there, that refusal returns a row whose form holds, and the caller's verdict answers. A form changed before every attempt fails naming the map: `OptimisticLockError` with `attributes: ["counts"]` on a versioned or retained entity (the stored version as both `expectedVersion` and `actualVersion`: the version didn't move, the form did), and `ConcurrentModification` with `attributes: ["counts"]` and the stored item otherwise, the errors those writes already fail with on a lost race (`attributes` on `OptimisticLockError` is new, and optional).
+- **A unique entity's `upsert`** reads the row and writes the map whole, so it sends no form guard and is never refused for the form.
+
+Requests are counted to the end (a retained update reads its new item back); "1.40.0" marks a cell answered as 1.40.0 answered it, request for request, outcome and row. Every cell is pinned, on DynamoDB Local and in memory, both forms the row can hold before the race, Plain, Versioned, Retained and Unique entities (`test/fixtures/renamed-sparse-map-verdict-table-1.40.0.json`, `helpers/RenamedSparseMapVerdictTable.ts`, 320 cells):
+
+| Caller's condition | Version moved | The map's form | Transaction's update | Retained update | Other read-first update | Update or upsert without a read | Unique entity's `upsert` |
+|---|---|---|---|---|---|---|---|
+| none, or holds | no | as read | written, 2 | written, 3 | written, 2 | entries: written, 1 (1.40.0); whole: `EDD-9150`, 1 | written, 2 |
+| none, or holds | no | changed once | planned again, written, 4 | read again, written, 5 | read again, written, 4 | (the form at the write, above) | written, 2 |
+| none, or holds | no | changed before every attempt | `OptimisticLockError` / `ConcurrentModification` naming `counts`, 6 | `OptimisticLockError` naming `counts`, 6 | `OptimisticLockError` / `ConcurrentModification` naming `counts`, 6 | (the form at the write, above) | written, 2 |
+| none, or holds | yes | as read, or changed once | retained: planned again, written, 4; versioned: unguarded on the version, written, 2, or 4 with the form changed | `OptimisticLockError`, 2 (1.40.0) | `OptimisticLockError`, 2 (1.40.0) | stale `expectedVersion`: `OptimisticLockError`, 1 (1.40.0) | — |
+| false | no | any | `TransactionCancelled`, 2 (1.40.0) | `ConditionalCheckFailed`, 2 (1.40.0) | `ConditionalCheckFailed`, 2 (1.40.0) | `ConditionalCheckFailed`, 1 (1.40.0) | `ConditionalCheckFailed`, 2 (1.40.0) |
+| false | yes | any | planned again, `TransactionCancelled`, 4 (1.40.0) | `OptimisticLockError`, 2 (1.40.0) | `OptimisticLockError`, 2 (1.40.0) | stale `expectedVersion`: `OptimisticLockError`, 1 (1.40.0) | — |
+| can't tell | no | as read | written, 2 | written, 3 | written, 2 | entries: as DynamoDB judges it, 1 (1.40.0); whole: `ConditionalCheckFailed`, 1 | as DynamoDB judges it, 2 |
+| can't tell | no or yes | changed | as "none, or holds", with DynamoDB judging the condition on the write that lands | as "none, or holds" | as "none, or holds" | (the form at the write, above) | as DynamoDB judges it, 2 |
+
+The pinned "can't tell" condition is `size(note) = 1` on `"é"`, which DynamoDB Local finds true, so its cells land where "holds" does. The evaluator can't tell: a `size()` of a string beyond ASCII whose answer depends on how its length is counted (DynamoDB documents it as "the length of the string" without saying in what; DynamoDB Local counts UTF-16 code units, `"é"` 1 and `"😀"` 2, so the evaluator answers only where UTF-16 code units, code points and UTF-8 bytes all give the same answer, as `size(note) = 0` on `"é"` does: `test/helpers/ConditionCases.ts`, checked against DynamoDB Local); text it doesn't read; and a request DynamoDB would refuse. The last two never come with a refusal returning an item: DynamoDB refuses such a request whole, before the condition. Through 1.40.0 a write to a row holding `sr` without a read reported success and lost the entry, so the cells that now fail there (`EDD-9150`, and `ConditionalCheckFailed` where the condition can't be told) refuse only what 1.40.0 stored as a row no read takes; a write whose row's form changed after its read landed through 1.40.0 only where the row ended holding entries (1.40.0 always wrote `counts#b`, which beside `sr` no read takes), and now lands where a read takes it either way. Where 1.40.0 landed (a whole row changed to entries), it now costs one more read and write, sent only after the race refused the first; a write that isn't refused sends what it sent.
+
+A "can't tell" condition DynamoDB finds false costs more where the map's form changes under the write (named, not changed): the form guard's refusal can't be told from the condition's, so the write is read and sent again, and the caller's verdict comes from the second attempt, in 4 requests where 1.40.0 took 2 (pinned for a transaction's update, `size(note) = 2` on `"é"`, in `helpers/RenamedSparseMapRaces.ts`); where the form changes before every attempt it ends in `OptimisticLockError` / `ConcurrentModification` naming the map, in 6, where 1.40.0 gave the caller's verdict in 2. It needs a condition the library can't evaluate itself (a `size()` of text beyond ASCII) together with another writer changing the map's stored form at that moment. `size()` stays "can't tell" there: DynamoDB doesn't document what it counts, and an answer the evaluator guessed would turn a true condition into a refusal.
+
 #### Lifecycle interactions
 
 - **`versioned: { retain: true }`** — snapshots preserve flattened attributes verbatim.
 - **`softDelete`** — GSI keys are stripped; sparse attributes are domain data and are **preserved**. Restore is a no-op for sparse attributes.
 - **Unique constraints** — sparse fields cannot be referenced. Same reason as keys — composite values aren't known at `make()` time.
-- **`timeSeries`** — sparse fields are aggregate state, not event state. They live on the **current item only** and are preserved across `.append()` (untouched, since they're outside `appendInput`). Event items (`#e#<orderBy>`) **DO NOT** carry sparse attributes — same treatment as enrichment fields outside `appendInput`. Per-event snapshots of aggregate state would multiply storage by `(events × sparse-keys)` — a real cost on long event streams (e.g. 10s heartbeats × 7d TTL ≈ 60K events per device) with no read-side benefit.
+- **`timeSeries`** — sparse fields are aggregate state, not event state. They live on the **current item only** and are preserved across `.append()` (untouched, since they're outside `appendInput`). Event items (`#e#<orderBy>`) **DO NOT** carry sparse attributes — same treatment as enrichment fields outside `appendInput`. Per-event snapshots of aggregate state would multiply storage by `(events × sparse-keys)` — a real cost on long event streams (e.g. 10s heartbeats × 7d TTL ≈ 60K events per device) with no read-side benefit. `appendInput` may still declare one, and an append writes its fields whole: a map without a `field:` rename has no whole form a read takes, so an append carrying one with entries is refused with a `ValidationError` before anything is sent (#238), as its `.remove()` of the map is; write the entries with `update().set(...)`. Through 1.40.0 it wrote the map whole under the field's name beside the row's entries, reported success, and every read returned the entries it already held. An empty map writes nothing a read sees and is sent as it was; a renamed map's whole attribute is the form a read takes first, so it is written as it was (`helpers/AppendSparseMaps.ts`, `test/fixtures/append-sparse-maps-1.40.0.json`).
 
 #### Constraints (enforced at `Entity.make()`)
 
@@ -2293,7 +2827,7 @@ yield* db.entities.Pages.put({ pageId: 'p1', views: {} })
 
 // First view — atomic counter on a fresh item, no parent-map dance.
 yield* db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.views.entry('2026-04'), 1)
+  .pathAdd({ segments: ['views#2026-04'], value: 1 })
 // On disk: views#2026-04 = N(1)
 
 // Concurrent writers to different months never race.
@@ -2332,7 +2866,7 @@ yield* db.entities.Pages.update({ pageId: 'p1' })
 
 // Atomic per-leaf update within a known bucket.
 yield* db.entities.Pages.update({ pageId: 'p1' })
-  .pathAdd((t) => t.metrics.entry('2026-04').views, 1)
+  .pathAdd({ segments: ['metrics#2026-04', 'views'], value: 1 })
 // On disk: metrics#2026-04.views = 101
 
 // Reset — two-op helper, atomic via the version CAS.
@@ -2368,7 +2902,7 @@ EventStore.makeStream({ …, storedAs: { data: Packed(…) }, snapshot: { schema
 | `S` | `JSON.parse` |
 | `B` | byte 0 header `vvv ff ccc` (layout version `001`; format `00` json, `01` binary reserved; codec `000` none, `001` gzip, `010` brotli, `011` zstd) → decompress → `JSON.parse` |
 
-A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, dates as objects — are refused at write). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
+A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, a `Date` or any other class instance — are refused at write; one of Effect's own instances a native attribute stores as a map, a `DateTime`, a look-alike, an `Option` or a `Result`, is written as that map, `storedFormOf`). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
 
 **Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `Compression.layer(...)` merged into the application layer (recommended), `DynamoClient.make({ compressors })`, or `DynamoClient.layer({ compressors })` (whose `Compression` output does not survive a wrapper layer that consumes it through `Layer.provide`) — and read with `Effect.serviceOption`, so no operation gains an `R`. `node:zlib`-backed implementations ship from `effect-dynamodb/compression/zlib`; any runtime can register its own. A codec a `Packed` config names is checked where the registry is first resolvable: `DynamoClient.make` (every bound entity and aggregate edge) and `EventStore.bind` fail at bind, and an unbound stream on its first operation per registry, with the `[EDD-9078]` configuration defect. Past that, a value that needs an unregistered codec (an unbound entity write over the threshold, or a read of a `B` whose header names a codec the config no longer does) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
 
@@ -2513,14 +3047,16 @@ DynamoModel.DateTimeZoned           // Wire: ISO string with offset/zone ↔ Dom
 When wire format ≠ storage format, use `storedAs` with a target schema:
 
 ```typescript
-// Wire: ISO string, DynamoDB: epoch seconds (for TTL)
-DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
+// A model field: a DateTime.Utc stored as epoch seconds (for TTL)
+Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
 
-// Wire: epoch ms, DynamoDB: ISO string
-DynamoModel.DateEpochMs.pipe(DynamoModel.storedAs(DynamoModel.DateString))
+// A timestamp's `schema`: wire ISO string, DynamoDB epoch seconds
+DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
 ```
 
-**Type safety:** `storedAs` constrains the storage schema to have the same domain type (`A`) as the field schema. Incompatible combinations are rejected at compile time.
+A date transform model field owns its wire form: `Entity.make` refuses one whose `storedAs` names the other wire kind, and under `Schema.optional` the transform's own form is stored (#232).
+
+**Type safety:** `storedAs` constrains the storage schema to have the same domain type (`A`) as the field schema. Incompatible combinations are rejected at compile time; none of them would be stored as asked (a `DateTime.Zoned` forced to an epoch through a cast is refused by `Entity.make`, kept in its ISO form under `Schema.optional`, or refused at the write). `A` is `storedAs`'s first type parameter, so `storedAs<DateTime.Utc>(DateEpochSeconds)` compiles as it always did. Inferred, the schema returned also carries the storage schema's encoded type (`DynamoModel.StoredAs<W>`, an optional type-only property, so it and the field schema are each assignable to the other's type); given `A` alone, or a storage schema typed `Schema.Schema<A>`, it is the field schema's own type (#236, `test/StoredAsSignature.types.test.ts`).
 
 ### Auto-Detecting Epoch Schema
 
@@ -3032,7 +3568,8 @@ are in text order, so a range in numeric order can be reversed in text
 returned nothing. `beginsWith` on a numeric `orderBy` still compiles to `eq`
 (`test/HistoryWhereOperand.test.ts` and its connected twin, over events 1.39.0
 stored). An `Option` `orderBy` is stored as a map, and DynamoDB refuses `append`'s
-`<` guard on a map, as it did on 1.39.0, so no such event is ever written there.
+`<` guard on a map, as it did on 1.39.0, so no such event is ever written there
+(`EDD-9163`, below).
 
 **`append` on a string-encoded numeric `orderBy`.** The stored `orderBy` is `S`,
 which DynamoDB compares as text, so the CAS `attribute_not_exists(pk) OR
@@ -3056,6 +3593,37 @@ each cancellation, `.skipFollowUp()` included (its success is still `void`, and 
 stale or rejected append still `StaleAppend` with no current item). Every other
 `orderBy` keeps the single conditional transaction: DynamoDB orders `N`
 numerically and ISO-8601 text chronologically.
+
+**An `orderBy` stored as a type `<` doesn't take (#242, `EDD-9163`).** The guard
+`#orderBy < :new` takes numbers, strings and binary. An `orderBy` stored as a map
+(an `Option`, a `Result`, Effect 4's `Either`, a `Duration`, a `BigDecimal`, a
+named or an offset zone), a list or a boolean makes DynamoDB refuse the condition
+whatever the item holds, so such an entity can never append; a nullable `orderBy`
+fails each append holding null. Up to 1.40.0 each was DynamoDB's bare
+`DynamoValidationError`. `Entity.make` doesn't refuse such an entity and nothing is
+checked before sending: the append is sent, DynamoDB's refusal (`Incorrect operand
+type for operator or function; operator or function: <, operand type: M`) is
+recognised (`OperandType` in `internal/WriteDiagnosis.ts`), and it is confirmed on
+the request that was sent: its condition holds the guard on this `orderBy`
+(`#_tsob < :_tsNewOb`), DynamoDB named `<`, and the guard's own operand
+(`:_tsNewOb`, the new `orderBy` as stored) is of the type DynamoDB named. Only then
+is it a `ValidationError` naming `timeSeries.orderBy`, the field and the type, with
+DynamoDB's error as its cause and nothing written. DynamoDB judges the operands an
+expression is given, not what the item holds: measured on DynamoDB Local, a stored
+`orderBy` of another type (a null under a nullable field) makes the guard false, a
+stale append, never this refusal, so the stored side is never the culprit, and
+nothing is read to find it. Anything else is DynamoDB's error, passed through
+unchanged as 1.40.0 gave it: the caller's own condition comparing the `orderBy`
+(or any attribute) with a null, a map, a list or a boolean is refused on the first
+append to a missing item and on every later one, whatever the append's own value;
+one comparing it with a value of another primitive type (a string against a
+number) doesn't hold, `ConditionalCheckFailed`. `OperandType` is opt-in
+(`diagnoseFailure({ optIn })`): only `append` asks for it, and every other write
+passes the same refusal through as it did. A struct `orderBy` never reaches
+DynamoDB: its event key text is `[object Object]` (`EDD-9162`). A date (ISO text,
+or a number under `storedAs`), a `Schema.DurationFromMillis`, a number, a literal
+and a `Redacted` string are stored as numbers or strings and append as they did
+(`test/OrderByOperandType.test.ts` and its connected twin).
 
 **Cancellations every `append` tells apart (#171).** A transaction DynamoDB
 cancels for a `TransactionConflict` alone (another transaction in flight on the
@@ -3255,7 +3823,9 @@ left out when compiled. Anywhere else — under `or` (which it would make match
 everything) or `not` (nothing), or an `or()` with no parts (nothing) — it has
 no reading that keeps what the caller wrote, so `emptyPartProblem` refuses it
 with a `ValidationError` before anything is sent: in `EntityPut` / `Update` /
-`Delete` when they run, per op in `transactWrite`, in `append`, for filters
+`Delete` when they run, per op in `transactWrite` (a planned update's or
+delete's too, before any op of the transaction reads: planning compiles it
+only after the reads, so it died in `compileExpr`, #236), in `append`, for filters
 when a query runs, and for aggregate `list` filters. An `isIn` with no values
 is not refused (#144): it compiles to `IN ()`, DynamoDB rejects it as a syntax
 error, and the rejection is diagnosed into a `ValidationError` naming the
@@ -3263,6 +3833,64 @@ error, and the rejection is diagnosed into a `ValidationError` naming the
 `Transaction.check()` with an empty condition is refused before sending.
 `compileExpr` itself throws on anything `emptyPartProblem` refuses, so no
 caller can compile one by skipping the check — reaching it is a library bug.
+
+**Operands in the form the attribute holds (#242).** A condition's or filter's
+operand that is one of Effect's instances (its prototype carries one of
+Effect's `~effect/…` markers: a `DateTime`, a zone, a `Duration`, a
+`BigDecimal`, a `Redacted`, an `Option`, …) or a `Date` is sent as a write of it
+at the path it's compared with stores it. One function decides: the path
+encoder's `operand` (`makePathValueEncoder`, schema package), which is the
+entity's `_storedFormAt`; `operandAsStored` / `operandsAsStored`
+(`internal/Expr.ts`) hand it every instance operand, and every operand position
+goes through them. Through 1.40.0 the instance was sent as its map, which no row
+holds where the field stores the value another way: `eq(t.at, at)` on a
+`Schema.DateTimeZoned` compared that map with the ISO text the row holds and
+never matched, and a condition naming it always failed; likewise a
+`Schema.DateTimeUtc` (ISO text, or a number under `storedAs`), a `Redacted` (its
+value), a `Schema.DurationFromMillis` (a number) and a `Date` on a `Schema.Date`
+(an empty map against ISO text or a number).
+
+*Only where the schema alone determines the stored form.* `operand` walks the
+path through EVERY union member that can hold it (a member that can't — a
+string, a literal, `null`, a struct without the field — is left out), and puts
+the operand in its stored form only when every position it reaches that takes
+the value stores it the same; a position that can't take the value holds no row
+it could match. Anywhere else the operand is sent as 1.40.0 sent it: union
+members storing the path differently (`{ kind: "encoded", when:
+DurationFromMillis } | { kind: "raw", when: Duration }`: a raw row holds the
+`Duration`'s map), an `Unknown` or `Any` at or on the path, a suspended schema,
+a declaration the walk doesn't follow (an `Option`, an opaque class), a record of
+such, a value no position takes, and one whose stored form DynamoDB can't store.
+A union AT the path is one schema: its encoding picks a member by the value,
+exactly as a write of that value does, so it is determined.
+
+*`contains` compares an element of what the field stores* (`containedKindOf`,
+`containedOperand`): an element of a list, as a list stores it; a member of a
+set (`Schema.ReadonlySet`, DynamoDB's `SS` / `NS` / `BS`), the single member of a
+write of a set holding it; a substring of text, the text a write of it stores.
+Anything else is sent as given.
+
+*Positions.* Each comparator, `between`, `isIn` and `contains`, in a callback or
+shorthand: an entity's conditions (put, update, delete, `append`, a planned or
+transactional op's), a bound query's, scan's, `history`'s and `deleted.list`'s
+filter, `Entity.filter`, `Query.filterExpr` on a query an entity made (the
+query carries its entity's `storedAt`), a collection's filter (members that hold
+the operand in different forms are judged each by its own, in the `OR` over
+`__edd_e__` that renamed fields already use), a vector search's equality filters,
+and an aggregate's `list` filter (the root's attribute encoder for a top-level
+field, `contains` included; anywhere deeper, as given). An instance whose map is
+the stored form (a zone, a `Duration`, a `BigDecimal`, an `Option` of a number,
+any value of an untyped field) is the bytes 1.40.0 sent, and an operand that
+isn't an instance or a `Date` (a primitive, a plain map or list, even one holding
+instances, a path) and a `begins_with` prefix are sent as given: reading inside
+a plain container would read the caller's values a second time. Finding an
+instance reads the operand's prototype once. A `.where()` bound composes key text
+through the key form, as it did. `Transaction.check` takes a condition
+`Expression.condition` compiled with no entity, and a query no one entity types
+(an event stream's, a collection made by `Collection.make`, one made by hand)
+has no stored form to give: their operands are sent as given. Pinned by
+`OperandsAsStored.test.ts`, `OperandStoredForm.test.ts` and
+`connected.operands-as-stored.test.ts`.
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first
@@ -3320,18 +3948,137 @@ paths by it (`Entity.condition`, a transaction's op conditions); a filter
 stored as `renamed`, `pathSet(["meta", "count"], 9)` wrote a stray
 `meta.renamed` and left `meta.count` as it was, and a condition on
 `t.meta.count` tested `meta.renamed`, which no row holds, so it failed whatever
-the row held. A filter and a projection already named `meta.count`. A first
-segment holding `#` is still a literal attribute name for a path write and a
-condition (a sparse map's entry). An aggregate's `list` filter compiles with no
-rename at any level, and `.history().where()` is a sort-key condition, so
-neither is affected. A path with no segment below the first spelled as a
+the row held. A filter and a projection already named `meta.count`. Every
+first segment goes through the field's rename, one holding `#` included (#238):
+through 1.40.0 a path write and a condition took such a segment as a literal
+attribute name while a filter and a projection renamed it, so with a model field
+`a#b` stored as `stored`, `pathSet(["a#b"])` set a top-level `a#b` no read looks
+at and a condition on `t["a#b"]` tested an attribute `put` never stores
+(`test/fixtures/hash-field-names-1.39.0.json`, `helpers/HashFieldNames.ts`). A
+sparse map's entry (`<prefix>#<key>`) named through its map is the entry's
+attribute, never a field's rename: a model field may carry the same name
+(`a#b` stored as `stored`, beside a map `g` stored under the prefix `a`, whose
+entry `b` is the attribute `a#b`), and only a bare first segment the caller
+spells `a#b` names that field. `.entry("b")` (in a condition, and the
+segments of a path write it built), `.set({ g: { b } })`,
+`removeEntries("g", ["b"])` and `clearMap("g")` name the attribute `a#b`. The
+path `.entry()` built carries that it's an entry (`entryOfPath` in
+`internal/PathBuilder.ts`, by the segments' identity), so nothing re-derives it
+from the spelling, and every path below it carries it too. With the rename of
+every first segment and no such mark, a condition on `t.g.entry("b")` tested
+`stored`: a delete guarded on the entry fired where the entry didn't hold, and
+an update was refused where it did
+(`test/fixtures/entry-beside-field-1.40.0.json`, `helpers/EntryBesideField.ts`,
+plain, retained, unique and in a transaction). 1.40.0 took the entry's
+attribute for the field on one path: a path write on segments `.entry()` built,
+on an entity whose unique constraint names the field, rewrote it as a write of
+the field; it writes the entry. The refusal of a `pathRemove` of an entry asks
+about the attribute the path names after the rename, as `.remove()`'s does, so
+a bare segment naming a field spelled like an entry removes the field where
+it's stored, and one `.entry()` built is refused as an entry's, naming
+`.removeEntries`. An entry whose key holds `#` (`x#y`) can't be named by
+`.entry()`, which refuses such a key, as before; `.removeEntries("g", ["x#y"])`
+removes it. So a field spelled like an entry wins for a bare segment, and the
+entry stays reachable through `.entry()` (a key without `#`) and
+`removeEntries` (any key): `test/SparseEntries.test.ts` pins both with a field
+`data#x` stored as `counter` beside the entry `x`, and a field `data#x#y`
+beside the entry `x#y`. `.entry()` resolves the same way on every terminal that takes a path
+callback, since #238: each builds its path builder with `pathBuilderOf(models)`
+(`internal/PathBuilder.ts`), the one place that knows which fields are sparse maps (an
+entity's query accessors, `scan()`, `.history()`, `versions()`, `deleted.list()`, a
+collection's accessors over its members' models, a write's `.condition()`, the entity's own
+`condition` / `filter` / `select`, an aggregate `list` filter). Through 1.40.0 only a write's
+condition and the entity's own builder knew the maps, so `.entry()` threw in every query
+callback. The entity's own `filter` and `select` (on an unbound `Query`) go through the naming a
+bound query uses (`entityNaming`), as its `condition` goes through the write's: through 1.40.0
+they named an entry of a map a `field:` rename stores whole, and a key an entry's struct renames
+as stored, as written (`helpers/EntryOnEveryTerminal.ts`,
+`test/fixtures/entry-terminals-1.40.0.json`). `.entry()` names a map only at the top level
+(`t.inner.zones.entry()` is refused: through 1.40.0 it tested `inner.z#east`), and only a field
+the model declares (`Object.hasOwn`): the tables a definition looks fields up in by name
+(`getSparseFields`, `getPackedFields`, `fieldRenames`) have no prototype, so a field named
+`constructor` or `valueOf` is not taken for a sparse map whose prefix is `undefined` (through
+1.40.0 an update of it beside a sparse map wrote `undefined#…` attributes and returned the old
+value). Path operations take segments, not a callback; segments a builder's `.entry()` built
+carry the mark that they name an entry (`entryOfPath`). A model field named like one of the
+builder's own members (`at`, `size`, `entry`, `segments`, `_tag`, `pipe`, `then`, `toJSON`) is
+the member in a callback, not the field, as through 1.40.0 (named, not changed): an equality
+shorthand (`{ eq: { at: 1 } }`, `.filter({ at: 1 })`), a record operation (`.set({ at })`) and a
+path operation's segments (`["at"]`) reach it (`test/PathBuilderMembers.test.ts`). A
+filter on `t.g.entry("b")` names the attribute a condition names, and asks the
+row where it holds a map a `field:` rename stores whole (`entryForms`). In a
+collection each member names the entry by its own prefix, a member that holds
+the map whole by its field (no `storedAs`) by the map's key below the field,
+and a member without the map reads it as a field it lacks: the attribute as
+built, or one no row holds where the member reads that attribute as something
+of its own (a field, or an entry of one of its maps), so every entry reads as
+absent on its rows: `eq` on one never matches them, `notExists` matches every
+one (`entriesFor` in `collectionNaming`, `helpers/EntryInQueries.ts`). A select of
+an entry is the "A `.select()` naming a sparse map field" rule above. An
+aggregate takes no `field:` rename (1.40.0 failed to make one over a
+`DynamoModel.configure` model), and `.history().where()` is a sort-key
+condition, so neither is affected. A path with no segment below the first spelled as a
 renamed field sends the requests it always sent
-(`test/fixtures/nested-path-requests-1.39.0.json`). A path does not follow a
-nested struct's own key encoding (`Schema.encodeKeys`) on any release: below
-the first segment it names the property as written. Through 1.39.0 one such
-path reached the stored key by coincidence, when the nested struct encoded a
-property to the name a top-level field of the same spelling was renamed to; it
-now names the property, like every other path below a key-encoded struct.
+(`test/fixtures/nested-path-requests-1.39.0.json`).
+
+**Below the first segment, a path follows a struct's own key encoding
+(`Schema.encodeKeys`) since #238.** One walk says what each segment is stored
+as (`storedSegments` in the schema package's `internal/SchemaAccessors.ts`,
+below a model's field by `storedBelowFields`, reached through
+`Entity._storedBelow` and `storedPath`), so a path write, a condition (an
+entity's, a transaction's), a filter (an entity's, a collection's and an
+aggregate `list`'s, which names its root's paths by the root schema's fields
+through the bound-query naming, `entityNaming`) and a projection name the same
+attributes. A segment that is a
+property's own name at its node, stored under another, is sent as the stored
+name: on `meta` encoding `amount` as `am`, `pathSet(["meta", "amount"])` and
+`t.meta.amount` name `meta.am`, the attribute `put` stores and a read takes, and
+a select of it hands the value back under the names it was selected by
+(`{ meta: { amount } }`). A segment that is a property's stored name at its
+node is sent as written, as 1.40.0 sent it, and handed back as written,
+including a name that is both one property's own name and another's stored
+name: on `encodeKeys({ a: "b", b: "a" })`, `["swap", "a"]` names the stored
+attribute `a`, which holds property `b`, as on 1.40.0. The walk follows
+structs, classes over them, records, arrays and tuples, and optional, nullable
+and union wrappers. It knows a struct's stored names only where `Schema.encodeKeys`
+built them, by their shape (one transformation to a bare struct whose `i`-th
+property is the encoded form of the struct's `i`-th, as the removal guard below
+reads it), and never runs the model's functions to find out. Where it can't tell what a node stores (a node it doesn't
+model, or a union whose members don't name every segment alike, such as a struct
+encoding `amount` as `am` beside one holding `amount`, or two renaming `x` and `y`
+crosswise: `unionNamedExactly`), the rest of the path is sent as written, from the
+union on. A union member that holds nothing at the segment (a scalar, a
+struct without the property) has no say. In a collection each member's rows are
+named by its own walk, joined by `__edd_e__` where the members differ. Through
+1.40.0 a path named the property as written below its first segment: a domain
+spelling wrote a stray attribute no read sees (`meta.amount` beside
+`meta.am`), a condition or filter on it failed whatever the row held, and a
+select of it came back without the value. Such a stray stays on the row,
+unread; `.set({ meta })` writes the struct whole and drops it (pinned in
+`helpers/NestedKeyEncodings.ts`). The stored spelling sends what it
+sent (`test/fixtures/nested-key-encodings-1.40.0.json`,
+`helpers/NestedKeyEncodings.ts`, plain, retained and in a transaction, on the
+recording table and DynamoDB Local). An aggregate `list` filter spelled by a
+property's own name matched no root row through 1.40.0 (under `not`, every
+one), and now sends what its stored spelling sent; a filter on a root that
+renames nothing sends what it sent (`test/fixtures/aggregate-list-filters-1.40.0.json`,
+`helpers/AggregateListFilters.ts`). Through 1.39.0 `compilePath` renamed every
+segment by the top-level renames, so one such path reached the stored key by
+coincidence, when the struct encoded a property to the name a top-level field
+of the same spelling was renamed to. A `pathRemove` below a key-renamed struct
+is judged as any other, against the struct as it's stored (`renamedStruct`):
+`pathRemove(["meta", "am"])` and `pathRemove(["meta", "amount"])` of a required
+`amount` are refused. 1.40.0 removed `meta.am` and left a row no read takes (by
+the domain spelling, it removed nothing).
+
+`Transaction.check` takes a compiled condition (`Expression.condition`), which
+is built with no entity to rename by, so it named a renamed field as the field,
+which no row holds: a comparison failed whatever the row held, and
+`attribute_not_exists` held whatever it held (also on 1.39.0). It now applies
+the same rule to the names it is given (`storedNames` in `Transaction.ts`,
+#236): a placeholder used only as a path's first segment, naming a renamed
+model field, names the stored attribute; one below a first segment (`#t.#c`),
+one used at both, and a name no field is renamed from are sent as given.
 
 **Path-addressed values are encoded (#133).** `pathSet`, `pathAppend`,
 `pathPrepend`, `pathIfNotExists` and record-based `append` (including the
@@ -3368,13 +4115,15 @@ a dynamic key of an untyped value) are passed through. Each such operand is
 encoded and checked against the schema at its path once, in `prepareUpdate`
 (`encodeOperands`), and written as encoded there: one the schema refuses fails
 the update with a `ValidationError` (`operation` `update.append`,
-`update.pathSet`, `update.pathAppend`, `update.pathPrepend` or
-`update.pathIfNotExists`) before it reads or sends anything, alone or in a
-`transactWrite`. It used to be decided as the write was built, after the reads
-of an update that reads first, so a failed read was reported in its place.
+`update.pathSet`, `update.pathAppend` or `update.pathPrepend`) before it reads
+or sends anything, alone or in a `transactWrite`. It used to be decided as the
+write was built, after the reads of an update that reads first, so a failed read
+was reported in its place. A `pathIfNotExists` operand is the exception: it is
+refused only where it would be stored (below).
 A copy (`pathSet` or `pathSubtract` naming another attribute, `isPath`) holds no
 operand: its `value` isn't written, so nothing reads it, encodes it or checks
 that it would store or read back.
+
 Only the moment changes: the check, its verdict, its error and the bytes of an
 operand it accepts are the ones the write was built with. An update refused for
 a second reason reports the operand, where it reported whichever it met first
@@ -3383,6 +4132,100 @@ as it read and built the write: a missing item (`ItemNotFound`), a stale
 another value on a retained entity (`ValidationError` `update`), a ref whose
 target isn't there (`RefNotFound`), a packed value with no compressor
 (`ValidationError` `update.packed`).
+
+**A `pathIfNotExists` operand is refused only where it would be stored (#236).**
+DynamoDB stores `if_not_exists(<path>, :v)`'s operand only where the row lacks
+the path; where the row has it, the stored value stays. So an operand a check
+refuses (the schema at its path, the read where it resolves the position, a
+custom declaration's read-back, `EDD-9126`) is not refused before reading:
+`encodeOperands` records it (`fallbacks`), and `fallbackRefusal` (`Entity.ts`),
+the one decision, refuses it with that check's error where the row as stored
+lacks the path (`pathPresent`, the path as `compilePath` resolves it). An update
+that reads its row decides on that read, before sending: a retained entity's,
+one restating a packed immutable, one clearing a sparse map, and every update
+`transactWrite` plans (`planned`'s `refuse`). One that reads nothing sends its
+write requiring the path, `attribute_exists(<path>)` beside its own
+`attribute_exists(#exists)`, and decides on the row DynamoDB's refusal returns
+(`ALL_OLD`); a missing parent fails that condition too, and is refused the same
+way. Where the row has the path the update is written and the stored value
+kept. A version the update expects and the row isn't at is refused first
+(`OptimisticLockError`), on every path, whether the row has the path or not; a
+row that isn't there stores nothing, and the update is answered as it is with
+any operand (`ItemNotFound`). An operand the checks accept is sent as 1.40.0
+sent it, with no condition added. 1.40.0 refused these operands before sending
+(after a retained entity's read) at a position the write schema's walk knows,
+even where DynamoDB would have kept the stored value, and with `ValidationError`
+before `OptimisticLockError` and `ItemNotFound`; at a
+sparse map's entry, which it didn't check, it stored them where the row lacked
+the path, leaving a row that no longer read. `PathIfNotExistsFallback.test.ts`
+and `connected.path-if-not-exists.test.ts` pin both outcomes on every path,
+alone and in a transaction, each beside what 1.40.0 did there.
+
+**Where the read resolves the position (#236): exact or absent.** The write
+schema's walk above doesn't know every position: a sparse map's entry (named by
+its stored name, `target#a`) its value schema can't check exactly (#238, below),
+a union's members past the first, a list of a
+union, a suspended or branded schema. There the operand used to be sent as
+given, and a row could be left that no read decodes. After the check above,
+`operandAsRead` (`Entity.ts`) asks where a row's read takes the operand:
+`readPosition` maps the path to the field `decodeRecord` reads the attribute as
+(a sparse map's entry under its field and key; a path's head as `compilePath`
+resolves it, a record op's as the expression does) and `readersAt`
+(`SchemaAccessors.ts`) walks that field's READ schema through the nodes
+`modelled` models exactly, collecting what decodes the value at the end: the
+node there, one per way through the unions, or each array's element for an
+append. A `Schema.UndefinedOr` field resolves as a `Schema.optional` one does:
+the read takes its absent attribute as `undefined` through a default of its own,
+which runs only where nothing is stored, so the walk takes the field beneath it
+(`ReadsAbsentAs`). Anything it can't resolve exactly (an `Option`, a transformed or
+checked node above the position, a decoding default, a hidden, packed or
+non-model attribute, an entry keyed `__proto__`, an entry of a sparse map stored
+under a `field:` rename, which a read takes whole from that attribute, a tuple
+position whose element depends on the list's length) gives no readers, and the
+operand is sent as 1.40.0 sent it (past the check of a value written into a
+sparse map's entry against the map's value schema, #238, below). Where it resolves, `judgeOperand` (`internal/OperandReaders.ts`)
+decides: what 1.40.0 sends is sent when one of the readers reads it back as
+stored, so no operand a row holding it reads is refused or changed; otherwise no
+row holding it reads, and it is written in the one other stored form the readers
+read back (the model's encoding at the position, or a reader's own), or refused
+with a `ValidationError` under the same operation names when there is none, or
+when the union's members would store it differently. Only a schema issue is an
+answer (`SchemaIssue.issueOf`): the check runs a schema synchronously where a
+read runs it as an Effect, so a reader or encoder that can't finish (an
+asynchronous step, a defect) says nothing, and the operand is sent as 1.40.0
+sent it. The write schema's check above follows the same rule, so such a
+schema's operand is sent at every position, encoded where its encoder runs;
+1.39.0 and 1.40.0 died on it at a field, below a struct and in an `.append()`. `readersAt`
+is property-tested in both directions with Effect's decoder as the oracle
+(`ReadersAt.property.test.ts`): no reader reads the operand ⇒ no row holding it
+decodes, and every reader reads it ⇒ every row holding it decodes. The one class
+the second can't check is an operand some readers read and others don't, at a
+position a union's members read differently: whether a row holding it reads
+depends on the member the row holds, which the readers don't see, so it may still
+be wrong for that member, as it always was.
+
+**A value written into a sparse map's entry by its attribute (#238).** A path
+naming an entry's own attribute (`["counts#z"]`, `["objs#k", "n"]`, one
+`.entry()` built) is held at the path the model holds it at (`modelPathOf`:
+the map's field, the key, the rest) and its value encoded and checked there,
+against the map's value schema, as a field's is against the field's, so a
+value the schema refuses fails with the same `ValidationError` before anything
+is read or sent (a `pathIfNotExists` value only where the row lacks the path,
+where it would be stored, as above). Through 1.40.0 it was written as given: into an entry the row
+held, where every read of the row then failed; beside a map a `field:` rename
+stores whole, where no read took it and the update reported success; or
+DynamoDB refused it. Two places keep 1.40.0's bytes (`entryAsGiven`): where the
+map's value schema can't check the value exactly (`checks`: below an opaque
+class, or a list's elements where the list checks or transforms itself), and
+where a read takes the value as given (`readsAsGiven`: the entity's READ schema
+at the path decodes it, by some member of each union on the way and through a
+class by the struct of its fields), such as a
+number on a map stored as text, which a read takes as earlier releases left it.
+Encoding such a value would change bytes 1.40.0 wrote and read correctly, and
+inside a union pick one member's stored form for a row another member holds. A
+value its schema refuses is reported as that operand (`update.pathSet`, …)
+ahead of a declaration's value no read takes (`EDD-9126`), which 1.40.0
+reported for a field holding a declaration whatever the schema refused.
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to
@@ -3393,6 +4236,53 @@ bump, timestamps, GSI recomposition, `expectedVersion`, user condition) as the
 `Update` in one `TransactWriteItems` with the snapshot `Put`, conditioned on
 the version read. DynamoDB therefore applies the path semantics itself — parity
 by construction, never emulated — and a rejected expression writes no snapshot.
+The record operations (`.subtract()`, `.append()`, `.add()`, `.deleteFromSet()`)
+are applied to the row read, here and in the other updates that read the row
+first (one changing a unique field, one computing an index composite), as
+DynamoDB applies their expressions: where it refuses one on a value of another
+kind (a string, a number for `DELETE`, a set of the other kind), the update
+fails with `DynamoValidationError` (`operation` `TransactWriteItems`, its
+message the library's in DynamoDB Local's wording, which the service's may not
+match) and writes nothing (`expressionRefusal`, #236), as the same update of an
+entity without the configuration fails. It used to append a string's characters
+(a row that no longer read), add a number to a string, and die on `NaN`. On an
+attribute or a sparse map's entry the row lacks, and on one it holds as `NULL`,
+the two still differ, as on 1.40.0: an update sent as an expression is refused
+by DynamoDB (`#f - :v` and `list_append(#f, :v)` on a missing attribute, every
+one of them on `NULL`), while one that reads the row first starts the attribute
+from nothing and stores `-v`, `v` or the operand alone (a `DELETE` leaves it as
+it was) (`connected.missing-operand-paths.test.ts` pins both). Where DynamoDB applies
+one, the result is DynamoDB's (`internal/DynamoArithmetic.ts`): a sum or
+difference is taken exactly on the two numbers' decimal text and given back as a
+read gives the stored result (a `number`, or a `bigint` past
+`Number.MAX_SAFE_INTEGER`), so a bigint field computes on both sides of 2^53 and
+`0.2 + 0.1` stores `0.3`; a number DynamoDB can't hold (39 significant digits) is
+sent as it is, for DynamoDB to refuse. A set's members are compared by value (a
+number and a bigint of one value, two arrays of the same bytes). It used to die
+mixing a bigint with a number read back, store a JavaScript float
+(`0.30000000000000004`), and compare a bigint or binary set's members by
+identity, so a union held a member twice (refused by DynamoDB) and a difference
+removed nothing.
+A set operand of `.add()`, `.deleteFromSet()`, `pathAdd` and `pathDelete` is
+sent, on every path, and applied to a row read, as the set at its position stores
+its members (`setOperand`): a `Schema.ReadonlySet(Schema.NumberFromString)`
+operand is sent as strings, where the position is read exactly and exactly one
+form of the set reads back there; anything else is sent as given. It is never
+refused, since a set operand is not the value stored. A `NumberValue`
+(`@aws-sdk/util-dynamodb`) operand is the number its text holds. Through 1.40.0
+the first was sent as numbers, which DynamoDB refuses as a set of the other kind
+(on a row without the attribute it stored a number set, and the row no longer
+read), and a retained update applied it as given (a difference removed
+nothing); a retained `.add()` of a `NumberValue` died, and a set of them was a
+union holding a member twice (refused) or a difference removing nothing.
+An update that sets an attribute and also changes it by `.subtract()`, `.add()`
+or `.append()` (`.set({ m: 9 }).subtract({ m: 1 })`) is sent with two
+overlapping paths wherever its record operations go into the expression (a plain
+entity's, a unique one's, setting the unique field or not), and DynamoDB refuses
+it (`DynamoValidationError`, nothing written); where the update applies them to
+the row it read and writes the result (a retained entity's, one computing an
+index composite), they apply in order, the set and then the change (`8`).
+Unchanged from 1.40.0, and pinned by `connected.overlapping-record-ops.test.ts`.
 Path operations combined with a unique-constraint change, or with a computed
 change to an index composite, are rejected with a `ValidationError`: both are
 read-then-write updates that cannot carry path expressions. Record retain
@@ -3406,6 +4296,102 @@ entries are dropped first (`asStored`), since the marshaller drops them too.
 List `append` / `prepend` validate each element, but cannot enforce list-level
 checks such as `maxLength`: DynamoDB builds the list server-side. `ADD`,
 `DELETE` and `SUBTRACT` are unchanged.
+
+**A path write into a union's member (#238).** The schema at a path is the one
+`childAtSegment` reaches by taking, at each union on the way, the first member
+that holds the next segment, and through 1.40.0 that member alone checked a
+`pathSet` value: `pathSet(["tag", "kind"], "b")` on
+`Union([{ kind: "a", x }, { kind: "b", y }])` was refused with `Expected "a"`
+whatever the row held, as was `pathSet(["vary", "v"], "tt")` on
+`Union([{ v: number }, { v: string }])`. A value that member refuses is now
+written as the first other way through the unions on the path takes it
+(`pathSet` and `waysTo` in `makePathValueEncoder`: each member of each plain
+union), encoded and validated there; a value no way takes is refused as
+before, with the first member's issue. `pathAppend`, `pathPrepend` and
+`pathIfNotExists` values are checked by the first member alone, as 1.40.0
+checked them.
+
+Every update with a `pathSet` into a union's member is then judged by one
+function, `reads` in `makePathValueEncoder` (called by `unionRefusal` in
+`Entity.ts`), over every clause of the update in the same field: each
+`pathSet` and `pathRemove` where the schema says what each member reads after
+it, and every other path operation (`pathAdd`, `pathSubtract`, `pathAppend`,
+`pathPrepend`, `pathIfNotExists`, `pathDelete`, a copy) and record operation
+(`.set`, `.add`, …) on the field as a clause it can't judge. It asks one of two
+questions.
+
+- **A value only another member takes** (one 1.40.0 refused) is written only
+  where what the update leaves is read **whatever the row holds**, at EVERY
+  union the field's clauses pass, passed through or ended at, at any depth: at
+  that union either (a) every member reads what the clauses leave below it, or
+  (b) they write every property of one member that reads it, so that the
+  update itself sets which member the row holds. A property counts as written
+  when it's set, removed (an optional one), or holds a plain struct every
+  property of which is written in turn, or a union one member of which is
+  (`fixes`). A member without the next segment reads past it (a plain struct),
+  or holds nothing there for DynamoDB to write into (a scalar, a list given a
+  property, a struct given a position), which refuses the update and leaves
+  the row as it was. Anything the schema can't judge (an increment, an append,
+  a copy, a whole-field write, a removed list position, a member that isn't a
+  plain struct: a `Schema.Class`, a transformation) isn't read, nor are two
+  clauses on one path, which DynamoDB refuses. Anywhere else the update is
+  refused as 1.40.0 refused it, with the first member's issue. A path write
+  reads nothing of the row, and a value written into a member the row doesn't
+  hold leaves that member's other properties under it: `pass.inner.v = "str"`
+  on `Union([{ kind: "a", inner: { v: number } }, { kind: "b", inner: { v:
+  string } }])`, whose members both hold `inner`, leaves `kind: "a"` beside a
+  string on a row of the first, which no read takes. It's refused, as on
+  1.40.0; `pass.kind = "b"` beside it is sent, and reads as `b` on either row.
+- **Otherwise**, values the first member takes, as 1.40.0 checked them, are
+  sent as 1.40.0 sent them unless no row can read what the update leaves: one
+  member at each union, the same for every clause under it, must read every
+  clause, a clause the schema can't judge taken as read. Refused with nothing
+  sent where none can (`ValidationError`, `update.pathSet`):
+  `tag.kind = "a"` beside `pathRemove(["tag", "x"])`, which 1.40.0 applied,
+  leaving a row no read takes. A value the first member takes is not checked
+  against the others: `pass.inner.v = 7` is sent as 1.40.0 sent it, and on a
+  row holding the second member its read-back reports a row that no longer
+  matches the model, as 1.40.0's did. Refusing it would refuse what 1.40.0
+  wrote correctly on every row of the first member.
+
+A path through a union whose members rename their keys (`Schema.encodeKeys`)
+is written by the names they store (see "A path below a struct that renames
+its keys"), where 1.40.0 wrote the names given, beside what the row held, where
+no read took them. That write is one 1.40.0 never made, so it's judged by the
+first question too, each such member read as the struct it renames (`readAs`),
+and refused with nothing sent where it fails: `renamed.kind = "b"` alone, or
+`pathRemove(["renamed", "x"])` where a member requires `x`, would leave a row no
+read takes. That holds only where the members name every segment alike
+(`unionNamedExactly` in `internal/SchemaAccessors.ts`): each name any member
+takes is stored under one name by every member taking it, and each stored name
+is reached by the same names in every member storing it. Where they don't (one
+member storing `x` as `y` and the other `y` as `x`, a discriminator stored as
+`ka` in one and `kb` in the other, a property stored under a name another
+member stores a different property under), no one name is right for every row:
+from that union on the path is written as given, as 1.40.0 wrote it, and isn't
+judged (a value only another member takes stays refused as on 1.40.0). Two such
+writes are left as 1.40.0 behaves, and named: with the discriminator stored
+under different names, `kind = "b"` beside `y = 2` writes the given names, and
+the row reads as the member it held; and a discriminator set alone to another
+member's tag where 1.40.0 sent it (`kind = "a"` on a row holding `b` in a field,
+any member's tag in a sparse map's entry) is sent as 1.40.0 sent it, leaving a
+row no read takes. A path through a
+recursive union (`Schema.suspend`) is written as 1.40.0 wrote it
+(`helpers/UnionMemberWrites.ts`, `fixtures/union-member-writes-1.40.0.json`:
+standalone, transaction, retained and unique, both `escapeKeys`).
+
+So `tag.kind = "b"` beside `tag.y = 2` is sent, and reads as `b` on a row of
+either member; `tag.kind = "b"` alone, or beside `pathRemove(["tag", "y"])`
+(`b` requires `y`), `tag.x = "tt"`, `tag.y = "s"` or `pathAdd(["tag", "y"], 1)`,
+is refused as on 1.40.0; `vary.v = "tt"` is sent, its member being all of `v`;
+`outer.g.kind = "b"` beside `outer.g.y = 2` on
+`Union([{ mode: "a", g: A }, { mode: "b", g: B }])` is refused as on 1.40.0
+(`mode` isn't written), and sent beside `outer.mode = "b"`. Each request is the
+one 1.40.0 sent for the same paths, but for the value
+(`test/fixtures/union-path-writes-1.40.0.json` and
+`union-path-writes-passed-1.40.0.json`, `helpers/UnionPathWrites.ts`: plain
+and retained entities, alone and in a transaction, on the recording table and
+DynamoDB Local; every case of each fixture is asserted).
 
 **Path operations on key and unique fields (#133).** DynamoDB evaluates a path
 operation, so compiling one on an index composite or unique field would change
@@ -3428,16 +4414,17 @@ Clearing a field a row can't lack is refused with a `ValidationError` before any
 A `pathRemove` below a field is refused only when every value the field reads that holds the path is left one it can't read, and no value that holds what's above the path is without it (`pathIsRequired`). The verdict is exact or unknown. The walk from the field to the removed property or position takes every way through the schema, through unions at every level, and a refusal needs every node on every way to be one the guard models exactly as a read decodes it:
 
 - a struct with one or more fixed properties and no index signature (`Schema.Struct({})` reads any value but `null` and `undefined`, so it isn't one);
-- a record with one index signature, keyed by plain `Schema.String`, and no fixed property;
+- a record with no fixed property and one or more index signatures, each keyed by plain `Schema.String` or by a template literal of plain strings and string literals: a key is read by every signature it matches (Effect checks it against each), and one it matches none of isn't read at all;
 - a list: an array, or a tuple whose rest, if it has one, is one element with nothing after it;
 - a union, as each of its members;
 - a scalar (`null`, `undefined`, a string, number, boolean, bigint or symbol, a literal, a unique symbol, an enum, a template literal), which holds no path;
 - a `Schema.Class`, as its struct;
-- a `Schema.suspend`, as what it suspends, looked at before it's unwrapped.
+- a `Schema.suspend`, as what it suspends, looked at before it's unwrapped;
+- a struct that renames its keys as it's stored, as `Schema.encodeKeys` builds it, as the struct of its properties under their stored names (#238). It's recognised by its shape alone, and the model's functions are never run: one transformation of two plain functions to a bare struct of as many properties, whose `i`-th holds `SchemaAST.toEncoded` of the struct's `i`-th (optionality included), and no property named like an array index (which JavaScript lists first, so the order wouldn't pair them). A stored property is then the encoded form of its own, so a key the stored struct requires is required whatever the functions do. Any other transformation of a struct (one that defaults a key its stored struct may leave out, say) is a transformed node. A removal below one is sent as 1.40.0 sent it: on stored `{ amount?: number }` read as `{ amount: number }` with `amount ?? 0`, `pathRemove(["meta", "amount"])` succeeds and the row reads `{ amount: 0 }`.
 
-Each only when it carries no transformation (a decoding default and a key rename are ones) and no check (`checks` or `encodingChecks`); a constructor default takes no part in a read. Any other node makes the verdict unknown, and the removal is sent as 1.39.0 sent it: `Schema.Unknown`, `Schema.Any`, a declaration, a record with several index signatures or a key that isn't plain `Schema.String`, a struct with an index signature, a tuple with elements after its rest, a transformed or checked node, and any node kind the guard doesn't know. Unknown is never taken for "required", and an empty or partial collection never stands for a verdict. The list lives in one place in the code (`Modelled` in `SchemaAccessors.ts`).
+Each only when it carries no transformation (a decoding default is one, and so is a key rename but for the struct above) and no check (`checks` or `encodingChecks`); a constructor default takes no part in a read. Any other node makes the verdict unknown, and the removal is sent as 1.39.0 sent it: `Schema.Unknown`, `Schema.Any`, a declaration, a record keyed by anything else, a struct with an index signature, a tuple with elements after its rest, a transformed or checked node, and any node kind the guard doesn't know. Unknown is never taken for "required", and an empty or partial collection never stands for a verdict. The list lives in one place in the code (`Modelled` in `SchemaAccessors.ts`).
 
-At the end of the walk, a property is required where a struct declares it on every way there and a row can't be without it (`rowCanLack`, asked of the property as of a field: a required key nothing fills, whose absent attribute isn't one of its values). A record's entry never is, and a struct without the property holds no such value, so removing it leaves the value as it was (DynamoDB's `REMOVE` of a missing map key changes nothing): `pathRemove(["f", "x"])` on `Union([{ x, y }, { y }])` or on a tagged union whose other member has no `x` is sent, as on 1.39.0. A struct without a property on the way doesn't read what a value holds under it, so it may read what the removal leaves of another member's value, and the removal is sent: `pathRemove(["f", "a", "x"])` on `Union([{ a: { x, y }, b }, { b }])` reads back as `{ b }`, as on 1.39.0. A list closes up when an element is removed, so a list position is judged by length alone, over the lists every way reaches: each accepts from its required positions to all of them, or with a rest any length from its required positions on, and an element that can fill a missing one (a decoding default, a middleware, a suspension) makes the lengths unknown. The removal is sent where a list may be too short to hold the position (DynamoDB's `REMOVE` past a list's end changes nothing) or one shorter than a length a list accepts is a length a list accepts, and refused otherwise. So any position of a `[string, string]`, a `NullOr([string, string])` or a `Union([[string, string], [number, number]])` is refused, and `f[0]` of a `[string, string?]`, either position of a `Union([[string, string], [string]])`, `f[2]` of a `Union([[string, string, string], []])` and an array's element are sent, as on 1.39.0. Length alone can't see that what's left puts a value where its position can't hold it (`f[0]` of a `[string, number?]`) or is a list only a member its tag rules out accepts, so such a removal is sent and leaves a row that can't be read, as on 1.39.0. A way the path can't take (a property of a list or a scalar, a position of a struct, a position past a tuple's last) has no say, since DynamoDB refuses the removal on such a value, and where no way holds the path the removal is sent and DynamoDB refuses it, as on 1.39.0. So a removal below a record with two index signatures is sent in either order of its signatures, as on 1.39.0, even where it leaves a row that can't be read; one below a tuple with elements after its rest, or in a union with a `Schema.Unknown` member, is sent and the row reads, as on 1.39.0; and `.remove(["f"])` and `.set({ f: undefined })` of a required field are refused as before. `PathIsRequired.property.test.ts` holds the guard to Effect's own decoder over generated schemas: a refusal is never wrong.
+At the end of the walk, a property is required where a struct declares it on every way there and a row can't be without it (`rowCanLack`, asked of the property as of a field: a required key nothing fills, whose absent attribute isn't one of its values). A record's entry never is, and a struct without the property holds no such value, so removing it leaves the value as it was (DynamoDB's `REMOVE` of a missing map key changes nothing): `pathRemove(["f", "x"])` on `Union([{ x, y }, { y }])` or on a tagged union whose other member has no `x` is sent, as on 1.39.0. A struct without a property on the way doesn't read what a value holds under it, so it may read what the removal leaves of another member's value, and the removal is sent: `pathRemove(["f", "a", "x"])` on `Union([{ a: { x, y }, b }, { b }])` reads back as `{ b }`, as on 1.39.0. A list closes up when an element is removed, so a list position is judged by what's left, over the lists every way reaches (`positionRemoval`): each accepts from its required positions to all of them, or with a rest any length from its required positions on, and an element that can fill a missing one (a decoding default, a middleware, a suspension) makes the lengths unknown. The removal is sent where a list may be too short to hold the position (DynamoDB's `REMOVE` past a list's end changes nothing). Otherwise each list a value is held by is paired with each list that may read what's left, and the pair refuses it when the reading list takes no list one shorter, or what's left puts an element where the reading list reads nothing it can be (before the position the element that was there, from it on the one after: `listRefuses`, by `disjoint`, which compares the kinds and literal values a node can be stored as, and calls any transformed or unknown node able to be anything), or a struct on the reading way declares a property beside the path, other than the path's own, that no value the holding way's struct gives it can be, and one of the two can't be without (`besideDisjoint`: a tag). The removal is refused when every pair refuses it (#238). So any position of a `[string, string]`, a `NullOr([string, string])` or a `Union([[string, string], [number, number]])` is refused, as are `f[0]` of a `[string, number?]` (what's left puts the number where the string was) and `p[0]` of `{ kind: "a", p: [string, string] }` beside `{ kind: "b", p: [string] }` (only the member the tag rules out reads what's left); and `f[0]` of a `[string, string?]`, either position of a `Union([[string, string], [string]])`, `f[2]` of a `Union([[string, string, string], []])`, `f[1]` of a `[string, number?]`, the same tagged union with either tag optional, and an array's element are sent, as on 1.39.0. A way the path can't take (a property of a list or a scalar, a position of a struct, a position past a tuple's last) has no say, since DynamoDB refuses the removal on such a value, and where no way holds the path the removal is sent and DynamoDB refuses it, as on 1.39.0. A record with several index signatures reads a key through every one it matches and ignores a key none matches, so each signature the key matches is a way, judged as an alternative (Effect applies every one, so this asks more than a read does, never less): on `{ [open-*]: [string, string?], [fixed-*]: [string, string] }`, `["fixed-k", 0]` is refused and `["open-k", 0]` and `["other-k", 0]` are sent, in either order of the signatures. One below a tuple with elements after its rest, or in a union with a `Schema.Unknown` member, is sent and the row reads, as on 1.39.0; and `.remove(["f"])` and `.set({ f: undefined })` of a required field are refused as before. A `pathRemove` below a sparse map's entry (`["m#k", "x"]`) is judged as a read rebuilds the map: the entry's key, then the rest of the path, against the map's own schema (`refusedPathRemove`, `readEntryOf`). A map a `field:` rename stores whole has its attribute read in place of its entries whenever a row holds it, so a path below one of its entries isn't judged. A removal of a whole entry is refused as before, naming `.removeEntries`. A removal is judged against the update as a whole (`pathIsRequired`'s `beside`: what the update's other clauses write or remove in the same field, or the same entry, `clausesOf` in `Entity.ts`). A list position's judgement reads the row's list and what's beside the path, and another clause of the same request can change either: `f.kind = "b"` beside the removal of `f.p[0]` above leaves `{ kind: "b", p: ["second"] }`, which reads, and `f.p[2] = "third"` beside it leaves a list as long as before (DynamoDB appends a position past the end, and every path in an update names what the item held). Where another clause writes or removes something the judgement reads (`touches`: another position of the list or something below one, a sibling of a property on the way where a struct holds it, the path itself, or what's above it or below it), the position is judged as 1.40.0 judged it, by length alone (`lengthsAlone`, with a record 1.40.0 didn't model unknown), and below a sparse map's entry, which 1.40.0 didn't judge, it isn't judged. Another element of a list further up, or a record's other key, isn't read. A property's judgement reads nothing of the row: no other clause changes it, short of one on the path, above it or below it, beside which DynamoDB refuses the removal (`ValidationException`: two document paths overlap), so it stands (`helpers/AccompaniedClears.ts`, `fixtures/accompanied-clears-1.40.0.json`). The guard is asked of the path as stored (`storedSegments`), and a struct that renames its keys (`Schema.encodeKeys`) is modelled as a struct keyed by the stored names, each with its property's own type and optionality (`renamedStruct`; one with checks of its own isn't modelled, and the removal is sent). 1.40.0 modelled no such struct, so a list position below one, beside another clause that touches it, isn't judged. `PathIsRequired.property.test.ts` holds the guard to Effect's own decoder over generated schemas: a refusal is never wrong.
 
 An update names model fields, never what the library stores. `refusedAttributeNames` refuses, in every record and path operation, another field's stored name (naming the field to use), a secondary index's key attribute, any `__edd_*` attribute, the version and timestamp attributes, `deletedAt` and the TTL attribute on an entity configured to use them, an immutable field and a sparse map; `.remove` and a single-segment `pathRemove` also refuse a sparse entry's stored name, naming `.removeEntries`, while the other path operations keep it, as that's how a counter entry is added to. A name the model simply doesn't know stays allowed, since it's the only way to clean up an attribute the model no longer declares.
 
@@ -3691,6 +4678,11 @@ reach the 16 MB request limit), resending `UnprocessedItems` with
 `DynamoError` stating how many rows remain and exactly how many it had deleted
 (#144). A sentinel an update
 writes for a changed value carries its constraint's `ttl`, as a put's does.
+A reservation no row holds any more (a release that never happened, as a delete
+of a `Schema.BigInt` unique value on 1.39 and earlier left it, or a write outside
+the library that changed the value) is reported by `rekey` in
+`report.reservations` with `reservations: true`, and released with
+`releaseOrphanedReservations` and `writesStopped` (§7, "Orphaned reservations"), under the same ownership rule.
 
 **`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
 sentinel, snapshot the replaced item, or tell whether to store a default or keep
@@ -3723,6 +4715,10 @@ way, and a sentinel release that raced is planned again from a fresh read
 | A defaulted index composite: omitted, as `omitsIndexedDefault` reads it | Keeps what the row holds; on a new row, the default | Yes |
 
 An empty set follows the second row. **Clearing a secondary index composite reads first**, because what's left of a half depends on the row, and the result is what `.set(...).remove([...])` leaves: `[owner, und]` given `und: undefined` truncates to `owner_o1`, and `[und]` loses the half under `'sparse'` and `'preserve'` alike, a clear being the cascade override. Without it the key would outlive its value. A primary composite, an immutable field, and a date the library stamps aren't cleared this way, so those stay one write. So does a clear no key holds. This read happens only when the input clears a composite: no other upsert pays for it.
+
+**A sparse map's default is stored beside the row's entries, on every path (#236).** An upsert given `undefined` for a sparse map whose decoding default holds keys writes the default's entries and keeps the ones the row holds, as the expression path's `SET` of each entry does: a row holding `data#k`, given a default `{ d1, d2 }`, holds `data#k`, `data#d1` and `data#d2` afterwards, whether the upsert is one `UpdateItem` or reads first (`unique`, `retain`, an omitted defaulted index composite). 1.39.0 gave this one input three outcomes by configuration: the expression path stored the default's entries beside the row's; `unique` naming a field outside the primary key (`unique: { note: ["note"] }`, alone or beside a primary-key one) and `retain` removed every entry and wrote none; `unique` naming only primary-key composites (`unique: { id: ["id"] }`) and the defaulted-composite path left the row's entries alone and wrote none. Nothing in the input names those configurations, so they don't decide what it stores: every path gives the expression path's outcome, as it has since 1.40.0. Leaving the field out keeps the row's entries and writes none, on every path, as on 1.39.0. A default holding a key the write refuses is refused citing the default, before anything is sent, as since 1.40.0: an empty key and one holding `#` on every path (1.39.0 refused them on the expression path and wrote none of the default on the others), and a composed attribute name over 255 bytes where the upsert writes the row whole, with `unique` naming a field outside the primary key or with `retain` (1.39.0 wrote none of the default there). The expression path, `unique` naming only primary-key composites and the defaulted-composite path store that one (on 1.39.0 the expression path stored it, and the other two wrote none of the default). `UpsertSparseDefault.test.ts` and `connected.upsert-sparse-default.test.ts` pin each path.
+
+**`undefined` for a defaulted field is its default, whatever form the rest of the input is in (#236).** A write's input may be in the domain form (encoded) or the stored form (decoded, then encoded), and `internal/InputForm.ts` (`encodeInput`) is the one decision of which, for every write that encodes one: `put`, `create`, `upsert`, `append`, an update's payload, and the put a transaction or a batch builds. `undefined` given for a field with a decoding default is a stored-form value (the domain side has no `undefined`), so it decoded to the default only where every other value was in the stored form too: `{ id, n: 1, data: undefined }` stored `data`'s default beside `n: Schema.Number` and was refused beside `n: Schema.NumberFromString` (`ValidationError`, `put.decode` / `upsert.decode` "Expected object at ["data"]", in a transaction or a batch "Expected string at ["n"]"), by every write. Where neither form takes an input whole, each field it gives as `undefined` now holds what a decode of that field alone makes of it, and the input is encoded: `data` holds its default, and the write stores what it stores beside `n: Schema.Number` (a `put` or `create` the default alone, an `upsert` the default's entries beside the row's). A field whose decode refuses `undefined` (a key-only default) or keeps it is left as given. An input either form takes is written as it was, and one none takes is refused with the issue it was refused with. `UndefinedBesideTransform.test.ts` and `connected.undefined-beside-transform.test.ts` pin each write.
 
 **Transaction puts.** `transactWrite` and `EventStore.append`'s
 `additionalItems` plan a put of a versioned or unique-constrained entity with
@@ -4027,6 +5023,8 @@ The `DynamoClient` service provides:
 | `query` | Entity queries, version history, soft-deleted list |
 | `updateItem` | Entity updates (partial, atomic version increment) |
 | `transactWriteItems` | Unique constraints, versioned writes |
+| `executeStatement` | `insert` |
+| `executeTransaction` | `insert` of an entity with unique constraints |
 | `transactGetItems` | Batch reads with consistency |
 | `batchGetItem` | Batch operations |
 | `batchWriteItem` | Batch operations |
@@ -4271,6 +5269,235 @@ it is documented instead (`delete` the key first). `delete` retries the
 `UnprocessedItems` of its `BatchWriteItem`s with `Batch.write`'s backoff and
 bound (5 retries), then fails with a `DynamoError`.
 
+**`delete` deletes the aggregate's own rows (#241).** It deletes the rows of the
+partition read whose `__edd_e__` is one of the aggregate's entity types
+(`ownedTypes`: its root's, each edge's and each sub-aggregate's, recursively),
+and leaves every other row there: an entity's, another aggregate's, one with no
+type. The read is the one 1.40.0 sent, nothing is keyed by value, and every row
+of its types is deleted, whoever wrote it, as before; a partition holding only
+its own rows gets the requests 1.40.0 sent, byte for byte
+(`fixtures/aggregate-delete-1.40.0.json`). A partition holding none of its rows
+fails with `AggregateAssemblyError` ("No items found"), as an empty one does,
+and nothing is deleted. Up to 1.40.0 it deleted every row the read returned,
+foreign rows included. It reads the same with `ownsRows` or without it
+(`AggregateDeleteRows.test.ts`, `connected.aggregate-delete-rows.test.ts`).
+
+**A value that keeps what it's given reads as on 1.40.0 (#241).** Every row
+beneath a sub-aggregate carries its discriminator, a `one` edge's row its own,
+every edge's row the root fields `context` copies there, and every row the
+aggregate's partition key attribute and, with a collection index, the collection
+sort key's copy. A read removes what `readTakesOff` says (below) and the stamps
+the value doesn't declare (`stampsToStrip`), and nothing else: a struct or a
+class drops what it doesn't declare, and a value that keeps what it's given
+(`Schema.Unknown`, `Schema.Any`, a record, a declaration) is stored as its row's
+attributes, so its row is its value, and it reads back with those attributes
+inside, as on 1.39.0 and 1.40.0. That is the rule, not a gap: the row can't say
+whether the value held such a key or the library wrote it, so the two can't both
+round-trip without a stored-format change, and the one 1.40.0 got right (a value
+holding the row's own value there, or none) wins. A custom `assemble` is handed
+the rows with them, as before.
+
+**`create` judges a value given where the library writes its own (#241,
+`EDD-9159`).** Every row holds attributes the library writes over what its value
+holds there: `__edd_e__`, the partition key attribute, `sk` and, with a
+collection index, the collection sort key's copy (`rowKeyAttributes`); the root's
+row its list keys when every list composite has a value (`listKeyAttributes`,
+sparse); and every row beneath the root the attributes `context` copies from the
+root (`mergeContextValues`). Up to 1.40.0 a value given for one of those names
+was replaced by the library's, and a read handed back something else: the
+library's value, its stored text where the member declares the name in another
+form, nothing, or a failure (`pk: { field: "id", composite: ["id"] }` read `id`
+back as the key text; a `many` element's sort key composite named `sk` failed
+every read). `create`, and only `create`, now refuses a value exactly when a
+`get` right after would not return it (`refuseGivenOverRows`,
+`AggregateDecompositionError`, nothing sent):
+
+- **The judgement, one function at every place.** Each row as the write builds
+  it is read as a `get` reads it: unmarshalled, its packed attributes unpacked
+  (`unpackAggregateItems`), taken as its member's value (`rowValueAsRead`:
+  renamed, sparse fields as a read restores them) and decoded by the member's
+  own schema, the decode assembly runs (`readAt`: the field's schema where the
+  member's places the name, `placedFields`; the value as it is where the member
+  keeps what it's given; otherwise the whole value's schema, so a union, record,
+  declaration, `Schema.suspend` or `StructWithRest` is read whole). What it
+  reads is compared with the value given, decoded (`DecomposedItem.value`), by
+  `sameValue`: sets (and `HashSet`s) by their members, maps by their entries,
+  `Date` / `DateTime` by instant (and zone where the type carries one), a
+  `Uint8Array` by its bytes, a `Redacted` by what it holds, `Option`, classes and
+  `Data` structurally; otherwise strictly, as a read returns it: a number by
+  `Object.is` (`NaN` is `NaN`, `-0` isn't `0`), a `bigint` only beside a
+  `bigint`, a `BigDecimal` by its digits and its scale (`1.5` isn't `1.50`). Each
+  of those three 1.40.0's `get` handed back as the root's value. Never
+  `Equal.equals`: a `BigDecimal` caches its normalized form on the instance
+  compared, which would add a property to the caller's value.
+  Equal: written byte for byte as on 1.40.0. Different, or a read that fails
+  there: refused. Given no value, a name the member's schema places is read too,
+  unless the member declares it with the root's own schema: the library's value
+  is then the member's (a context copy), and only a read that fails there is
+  refused (`unreadOverRowReason`; a root `Schema.NumberFromString` copied onto a
+  member declaring `Schema.Number`, which 1.40.0 stored and every read failed
+  on). The places: a `one` edge's value, a `many` element, a
+  sub-aggregate's root, and the root's own row; a root, or a sub-aggregate,
+  whose schema can't place a name (a union, `Schema.suspend`) is read whole from
+  the rows built, by the schema `get` decodes it with (`nodeReadOf`: the root by
+  `assembleAggregate`, a sub-aggregate by its field's schema in its parent); a `many` edge with a custom
+  `decompose` or `assemble` is read whole, through them (`customOverRowReason`):
+  refused where its read with the library's values differs from its read with
+  the values its rows were given, or, its rows given none, where its read with
+  the root's `context` values fails (`customUnreadReason`).
+- **The value given is looked up by the one name the input holds it under**
+  (`inputNameIn`): a `many` edge's `inputField` where the input holds that name,
+  else the field's. Hydration's ids, the rename before decoding
+  (`renameInputFields`, now applied whether or not an id is fetched: 1.40.0 left
+  a value under its `inputField` unrenamed when no id was fetched and refused the
+  `create` with a `ValidationError`, though the input type names it so) and the
+  judged value (`inputFor`) all go through it. A `${field}Id` is not judged: the
+  caller gives the id, not the value hydration stores.
+- **The message** names the member and the field, and shows the value given and
+  what a read returns, each rendered so the two can be told apart (`rendered`: a
+  string quoted, a number bare, `6n`, `Set { "a", "b" }`, `DateTime.Utc(…)`,
+  `Uint8Array [1, 2, 3]`), or the read's failure.
+- **Not judged, written and read as on 1.40.0:** a name given no value (not
+  given, a decoding default, an optional field left out) whose read succeeds; a
+  discriminator, the
+  library's to fill whatever the value holds (a `Schema.BigInt` `1n` for a
+  discriminator `1`, an element copied between sub-aggregates of one model); a
+  name the library doesn't write on that row (an index key name no list key
+  composes there, such as `gsi1pk` on an edge or on a root whose list composite
+  has no value, and a timestamp the library stamps), which a read takes off as
+  1.40.0 did; and a value nested below the top level, which is no attribute of
+  the row. `Aggregate.make` refuses nothing, pure or operational: whether a write
+  gives a field another value is known only at the write, and a required field
+  whose every value is the library's (`csk: Schema.Literal("$app#v1#note")`)
+  round-trips.
+- **`update` isn't judged.** A value given there for such a name is replaced by
+  the library's, as on 1.40.0. The state an update mutates is what its read gave,
+  and what the read filled in (a context copy, a list key's or the collection
+  sort key's text, a discriminator) can't be told from what the caller set, so a
+  judgement would refuse updates 1.40.0 made. What it returns is what a read
+  after it returns ("What `update` returns", below).
+
+The pairings (`AggregateContextPairings.test.ts`,
+`helpers/AggregateContextPairings.ts`, against
+`fixtures/aggregate-context-pairings-1.40.0.json`) run every scalar, date,
+`bigint`, set, byte and opaque declaration of a root `context` field against
+every declaration a member gives it (the same form, another form, optional,
+renamed with `field:`, stored packed), at a `one` edge, a `many` element, a
+sub-aggregate's root and under a custom `decompose`, given the root's value,
+another, or none: where 1.40.0's `get` returned the value as given, `create`
+sends, stores and reads what 1.40.0 did; where it returned another or failed, it
+is refused. A `many` value given under its `inputField`
+(`AggregateInputField.test.ts`, `fixtures/aggregate-input-field-1.40.0.json`) is
+judged at the root and beneath a sub-aggregate, with a ref hydrated and without,
+under each `escapeKeys` setting.
+
+Rows already stored read as before (`AggregateHeldOverRows.test.ts`,
+`connected.aggregate-held-over-rows.test.ts` against
+`fixtures/aggregate-held-over-rows-1.40.0.json`; `AggregateContextRead.test.ts`,
+`connected.aggregate-context-read.test.ts` against
+`fixtures/aggregate-context-read-1.40.0.json`; `AggregateRowKeyFields.test.ts`,
+`connected.aggregate-row-key-fields.test.ts` against
+`fixtures/aggregate-row-key-fields-1.40.0.json`, the declared prefix names against
+`fixtures/aggregate-read-strip-1.40.0.json`; `AggregateDiscriminatorRead.test.ts`,
+`connected.aggregate-discriminator-read.test.ts` against
+`fixtures/aggregate-discriminator-read-1.39.0.json` and
+`fixtures/aggregate-discriminator-read-opaque-1.40.0.json`). **The upgrade sweep**
+(`AggregateUpgradeSweep.test.ts`, `connected.aggregate-upgrade-sweep.test.ts`,
+`helpers/AggregateUpgradeSweep.ts`) takes every fixture shape as published 1.40.0
+created it (`fixtures/aggregate-upgrade-sweep-1.40.0.json`) and continues it on
+this release: a `get`, a no-op `update`, three changed updates, an update whose
+second transaction fails, its retry and a no-op again, each compared with what
+1.40.0 sent, stored and returned, apart from the changes the changeset names,
+each asserted on this release's own run. It runs every shape created by this
+release too, where the creates `EDD-9159` refuses are named and every other one
+sends and stores what 1.40.0 did.
+
+**What a read takes off (#241).** `readTakesOff(row, name)` states the one rule every read applies (the root's, a sub-aggregate's root's, an
+edge's): `__edd_e__`, `pk` and `sk` always; a name
+1.40.0 took off that kind of row (`takenOffThrough140`: on the root's row the
+index keys `gsi1pk` … `gsi5sk`, `lsi1sk`, `lsi2sk`; on a sub-aggregate's root row
+any name beginning `pk`, `sk`, `gsi` or `lsi`; on an edge's row any name
+beginning `gsi` or `lsi`) unless the row's value declares it there and the
+library writes no key attribute of that name there. So a declared `gsiNote` on a
+`one` edge, `skills` on a sub-aggregate with edges of its own, or an optional
+`gsi2pk` on a root with no list key of that name reads back as given (1.40.0
+took it off: a `Missing key`, or the field left out), and a name the value
+doesn't declare is taken off exactly as on 1.40.0, another writer's index key
+included. A sub-aggregate with no edge of its own is read as a `one` edge is
+(`subAggregateRowKind`), so its row follows the edge's rule.
+
+**What `update` returns (#241).** 1.40.0's object: the state the mutation
+produced, as decoded (`decoded`), with its classes, element order and own
+properties (an explicit `undefined` stays); where a node declares a stamp, 1.40.0's
+assembly of the rows read with the writes applied, as 1.40.0 built it. One change
+(`withStoredContextCopies`, `contextCopiesAsStored`): where a member's value holds,
+own, a copy of a `context` field (`contextCopiesOn`), the copy is set to what its
+row holds after the write, read as a read reads it there; a copy equal to it
+(`sameValue`) is left as the value holds it. 1.40.0 returned the copy the state was
+read with, the old value after an update changing the root's. A copy is never
+added or removed, and a `many` edge with a custom `decompose` or `assemble` keeps
+1.40.0's copies (which row a value came from can't be told there). A value whose
+copy is corrected, and each value holding it, is built as a read builds it
+(`rebuiltWith`): a plain object copied, a `Schema.Class` instance by its class's
+constructor (its private fields and methods work); any other object, or one its
+constructor refuses, is 1.40.0's, unchanged. Never a copy by prototype
+(`AggregateUpdateInstances.test.ts`). Pinned against
+published 1.40.0 whole (`AggregateUpdateResult.test.ts`,
+`fixtures/aggregate-update-result-1.40.0.json`: class, order, own properties) and
+over every shape of the upgrade sweep. A `get` right after still reads otherwise
+where it did on 1.40.0: `many` elements out of key order, a custom `assemble`'s
+derived values, a discriminator or key attribute the value holds another value in,
+a name a read takes off, the copies a read hands back inside a `Schema.Unknown`
+value the update added, an element removed whose row stays (a type another
+aggregate shares, §7 "Which rows in its partition are an aggregate's").
+
+**A context copy the root's value has moved past (#241).** A group one of whose
+rows holds a context attribute's copy that differs from the root's stored value
+(the row's attribute against the root row's first, then the copy read through its
+member against the root's value, `staleContextGroups`) counts as changed and is
+written: rows an earlier update left behind when a later group's transaction
+failed after the root's committed. 1.40.0 left them holding the old value until
+something else in their group changed. **What is a copy is decided once, from the
+definition (`contextCopiesOn`):** a `context` name on a row beneath the root,
+except an attribute the library manages there whatever `context` names
+(`__edd_e__`, the partition key attribute, `sk`, an index key, a timestamp it
+stamps, the node's discriminator), whose value is never the root's. So an aggregate
+nobody left half-written sends exactly 1.40.0's requests on every update, a no-op
+included (`AggregateManagedContext.test.ts`,
+`fixtures/aggregate-managed-context-1.40.0.json`: ten no-ops, a root-only update,
+ten no-ops, on rows 1.40.0 wrote and on this release's, for a context name equal
+to a discriminator, a timestamp, a key attribute, a member's own field and a key
+composite).
+
+**Rows under the other `escapeKeys` setting's text (#241, `EDD-9160`).** A
+sort key built from a `many` element's composites or a discriminator value can
+compose different text under the two settings: a `$`, `#` or other escaped
+character, a number other than a non-negative integer below 1e16 (a date stored as
+an epoch before 1970 among them), a negative `bigint`, and an `entity:` edge's
+composite its model encodes, which this release composes from the domain value
+under `escapeKeys: true`. Rows written before the setting was turned over stay
+under the old text until `rekey` moves them. Up to 1.40.0 an update writing such a
+group put its rows under the new text beside the old, so every element read twice,
+a sub-aggregate whose root was doubled failed to read, and where one value's text
+under one setting is another's under the other (`a b` escapes to `a%20b`), one
+element's row overwrote another's. Before a group is written, each of its values
+is taken with the row it was read from (`rowsReadAt`, by the value's path) and the
+row's stored sort key compared with the key this configuration composes for that
+value (`sortKeyOf`, the function the write keys rows with); any difference is
+refused (`refuseOtherSettingRows`), with a `ValidationError` naming the member,
+both keys and `rekey`, after its `Query` and before anything is written. Not
+refused, and sent as on 1.40.0: keys whose text is the same under both settings; a
+row the update moves itself (an `entity:` edge's under 1.40.0's composition,
+`previousRows`); and a group the update doesn't write. `delete` removes the rows it
+reads, under either setting. `AggregateEscapeFlip.test.ts`
+(`fixtures/aggregate-escape-flip-1.40.0.json`, and every key kind in
+`fixtures/aggregate-escape-flip-kinds-1.40.0.json`: strings needing escapes,
+fractions and negatives, bigints, ISO and pre-1970 epoch dates, an `entity:` edge,
+in a `many` edge, a sub-aggregate's `many` edge and its discriminator, both
+directions, `delete`) runs each step from the rows 1.40.0 wrote, against what it
+sent, stored and read, and from the rows this release wrote under the other
+setting.
+
 **What `create` hydrates, and by what key.** An edge with an `entity` is given
 ids where its input takes them: a `one` or `ref` edge's `${field}Id`, the
 elements of a `many` edge given as ids, and the `${field}Id` of a `many`
@@ -4387,6 +5614,84 @@ too, and one whose identifier names another field is fetched by its key. Up to
 1.39.0 the fetch named the identifier, or `id` without one, and died composing
 the key (`Missing composite attribute`).
 
+**Entity-level refs name the key composite too (#241).** An `Entity.make({ refs })`
+ref's `${field}Id` names the referenced entity's key composite (`refIdAttribute`:
+`refKeyComposite`, so one rule for edges and refs), and its input schema is that
+field's own. Everything that reads a ref's id reads it there: `hydrateRefs` fetches
+under it, `putValuesOf` (`rekey`'s read-back) and a `.within()` row check
+(`storedKeyForm`) read it back from the stored ref under it, and a cascade from the
+referenced entity reads its id off the update's key under it, as the key holds it
+(not its text: a number key's `5` composes `teamid_0000000000000005`, where `"5"`
+composed `teamid_5`, a partition no `put` writes, on 1.39.0 and 1.40.0 alike). Up to
+1.40.0 all of these named the entity's identifier, so a ref to an entity whose
+identifier is another field than its key failed `put` (`get.decode`,
+`Missing key`), and a cascade from it updated nothing. A cascade stores what a
+`put` naming the entity stores: the item encoded through the referenced entity's
+`modelSchema` (`refDataOf`, the one function `hydrateRefs` uses too), written to
+the attribute the target stores its ref in, in its stored form (`Entity._setOf`,
+the function `update` and `upsert` write every field through). Up to 1.40.0 it
+marshalled the domain item under the ref's field name, so a `Schema.Redacted`
+became an empty map (the row then died on every read), a date its `DateTime`'s
+internals, and a renamed ref got a second attribute while keeping its stale copy
+(`fixtures/entity-ref-cascade-1.40.0.json`, `helpers/EntityRefCascade.ts`). What
+both store is what a read of the entity returns, its `DynamoModel.Hidden` fields
+left out, and the referencing entity reads its ref as that (`refHeldSchema`, on
+the hidden set `hiddenFieldNamesOf` that the entity's own read uses too): where a
+hidden field is required, the ref is the target's other fields, a plain object.
+Up to 1.40.0 the ref was read as the whole target, so a `put` naming one wrote its
+row without the field and failed (`Missing key`), as did every read of it
+(`fixtures/entity-ref-hidden-1.40.0.json`, `EntityRefHidden.test.ts`). Named, not
+changed: two levels deep (`League` refs `Club`, which refs `Team`, whose hidden
+field is required), `League`'s write still fails, as on 1.40.0, since its ref's
+read builds a `Club` by the class's constructor, which checks `team` as a whole
+`Team` (`RefHiddenPositions.test.ts`). For an
+entity whose identifier is its key, nothing a `put` sends or stores changes
+(`fixtures/entity-ref-keys-1.39.0.json`, `EntityRefKeys.test.ts`,
+`connected.entity-ref-keys.test.ts`). An entity keyed by more than one composite
+has no key composite: everything reads under its identifier, as before, so a
+`put` fetches under it and its cascade sends the requests 1.40.0 sent. That
+composes the key where the other composites compose without a value (an encoding
+default fills one in), and fails as on 1.40.0 where they don't (`get.decode`,
+`Missing key`), so nothing is refused for the number of composites
+(`fixtures/entity-ref-keys-encoding-default-1.40.0.json`). The identifier is
+still required at `Entity.make`, as before.
+
+**Every write keys a ref's indexes from the id given (#241).** `put` composes an
+index keyed by `${field}Id` from the id in its input; `upsert` and `update` /
+`patch` / a planned `transactWrite` update compose from the hydrated payload,
+which holds the ref, not its id, so `withRefIds` puts the given id back beside it
+before the policy-aware composer runs, and `removedSetOf` names a removed ref's id
+in `removedSet`. Up to 1.40.0 an upsert wrote no key for such an index, and an
+update reassigning the ref skipped the half and kept the old key. The id is read as
+a value of the key (`keyValueOf`, the rule `refIdValue` reads an edge's id by), so a
+`NumberFromString` / `BigIntFromString` / `DateEpochSeconds` key is fetched (up to
+1.40.0 `get` refused its stored form, `get.decode`). A stored ref holds its id in the
+referenced entity's stored form, so `storedRefIdOf` reads it back as a value of the
+key, for `putValuesOf` (`rekey`) and `storedKeyForm` (`.within()`): up to 1.40.0 a
+date key stored as epoch milliseconds was read as stored, a bound on it matched no
+row and `repairIndexKeys` rewrote a correct cascade key as epoch text. A cascade
+composes its query from the source's domain id through the target's key form. A ref
+the model declares optional keeps that optionality in the derived schemas, so its id
+may be left out of `put` / `create` / `upsert` (nothing fetched, no ref and no key of
+an index keyed by its id stored) and the ref may be removed by its field
+(`.remove(["team"])`, which takes the row out of that index); a required ref, and any
+`${field}Id`, is still refused by `.remove()`
+(`fixtures/entity-ref-writes-1.40.0.json`, `helpers/EntityRefWrites.ts`).
+
+**A ref's id may be a primary key composite.** With `primaryKey: { pk: ["projectId"] }`
+and `refs: { project: ... }`, the key schema (`keySchema`, `Entity.Key`) takes the id as
+the input does, so `get`, `update`, `delete` and every other key-taking operation name
+it; the update schema and type leave it out, since no update changes the key. A key
+composed from the caller's key takes the caller's id. A key composed from a row read
+back (a retained or unique update, a soft or retained delete, `restore`, `purge`,
+history) reads it from the stored ref: `toDomainView` puts each ref's id beside the ref
+(`storedRefId`), and where the operation also has the caller's key (a whole-item update,
+`restore`), and in an error's key (`errorKeyOf`, for `insert` and a guarded put), the
+caller's id wins (`withRefIds`). Up to 1.40.0 the key schema dropped the
+id, so every key-taking operation but `put` and `create` died with
+`Missing composite attribute "projectId"`, and `restore` wrote no key for an index keyed
+by a ref's id (`RefIdPrimaryKey.test.ts`, `connected.ref-id-primary-key.test.ts`).
+
 Every id is judged before anything is fetched. An entity keyed by more than
 one distinct composite, or none, has nothing one id names: `create` fails with
 a `ValidationError` (`EDD-9129`) naming the edge. An id of no type of the key
@@ -4438,9 +5743,114 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 | **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` / `Record` / `Tuple` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` / `Union` node carries no encoding of its own; that included `Schema.optional(X)` and `NullOr(X)` around a transform. Fields with nothing to encode get no encoder and their bytes are unchanged. |
 | **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
 | **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
+| **A `many` element that shows no fields** | An element whose schema shows no fields of its own (a union, `Schema.NullOr`, or a transformation of the whole element such as `Schema.encodeKeys` or a struct decoded to another) has one encoder for the whole element instead (`wholeElementEncoder`, #241): the encoder `buildAttrEncoders` gives a field holding it, so it's encoded once, through the schema a read decodes it with. Where that encoder doesn't take the element, the per-field encoders run, as up to 1.40.0. Not for an opaque ref element (encoded as the entity's model), an element with nothing to encode, or an edge with a custom `decompose`. Below. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
 | **Union members** | `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` in every mode (`walkedContainer`), rebuilding each container kind around substituted children with the original node's annotations and `.check()` refinements (`withMetadataOf`). Under `tolerantTransforms` (aggregates) every transformed leaf is substituted; for entity derivation only self-date and `Redacted` leaves are. Union members follow the union rules in §8 (Self dates nested in containers): a self date accepts only its own wire kind, its domain or a legacy map; on a storage-kind collision only its exact canonical form, decoded first; an epoch date next to a numeric member is rejected (**EDD-9058**). The collision set propagates into nested unions. A transform date member keeps its own decode, so a stored `5` in `Union([DateTimeUtcFromString, Number])` stays a number. |
-| **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. |
+| **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. The exception is an `entity:` edge under `escapeKeys: true` (below). |
+
+**An `entity:` edge's sort key (#241).** Up to 1.40.0 an edge declaring `entity:` read its
+declared `sk.composite` through the entity model's top-level encoders, run over the element's field
+of the same name whatever that field is: `byn#5` for a `Schema.NumberFromString` `5`, where a plain
+edge composes `byn#0000000000000005` from the value. Under `escapeKeys: false` that is kept, byte for
+byte. Under `escapeKeys: true` such an edge composes its sort key from the element's own values, as a
+plain edge does (`ResolvedNode.keyAttrEncoders` is empty, `otherCompositionEncoders` the entity's).
+Which composites change is decided in one place, `entityEdgeEncodedComposites`: a composite, a
+field or a path into one (`entry.n`), whose top-level field the entity's model encodes for keys
+(`buildKeyAttrEncoders`: a transformation, optional or not, such as a codec, a date stored as a
+number or a `Schema.Class`). Its text changes where the encoded value's text differs from the
+value's; a composite it doesn't name never changes. The composer, `update`'s move and `rekey` read
+the encoders resolved from it. An edge with no declared sort key (keyed by the entity's identifier)
+is unchanged under both settings, since a plain edge takes no id that isn't a string. Every row
+below, and every unchanged type named after it, is measured against published 1.40.0
+(`test/helpers/AggregateEntityEdgeKeyTable.ts`, `AggregateDottedEdgeKeys.ts` for a dotted
+composite's reads, moves and `rekey`).
+
+| Field the entity's model declares | 1.40.0, `escapeKeys: true` | Now |
+|---|---|---|
+| `Schema.NumberFromString` `5` | `5` | `0000000000000005` |
+| `Schema.BigIntFromString` `5n` | `5` | 38 digits |
+| `DynamoModel.DateEpochMs`, `storedAs(DateEpochMs)` | `0001714979289000` | `2024-05-06t07:08:09.000z` |
+| `DynamoModel.DateEpochSeconds` | `0000001714979289` | `2024-05-06t07:08:09.000z` |
+| `Schema.DateTimeZonedFromString` | `2024-05-06t09:08:09.000+02:00[europe/paris]` | `2024-05-06t07:08:09.000z` |
+| A codec storing other text (`x` as `x `, `A` as `41`) | `x%20`, `41` | `x`, `a` |
+| `Schema.optionalKey(Schema.NumberFromString)` `5` | `5` | `0000000000000005` |
+| A path into a field encoded whole (`entry.n` of a `Schema.Class` with a `NumberFromString` `n`, or of a codec of the whole object) | `5` | `0000000000000005` |
+
+`Schema.DateTimeUtc` and `Schema.DateTimeUtcFromString` (ISO text either way), a path into a
+`Schema.Struct` (never encoded for a key as a whole, so `entry.n` reads the value), a path into a
+`Schema.Class` whose leaf isn't transformed, a union or `Schema.NullOr` (never encoded for a key) and
+every other key are unchanged.
+
+Rows stored under 1.40.0's text, with `escapeKeys: true`:
+
+- **Read** as before, by the same partition `Query`: assembly hands rows to nodes by entity type and
+  discriminator, never by sort key.
+- **`update`** writes a changed group, as always, whole. Each element it read under 1.40.0's text
+  (`skCompositesOtherComposition`, which no element's current key is) is deleted in the group's own
+  transaction, unless the write puts a row there, and the element's row keeps that row's `created`
+  through the carry every update uses (`existingCreated`). A no-op writes nothing. The deletes count
+  against the transaction's 100 items, one per moved row beside the group's own (the root and 49
+  such rows are 99 items, with 50 they are 101): a group whose rows and such rows exceed 100 is rejected,
+  diagnosed as `AggregateTransactionOverflow` with `previousKeyText` (their count) when the group
+  fits without them, naming `rekey`; an overflow the group has anyway names none. The rejected
+  group writes nothing and its rows read as before; groups the update wrote before it stay written
+  (`committed` names them), as on any group's failure.
+- **`delete`** deletes every row of the aggregate's types it reads, under either text.
+- **`rekey`** finds a row at the other composition's text too (`oldPosition`'s `skElse`): under
+  `true` 1.40.0's escaped text, and its unescaped text as the other setting's; under `false` the text
+  `true` composes now. A dry run counts them.
+
+Two elements whose values compose one key now (letter case through a codec whose stored text keeps
+it, one instant in two zones) were two rows on 1.40.0. They read as before. A write of their group is
+refused with the error a plain edge gives (`refuseSharedSortKeys`, judged over the groups the write
+sends: an `update` decomposes the old and new values without refusing, so a write of another group
+goes ahead), and `rekey` reports the aggregate `failed` with that reason and moves nothing. An
+`update` removing or changing one of them repairs the group.
+
+**Writers of two releases (#241).** Under `escapeKeys: true` a 1.40.0 writer and this release
+compose different text for such an edge's sort key. 1.40.0, reading a group this release wrote,
+writes the group under its text and deletes only the keys its own decomposition of the read value
+gives, none of them this release's: each element is then stored under both texts, and an element it
+removes stays under this release's (`fixtures/aggregate-mixed-writers-1.40.0.json`, captured from
+1.40.0 over rows this release wrote). The changeset tells every writer to move together. Rows a
+1.40.0 writer left:
+
+- **Copies** (`copiesOfOneElement`, the one decision): two rows of one node that a read gives the
+  same value of, so they differ only in key text and in the timestamps a read takes off. Equal values
+  compose one key under each text, so two such rows are one element under two texts. Assembly hands
+  the element back once (`ResolvedNode.movedKeyText`); a changed `update` of the group deletes the
+  copy under 1.40.0's text through the move above, the element's row keeping its own `created`; a
+  no-op writes nothing; `rekey` deletes the copy (a row placed `both` whose two rows are copies),
+  guarded as any move.
+- **Doubles that differ** (`doubledKeys`): two items composing one key whose 1.40.0 text is one, with
+  a row of their type read at both. Which holds the element can't be told from what's stored. A
+  write holding both is refused (`refuseSharedSortKeys`, naming both rows and the way out); `rekey`
+  reports a `bothKeys` conflict per key, naming both rows, and leaves the aggregate. An `update`
+  stating the elements the group should hold, one per key, writes them under this release's text
+  and deletes every row read under 1.40.0's (`previousRows`). Any other key two items compose is a
+  collision, refused as before.
+- An element 1.40.0 removed reads again; the same `update` removes it.
+
+Pinned in `helpers/AggregateMixedWriters.ts`, on a recording table and DynamoDB Local.
+
+**A `many` element that shows no fields (#241).** An element whose schema is a union (a member
+renaming a field among them, `line` stored and `text` held), `Schema.NullOr`, or a transformation of
+the whole element (`Schema.encodeKeys`, a struct decoded to another) has no fields for
+`buildAttrEncoders` to key encoders by. Up to 1.40.0 it was stored as the domain value it held, on
+1.39.0 too: `text` under its domain name, a `Schema.NumberFromString` in a member as `N`, a
+`Schema.DateTimeUtcFromString` as a `DateTime`'s internal fields. `wholeElementEncoder` gives such an
+element the encoder `buildAttrEncoders` gives a field holding it, and `storedElement` runs exactly one
+encoding per element: that one, or the per-field encoders where it doesn't take the element (the
+element is then stored as 1.40.0 stored it). The key is read off the element as before (`keyAttrs`),
+so no key moves. A read decodes either form through the tolerant decode it always used: a member's
+transformation reads the stored form, and its type side takes the domain value a row 1.40.0 wrote
+holds. A transformation reads only its own fields, so a sub-aggregate's discriminator, which 1.40.0
+read back inside such an element, stays out of one stored in its stored form. Rows switch a group at a
+time: both sides of an update's diff are decomposed with the same encoders, so a no-op writes
+nothing, and a changed group's rows are written in the stored form. Until each group is next changed,
+one attribute can hold the domain value on some rows and the stored form on others (`text` and
+`line`, `N` and `S`), which a filter or a secondary index of the caller's own on it has to allow for.
+`test/fixtures/aggregate-whole-elements-1.40.0.json` holds what 1.40.0 and 1.39.0 stored.
 
 **Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
 drops a `Schema.Class`'s `.fields`, so the schema walker cannot recurse into an
@@ -4489,8 +5899,8 @@ A real date then has to be accepted wherever a read date was. Under
 `DynamoModel.Packed`, `stringifyStrict` refused an instance and let the plain
 look-alike through, so a read date packed and a new one was refused; `JSON.stringify`
 would call its `toJSON` and store ISO text, which the declaration refuses on read.
-So `check` accepts a real `DateTime` and `storingDates` stores it as `storedDate`:
-the same keys, in the order DynamoDB Local hands the map back, so what's packed from
+So `written` accepts a real `DateTime` and `stringifyStrict` stores it as `storedDate`
+(`internal/StoredForm.ts`): the same keys, in the order DynamoDB Local hands the map back, so what's packed from
 a date a read returned doesn't move by a byte (`fixtures/stream-dates-1.39.0.json`,
 stored by the published 1.39.0, pins this). Real DynamoDB's map order isn't
 guaranteed, so that text was never fixed on that path. Anything else JSON can't
@@ -4542,19 +5952,306 @@ as the same object. `effectDeclarationOf` recognises a declaration by its parse
 function, so a `.check()`, an annotation and a brand keep it, and a `Schema.declare`
 of one's own doesn't have it.
 
+**Effect's instances in a packed value (1.41.0).** A packed write refused every class
+instance but a `DateTime` ("an instance of Object"), so a `Duration`, a `BigDecimal`, a
+zone, a cookie, a `UrlParams`, a version or range, an address, a DNS record, an `Option`
+or a `Result` couldn't be written in a packed struct, a packed `Schema.Unknown`, event
+data or a snapshot state, though a native attribute stores each as a map and reads it
+back. `storedFormOf` (`internal/StoredForm.ts`, schema package) is the one function that
+says what packed storage writes for one of Effect's instances, and `stringifyStrict` is
+the one place that calls it (through `written`, which reads each property of the value
+once and writes what it read), so every packed write takes it: entity fields, aggregate
+edges, event data, snapshots and `StorageEncoding`. It's the map the marshaller stores:
+each enumerable property, its prototype's included, without a function, `undefined` or a
+decimal's cached normalized form (`isCachedNormal`, which `Marshaller.ts` imports from
+there, so a native and a packed write leave out the same property). Inside a look-alike
+(an instance carrying, on its prototype, one of the markers `EffectInstances` rebuilds
+by) every value is the library's, so it's what the unmarshaller hands back: a
+safe-integer bigint as a number, a cookie's expiry as the ISO text `finishingInstances`
+writes (`expiryText`, which `optionsWriteAs` uses too), a named zone's formatter as the
+empty map. An `Option` or a `Result` holds the caller's value, which is left as it is
+and packed by the rules every packed value follows: a bigint, a `Date` or bytes in it is
+refused where it is, and an instance in it is its stored map. Each map is put in the
+order DynamoDB Local hands a stored map back (`inStoredOrder`: Java `HashMap` bucket
+order, ties in write order, a table sized for the keys and doubled past three quarters
+full), measured against every map 1.39.0 stored for a look-alike, so a real instance
+packs to exactly the bytes 1.40.0 packed for the map a native read hands back for it
+(`fixtures/packed-lookalikes-1.40.0.json`, captured from the published 1.40.0, pins
+both that and every value 1.40.0 packed). A date keeps `storedDate`, which gives the
+same bytes. What JSON can't hold is left in place for `written` to refuse at its path: a
+`MacAddress`'s or a TLSA record's bytes, a `BigDecimal` or a `Duration` past 2^53, as
+1.40.0 refused the map of each. A packed look-alike reads back through
+`readingInstances` as the instance, as a native one does, and writing what was read
+stores the bytes read; an `Option` or a `Result` is rebuilt by its own declaration; in a
+`Schema.Unknown` it's the map, as natively. A map written in another key order (by hand,
+since no read hands one back) still reads as the instance, as it did on 1.40.0, and is
+written back in this order. A top-level packed field whose encoded side is one of these
+declarations is still refused at load (`EDD-9073`), since classification also decides
+which native fields a read dispatches on.
+
 **What the marshaller does beyond marshalling** (`Marshaller.ts`). It marshals first,
 exactly as `@aws-sdk/util-dynamodb` does. Only if that throws does it look for empty
 sets to leave out, and for a `BigDecimal` whose cached `normalized` form leads into a
 cycle, which it writes as a fresh decimal (`holdsCachedCycle` reads data descriptors
-and calls no getter, so an item holding none is handled as it always was). Then
-`datingCookies` looks through the marshalled output for a cookie's marker and writes
-the expiry of each of Effect's cookies (by prototype) as ISO text, where a `Date`
-marshals to an empty map; it finds the source cookie by descriptors, calls no getter,
-and touches nothing else. A typed cookie reads the text back as the `Date`
+and calls no getter, so an item holding none is handled as it always was). A value
+holding one it's inside, which marshalling follows until the stack runs out (an Effect
+`Chunk`, whose empty end holds itself), is refused there as `UnstorableValue`
+(`EDD-9124`, `cycleIn`, by data descriptors, naming the path where it meets itself), as a
+`HashSet` is, where 1.40.0 died with a stack overflow. Then
+`finishingInstances` looks through the marshalled output for a cookie's marker and a
+zone's. It writes the expiry of each of Effect's cookies (by prototype) as ISO text,
+where a `Date` marshals to an empty map, finding the cookie by descriptors and calling
+no getter; and a named zone's map as Effect 4.1.2 held it (below), decided on the map
+marshalling made. It touches nothing else. A typed cookie reads the text back as the `Date`
 (`cookieOptions`). Cookies are held to the write-back check like every kind but a
 date, comparing an expiry as the marshaller writes it (`optionsWriteAs`), so a cookie
 1.39.0 wrote with an expiry (an empty map), one holding properties of its own inside
 it, and a jar keyed other than by its cookies' names stay the map.
+
+**What an untyped position doesn't keep (1.41.0, `EDD-9161`).** At a position no schema
+types (`Schema.Unknown`, `Schema.Any`, at any depth, `holdsUntyped`), the value is
+marshalled as given, so only the value can say whether DynamoDB keeps it. Up to 1.40.0 a
+`Date` there was written as an empty map and read back as `{}`, with no error.
+`internal/LostValues.ts` (schema package) is the one decision: `lostAs` says what of one
+value is lost, `lostElement` what of a list's element, and `lostIn` walks a value as the
+marshaller does (data descriptors, prototypes included, no getter called; a cycle isn't
+followed) for the first such part, with its path. Lost: a `Date` (valid or not) and a
+`RegExp`; a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`; an
+`Error` whose `message` or `cause` isn't an enumerable property; a `Redacted`; a `Map`
+with a key that isn't a string; and the binary data 1.40.0 stored as less than it is
+or failed to send, measured kind by kind with the AWS SDK it locked
+(`fixtures/untyped-binary-kinds-1.40.0.json`) and named one by one, never as "any typed
+array": an `ArrayBuffer`, a `DataView` or a `Blob` (a `File` is one), stored as empty
+bytes, a `SharedArrayBuffer`, stored as an empty map, and an instance of a subclass of
+any of them, stored as the map of its enumerable properties, since each holds its bytes
+outside its properties (`instanceof`); and the ten typed arrays the SDK fails to send,
+each by its own prototype (`Int8Array`, `Uint8ClampedArray`, `Int16Array`,
+`Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`,
+`BigInt64Array`, `BigUint64Array`: a `DynamoError` holding the SDK's `TypeError`; the
+SDK takes a value for bytes by its constructor's name). Every other kind is stored as
+it was: a `Uint8Array` or a `Buffer` as bytes, and a `Float16Array`, a subclass of a
+typed array (a `Uint8Array`'s included) or a kind a later runtime adds as the map of
+its elements, which reads back as their numbers. A cookie's
+expiry is exempt (`finishingInstances` writes it as text), and so is `undefined`, a
+function or a hole in a list: the list closes up, a documented limit a caller can rely on
+(`NoStoredFormScenarios`). Every other value stores whole as the map of its enumerable properties and
+reads back as that map, a class instance included; a bigint or a boxed primitive is left
+to the rules it always had. `readBackOf` (`internal/RoundTrip.ts`) looks through a value
+at such a position before anything else, so every write path that checks a custom
+declaration checks this too (`encodeForWrite`, `_refuseNotReadBack`, `encodeToWire`, the
+outbox), with `unstorableOperand` for an update's `.append()` and path operands, just
+before it marshals each, and `refuseLost` for an aggregate's rows, before they're
+marshalled. A packed field asks the same functions in `written` (a map and binary
+data are refused first as not JSON), so it refuses the same values in the same words.
+Only a field or an aggregate whose schema holds an untyped position pays; reads are
+untouched, so a row 1.40.0 stored as `{}` reads as `{}`.
+
+A part behind a getter (an enumerable accessor, own or inherited, or an accessor at a
+list's index) is only known by calling the getter, and the marshaller calls it, once for
+each time it marshals the value. `lostIn` doesn't call it: it marks the value, and each
+object on the way to the getter (`holdsGetters`). `Marshaller.marshallStorable` reads an
+item holding a marked part through `readJudged`: a view, built from descriptors without
+reading anything, whose getters are judged by `lostIn` as the marshaller calls them, the
+refusal thrown as an `UnstorableValue` carrying `lost`, which every write path already
+turns into its `ValidationError`. The view forwards every read, so the marshaller takes
+the branch it took and stores the same keys in the same order; its target is a stand-in, so
+a frozen value can be viewed, and a copy the library made around a marked value (an
+event's `data`) leads to it through descriptors. Until anything has been marked nothing
+is looked for. Every getter is called exactly as often as published 1.40.0 called it, on
+every write path (`LostBehindGetters.test.ts`, counts measured with 1.40.0's own copy of
+`CustomDeclarationPaths`); an update's path operand no longer goes through the schema a
+third time to be looked through, which had added two calls. A getter the marshaller doesn't
+read (a class's own, not enumerable) isn't called or looked at. Left as 1.40.0 (named, not
+reworked): a getter a list inherits at an index (on the list's prototype) isn't looked
+behind, so a `Date` it returns is stored as `{}`, as 1.40.0 stored it
+(`LostBehindGetters.test.ts`). Only a `Proxy` sees what the walk reads: at an untyped
+position, `getPrototypeOf`, `getOwnPropertyDescriptor` and `ownKeys` traps and reads of a
+list's `length`; the payload and its declared fields see exactly 1.40.0's traps, a
+condition's or filter's operand one `getPrototypeOf` more (finding an instance), and once a
+getter in an untyped field has been met in the process, `readJudged` reads the
+descriptors of what each marshalled item holds (`ProxyTraps.test.ts`).
+
+**A named zone's name on any Effect 4.1 (1.41.0).** Effect 4.1.3 changed a named zone.
+It gained an own enumerable `resolvedId` (the name `Intl` resolves it to), and its `id`
+became the name it was made from, unless `Intl` resolves that only in another case. On
+4.1.2 the `id` was the resolved name and there was no `resolvedId`. So every named
+zone, native or packed, stored one more entry on 4.1.3, and a zone made from an alias
+(`Etc/UTC`, `GMT`, `Asia/Kolkata`, `US/Eastern`) stored another `id`, ISO text and key
+text: a consumer's stored bytes depended on the Effect patch installed. Now one rule
+names a zone and one rule writes it, whichever Effect is installed.
+
+- *The name* is `storedZoneName` (`internal/StoredForm.ts`): a zone's `resolvedId` where
+  it holds one as text, otherwise its `id`. That is the resolved name on either Effect,
+  for a zone made fresh or read back from a map of either form, and it's what 4.1.3's
+  `Equal` compares (`resolvedId` against `resolvedId ?? id`; 4.1.2's compares `id`), so
+  two zones Effect holds equal have one name. Key text (`zonesAsStored`), a unique
+  sentinel and a time-series event's sort key (composed from the value stored, which
+  `storedZoneText` names again: `storedSentinelValue`, `readSentinelValue`, `append`,
+  and a `history().where()` bound), the ISO text of `DynamoModel.DateTimeZoned` and of
+  a date stored as text (`zonedIsoText`), an aggregate's comparison and every write take
+  it from there.
+- *One walk reaches every zone.* `walkLeaves` (`internal/StoredForm.ts`) is the walk
+  every text naming a zone takes: `zonesAsStored`, `namesZone` (which decides whether
+  `storedZoneText` looks at a field's value) and `rekey`'s `givenZoneReading`. It goes
+  through a zoned date's zone, an `Option`, a `Result`, a list or tuple, a `Set`, a
+  `Map`, a record or struct and any other object's own properties (a `Schema.Class`
+  instance, one of Effect's collections), so a list of zones keys `timezone.named(utc)`
+  on either Effect, as does a tuple, an `Option` of a list, a struct or a record in an
+  `Option`, a `Result`, a union and a class instance in an `Option`. It reads each
+  property from its descriptor, so no getter is called (a zone behind one keeps the
+  text its getter gives), and leaves an object keeping its content in internal slots
+  (a `Date`, a typed array) unwalked. A field holding one of Effect's string codecs
+  inside it (`Schema.Array(Schema.TimeZoneNamedFromString)`, an `Option` of one) has no
+  encoding of its own, so the key form's case 3a keys its stored value: `storedZoneText`
+  now takes any field encoding somewhere inside it (`holdsEncoding`), and case 3a keys
+  that value with its zones named (`utc,utc`, `some("utc")`). A sentinel read back takes
+  the form `put` stored first (`storedFormOfRead`, an `Option` handed back as a map) and
+  then names its zones (`thenForm`). The stored form is the marshaller's own walk, which
+  reaches every map it writes and names each zone's map where it builds it
+  (`zoneEntriesWritten`). `ZoneDepth.test.ts` holds each container, on either Effect,
+  to one key text per resolved name (a literal table), one sentinel, and stored zones
+  under the resolved name, natively and packed, for zones made fresh, as each Effect
+  makes one, decoded from 4.1.3's form and read back from either Effect's map; the
+  property test in `ZoneNames.test.ts` does the same for a zone itself, with the ISO
+  text.
+- *The write* is `rewrittenZoneId` / `zoneEntriesWritten`: a named zone's map holding
+  `resolvedId` is written with `id` under the name and without `resolvedId`, which is
+  what 1.40.0 stored on 4.1.2. It's decided on the entries a write obtained, never by
+  finding the instance they came from: the map the marshaller made (`finishingInstances`),
+  the entries packed storage read (`written` in `PackedCodec.ts`, which reads each
+  property once and writes what it read), a zone's own properties (`libraryMap`,
+  `storedDate`, the write-back check's `writtenProperties`). So it holds for a zone made
+  fresh or read back, as an own property, behind a getter, inside a date, an `Option`,
+  a list, a record or an untyped field, and for a map that only looks like one.
+- *Reads* take both forms, forever. A typed zone's map holding `resolvedId` is rebuilt
+  as the zone `storedZoneName` names (`reviveTimeZone`), on either Effect, and the
+  write-back check compares the instance with the map as it's written again
+  (`asWrittenAgain`). Where no schema types it, either form reads back as the map it is,
+  as a 4.1.2 map always has. So a row holding `resolvedId` keeps it only until the item
+  is next written: a `put` of what `get` returned stores the 4.1.2 form, an aggregate
+  update compares both sides by the name and writes nothing when nothing else changed,
+  and an entity `update` that doesn't touch the field leaves the stored map alone.
+
+The resolved name is what the runtime's `Intl` makes of the name a zone was made from,
+and has been since 1.38.0 on 4.1.2: there `id` was `Intl`'s resolution. So it depends
+on the runtime's time zone data. `Asia/Kolkata` resolves to `Asia/Calcutta` on Node
+24 (ICU 78.3), and `Etc/UTC` to `UTC`; a runtime that canonicalises differently (the
+ECMA-402 change that stops `resolvedOptions().timeZone` canonicalising, which Firefox
+already follows) gives the same zone another name, so another key text, ISO text and
+stored `id`. Rows keyed under one runtime are not found by a key composed under the
+other. This is the runtime's, not the library's, and the library doesn't change it.
+Effect's own codecs are left as they are:
+`Schema.TimeZoneNamedFromString`, `Schema.TimeZoneFromString` and
+`Schema.DateTimeZonedFromString` write a zone made from an alias by the name it was
+made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`), and the attribute stores what
+they write, so it differs between the two (reads take both, and an equality condition
+or filter on it compares the stored string). Every key composed from it names the zone
+as above, so it's the same on both. `ZoneNames.test.ts` (both
+packages) makes 4.1.3's zone on the installed Effect's prototype and asserts the stored
+values literally, so it holds on either version, and `EffectValueTypes.test.ts` holds
+each of Effect's value types in each position (typed and untyped native attributes,
+packed, key text, aggregate comparison) to one literal table, and each of these codecs,
+given an alias zone made on the installed Effect, to one key text per position (sort
+key, index key, unique sentinel, event key, `history().where()`), with the attribute's
+text per version.
+
+**Rows keyed by a zone's given name (`rekey`, 1.41.0).** 1.38.0 to 1.40.0 composed a
+zone's key text from its `id`, so on Effect 4.1.3 they keyed an alias or a renamed zone
+by the name it was given (`…[asia/kolkata]`, `timezone.named(etc/utc)`), where every
+key now composes the resolved name, the text 1.40.0 composed on 4.1.2. Normal operation
+never looks there (no fallback read), so until `rekey` runs such a row is absent, as at
+any key holding nothing: `get` and `update` report `ItemNotFound` (an aggregate's `get`,
+`update` and `delete`, `AggregateAssemblyError`), a `delete` reports success and leaves it
+(`ItemNotFound` where it reads the item first: a unique constraint, soft delete), a `put`
+writes a second row, which `rekey` reports as `bothKeys` and leaves, and its unique value
+isn't enforced. Another item can take that value: every `rekey` then reports the row
+`taken` and leaves its sentinel where it is, both items holding the value, until the other
+item lets go of it, when the next `rekey` moves the sentinel (`ZoneKeyRekey.test.ts`).
+The upgrade note says to run `rekey` first. `rekey` alone looks: `givenZoneReading`
+(`internal/ZoneKeyText.ts`) takes a row's key-form record and its stored values, walks
+each key-form value as `walkLeaves` walks it, and takes each zone, or each text, under
+the name the row stores at the same place (the same index, property, `Option` value or
+zoned date's zone): a zone whose stored map holds `resolvedId` beside another `id` under
+that `id`, and text a codec or the library stored naming a zone by another name (a
+zone's name, a zoned date's ISO text) as stored. So a list holding `Etc/UTC` and `GMT`,
+both `UTC` now, reads `timezone.named(etc/utc),timezone.named(gmt)`, and a list through a
+codec `etc/utc,gmt`, as 1.40.0 keyed them (`ZoneDepthRekey.test.ts`, on rows published
+1.40.0 wrote on 4.1.3: `zone-depth-keys-1.40.0-effect-4.1.3.json`). It joins the
+readings `rowKeyForms` gives, so an entity row's table key (item, snapshot, tombstone,
+time-series event) and its index keys (`staleIndexKeys`, rewritten with
+`repairIndexKeys`) are recognised under it; `givenSentinelValues` gives a unique
+sentinel's old key from it (`otherSentinelKeys`, `sentinelHeldAt`); and an aggregate's
+`holdsPartition` takes it as a reading of the root's partition. A row naming no zone
+another way gets no extra reading, so its run costs nothing more; a row the head itself
+wrote on 4.1.3 through a codec (its attribute holds `Etc/UTC`, its keys `utc`) gets one,
+which finds nothing to move. A projection's row tombstones and outbox items hold no
+values, so their key can't be read this way, and they're left. An event stream's keys
+hold its stream id, which is text, so they hold no zone. Pinned by
+`ZoneKeyRekey.test.ts` on rows published 1.40.0 wrote on 4.1.3
+(`zone-keys-1.40.0-effect-4.1.3.json`: codecs, a zoned date stored as text, unique
+sentinels, snapshots, tombstones, events, an index, an aggregate) and 1.39.0 wrote on
+4.1.3 (`named-zone-keys-1.39.0-effect-4.1.3.json`: a zone itself), with a case-only
+zone and a zone of one name that don't move.
+
+**Readings combined composite by composite (`rekey`, 1.41.0).** One key can hold composites
+earlier releases each composed their own way: 1.39.0 on Effect 4.1.3 restored an item keyed
+by a `Duration` and a date zoned in `Etc/UTC` under `…#d_[object object]#at_…[etc/utc]`, the
+`Duration` as `restoredObjectReading` reads it and the zone as `givenZoneReading` does, a key
+no one reading composes. So `rowKeyForms` (and an aggregate's `holdsPartition`) hands the
+key form's record and each earlier reading (`keyForm139`, `givenZoneReading`,
+`restoredObjectReading`) to `keyReadings` (`internal/KeyReadings.ts`), which reads each
+composite as the key form does or as any earlier reading does, in every combination: the key
+form's reading first, then each earlier reading by itself, then the other combinations, fewest
+composites changed first, no reading twice (told apart by their values, not by the key text
+they compose: two composing one text, say under casing, are both tried and both count
+towards the cap; named, `KeyReadings.test.ts`). Each reading is composed under every form of key
+text (1.36's, 1.37's, the escaped one, the inverted index's), as every reading was, so the
+product covers both. The readings are capped at `READINGS_BOUND`, 64 per row: every
+combination of six composites read two ways, or three read four ways. Past it, the
+combinations changing the most composites aren't tried; a row stored under one of them isn't
+recognised, stays where it is and is counted `skipped.unrecognizedKey`, and the dry run
+counts it the same way. Each earlier reading by itself is always among the 64. A row no
+earlier reading reads differently has the key form's reading alone, so its run costs nothing
+more. Pinned by `MixedReadingsRekey.test.ts` on the rows published 1.39.0 wrote on 4.1.3
+(`mixed-restore-keys-1.39.0-effect-4.1.3.json`), under either `escapeKeys` setting.
+
+**Zones those releases stored as values (`rekey`, 1.41.0).** On Effect 4.1.3, 1.38.0 to
+1.40.0 stored every named zone's map with its `resolvedId` (any zone, not only an alias),
+and the library's ISO text of a zoned date under the name the zone was given. A write
+stores neither now, and an equality condition or filter's operand is what a write
+stores, so until `rekey` runs it matches none of those rows; reads are unaffected. No
+fallback is compiled into the expression: `rekey` rewrites them in the pass that moves
+rows. `staleZonesOf` (`internal/ZoneKeyText.ts`) takes a model field's read schema (the
+record schema's) and write schema (the input schema's) and, for a value read back, decodes
+it as a read does and encodes it as `put` does, then walks what that writes (`walkLeaves`)
+and compares each place with what the row holds there: a zone whose stored map holds
+`resolvedId` is a place, and so is the library's ISO text naming a zone by a name the
+runtime resolves to another. Text whose encoding follows the zone's `id` (Effect's string
+codecs, an application's) isn't: a write encodes it again with each zone a probe whose `id`
+differs from its name, and only text that stays the same is the library's. A value no
+schema types (`Schema.Unknown`) has no reader. A cheap look at the value read (a map with
+`resolvedId`, text naming an alias, by a cache of resolved names) gates the decode, so a
+row without one is never decoded. `staleZoneSets` (`Entity.ts`) puts what a write stores at
+each place, leaving the rest of the attribute as read (a packed attribute is packed again,
+as a write packs it), and the row is rewritten: under its current key in place, an item in
+the `UpdateItem` that rewrites its index keys and a snapshot, tombstone or event by one of
+its own (`rekeyHistoryZones`), each conditioned on every attribute it rewrites still
+holding what was read; a row it moves, in its move's Put (`movedRowOf`,
+`moveHistoryRow`). Each row counts once in `zonesRewritten`, and a dry run counts what it
+would rewrite. A row holding none sends no request (`ZoneValuesRekey.test.ts`, on rows
+published 1.40.0 wrote on 4.1.3 and on 4.1.2: `zone-values-1.40.0-effect-4.1.{3,2}.json`).
+A sparse map's entries, an aggregate's rows under their current keys and an event
+stream's events are not rewritten (left as 1.40.0, named: `ZoneValuesRekey.test.ts` pins a
+sparse entry and an aggregate's root row): an aggregate's rows `rekey` moves are rebuilt
+as any aggregate write builds them, and the rest keep their form until they're next
+written. An item under its current key is rewritten all or nothing: where its zones or
+index keys are due a rewrite, its unique sentinels move first, planned from the row as
+read (`rekeySentinels`), and a sentinel that can't move (`taken`, `bothKeys`,
+`uncomposable`, `contended`) leaves the row as it was, reported; a dry run judges the same
+(`ZoneUniqueRekey.test.ts`). Only then are its zones and index keys rewritten: a zone
+rewritten first lost its given name, and with it the key of the sentinel still under it.
+Each sentinel under other key text is a unit of its own, so another of the item's that can
+move does (`ZoneKeyRekey.test.ts`).
 
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
@@ -4568,8 +6265,9 @@ that takes the map keeps writing. A value the marshaller refuses is left to
 `marshalOrFail` (`EDD-9124`). The choke points are `encodeForWrite` and
 `_refuseNotReadBack` on an entity (`validateAndBuildPutItem` for Batch and
 `TransactWriteOps`), `notReadBackOperand` for an update's stored operands
-(`.append`, `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists`; `.add`,
-`.subtract` and `.deleteFromSet` apply a value, they don't store it),
+(`.append`, `pathSet`, `pathAppend`, `pathPrepend`; `.add`, `.subtract` and
+`.deleteFromSet` apply a value, they don't store it; a `pathIfNotExists`
+operand is refused only where it would be stored, `fallbackRefusal`),
 `refuseNotReadBack` on an aggregate, which runs the real `assembleAggregate` over the
 marshalled groups so a custom `decompose` and packed edges are covered,
 `encodeToWire` on a stream and `outboxItems` for an outbox. A member holding no custom
@@ -4653,7 +6351,8 @@ its keys. A field whose codec stores every number as 0 decomposes 50 and 60 alik
 the other is a no-op, whatever key the stored row is under. A no-op writes nothing, with the option or
 without it.
 
-Neither `update` nor `rekey` deletes or moves a row the value doesn't key (`delete` has its own rule):
+Neither `update` nor `rekey` deletes or moves a row the value doesn't key (`delete` has its own rule,
+§7 "`delete` deletes the aggregate's own rows"):
 a row a custom `decompose` left under a key it no longer composes, or an edge row its `assemble` drops.
 An encoding `decompose`'s rows are such rows: decomposing the value read keys them elsewhere (`f / 10`
 once more: a row stored under 50 reads as 50, which is keyed 5). So an `update` that removes such an
@@ -4939,12 +6638,12 @@ configuration that could add one (#98).
    declared dates before it validates (`fillStamps`), so the value it returns holds
    them. `update` keeps `createdAt` whatever the mutation did, as an entity's update
    has no `createdAt` to name. A mutation that changes `updatedAt` wins; otherwise a
-   rewritten row is stamped, and a row the diff left keeps its value. When a node
-   declares a stamp, the result is assembled from the rows written, with no I/O. When
-   none does, it's the decoded value, and nothing extra runs.
+   rewritten row is stamped, and a row the diff left keeps its value. `update`'s
+   result is the partition as its write leaves it, assembled with no I/O ("What
+   `update` returns", above), so it holds the stamps stored.
 7. **A `many` edge with a custom `decompose`.** `fillStamps` works on the value as the model has it, before it's decoded (`fillRows`). With `decompose` and `assemble` it takes the value apart, fills each row and puts it back, so a `Schema.Record` of rows is stamped like an array, and its rows' fields are read from the record's value schema (`manyElementFields`, `extractKeyedValue`), so a date in one is stored in its own form. A value they can't take apart or put back is left for the schema to report. Two can't be filled: a value with `decompose` and no `assemble` that isn't an array (there's no way to put its rows back, nor does it read back), and an opaque field (`Schema.Unknown`) with no `entity`, where nothing says what its rows hold, so they're stamped and it's stripped on read, as a row that doesn't declare the date. A `Schema.ReadonlyMap`, `Schema.HashMap` or `Schema.Chunk` field works here, as it doesn't anywhere else (`EDD-9125`), because its collection is rows and is never stored itself.
 8. **The input matches what `create` takes, at every row.** A `one` or `ref` edge whose `entity` one id names takes an id (`venueId`), of the type of the entity's key composite (`refIdInput`, `_EdgeIdValue`: a number, a bigint, a `Date`, a brand), which `create` fetches and denormalises. One with no `entity`, or whose `entity` is keyed by more than one attribute (or none), has nothing to fetch by, so it takes the value under its field name, with its stamps optional: the derived `inputSchema` (`deriveWithStamps`, `rowInput`) and the type (`AggregateInputType`, `_IsValueEdge`) agree. A `many` edge's elements follow the same rule: ids of that type for an element that is the entity, `${field}Id` for the field of an element that holds it (`deriveElementInputSchema`, `_TransformManyEdge`), an element declared a union as 1.39.0 took it (the union as declared; its type 1.39.0's, `_UnionElementInput`), and the elements as given for an edge with nothing to fetch. A `Schema.Record` `many` edge's values have optional stamps too (`keyedInput`, `_TransformManyEdge`), and its `sk.composite` names are checked against them (`ManyEdgeSkPaths`). Any other object field takes any name there: its rows are whatever its `decompose` makes, and a scalar field has no rows and takes none.
-9. **A stamp takes the form its row stores the field's values in.** On `create` and `update`, on the root and on edges, a stamp in a field a row declares is stored as the row stores any value of that field (`storedDateEncodings`, read by both `buildAttrEncoders` and `rowStampsOf`): the field's own date encoding, but ISO text under `Schema.optional`, whose union hides the annotation from the value encoder, as 1.39.0 stored a value passed there. A row that doesn't declare the field holds the root's form: the root's declaration's, else the stamp's own encoding. So one attribute never holds a value in one form and a stamp in another, and a row 1.39.0 wrote keeps its form (`test/fixtures/aggregate-stamp-forms-1.39.0.json`). 1.39.0 stamped an edge in the root's form whatever the edge declared; an edge declaring a date in another encoding now stores its stamp in that encoding, and reads either.
+9. **A stamp takes the form its row stores the field's values in.** On `create` and `update`, on the root and on edges, a stamp in a field a row declares is stored as the row stores any value of that field (`storedDateEncodings`, read by both `buildAttrEncoders` and `rowStampsOf`): the field's own date encoding, `Schema.optional` included, as an entity's write stores it (#241; up to 1.40.0 the union hid the annotation and such a field's values and stamps were stored as ISO text, `test/fixtures/aggregate-stamp-forms-1.39.0.json`). A row that doesn't declare the field holds the root's form: the root's declaration's, else the stamp's own encoding. So one attribute never holds a value in one form and a stamp in another on a row. Key text keeps the form it had (`storedDateEncodings(field, keyText)`, `buildKeyAttrEncoders`, and `RowStamps.createdKey` / `updatedKey` for a key over a stamp), so no key moves. A row stored as ISO text reads as it is and switches a group at a time: both sides of an update's diff are decomposed with the same encoders, so a no-op update writes nothing, and a changed group's rows are all written in the declared form, a kept `created` converted to it (`inStampForm`, the same instant; `test/fixtures/aggregate-optional-dates-1.40.0.json`). 1.39.0 stamped an edge in the root's form whatever the edge declared; an edge declaring a date in another encoding now stores its stamp in that encoding, and reads either.
 
 **A key with no value.** A composite of an aggregate key can be optional. What happens without a value depends on what the key does:
 
@@ -5871,6 +7570,16 @@ yield* EventStore.processBatch(records, { projections: { a: pA, b: pB }, source:
   on redelivery gives at least once (duplicates on every reordering).
 - **`catchUp(streamId)`** brings the row of the stream's latest event to the head.
   **`rebuild(streamId)`** re-derives every row from version 1 and returns no events;
+  it never replays side effects, the outbox included (#237): single- or
+  multi-source, it writes the row with its checkpoints and revision and no outbox
+  item, whatever the row's state (`applyRow`'s `fromScratch` enqueues nothing;
+  `effects` still runs in the fold, so the row is the one the live path derives),
+  so the row goes alone through `writeRow`'s write-alone path (the entity's
+  conditioned `put`, or `create` for a row read absent; a tombstone, its `Put`).
+  Pending items are untouched. Events a row behind its stream hadn't applied go
+  without their effects (`catchUp` first, where they matter). Another
+  projection of the read model whose checkpoint a rebuild drops with its data
+  folds its stream again and enqueues those effects again, as on 1.40.0;
   live delivery for the instance must be paused while it runs (a row already at the
   head keeps its checkpoint, so a concurrent applier's condition still holds). Neither
   reads the stream's snapshot, because it is decider state.
@@ -6013,14 +7722,170 @@ instance).
   of its own (`_projectionTombstones`: some projection has `removal`), so a
   read model whose projections have none sends `create`'s put alone, as
   before.
-  - **A tombstone keeps the remover's attributes.** Its checkpoints and
-    revision, nothing of another projection's, and a projection's row written
-    over a tombstone holds what its own state gives it, as on 1.39.0. On a row
-    several projections share, another projection's checkpoint doesn't survive
-    the row's removal, so its redelivery applies again, as on 1.39.0. Whether
-    a field on a row is the writer's own data or another projection's
-    bookkeeping can't be told without a record of which projections wrote the
-    row, which this release doesn't keep.
+  - **The row token (#237), on a read model several projections write.** When
+    more than one projection layout is recorded on a read model
+    (`rowTokened`), its rows carry `__edd_rt__`: 128 random bits, then the tags
+    of the layouts that have written the row (`layoutTag`: a hash of the
+    layout's roles, `removal` and TTL, so every program defining the
+    projection gives it the same tag). Every projection write (row, tombstone,
+    rebuild) and `create` over a tombstone writes a fresh one, conditioned on
+    the one it read (`rowTokenTerm`) beside the projection's own revision or
+    checkpoint: a write that read the row before another fails and retries,
+    whichever projection made the other and whatever counters it left alone.
+    1.39.0 and 1.40.0 guarded a write by the projection's own revision or
+    checkpoint alone, so one projection's write replaced another's that
+    landed after its read.
+    **Only where its name is free (`rowTokenInUse`).** Where anything the read
+    model's definitions name holds `__edd_rt__` on its rows (a model field, a
+    `field:` rename, a key attribute of its table or of any of its indexes,
+    every member's, aggregate's and event stream's index on the table
+    included, its `created` / `updated` timestamp, the table's TTL attribute,
+    or an outbox's key or index attribute on its table), its rows carry no
+    token: no write names it, reads one or carries anything for it, its
+    projections write, keep and refuse as a read model with one layout does
+    (below: 1.40.0's requests, but for the terms and the read on read models
+    with `removal`), and `EDD-9144` never applies. Such a read model doesn't
+    get the token's
+    protection; renaming the attribute that holds the name gets it. One
+    function decides it, from the definitions and the table's TTL attribute
+    (from the table's layer), never from what a stored row holds: a stored
+    `__edd_rt__` is the user's value there, never a token, whatever the
+    number of projections. An index attribute of that name declared only
+    through a second `Table.make` handle on the same physical table isn't
+    seen: the rows carry the token. A versioned read model is refused
+    (`EDD-9081`), so the version attribute can't hold it; a sparse map's entries hold `#`, so
+    can't. An aggregate's ownership check, which knows no TTL attribute,
+    counts the token where only the TTL attribute takes its name, which adds
+    a writer of an attribute no key is made of
+    (`test/RowTokenNames.test.ts` and `test/connected.row-token-names.test.ts`:
+    each position, one projection and two, standalone and with an outbox
+    marked or not, both `escapeKeys`, against requests, rows, reads and
+    effects captured from the published 1.40.0,
+    `test/fixtures/row-token-names-1.40.0.json`).
+    The token's tags describe the row as it is after each write
+    (`writersAfter`): a layout whose attributes a write drops loses its tag,
+    so a later check never names an attribute that is no longer there.
+    A tombstone keeps the bookkeeping (checkpoints, map, owners, revision) of
+    the other layouts that have written the row since the token, so their
+    redelivered events stay recognised. One function says what's carried
+    (`carriedOf`: each attribute as the row reads it), and each site stores it
+    as it stores its own: a tombstone natively, a map whole; a row as the
+    entity stores any value of the field, renamed, packed or as sparse
+    entries, an entry whose key sparse storage can't hold left off (`onRow`);
+    so each reader reads what was written. A write over a tombstone
+    carries it over what `initial` gives; `create` over a tombstone carries
+    what it holds, the layouts with `removal` first as before, then the
+    others. 1.39.0 and 1.40.0 kept only the remover's, so another projection's
+    redelivery applied again over the tombstone, bringing the removed row
+    back, and a late removal removed a row written after it. A row last
+    written under 1.40.0 holds no token, so the first removal after upgrading
+    keeps only the remover's, as on 1.40.0. Only layouts the row's token
+    records are consulted, so projections writing disjoint rows never gain
+    each other's attributes (`test/EventStore.projection-carry.test.ts`: each
+    kind of bookkeeping, at each site, then a redelivery, the next event, a
+    removal, `create` and a rebuild, against 1.40.0's outcomes).
+    A write over a live row carries the others' bookkeeping into what it left
+    out only when, with it, it stores every attribute the row holds but its
+    row token, under the name the row holds it by (`keepsData`). That is
+    judged on two stored things alone: the row's attribute map as read and the
+    attribute map the write's request carries (the item as the entity writes
+    it, the carried bookkeeping included: encoded, renamed, packed, a sparse
+    map as its entries, each entry on its own, then marshalled;
+    `validateAndBuildPutItem`'s `marshalled`, the transaction's own). No
+    definition says which attributes are data, the writer's included: an
+    attribute another program names otherwise is one the write drops, a field
+    it renames (either way), one it doesn't define or keeps inside a packed
+    field, a sparse map under another prefix, and so is the others'
+    bookkeeping where this program would store it under another name. A
+    projection's row write is always a whole `Put`, so nothing is left in
+    place or removed by name: what the request carries is what's stored.
+    There is no second model of what the marshaller keeps: anything it
+    leaves out is a dropped attribute, whatever leaves it out, an
+    `Option.none()`, an emptied sparse map, an empty set (DynamoDB has none, so
+    an emptied set, or a sparse entry holding one, is an absent attribute) or
+    a function; anything it stores under the attribute's name is kept, whatever
+    its value or type (an empty string, binary, map or list, a map or list
+    whose `undefined` members it removed, a class instance it stores as a map,
+    a date another deployment stores as another type, a field packed by one
+    program and native in the other). A value it refuses (an empty set in a
+    list, a symbol, `NaN`) fails the write, as on 1.40.0
+    (`test/EventStore.projection-stored-data.test.ts`, each kind standalone and
+    in the outbox's transaction under both `escapeKeys` settings, and
+    `test/connected.projection-stored-data.test.ts` on DynamoDB Local;
+    `test/connected.projection-row-token.test.ts` for an emptied set and an
+    empty map key DynamoDB refuses). The rule: each event is applied once,
+    in the order processed, and a write that keeps an attribute keeps the
+    checkpoints of the projections that wrote the row, whatever value it gives
+    the attribute. It has two consequences. A value overwritten stays
+    overwritten: a projection that resets another's field to its initial
+    value keeps the other's checkpoints, so the other goes on from that value
+    (B applies 5, A resets the row with B's field at 0, then B's next event, 7,
+    gives 7, and its redelivered 5 is `alreadyApplied` and leaves 0; 1.40.0
+    dropped B's checkpoints there, since A's state held none, so B folded its
+    stream again: 12, and 5). An attribute removed drops the others'
+    bookkeeping and tags, as on 1.40.0, so they start over: they fold their
+    streams again on their next or redelivered event and put their part back.
+    Carrying their checkpoints there would say "applied" over data that is
+    gone, for good.
+    Which projection wrote which data attribute is not recorded (the token
+    records who wrote the row, not what each wrote, and no attribute is added
+    for it), so a write that removes only its own optional field drops the
+    others' bookkeeping too, and a field both add to then counts the others'
+    events twice, as on 1.40.0 (B 5, A 1 with a note, A 2 without it, B 7:
+    20, where each event once is 15). A write that stores every data
+    attribute the row holds keeps their checkpoints, so such a field is not
+    counted twice there (1.40.0 counted it twice: 18, where each event once
+    is 13). A rebuild over a live row carries none: it drops the other
+    projections' contributions to the state, so they fold again, and the row
+    converges, as on 1.40.0.
+    A row read without a token on a read model whose rows carry one was last
+    written by a process still on 1.40.0 (a rolling deployment), or before the
+    token. The write over it is conditioned on the token's absence and on
+    every projection's bookkeeping as read (`asReadTerm`, `heldTerm`), which
+    each of their writes changes, so it never replaces a write landed since,
+    whichever release made it, and a row 1.40.0 rewrote never wedges: its
+    terms hold until the next write. `create` over a tombstone uses the same
+    term. A write naming a token asks for the row as stored when its
+    condition fails (`ReturnValuesOnConditionCheckFailure: ALL_OLD`), so
+    `ConcurrentModification` names what changed (`changedOf`): the
+    projection's own revision or checkpoint, the token, another's bookkeeping,
+    or the removal stamp. The other direction can't be fixed in this
+    release: a process on 1.40.0 conditions its write on its own revision or
+    checkpoint alone, so a write it read before another projection's replaces
+    it, as on 1.40.0. The token protects a row once every writer of the read
+    model runs 1.41.0 or later (`test/EventStore.projection-row-token.test.ts`,
+    against requests captured from the published 1.40.0,
+    `test/fixtures/projection-rolling-1.40.0.json`).
+    A read model with one layout carries no token: its own revision (raised by
+    every write and by `create` over a tombstone) or checkpoint serialises its
+    writes, and it sends and stores what 1.40.0 did, but for two terms and the
+    read below. A projection with `removal` and no revision writing over a
+    tombstone it read adds `attribute_exists(__edd_removed__)`
+    (`tombstoneTerm`), since `create` over the tombstone keeps the checkpoint,
+    which alone let 1.39.0's and 1.40.0's write replace the created row. And
+    `create` over a tombstone names it by every projection's bookkeeping as
+    it read it as well as by its removal stamp (`asReadTerm`), since a stamp
+    has a millisecond's resolution: a row written over the tombstone and
+    removed again within one passed 1.39.0's and 1.40.0's guard, and `create`
+    carried the older tombstone's checkpoints. A row token on read models
+    with `removal` would have closed it too, but changes every write of every
+    such read model (an attribute stored, a term sent); the exact guard adds
+    terms to `create`'s condition over a tombstone alone, and no request.
+    The layouts are those this program defines. A program defining one
+    projection of several writes a token only on a row that holds one, and
+    checks a token only where the row holds one: there its write is
+    conditioned on the token it read, so it never replaces a write landed
+    since, and its fresh token keeps the tags of layouts it doesn't define.
+    On a row read without one it conditions its write as 1.40.0 did, on its
+    own checkpoint or revision alone, so another program's write landed since
+    can be replaced, as on 1.40.0. It can't tell the read model has other
+    projections. Two options were not taken: a term on every write over a row
+    without a token (it would change every single-projection read model's
+    writes), and an explicit declaration on the read model that its rows are
+    shared, making a single-layout program write the token (new API surface;
+    defining all of a read model's projections already does it). It carries
+    no bookkeeping of layouts it doesn't define. So every program writing a
+    read model's rows must define all of its projections.
   - **`create` over a tombstone** consults the projections with `removal`,
     the one defined last first: each attribute one of them names that the
     tombstone holds is carried, a checkpoint (or map, or owner) as it is and a
@@ -6030,11 +7895,25 @@ instance).
     1.39.0 took the layout of the projection with `removal` defined last
     alone, so over another projection's tombstone it carried nothing, and a
     late redelivery of the removal applied again and removed the created row.
-    A projection without `removal` writes no tombstone and isn't consulted.
+    A projection without `removal` writes no tombstone and is consulted last,
+    for what the row token had a tombstone keep of it.
+    Each value goes on the row as the row stores it. A tombstone 1.39.0 wrote
+    holds a sparse checkpoint map whole (so does a current one): `create`
+    writes its entries as the row's sparse entries, so the checkpoints
+    survive and a redelivered event is still `alreadyApplied`; an entry whose
+    key sparse storage can't hold is left off, and the whole-map attribute
+    isn't copied (copied whole, it read on the row as `{}`). No extra request
+    (`test/EventStore.projection-tombstone-layouts.test.ts`, over a tombstone
+    captured from the published 1.39.0,
+    `test/fixtures/projection-tombstone-sparse-map-1.39.0.json`). An explicit
+    migration of the checkpoint format wasn't taken: a tombstone holds its map
+    whole by design, so nothing stored is in the wrong form; only `create`'s
+    copy was, and `create` has the tombstone in hand.
     When a projection's tombstones set the table's TTL attribute, it is never
     carried, so the row doesn't expire with the tombstone. Over a tombstone of
     the projection with `removal` defined last, `create` sends and stores what
-    1.39.0 did (`test/fixtures/projection-tombstones-shared-1.39.0.json`).
+    1.39.0 did (`test/fixtures/projection-tombstones-shared-1.39.0.json`), but
+    for the row token and what the tombstone keeps of other layouts (above).
   - **One role per attribute in a projection (`EDD-9133`), on a read model
     whose rows may be tombstones.** When a projection on the read model has
     `removal`, a stored attribute (compared through the entity's renames, as
@@ -6048,8 +7927,16 @@ instance).
     rows (`a#<id>` and `b#<id>`, say) can't be told at definition from
     projections sharing rows, and each projection writes only its own
     attributes, so on its own rows they keep their roles, as on 1.39.0.
-    Projections that share rows and swap an attribute's roles are broken, as
-    on 1.39.0, and can't be detected.
+    Projections that share rows and swap an attribute's roles are refused on
+    a row both have written (`EDD-9144`), and only there.
+    A checkpoint map stored as a sparse map is compared by its container's
+    name, not by the attributes its entries are stored in, and needs nothing
+    more: every role is a model field (`EDD-9081`), and `Entity.make` refuses a
+    model field stored where a row's reader takes an entry of a sparse map
+    (`EDD-9140`), so no revision, checkpoint or owner can be stored as
+    `<prefix>#<key>` beside it. 1.39.0 loaded a revision renamed `p#rev`
+    beside a checkpoint map with prefix `p`, and stored the map's entry there
+    (`test/EventStore.projection-shared-rows.test.ts`).
     The table's TTL attribute is known only when a projection runs: one a
     projection keeps (by its stored name) while a projection's tombstones set
     it (`removal.ttl`) refuses every projection on the read model with a
@@ -6061,6 +7948,32 @@ instance).
     `drainPending` write no row and don't run it, so a worker providing only
     its outbox's table delivers as on 1.39.0. Projections may share an
     attribute in one role, such as a revision.
+  - **A projection's write for a row it read absent (#237).** On a read
+    model whose rows may be tombstones (`_projectionTombstones`), it proves
+    the key still holds nothing (`attribute_not_exists` on the key, and on the
+    row token where rows carry one), as the put of a write with outbox items
+    always did, and never takes the place of a tombstone written since
+    (`projectionWrite.expectAbsent`): `create` doesn't read the key again for
+    one, so a new row costs one `GetItem` fewer. 1.39.0 and 1.40.0 replaced a
+    tombstone another worker of the same projection wrote after the read,
+    carrying the tombstone's checkpoint onto the row at the earlier event, so
+    the removal was lost for good: its redelivery was `alreadyApplied`
+    (`test/EventStore.projection-row-token.test.ts`).
+  - **One meaning per attribute on a row two projections write
+    (`EDD-9144`).** On a row whose token records another layout, an attribute
+    that layout keeps as bookkeeping, that is on the row, and that this
+    projection keeps in another role is refused when the row is read, before
+    the projection uses it (1.39.0 and 1.40.0 read one projection's revision
+    as another's checkpoint, reported the event `alreadyApplied` and left the
+    row a tombstone); and a write over the live row that gives such an
+    attribute another value, without keeping it in that role, is refused
+    before anything is sent. Rows only one of them has written refuse
+    nothing: projections writing disjoint rows may give one name different
+    meanings, as `EDD-9133` allows. Nor does an attribute the row no longer
+    holds (the token's tags follow the row, above), or a rebuild, which reads
+    none of its old values from the row and so misreads nothing. The
+    read-time refusal comes before `alreadyApplied` is decided, so a
+    redelivery is refused too.
   - **A sparse-map checkpoint field.** Its keys (`<source>#<streamId>`) hold
     `#`, which a sparse map can't store. A tombstone's write is checked as the
     row's write is (`serializeSparseOrFail`, on a copy), so both refuse such a
@@ -6068,13 +7981,156 @@ instance).
     written. What's stored is the tombstone as 1.39.0 stored it: a map left
     empty is kept whole, `{"M":{}}`. A write that adds no key (every event
     skipped, or an instance holding its source's own field) isn't refused.
+    The key can't be judged before the row is read, so the refusal comes
+    after the reads, for a live event, a removal and `rebuild` alike (one
+    `GetItem`; `rebuild`, each instance's `Query`, then the `GetItem`), as on
+    1.40.0 and, for live events, 1.39.0. Whether an instance's checkpoint goes
+    in the map at all is the row's to say when its source has a field of its
+    own (the map takes it only while another instance owns the field), and
+    whether the write adds the key is the fold's. A check before the read
+    would have to refuse every instance that might add one, and so would
+    refuse three folds that add none and complete: an instance whose events
+    are all skipped (applied, nothing written); an instance whose `evolve`
+    fails (reported, and the row's other instances still written); and events
+    `evolve` rejects (`terminal`), alone, on a row that doesn't exist (applied,
+    nothing written). Pinned in
+    `test/EventStore.projection-tombstone-layouts.test.ts`, the requests sent
+    before the refusal included.
 - **The outbox** writes effects as items (`<entityType>#outbox`, sort key
   `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
-  in the row's transaction. `drain` claims the head item (a conditional update
+  in the row's transaction. From 1.41.0 each item carries a mark,
+  `__edd_rm__` = `<read model tag>.<effect tag>` (`outboxMark`): the read
+  model's tag (`readModelTag`), then a 64-bit FNV-1a hash, base 36, of the
+  projection (`layoutTag`) and the event (its source, stream id and version).
+  Each item's Put is conditioned on its key holding nothing or the item of
+  the same effect (`attribute_not_exists(#pk) OR #rm = :rm`, `#rm` the mark;
+  `outboxGuard`): a redelivery or retry replaces its own item, as on 1.40.0,
+  and nothing else is replaced. Two items meet at one key three ways: read
+  models whose row keys are the same text (`[shop]` with `north#branch_b1`
+  beside `[shop, branch]`, `escapeKeys` off) writing at one revision; two
+  projections of one read model, each with its own revision, writing at one
+  revision, which happens in the ordinary course; and one projection whose
+  revision starts again (its row deleted outside the projection, or its
+  tombstone expired) while an item of another event is still pending at the
+  key. 1.39.0 and 1.40.0 put items unconditioned, so the second replaced the
+  first and its effect was never delivered. The transaction's reasons are
+  read by position: the row's (position 0) is a lost race, whatever else
+  failed; items' alone are keys other effects' items hold, and the whole
+  transaction is sent again with those items at their next stage
+  (`outboxStages`), the others where they were. The stages, decided from the
+  definitions:
+  - `"none"`: no mark and no condition, as on 1.40.0, where the mark's name is
+    something else's (below).
+  - `"plain"`: the condition above.
+  - `"sameEvent"`: that, or an item without a mark (written before 1.41.0) of
+    the same event (`... OR (attribute_not_exists(#rm) AND #es = :es AND #ei =
+    :ei AND #ev = :ev)`, `source`, `streamId` and `version` as 1.40.0 stored
+    them), which is replaced, as on 1.40.0. Only where nothing else can have
+    written at the key: no other read model's keys can be this one's
+    (`outboxKeysApart`: on each table its outboxes are on, every other read
+    model writing outbox items there composes keys that can never be its own)
+    and no other projection of the read model writes outbox items (an item
+    records its event, not its projection: the other projection's item of the
+    same event would be replaced, and its effect lost). Decided from the
+    `Table.make` definitions: a second handle on the same physical table isn't
+    seen, so read models whose keys meet only through it count as apart and
+    such an item is replaced, as on 1.40.0, even where it is the other's. A
+    drainer delivering the item between the cancelled `plain` transaction and
+    this one lets this one write it again: delivered twice (1.40.0 replaced it
+    in one request). Both need an item pending from before the upgrade.
+  - `"beside"`: at the key followed by `#<mark>`, which only this effect
+    writes, with `ReturnValuesOnConditionCheckFailure: ALL_OLD`.
+
+  A read model's items go `plain`, `sameEvent`, `beside` where `sameEvent`
+  applies, else `plain`, `beside`. The key beside sorts right after the
+  other's and before the next position's, so each drainer delivers its own in
+  order, passing over another read model's, and one read model's drainer
+  delivers both its projections' items, in key order. Items beside one key go
+  in their marks' order. Two of one projection's own effects are beside one
+  key only after its revision started again (its row lost, or rebuilt by
+  another projection) while its items were pending, its events then falling
+  at other revisions: those two are delivered in their marks' order, not
+  necessarily the order they were applied in (1.40.0 kept only the later).
+  An order-keeping suffix needs either something the writer can't know
+  without reading the key (what is already beside it) or a value that
+  differs between a retry and the write it retries (a clock), which would
+  write a retried effect twice. Nothing is read first,
+  an item at a free key is where 1.40.0 wrote it, and only a collision adds a
+  request (a cancelled transaction, then the one sent; two for an unmarked
+  item of another event). Two projections of one read model at one revision
+  collide in the ordinary course: each such write costs the second a
+  cancelled transaction. A key beside held too can't be another effect's in
+  normal operation (only the effect writes its mark): `EDD-9145`, naming what
+  holds it, nothing written. An item without a mark where `sameEvent` doesn't
+  apply may be another's: kept, and the new one beside it, so its effect is
+  delivered twice where it was this projection's own, rewritten after its row
+  was lost. Not taken: refusing the second write, diagnosed (`escapeKeys`
+  cures the read models' case, but the write fails where both effects can be
+  kept, and nothing cures the projections' case); the mark in every item's
+  key (a stored-format change for every item, for what only colliding keys
+  need); reading the key before writing (a read on every write).
+
+  **The mark's name.** A new library attribute is written only where its name
+  is free (`outboxMarkInUse`, one function, from the definitions): where
+  `__edd_rm__` is a key attribute of where the items are written (the outbox
+  table's key or index attributes, any key attribute of its table: a member's
+  primary or secondary index, a vector index's partition or filter attribute,
+  an aggregate made on the table, registered or not, an event stream's index;
+  `Table.tableKeyAttributes`), the read model's items carry no mark, their Put
+  no condition (`"none"`), and its drainers read no mark: exactly 1.40.0's
+  requests, items and deliveries (`fixtures/outbox-mark-names-1.40.0.json`),
+  and none of this protection. Never decided by what a stored item holds. An
+  index attribute of that name declared only through a second `Table.make`
+  handle on the same physical table isn't seen: the items carry the mark.
+
+  `drain` claims the head item (a conditional update
   with an expiring claim), delivers it, deletes it on its claim, and repeats:
   in order per row, at least once. `deliver` on `applyBatch` / `processBatch`
   drains after the write; `drainPending` sweeps through a sparse
-  `outbox.index`.
+  `outbox.index`. The index is keyed by entity type alone, so read models of one
+  entity type sharing it (another schema or primary collection) list each
+  other's items. Whose an item is, is one decision (`outboxOwnership`, also
+  `rekey`'s): the row it names must have a key the read model's composer
+  writes, under every setting a row can have been written under, for values
+  of its composites' kinds (a date the library encodes as its ISO text or
+  epoch, a number's key text, a literal's, any text for a string, `#`
+  included: `KeyComposer.composeKeySpace` with `walkOpen`); what its reader
+  would take isn't enough (a date's reader takes `x_q` as a date's text, which
+  no date writes). Then the read model its mark names (the text before the
+  first `.`; a hash of the schema's name and version, the entity type and its
+  version, the primary collection and the primary key's composites,
+  `readModelTag`) says whether it's this read model's. Read models whose keys
+  meet only through a string value holding `#` (`[shop]` with `north#branch_b1`
+  beside `[shop, branch]`), which bind as on 1.39.0, can't be told apart by
+  key; the mark tells them apart. An item written before 1.41.0, at a key the
+  read model writes, carries no mark: `drainPending` drains it, as 1.40.0 did
+  every item of the index, so an item another read model's key can make too
+  is drained by both drainers, as on 1.40.0. Outbox items are short-lived, so
+  those drain away after an upgrade. The others' items are left unclaimed for
+  their drainers. The decision is made item by item where an item is claimed
+  (`drainRaw`, under `drain`, `deliver` and `drainPending` alike): read models
+  whose row keys are the same text (`[shop]` with `north#branch_b1` beside
+  `[shop, branch]` with `north` and `b1`, `escapeKeys` off) have their items
+  under one row key, and each drainer passes over the other's at the head of
+  the row, unclaimed, and goes on after it (`ExclusiveStartKey`). Its requests
+  are the ones 1.40.0 sent wherever a row holds only its own items. On 1.39.0 and 1.40.0
+  it claimed another read model's head item, failed to decode it with its own
+  schema, and left the claim, so that read model's drainer stopped there until
+  the claim expired.
+
+  **Rolling deployment.** The mark is part of no key, and an item beside
+  another is an ordinary key under the row's: the published 1.40.0's
+  `drainPending` and `drain`, given the items this release writes (marks, two
+  projections' items at one revision, an item beside its own after its row
+  was lost), deliver every one, in key order, and delete them, with the
+  requests this release's drainer sends (`fixtures/outbox-rolling-1.40.0.json`,
+  `test/OutboxRolling.test.ts`). A 1.40.0 drainer of read models whose row
+  keys are the same text still takes the other read model's items at its row
+  for its own, as it did before: those now include the items kept beside
+  them, so drainers of such read models are upgraded before their writers.
+  The outbox table's `rekey` asks the same function of every read model of the
+  entity type on the table, and reads the row an unmarked item names only when
+  more than one can have written it and they'd move it apart (§7 "`rekey`").
 - **`EventStore.processBatch`** routes through each projection's internal
   routes (one per source stream; `bindProjection` wraps their decode and apply
   in its context), so single- and multi-source projections share one feed.
@@ -6323,7 +8379,55 @@ like a GSI half whose composites are all primary-key members.
 **Out-of-band refresh.** `db.entities.Products.reembed({ concurrency })` streams
 the entity's items (Scan scoped by `__edd_e__`), re-derives source text, embeds,
 and writes the vector back. This is the migration path when the embedding model
-changes — DynamoDB will never recompute a vector for you.
+changes — DynamoDB will never recompute a vector for you. Each write is
+conditioned on the item existing with every attribute holding a source field or a
+partition composite as read (or still absent) (#240): a write that changed one in
+between wrote its own vector and partition, so `reembed`'s is cancelled, and the
+item is skipped, neither retried nor counted. A sparse map's entries are held as
+read; one added in between isn't seen. Up to 1.40.0 the condition was
+`attribute_exists(#pk)` alone, and such a write's vector was overwritten with the
+old text's. `reembed` is never unguarded (`reembedGuard`): when the source and
+partition terms don't all fit DynamoDB's limits on one expression (about 300 source
+fields), the write holds each vector index's vector and partition attributes as
+read instead (`vectorsAsRead`, the function `rekey`'s move uses; for an index it
+doesn't embed too), since a write that changed the source wrote its own vector,
+and then as many source terms as fit. When those don't fit either (a vector of
+hundreds of thousands of dimensions), the item isn't written: `reembed` fails
+with a `ValidationError` naming its key, as it fails on any item it can't write
+(one its embedding takes past 400 KB). A
+narrow source sends exactly the condition it sent before (`VectorWriteRaces.test.ts`,
+`wideSourceScenarios` and `wideSourceUnguardable`, and their connected twins). The option not taken is a
+revision attribute that every write bumps: `reembed` would hold it alone, one term
+that sees every write, a sparse map's new entry and the attributes past the limits
+included, and `rekey`'s guard would see a `reembed` too. Every item would then
+carry an attribute no release writes today, so it is a stored-format change, and it
+waits for the next major, behind one flag off by default until then.
+
+The other way round, a `reembed` landing between the read and the write of a
+write that reads a versioned item first isn't seen by its version guard either.
+Two such writes copy the vector they read (#240), and hold each vector index's
+vector and partition attributes as read, where they fit (`vectorsAsRead`, the
+function `rekey`'s move uses): a soft delete, whose tombstone stashes the
+embedding (`deleteGuard`'s whole-row guard), and an update too wide for one
+expression, which puts the item back whole (only the indexes it doesn't embed
+itself). A lost race is a `ConcurrentModification` naming the vector attributes
+(`vectorRace`): the soft delete reads again and deletes again within
+`GUARDED_PUT_ATTEMPTS`, as for any race, and fails with a `.condition()` (in
+`transactWrite`, planned again, as any race there is, never taken for the
+caller's condition); the update fails, as a read-first update fails on any race. Up to 1.40.0 the
+tombstone stashed the old vector, so `restore` brought it back, and the update
+wrote it over the new one. The rest copy no vector: a retain delete's snapshot
+strips it and the item goes, and an update writing only what changed leaves the
+vector attributes alone unless it embeds them itself, so they hold nothing more,
+and nothing changes for an entity without a vector index
+(`connected.versioned-copies.test.ts`, against the requests the published
+1.40.0 sent). The terms carry the vector in the request: for 1,536 dimensions,
+about 12.7 KB of DynamoDB's size accounting (17.5 KB for float32-derived
+values) added to a soft delete's transaction, far within its 4 MB, and the same
+to an update's substitutions, within their 2 MB. "Where they fit" counts the
+whole condition, the caller's `.condition()` included: the terms are left out,
+and the version alone is sent as 1.40.0 sent it, when they would take the
+expression past its length or operator limits or its substitutions past 2 MB.
 
 ### Lifecycle integration
 
@@ -6471,7 +8575,8 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `ValidationError` | Schema decode/encode failure, or a refused operation: an item with an incarnation token but no version, a write that would overwrite a different `v#N` snapshot, a replacing put in `Batch.write`, a condition or filter with an empty part under `or` / `not` (or an `or()` with no parts), `expectedVersion` on an unversioned entity; or a request DynamoDB rejected — an item over 400 KB, a transaction over 4 MB, a partition key over 2048 or a sort key over 1024 bytes, one item touched twice, a condition over its expression limits, an `isIn` with no values, an empty key value, a consistent read of a GSI, a reversed `between`, a vector search's `TopK` outside 1..100 — diagnosed and naming the culprit (`cause`: DynamoDB's error) |
 | `TransactionCancelled` | Transaction failed with cancellation reasons |
 | `UniqueConstraintViolation` | Sentinel item already exists for unique field (from the entity's write, `transactWrite`, or an `append`'s `additionalItems`) |
-| `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion` |
+| `ItemAlreadyExists` | `insert()` found the primary key taken. Carries `entityType` and `key` (the primary key composites), no current item: DynamoDB returns none |
+| `OptimisticLockError` | A versioned write lost a version race (`expectedVersion` mismatch, a concurrent write between a read-then-write update's read and write, or a guarded put / upsert / transaction put that lost the race on every attempt); carries the real `actualVersion`, and `attributes` naming a renamed sparse map whose stored form changed before every attempt (§7 "Which verdict a refused write gets") |
 | `ConcurrentModification` | An unversioned read-then-write write found an attribute it read changed before its write landed (or lost a guarded put's race on every attempt), or a unique sentinel it was releasing changed hands; nothing written (`attributes`, `current`) |
 | `TransactionOverflow` | DynamoDB rejected a write's own transaction (item, sentinels, snapshot) for exceeding 100 items; nothing written (`cause`: DynamoDB's error) |
 | `UpdateAppliedButUnreadable` | A retain update was applied at `version` but its result could not be read back provably; do not retry (`version`, `reason`) |
@@ -6489,6 +8594,8 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `AdditionalItemConditionFailed` | A condition the caller set on an `EventStore` `additionalItems` op failed (`indices` into the caller's array) — not a version conflict |
 | `CompressorNotRegistered` | Never in an error channel: the `cause` of the `ValidationError` a packed value fails with when it needs a compression codec with no registered `Compressor` — a write whose JSON crossed its `compression.threshold`, or a read of a `B` value whose header names the codec (`codec`, `direction`, `entityType`, `attribute`, `operation`) |
 | `AppendTooLarge` | DynamoDB rejected an `EventStore` append for exceeding 100 transact items (`count` is the items sent, `cause` DynamoDB's error); nothing is written and an append is never split. For a stepped command, `count` against `limit` means the step size is too large |
+
+**What an error holds.** `key` on a write's error is the primary key composites, on every path: never the whole input, whose encoded values would put a `Schema.RedactedFromValue` field in plaintext on the error. `cause` keeps what the SDK threw, but `classifyError` makes the stored rows on it (`Item` and `CancellationReasons[i].Item`, returned by `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`) non-enumerable (`internal/ReturnedItem.ts`): the verdicts and callers can still read them, and `JSON.stringify` and structured loggers don't print them. An error field that holds an item or the caller's values is read, never printed: `UniqueConstraintViolation.fields`, `DeleteAppliedButUnreadable.item`, and `current` on `ConditionalCheckFailed`, `ConcurrentModification` and `StaleAppend`. Effect prints an error through its `toJSON` (`JSON.stringify`, `inspect`, its built-in log formats), which copies the arguments the error was made with, so each of these errors overrides `toJSON` to leave the field out (`printedJson` in the schema package's `Errors.ts`). The field stays an own, enumerable property, not a hidden one: a copy (`{ ...error }`), `Object.keys`, `Equal.equals` and test equality (`toEqual`) see it as they did in 1.40.0, and a hidden field would have made two errors that differ only in it equal under `toEqual`. A logger that copies an error's own properties itself, instead of printing it through `toJSON`, still sees it. A new error field that holds values follows the same rule. `ValidationError`'s `cause` needs nothing: schema issues name the path and the expectation, never the value.
 
 ### Credential Refusal Replies
 
@@ -6517,6 +8624,7 @@ pre-#147 unions.
 |-----------|-----------------------------------------------|
 | `put` | `ValidationError`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `TransactionOverflow` |
 | `create` | as `put`, plus `ConditionalCheckFailed` |
+| `insert` | `ValidationError`, `UniqueConstraintViolation`, `ItemAlreadyExists`, `TransactionOverflow` |
 | `upsert` | as `put`, plus `ItemNotFound`, `ConditionalCheckFailed` |
 | `update` | `ItemNotFound`, `OptimisticLockError`, `ConcurrentModification`, `UpdateAppliedButUnreadable`, `UniqueConstraintViolation`, `ValidationError`, `TransactionOverflow` |
 | `patch` | as `update`, plus `ConditionalCheckFailed` |
@@ -6606,6 +8714,7 @@ for unrelated errors and the collision was caught only at review.
 | 9096 | Numeric key text |
 | 9097 | Retired: transactions over rows under 1.36 keys |
 | 9098 | `rekey` options and resume tokens |
+| 9161–9164 | Effect value types: what DynamoDB doesn't store at an untyped position, object key composites (#242) |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -6712,12 +8821,13 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9106` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` and `Table.make`, and the type-level guard for a sharded half where literals show it | Two key halves of one entity stored in one attribute, sharded or not, without the same fields, in the same order and casing, or a sharded partition key with one sharded differently |
 | `EDD-9108` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | One entity uses one physical index twice, even over the same fields |
 | `EDD-9109` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredInKeyAttribute`), through `Entity.make` | A model attribute, a system timestamp or a version field is stored in a key attribute the entity writes (`writtenKeyAttributes`: the table's, and since 1.40 each secondary index's), by rename or by name; or, since 1.40, a model attribute is named as one under a rename, which moved the composed key into the field's attribute |
+| `EDD-9110` | `Entity.ts` (`ValidationError`, operation `insert`) | `insert()` of an entity with `versioned: { retain: true }`, whose version number comes from a query a role limited to `PartiQLInsert` can't run, or `insert()` given a non-empty condition by an untyped caller (a PartiQL `INSERT` has none; an empty one is no condition, as on every write) |
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
 | `EDD-9113` | Retired, never released | Allocated during 1.40's development for a load-time refusal of a `timeSeries.appendInput` that carries a `shards.by` attribute of an index no append of which could compose the index's key, and retired before release. Such a definition loads, as on 1.39.0, and an append that can't compose the key fails with `EDD-9100` when it's made. Don't reuse the number |
 | `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites; `Aggregate.make`, pure and operational (`AggregateSchemas.refuseAggregateKeyOverMovingValue`, `refuseManySortKeysOverMovingValue`) | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by`; a stamped `updatedAt` in an aggregate's partition key or a `many` edge's sort key (§7 "Composites the library stamps") |
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
-| `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
+| `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds, or a value holding one it's inside, such as an Effect `Chunk` in an untyped field (a stack overflow up to 1.40.0). A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
 | `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container, other than one between lists holding the same type: `Schema.Date`, `Schema.Redacted`. `Schema.Redacted` beneath a transformation onto another type, such as `Schema.OptionFromOptional`, on every owner. A union a read can't tell a bigint from something else stored as a number in (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field that a read would try first, or another event), since `5n` and `5` are stored the same: on a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
@@ -6726,10 +8836,24 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9130` | `DynamoClient.ts` (`make`), through `Aggregate.ts` (`ownershipConflict`) | An aggregate declaring `ownsRows` beside another member the client sees that can write a row of one of its entity types into its partition: the message names the aggregate, the member, the type and the channel. A defect from `DynamoClient.make`, as `EDD-9037` is (§7 "Which rows in its partition are an aggregate's"). |
 | `EDD-9131` | `Aggregate.ts` (`hydrateAggregateRefs`, `refIdValue`) | An aggregate `create` is given an id that is no value of the edge's entity's key composite, neither of its type nor its stored or JSON form (`"5"` for a number key), so it names no item; or an id of its type `put` refuses, as DynamoDB can't store it (`Infinity`, anywhere in a struct, an `Option` or a `Result`) or as it doesn't encode as the composite is stored (an infinity through a digits-only string codec), judged by `put`'s own rule (`Entity._unstorableKey`). A `ValidationError` naming where the id was given, what it was given, the composite and the entity, judged before anything is fetched or written. Up to 1.39.0 a string was fetched under a key no `put` writes (`RefNotFound`), and anything else was dropped. |
 | `EDD-9133` | `internal/TransactableOps.ts` (`addProjectionLayout`, `projectionTtlConflict`), through `internal/ProjectionEngine.ts` (`EventStore.projection` / `multiProjection`, `preflight`) | On a projection read model one of whose projections has `removal`, one stored attribute one projection keeps in two roles: a checkpoint, checkpoint map, checkpoint owner or revision it also uses in another role, compared by stored name. Thrown by the definition that completes the conflict (the projection's own, or the first `removal`), with nothing recorded. Without `removal` nothing is refused, nor are two projections keeping one attribute in different roles. The table's TTL attribute, known only at run time, is checked by every entry point that writes a row (not the drains) before it sends anything: an attribute a projection keeps that is stored as it, while a projection's tombstones set it (`removal.ttl`), fails every projection on the read model with a `ValidationError`. |
-| `EDD-9134` | `internal/ProjectionEngine.ts` (`sharedOutboxKeySpace`, `refuseSharedOutboxKeySpace`), through `DynamoClient.make`, a table's `rekey` and `EventStore.processBatch` | Two read models whose projections' outboxes are on one table, in the same key space (the partition and sort key text their primary keys compose: schema name and version, primary collection, entity type, the composites' labels, and what each composite's type can compose: a number's or bigint's key text, a literal union's members, `true` and `false`, or any text). `DynamoClient.make` (among the entities it binds and its tables' members) and `processBatch` (among the read models of the projections it's handed) refuse two whose keys can be the same with values that hold no `#`: their items would overwrite each other. A defect, before anything runs. Two whose keys meet only through a value holding `#`, or part where one's value can't spell the other's text (a number beside a label), bind and run. `rekey` of the outbox's table refuses two whose items it could read as each other's, a value holding `#` included and a literal composite read as any text, as its reader reads one, with the outboxes of projections defined since the client was made; and a member of that table claiming the outbox items of a read model's entity type that could read them as its own, unless it composes its keys exactly as the read model does. A `ValidationError`, before it sends anything; `rekey` of other tables runs. Tables are compared by the physical name the context gives them, so two handles on one table are one table. Read models that never meet at one of these can't be checked: key spaces must be distinct per outbox table. |
+| `EDD-9134` | `internal/ProjectionEngine.ts` (`sharedOutboxKeySpace`, `refuseSharedOutboxKeySpace`), through `DynamoClient.make`, a table's `rekey` and `EventStore.processBatch` | Two read models whose projections' outboxes are on one table, in the same key space (the partition and sort key text their primary keys compose: schema name and version, primary collection, entity type, the composites' labels, and what each composite's type can compose: a number's or bigint's key text, a literal union's members, `true` and `false`, or any text). `DynamoClient.make` (among the entities it binds and its tables' members) and `processBatch` (among the read models of the projections it's handed) refuse two whose keys can be the same with values that hold no `#`: their items would overwrite each other. A defect, before anything runs. Two whose keys meet only through a value holding `#`, or part where one's value can't spell the other's text (a number or a date beside a label), bind and run. `rekey` of the outbox's table asks the same question, with the outboxes of projections defined since the client was made, and of a member of that table claiming the outbox items of a read model's entity type, unless it composes its keys as the read model does (each composite of the same kind of key text, a literal union taken as its kind). 1.40.0's `rekey` also refused two whose items its reader could read as each other's (a value holding `#` included, a literal composite read as any text); from 1.41.0 it decides those item by item (`rekeyOutboxMember`, DESIGN §7 "`rekey`"). A member that is no read model (a projection object built by hand, with its routes and no read model) isn't compared, and runs as on 1.39.0. A `ValidationError`, before it sends anything; `rekey` of other tables runs. Tables are compared by the physical name the context gives them, so two handles on one table are one table. Read models that never meet at one of these can't be checked: key spaces must be distinct per outbox table. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
+| `EDD-9144` | `internal/ProjectionEngine.ts` (`sharedMeaning`), through `EventStore.projection` / `multiProjection` (`apply`, `applyBatch`, `processBatch`, `catchUp`, `rebuild`: every row write) | On a read model whose rows carry the row token (#237: more than one projection layout, and the token's name free, `rowTokenInUse`), a row whose token records another layout that keeps an attribute as bookkeeping (checkpoint, checkpoint map, checkpoint owner, revision) this projection keeps in another role, the attribute on the row: refused with a `ValidationError` when the row is read, before the projection uses it (not by a rebuild, which reads no old value from the row), and a write over the live row that gives such an attribute another value, without keeping it in that role, refused before anything is sent. Rows the other layout hasn't written refuse nothing (`EDD-9133` allows projections on disjoint rows to give one name different meanings). 1.39.0 and 1.40.0 read the other projection's revision as this one's checkpoint (`alreadyApplied`, the row left a tombstone) or overwrote its bookkeeping. |
+| `EDD-9145` | `internal/ProjectionEngine.ts` (`writeRow`), through a projection's `apply`, `applyBatch`, `processBatch`, `catchUp` and `rebuild`, single- and multi-source | A projection's outbox item whose key held another effect's item (another read model's whose row keys are the same text, another projection's of the read model, or another event's: `outboxGuard` cancelled it) was written beside it, at its key followed by `#<mark>`, and that key is held too, by an item that isn't this effect's (`ALL_OLD` names it). Only the effect writes its mark, so nothing the library writes is there in normal operation. A `ValidationError` naming the read model, its tag, the row, the revision, the item's position, the key, the item's mark and what holds it, asking whether that item was written outside the projection, with DynamoDB's error as the cause; the transaction was cancelled, so nothing was written. |
+| `EDD-9149` | `internal/Expr.ts` (`emptyPartProblem`), through every entry point that refuses an empty part: an entity's and a collection's filter, a write's and an `.append()`'s condition, a transaction's op conditions, and an aggregate's `list` filter | An expression one of whose operands is the path builder itself (`t`, or `t.size()`), which names the whole item, not an attribute, and would compile to an empty attribute name (#238). A `ValidationError` naming the operation, before anything is sent. 1.39.0 and 1.40.0 sent such a condition as `( = :e0)`, and DynamoDB rejected it with a `DynamoValidationError`; 1.40.0 sent such a filter the same way, and 1.39.0's filter died with a `TypeError` before sending. A `.select()` of the path builder itself is sent as before, and DynamoDB rejects the empty `ProjectionExpression`. |
+| `EDD-9150` | `Entity.ts` (`renamedMapRefusal`), through an update's write (`update`, `patch`, their bound builders) and a plain entity's `upsert` | An update or a plain entity's `upsert` that writes an entry of a sparse map a `field:` rename stores whole (`{ storedAs: SparseMap(), field: "sr" }`: `.set()` of the map, `.add()` / `.subtract()` of an entry's attribute, `.removeEntries()`, a path operation writing an entry; a copy's source writes nothing and isn't guarded), sent without reading the row, to a row that holds the map whole under the renamed attribute, where `put` stores it (#238). The write is sent as before with `attribute_not_exists(<attribute>)` beside its own guard; DynamoDB refuses it, and the refusal is told by the stored item it returns: a `ValidationError` naming the map and the attribute, with nothing written. Only where the rest of the write's condition (the caller's `.condition()`, `expectedVersion`, an upsert's key guards) is known to hold on that item (`rejectedBy` in `internal/FormGuard.ts`, through `internal/ConditionHolds.ts`); where it doesn't, or where the evaluator can't tell (a `size()` whose answer depends on how a string's length is counted), the caller's own verdict, as through 1.40.0. 1.39.0 and 1.40.0 wrote the entry beside the whole map, which every read takes in its place, and reported success (a `.subtract()` failed with a `DynamoValidationError` naming no attribute). A retained or unique entity's `upsert` reads the row and writes the map whole, and isn't guarded. An update that holds the row (a retained or versioned read, `clearMap`, a transaction's plan) writes the entry where the row holds the map instead, and isn't refused: a row whose form changed since its read is read and written again, and one changing before every attempt fails with `OptimisticLockError` or `ConcurrentModification` naming the map in `attributes`. The next major stores such a map as entries everywhere and retires this code (§7 "A map a `field:` rename stores whole", "Which verdict a refused write gets"). |
+| `EDD-9151` | `Entity.ts` (`clearedOverlap`), through an update's write (`update`, `patch`, their bound builders, and a transaction's plan of one) | An update that clears a sparse map (`.clearMap()`) and also reads the value of an entry the row held, or writes below it (`.subtract()`, `pathSubtract()`, `.append()`, a `SET`, `ADD` or `DELETE` below it), whether the row held the entry as its own attribute or inside the attribute a `field:` rename stores the map under: the clear comes first, so there's nothing left for the operation to work on (#238). Refused after the clear's read, before the write. 1.40.0 sent it, and DynamoDB refused it with a `ValidationException` (the entry named twice, or an attribute the row lacks). A `.set()`, `.add()`, `pathIfNotExists()`, `.removeEntries()`, or a `REMOVE` or `DELETE` of such an entry is resolved instead, and a retained entity's record operations apply in memory (§7 "Clearing"). |
+| `EDD-9152` | `internal/OwnNames.ts` (schema, `refuseProtoName`, `requiredProtoPropertyIn`, `isRequiredStored`), through `Entity.make`, pure and operational; `internal/EventProjection.ts` (`refuseReadModel`), through `EventStore.projection` and `multiProjection` | An entity naming `__proto__` where every item it writes would hold it, as an attribute or as a property of a stored map: an attribute the library writes on every item (a timestamp, the version, a key attribute of the table, and both key attributes of an index whose every composite, in both halves, is a model field that always stores something; a put writes an index's keys only where it holds every composite), the attribute a `configure` rename stores a field that always stores something under, a required model field stored under its own name that always stores something (a key composite or a ref among them), or such a property of one, reached through containers each certain to hold a map: the field itself required, and each property on the way a required struct of its stored form. A projection naming it as a field every row it writes holds: its checkpoint, revision, checkpoint map or an instance field, renamed to another attribute or not (the projection sets and reads it by name on each row; on 1.40.0 none of them worked). A JavaScript object can't take that name by assignment (it sets the prototype instead), and the AWS SDK's marshaller drops an attribute or a map entry so named, so no release stored such an item whole: a put stored it without the value, an update failed, a timestamp or a key composite so named threw at `make`, and DynamoDB refused every write of an entity holding a `NullOr` or `OptionFromNullOr` one (#239). Refused at load, naming where the name is. "Always stores something" is judged on the stored (encoded) form, followed through transformations, classes and `suspend`, and holds only where that form is one modelled exactly (text, a number, a boolean, a `bigint`, `null`, a map, a list, or a union of only those): a required field typed `NullOr` or `OptionFromNullOr` (which store `null`) is refused. Not refused, as a write need not hold the name: an optional field or property so named, a required one whose stored form admits `undefined` (`UndefinedOr`, `NullishOr`, a union with `Undefined`, `OptionFromUndefinedOr`, `OptionFromNullishOr`, a decoding default) or is not modelled exactly (`Unknown`, `Any`, a declaration the library can't see into: those load), a renamed field that may store nothing, an index's key attribute that some item may be without (a write giving it a key is refused when it's sent, `EDD-9165`), anything below a container that may be left out or hold no map (an optional or `optionalKey` field or property, a nullable one, a union alternative, a list or a tuple's element, a record's value, an `Option`, a declaration with no encoding), and anything stored as JSON text (a packed field, `Schema.fromJsonString`). A write storing nothing under such a name does what 1.40.0 did, and one giving it a value is refused when it's sent (`EDD-9165`). Where 1.40.0 derived a struct holding such a field by assignment (an entity's payload and record schemas, and every struct the library rebuilds: `substituteSchemas`, `substituteSchemaDeep`, an aggregate's rebuilt structs), the assignment set the struct's prototype, so the field wasn't in it: a payload leaving it out was taken, and its value was lost. Such a struct now holds it as `protoAbsent` (`internal/EntitySchemas.ts`): an optional key on both sides that takes a value storing nothing (left out, `undefined`, a `None` encoded `undefined`, an empty set) as left out, and fails a value storing something (`EDD-9165`), judged on the declared field's stored form. So a write leaving it out sends, stores and returns what 1.40.0 did. A renamed field keeps the declared field (its attribute holds the value). Named, not reworked: an aggregate's field typed `OptionFromOptionalNullOr(…, { onNoneEncoding: null })` and left out of an `update` is refused (`EDD-9165`), where 1.40.0's `update` stored the row without it (the state read back holds `None`, which stores `null`; `test/connected.proto-left-out.test.ts`). An aggregate is `EDD-9153`. |
+| `EDD-9153` | `internal/AggregateSchemas.ts` (schema, `refuseAggregateProtoName`, with `protoRefusal` and `requiredProtoPropertyIn` in `internal/OwnNames.ts`), through `Aggregate.make`, pure and operational, top-level only | An aggregate naming `__proto__` where every row it writes would hold it: a required field of the root or of a required sub-aggregate's root (an attribute of that row), a `ref` edge (its entity is stored inline under the edge's name), a required sub-aggregate's discriminator (an attribute of each of its rows), or a required property, reached through containers each certain to hold a map, of a required root field's value or of a required `one` edge's value (a property of a stored map, or an attribute of the edge's row). For the reasons `EDD-9152` gives, 1.40.0 failed on such a value (a defect or a `ValidationError` at `create`, an `AggregateAssemblyError` at `get`, DynamoDB refusing every `create` of a `NullOr` one), or completed and lost it (a required `OptionFromNullOr` field), or, for a discriminator, stored rows its `get` couldn't read. Refused at load, naming where the name is. A sub-aggregate's own `make` takes it: its rows are written where an aggregate places it, and that aggregate's `make` walks into it. "Every row would hold it" is judged as in `EDD-9152`, on the stored form. Not refused, as in `EDD-9152`: an optional field or property so named, or a required one whose stored form admits `undefined` or is not modelled exactly, anything below a container that may be left out or hold no map (an optional or nullable sub-aggregate, `one` edge value or field, a `many` element, a union, a record, an `Option`), and anything stored as JSON text; a write giving such a value is refused when it's sent (`EDD-9165`). A `one`, `many` or sub-aggregate edge's own name is a property of the assembled aggregate, never an attribute: it may be `__proto__`. |
+| `EDD-9158` | Retired, never released | Allocated during 1.41's development for refusing an entity-level ref's `${field}Id` for an entity keyed by more than one composite, and retired before release: a key whose other composites have an encoding default composes from the identifier alone, and 1.40.0 fetches and stores it. Such an id is fetched under the identifier, as on 1.40.0, and fails as it did where the key can't be composed. Don't reuse the number |
+| `EDD-9159` | `Aggregate.ts` (`givenOverRowReason`, `customOverRowReason`, through `refuseGivenOverRows`), at `create` only (`AggregateDecompositionError`, nothing sent) | A `create` whose input gives, at the top of a row's value (the root's, a sub-aggregate's root, a `one` edge's value, a `many` element, or a `many` edge's value through its custom `decompose` / `assemble`), a value for a name the library writes on that row (`__edd_e__`, the partition key attribute, `sk`, the collection sort key's copy, the root's list keys on a write composing them; on a row beneath the root, a context attribute) that a `get` right after would not return (#241): the row as built, read as a `get` reads it (unpacked, renamed, sparse fields restored, decoded by the member's own schema), compared with the value given (`sameValue`: sets by members, dates by instant, otherwise strictly, `5n` ≠ `5`, `-0` ≠ `0`, `1.5` ≠ `1.50`). A union or `Schema.suspend` root or sub-aggregate is read whole (`nodeReadOf`). Up to 1.40.0 the library's value replaced it and the read handed back something else, or failed. Equal: written as on 1.40.0. Given no value, a name the member places with another schema than the root's is refused only where that read fails (`unreadOverRowReason`, `customUnreadReason`). The value given is looked up under the name the input holds it by (`inputNameIn`: a `many` edge's `inputField`). Not judged: a discriminator, a name the library doesn't write on that row, a nested value, and `update`. `Aggregate.make` refuses nothing. The message names the member and the field and shows the value given and what the read returns (or its failure), each rendered unambiguously |
+| `EDD-9160` | `Aggregate.ts` (`refuseOtherSettingRows`), at `update` (`ValidationError`, nothing written) | An aggregate `update` about to write a group one of whose rows is stored under another sort key than this configuration composes for the value read from it (`sortKeyOf`, through `rowsReadAt`): written under the other `escapeKeys` setting (a `$`, `#` or other escaped character, a number other than a non-negative integer below 1e16, a negative `bigint`, in a `many` element's sort key or a discriminator value, or an `entity:` edge's composite its model encodes), before the setting was turned over (#241). Up to 1.40.0 the update wrote the group's rows under the new text beside the old, so every element read twice (or a doubled sub-aggregate root failed to read, or, with texts aliasing across the settings, one element's row overwrote another's). Not refused: a key whose text is the same under both settings, a row the update moves itself (an `entity:` edge's under 1.40.0's composition), a group the update doesn't write. The message names the member, the row's sort key and `rekey` |
+| `EDD-9161` | `internal/LostValues.ts` (schema, `lostAs`, `lostIn`, `readJudged`), through `internal/RoundTrip.ts` (`readBackOf`, `notReadBack`) on `Entity.ts` (`encodeForWrite`, `unstorableOperand`, `_refuseNotReadBack`), `Marshaller.ts` (`marshallStorable`: a part behind a getter, judged as it's called), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox), `Aggregate.ts` (`refuseLost`), and `internal/PackedCodec.ts` (`written`) | A write's value, at a position no schema types (`Schema.Unknown`, `Schema.Any`, at any depth, `holdsUntyped`), holding a part DynamoDB doesn't store: a `Date` (valid or not) or a `RegExp`, written as an empty map that reads back as `{}`; a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`; an `Error` holding a `message` or a `cause` that isn't an enumerable property; a `Redacted`, of which only the marker is stored; a `Map` with a key that isn't a string, whose keys read back as text; and the binary data 1.40.0 stored as less than it is or failed to send, kind by kind: an `ArrayBuffer`, a `DataView` or a `Blob` (a `File` is one), stored as empty bytes; a `SharedArrayBuffer`, stored as an empty map; an instance of a subclass of any of them, stored as the map of its enumerable properties; and the typed arrays `Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`, `BigInt64Array` and `BigUint64Array` themselves, which the AWS SDK fails to serialise (up to 1.40.0 a `DynamoError` holding its `TypeError`). Any other binary kind (a `Float16Array`, a subclass of a typed array, a kind a later runtime adds) is stored as 1.40.0 stored it. A cookie's expiry is stored as ISO text, so it isn't one, and a list holding `undefined`, a function or a hole closes up as it always has. A `ValidationError` naming the path, with nothing written, on every write path: `put` / `create` / `upsert`, an update's `.set` and path operations, `transactWrite`, `Batch.write`, a time-series `append`, an aggregate's `create` and `update`, an event stream's `append` (event and metadata) and snapshot, and a projection's outbox. A packed field refuses the same values with the same words, through the same function, where it refused them before as JSON can't hold them (a map and binary data still as not JSON). A part behind a getter is judged as the marshaller calls the getter, which is called as often as 1.40.0 called it. Only a schema holding an untyped position pays for the walk. Rows already stored as `{}` read as `{}`. |
+| `EDD-9162` | `internal/ObjectKeyText.ts` (schema, `defaultObjectText`, `objectKeyRefusal`, `judgeObjectKeyText`), decided where a key is composed (`KeyComposer.siteCompositeText`) under a write's own schema (`Entity.ts` `ownSchema`, `DynamoSchema.objectKeys`) | A write composing a key from an object whose key text is its default `[object …]` tag (a struct, a `Data` class, a class of one's own without a `toString`), which every such object composes alike: in the primary key, an index, a unique constraint, a vector partition or a time-series `orderBy`, on `put`, `create`, `upsert`, an update recomposing an index key, `append`, and a transaction's and a batch's put. A `ValidationError` naming the field and what composes it, with nothing written. A key-taking read or delete (`get`, `delete`, a query accessor, an update's own key record, `restore`) still composes the text, to reach a row an earlier release wrote under it. A value with a key form isn't refused. A key the write doesn't compose (sparse, a half an update leaves) refuses nothing. An aggregate's `create` and `update` too, through `Aggregate.ts` (`ownKeys`, `buildDynamoItems`): the partition key (`create`), the collection sort key, the list keys and a row's static discriminators; an `update` keeps a root composite equal to the one read. |
+| `EDD-9163` | `internal/WriteDiagnosis.ts` (`OperandType`, a site's opt-in diagnosis), rewritten by `Entity.ts` (the time-series `append`, `orderByRefusal`) | A time-series `append` whose `orderBy` value is stored as a type DynamoDB's `<` doesn't take: a map (an `Option`, a `Result`, a `Duration`, a `BigDecimal`, a zone), a list, a boolean or null. The append guards on the stored `orderBy` being below the new one (`#_tsob < :_tsNewOb`), and DynamoDB refuses that condition whatever the item holds, so such an entity can never `append` (a nullable one, each append holding null). It isn't checked: the append is sent, and DynamoDB's refusal (`Incorrect operand type for operator or function; operator or function: <, operand type: M`), confirmed on the request sent (the guard `#_tsob < :_tsNewOb` is in its condition and `:_tsNewOb` is of the type DynamoDB named), is rewritten into a `ValidationError` naming `timeSeries.orderBy`, its field and the type, with DynamoDB's error as the cause and nothing written. A refusal of the caller's own condition is DynamoDB's error, unchanged. A struct's `orderBy` is refused before that, as its key text (`EDD-9162`). |
+| `EDD-9165` | `Marshaller.ts` (`protoEntryAt`, in the walk `marshallStorable` makes of every item it marshals; `fromAttributeMap` and `fromAttributeValue` on the read), through `marshalOrFail` and `unstorableIn`; `Entity.ts` (`protoAttributeIn` and `unstorableFields` for an update's record operations, `unstorableOperand` for a path operation's segments); `internal/Expr.ts`; `internal/EntitySchemas.ts` (schema, `protoAbsent`, a payload's decode or encode through a derived struct, see `EDD-9152`) | An attribute or a map entry named `__proto__` that a write would send: an own map entry keyed `__proto__` at any depth (a `Schema.Record` entry, a `Map` entry, any object marshalled as a map), and an attribute so named: an optional model field stored under that name given a value (a packed one included), a field stored under an attribute so named given a value, an index key attribute so named given a key (its composites present: a key attribute with no value, `KeyValueError` in `KeyComposer`'s `keyAttribute`, made a `ValidationError` where a write composes its keys), `.set()`, `.add()`, `.subtract()` or `.append()` of it, and a path operation with a segment `__proto__`, naming the attribute or an entry of a map (every one but `pathRemove`). The AWS SDK's marshaller and unmarshaller assign each to a plain object, and assigning `__proto__` sets that object's prototype instead, so it is never sent, and one stored otherwise is never read back. A `ValidationError` naming the field and the key, on any write, condition or filter (`Transaction.check`'s included, `TransactWriteOps`), with nothing written (an aggregate `update` reads its state first). The `Expression` builders, which have no error channel, compile such an entry as 1.40.0 did (left out of the map: `unsent` in `internal/Expr.ts` remembers it), and the operation sending the result refuses it; 1.40.0 sent it, and DynamoDB refused it ("Supplied AttributeValue is empty"). `Marshaller.toAttributeValue` and `toAttributeMap` throw `UnstorableValue` with this code. Only that name, and only an own property: the `__proto__` every object inherits is not one, every other `Object.prototype` name is an entry like any other, and a sparse map's entry keyed `__proto__` (its own attribute, `field#__proto__`) and one in JSON text (a packed field, `Schema.fromJsonString`, never marshalled as a map) are stored and read back as any other. 1.40.0 stored an item without an attribute so named (an index key so named left the row out of the index; a field stored under it failed every `put` and `get`, and `upsert` died), sent a write holding such an entry for DynamoDB to refuse ("Supplied AttributeValue is empty"), and a path operation stored the entry. A row holding one (stored before, or by another writer) is read without it, whatever it holds: the reader leaves it out before the AWS SDK's unmarshaller sees it, where 1.40.0's set the row's or the map's prototype from a map stored there (any read of a row holding such an attribute died, whatever it held; a struct field holding such an entry read the entry's map as its own fields). `pathRemove` removes it |
 
-Next free code: none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` and `9113` are retired, don't reuse them); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: `9111`, else none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9114`–`9120` are taken on branches in flight, and `9107` and `9113` are retired, don't reuse them); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

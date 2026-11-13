@@ -19,9 +19,11 @@ import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import { fromAttributeValue, toAttributeMap, toAttributeValue } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { markOf } from "./helpers/OutboxMarks.js"
 import { makeRecordingTable, type Request } from "./helpers/RecordingTable.js"
 
 type Pinned = {
@@ -420,17 +422,70 @@ const steady = (node: unknown): unknown =>
         )
       : node
 
+/**
+ * The requests without what 1.41.0 adds to an outbox item's `Put` (#237): its mark on the item
+ * (`__edd_rm__`: the projection's read model's tag, then its effect's), and the condition that it
+ * replaces no other effect's item. Each is checked, and how many items held the mark is counted.
+ */
+const untagged = (requests: unknown): { readonly tagged: number; readonly as139: unknown } => {
+  let tagged = 0
+  let guarded = 0
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk)
+    if (typeof node !== "object" || node === null) return node
+    const out: Record<string, unknown> = {}
+    const guard = (node as Record<string, unknown>).ConditionExpression
+    const outboxGuard = guard === "attribute_not_exists(#pk) OR #rm = :rm"
+    if (outboxGuard) {
+      expect((node as Record<string, unknown>).ExpressionAttributeNames).toEqual({
+        "#pk": "pk",
+        "#rm": "__edd_rm__",
+      })
+      const item = (node as { readonly Item: Record<string, { readonly S?: string }> }).Item
+      expect((node as Record<string, unknown>).ExpressionAttributeValues).toEqual({
+        ":rm": { S: markOf(Summaries, item) },
+      })
+      guarded++
+    }
+    for (const [name, value] of Object.entries(node)) {
+      if (name === "__edd_rm__") {
+        expect(value).toEqual({ S: markOf(Summaries, node as Record<string, { S?: string }>) })
+        expect((value as { S: string }).S.startsWith(`${readModelTag(Summaries)}.`)).toBe(true)
+        tagged++
+        continue
+      }
+      if (
+        outboxGuard &&
+        (name === "ConditionExpression" ||
+          name === "ExpressionAttributeNames" ||
+          name === "ExpressionAttributeValues")
+      ) {
+        continue
+      }
+      out[name] = walk(value)
+    }
+    return out
+  }
+  const as139 = walk(requests)
+  expect(guarded).toBe(tagged)
+  return { as139, tagged }
+}
+
 describe("a cookie's expiry is written as ISO text wherever the cookie is written", () => {
   for (const [group, name, run, typed] of CASES) {
-    it.effect(`${group} ${name}: what 1.39.0 sent, but each cookie's expiry`, () =>
-      Effect.gen(function* () {
-        const expected = scenarioOf(group, name)
-        expect(expected.outcome).toBe("ok")
-        const sent = yield* run()
-        const { at, as139 } = isoExpiries(sent)
-        expect(steady(as139)).toEqual(steady(expected.requests))
-        expect(at).toEqual(typed)
-      }),
+    it.effect(
+      `${group} ${name}: what 1.39.0 sent, but each cookie's expiry, and each outbox item's read model and condition`,
+      () =>
+        Effect.gen(function* () {
+          const expected = scenarioOf(group, name)
+          expect(expected.outcome).toBe("ok")
+          const sent = yield* run()
+          const { at, as139 } = isoExpiries(sent)
+          const { tagged, as139: plain } = untagged(as139)
+          expect(tagged).toBe(group === "projection" ? 1 : 0)
+          expect(steady(plain)).toEqual(steady(expected.requests))
+          expect(at).toEqual(typed)
+        }),
     )
   }
 })

@@ -1,0 +1,327 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (with effect@4.1.4), installed outside the repo and run by a scratch script against DynamoDB Local. Doc: { id, cat, note (stored as nt), f: Record<string, number> stored as a sparse map under m, g: Record<string, { x }> stored as a sparse map under gm }, Note: { id, cat, note }, both in the collection cats on gsi1 (projecting all attributes). Seeded with Doc a { note: 'n', f: { k: 1, j: 2 }, g: { a: { x: 3 } } }, Doc b { note: 'o', f: {} } and Note c { note: 'p' }, all in cat c. For each select: its outcome (a result as JSON, a failure or defect as its tag or name and the first line of its message) and the requests it sent, each as { operation: its key condition, filter, projection, names and Limit }. Never regenerate it: it is the record of what 1.39.0 did.",
+ "cases": {
+  "scan, select(['f'])": {
+   "outcome": {
+    "ok": [
+     {},
+     {}
+    ]
+   },
+   "sent": [
+    {
+     "scan": {
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj_f",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#proj_f": "f"
+      }
+     }
+    }
+   ]
+  },
+  "scan, select(['id', 'f'])": {
+   "outcome": {
+    "ok": [
+     {
+      "id": "b"
+     },
+     {
+      "id": "a"
+     }
+    ]
+   },
+   "sent": [
+    {
+     "scan": {
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj_id, #proj_f",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#proj_id": "id",
+       "#proj_f": "f"
+      }
+     }
+    }
+   ]
+  },
+  "scan, select(['note', 'f'])": {
+   "outcome": {
+    "ok": [
+     {
+      "note": "o"
+     },
+     {
+      "note": "n"
+     }
+    ]
+   },
+   "sent": [
+    {
+     "scan": {
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0, #proj1",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#proj0": "nt",
+       "#proj1": "f"
+      }
+     }
+    }
+   ]
+  },
+  "scan, select((t) => [t.f])": {
+   "outcome": {
+    "ok": [
+     {},
+     {}
+    ]
+   },
+   "sent": [
+    {
+     "scan": {
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#proj0": "f"
+      }
+     }
+    }
+   ]
+  },
+  "scan, select((t) => [t.f.k, t.note])": {
+   "outcome": {
+    "ok": [
+     {
+      "note": "o"
+     },
+     {
+      "note": "n"
+     }
+    ]
+   },
+   "sent": [
+    {
+     "scan": {
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1, #proj2",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#proj0": "f",
+       "#proj1": "k",
+       "#proj2": "nt"
+      }
+     }
+    }
+   ]
+  },
+  "scan, select((t) => [t.g.a.x])": {
+   "outcome": {
+    "ok": [
+     {},
+     {}
+    ]
+   },
+   "sent": [
+    {
+     "scan": {
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1.#proj2",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#proj0": "g",
+       "#proj1": "a",
+       "#proj2": "x"
+      }
+     }
+    }
+   ]
+  },
+  "scan, select(['id']), no sparse map": {
+   "outcome": {
+    "ok": [
+     {
+      "id": "b"
+     },
+     {
+      "id": "a"
+     }
+    ]
+   },
+   "sent": [
+    {
+     "scan": {
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj_id",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#proj_id": "id"
+      }
+     }
+    }
+   ]
+  },
+  "index query, select(['f'])": {
+   "outcome": {
+    "ok": [
+     {},
+     {}
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj_f",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj_f": "f"
+      }
+     }
+    }
+   ]
+  },
+  "index query, select(['f']).limit(1).fetch()": {
+   "outcome": {
+    "ok": {
+     "items": [
+      {}
+     ],
+     "cursor": {
+      "_id": "Option",
+      "_tag": "Some",
+      "value": "eyJzayI6eyJTIjoiJHNlbCN2MSNkb2MifSwicGsiOnsiUyI6IiRzZWwjdjEjZG9jI2lkX2EifSwiZ3NpMXNrIjp7IlMiOiIkc2VsI3YxI2RvY18xI2lkX2EifSwiZ3NpMXBrIjp7IlMiOiIkc2VsI3YxI2NhdHMjY2F0X2MifX0="
+     }
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj_f, #proj_gsi1pk, #proj_gsi1sk, #proj_pk, #proj_sk",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj_f": "f",
+       "#proj_gsi1pk": "gsi1pk",
+       "#proj_gsi1sk": "gsi1sk",
+       "#proj_pk": "pk",
+       "#proj_sk": "sk"
+      },
+      "Limit": 1
+     }
+    }
+   ]
+  },
+  "collection, select(['f'])": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {}
+     ],
+     "Notes": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0, #proj1",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "f",
+       "#proj1": "__edd_e__"
+      }
+     }
+    }
+   ]
+  },
+  "collection, select(['note', 'f'])": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {
+       "note": "n"
+      },
+      {
+       "note": "o"
+      }
+     ],
+     "Notes": [
+      {
+       "note": "p"
+      }
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0, #proj1, #proj2, #proj3",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "nt",
+       "#proj1": "f",
+       "#proj2": "note",
+       "#proj3": "__edd_e__"
+      }
+     }
+    }
+   ]
+  },
+  "collection, select(['note']), no sparse map": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {
+       "note": "n"
+      },
+      {
+       "note": "o"
+      }
+     ],
+     "Notes": [
+      {
+       "note": "p"
+      }
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0, #proj1, #proj2",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "nt",
+       "#proj1": "note",
+       "#proj2": "__edd_e__"
+      }
+     }
+    }
+   ]
+  }
+ }
+}

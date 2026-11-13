@@ -53,12 +53,82 @@ const canonical = (value: unknown): string =>
       : v,
   )
 
-/** `sent` and `items` are what 1.39.0 sent and stored: every request is the same bytes. */
+type Put = {
+  readonly TableName: string
+  readonly Item: Record<string, { readonly S?: string }>
+  readonly ConditionExpression?: string
+  readonly ExpressionAttributeNames?: Record<string, string>
+  readonly ExpressionAttributeValues?: Record<string, unknown>
+}
+
+/**
+ * `requests` (1.39.0's), with each `create` over a tombstone also naming, as the tombstone held
+ * them, the values it carries (`carries`, stored names: the checkpoints, then the revision): from
+ * 1.41.0 that guard is exact, where the removal stamp alone has a millisecond's resolution (#237).
+ */
+export const exactOverTombstone = (
+  requests: ReadonlyArray<Sent>,
+  carries: ReadonlyArray<string>,
+): ReadonlyArray<Sent> => {
+  const tombstones = new Map<string, Put["Item"]>()
+  const keyOf = (item: Put["Item"]) => `${item.pk?.S}|${item.sk?.S}`
+  const exact = (put: Put): Put => {
+    const names = put.ExpressionAttributeNames ?? {}
+    if (put.Item.__edd_e__?.S?.endsWith("#tombstone") === true) {
+      tombstones.set(keyOf(put.Item), put.Item)
+      return put
+    }
+    if (!Object.values(names).includes("__edd_removed__")) return put
+    const tomb = tombstones.get(keyOf(put.Item))!
+    const terms = carries.map((name, i) =>
+      Object.hasOwn(tomb, name) ? `#eddTb${i} = :eddTb${i}` : `attribute_not_exists(#eddTb${i})`,
+    )
+    return {
+      ...put,
+      ConditionExpression: `(${put.ConditionExpression}) AND (${terms.join(" AND ")})`,
+      ExpressionAttributeNames: {
+        ...names,
+        ...Object.fromEntries(carries.map((name, i) => [`#eddTb${i}`, name])),
+      },
+      ExpressionAttributeValues: {
+        ...put.ExpressionAttributeValues,
+        ...Object.fromEntries(
+          carries.flatMap((name, i) =>
+            Object.hasOwn(tomb, name) ? [[`:eddTb${i}`, tomb[name]]] : [],
+          ),
+        ),
+      },
+    }
+  }
+  return requests.map((request) => {
+    const input = request.input as {
+      readonly TransactItems?: ReadonlyArray<{ readonly Put?: Put }>
+      readonly Item?: unknown
+    }
+    if (request.operation === "putItem") return { ...request, input: exact(input as Put) }
+    if (input.TransactItems === undefined) return request
+    return {
+      ...request,
+      input: {
+        ...input,
+        TransactItems: input.TransactItems.map((t) =>
+          t.Put === undefined ? t : { ...t, Put: exact(t.Put) },
+        ),
+      },
+    }
+  })
+}
+
+/**
+ * `sent` and `items` are what 1.39.0 sent and stored: every request is the same bytes, but each
+ * `create` over a tombstone exact (`exactOverTombstone`, naming `carries`).
+ */
 export const expectAsFixture = (
   sent: ReadonlyArray<Sent>,
   items: ReadonlyArray<Record<string, unknown>>,
+  carries: ReadonlyArray<string> = ["version", "rev"],
 ) => {
-  const expected = fixture()
+  const expected = { ...fixture(), requests: exactOverTombstone(fixture().requests, carries) }
   expect(sent.map(canonical)).toEqual(expected.requests.map(canonical))
   const bytes = (requests: ReadonlyArray<Sent>) =>
     requests.map((request) => JSON.stringify(request))

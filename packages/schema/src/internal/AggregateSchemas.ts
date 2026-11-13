@@ -5,7 +5,7 @@
  */
 
 import { Option, Schema, SchemaAST } from "effect"
-import { ConfiguredModelTag, getIdentifierField } from "../DynamoModel.js"
+import { ConfiguredModelTag, getIdentifierField, getPackedFields } from "../DynamoModel.js"
 import type { AggregateEdge, ManyEdge, RefEntity } from "./AggregateEdges.js"
 import type {
   AggregateInputType,
@@ -16,6 +16,23 @@ import type {
 import { bothKindsKeyRefusal, storedFieldAtPath } from "./CompositeCodec.js"
 import type { TimestampsConfig } from "./EntityConfig.js"
 import { optionalField, type ResolvedSystemFields, resolveSystemFields } from "./EntitySchemas.js"
+import {
+  certainStruct,
+  givenData,
+  isRequiredStored,
+  ownValue as own,
+  protoRefusal,
+  requiredProtoPropertyIn,
+  setOwn,
+} from "./OwnNames.js"
+
+/**
+ * What a caller's aggregate input gives under `name` where `create` reads it for an id, a `many` list
+ * or a sub-aggregate: read as 1.40.0 read it (`payload[name]`), and never a function, as 1.40.0 took
+ * none there ({@link givenData}).
+ */
+export const given = givenData
+
 import {
   extractArrayElement as extractArrayElementImpl,
   extractKeyedValue,
@@ -125,6 +142,222 @@ export const refuseManySortKeysOverMovingValue = (
     }
   }
   walk(rootFields, rootEdges)
+}
+
+/**
+ * The names a stored value of `schema` declares: the fields of its stored side, through optionality,
+ * classes, unions and suspensions. A record's keys are taken, not declared, and a declaration
+ * (`Schema.declare`) declares nothing that can be seen, so neither gives a name.
+ */
+export const storedFieldNames = (schema: Schema.Top): ReadonlySet<string> => {
+  const names = new Set<string>()
+  const seen = new Set<SchemaAST.AST>()
+  const visit = (ast: SchemaAST.AST): void => {
+    if (seen.has(ast)) return
+    seen.add(ast)
+    if (SchemaAST.isObjects(ast)) {
+      for (const property of ast.propertySignatures) {
+        if (typeof property.name === "string") names.add(property.name)
+      }
+    } else if (SchemaAST.isUnion(ast)) {
+      for (const member of ast.types) visit(member)
+    } else if (SchemaAST.isSuspend(ast)) {
+      let inner: SchemaAST.AST
+      try {
+        inner = SchemaAST.toEncoded(ast.thunk())
+      } catch {
+        return
+      }
+      visit(inner)
+    }
+  }
+  visit(SchemaAST.toEncoded(schema.ast))
+  return names
+}
+
+/** The kinds of row an aggregate writes, by how a read hands back the value one holds. */
+export type RowKind = "root" | "subAggregate" | "edge"
+
+/** The index key attributes a read takes off the root's row. */
+const ROOT_INDEX_ATTRIBUTES: ReadonlySet<string> = new Set([
+  "gsi1pk",
+  "gsi1sk",
+  "gsi2pk",
+  "gsi2sk",
+  "gsi3pk",
+  "gsi3sk",
+  "gsi4pk",
+  "gsi4sk",
+  "gsi5pk",
+  "gsi5sk",
+  "lsi1sk",
+  "lsi2sk",
+])
+
+/** The names a read takes off every row, whatever its value declares: its type and the table's key. */
+const ROW_RESERVED: ReadonlySet<string> = new Set(["__edd_e__", "pk", "sk"])
+
+/**
+ * Whether a read up to 1.40.0 took the attribute `name` off a row of `kind` before handing back the
+ * value it holds, whatever the value declared: `__edd_e__`, `pk` and `sk` everywhere; on the root's
+ * row the index keys `gsi1pk` … `gsi5sk`, `lsi1sk` and `lsi2sk`; on a sub-aggregate's root row any
+ * name starting `pk`, `sk`, `gsi` or `lsi`; on an edge's row any name starting `gsi` or `lsi`.
+ * {@link readTakesOff} applies it to a name the value doesn't declare (#241).
+ */
+export const takenOffThrough140 = (kind: RowKind, name: string): boolean => {
+  if (ROW_RESERVED.has(name)) return true
+  switch (kind) {
+    case "root":
+      return ROOT_INDEX_ATTRIBUTES.has(name)
+    case "subAggregate":
+      return (
+        name.startsWith("pk") ||
+        name.startsWith("sk") ||
+        name.startsWith("gsi") ||
+        name.startsWith("lsi")
+      )
+    case "edge":
+      return name.startsWith("gsi") || name.startsWith("lsi")
+  }
+}
+
+/**
+ * What a read knows of a row an aggregate writes (#241): its kind, the names its value declares at
+ * that position (`declaredValueNames`, by stored name; none where its schema can't be seen into)
+ * and the key attributes the library writes on a row of that kind ({@link rowKeysOn}).
+ */
+export type ReadRow = {
+  readonly kind: RowKind
+  readonly declared: ReadonlySet<string>
+  readonly keys: ReadonlySet<string>
+}
+
+/** A row's {@link ReadRow}: `declared` is what `declaredValueNames` gives for its value. */
+export const readRowOf = (
+  kind: RowKind,
+  config: RowKeyConfig,
+  declared: Iterable<string> | undefined,
+): ReadRow => ({
+  kind,
+  declared: new Set(declared ?? []),
+  keys: new Set(rowKeysOn(kind, config).map(([name]) => name)),
+})
+
+/**
+ * Whether a read takes the attribute `name` off a row before handing back the value it holds
+ * (#241): `__edd_e__`, `pk` and `sk` always; a name 1.40.0 took off ({@link takenOffThrough140})
+ * unless the row's value declares it at that position and the library writes no key attribute of
+ * that name there. A name the value doesn't declare is taken off as on 1.40.0, another writer's
+ * index key included. The one statement of the rule: every read asks it, and `create`'s refusal
+ * of a value given where the library writes another (`EDD-9159`) names the attributes it writes on
+ * a row by its write-side twin ({@link rowKeysOn}).
+ */
+export const readTakesOff = (row: ReadRow, name: string): boolean => {
+  if (ROW_RESERVED.has(name)) return true
+  if (!takenOffThrough140(row.kind, name)) return false
+  return row.keys.has(name) || !row.declared.has(name)
+}
+
+/**
+ * How a sub-aggregate's root row is read (#241): with an edge of its own, as a sub-aggregate's root
+ * (`"subAggregate"`); without one, as a `one` edge's row (`"edge"`), since assembly reads a
+ * sub-aggregate with no edges as it reads a `one` edge.
+ */
+export const subAggregateRowKind = (edges: Record<string, unknown>): RowKind =>
+  Object.values(edges).some(
+    (edge) =>
+      typeof edge === "object" &&
+      edge !== null &&
+      "_tag" in edge &&
+      (edge._tag === "OneEdge" || edge._tag === "ManyEdge" || edge._tag === "BoundSubAggregate"),
+  )
+    ? "subAggregate"
+    : "edge"
+
+/** A key attribute the library writes on a row, with what it holds, to name it in an error. */
+export type RowKeyAttribute = readonly [attribute: string, what: string]
+
+/** The parts of an aggregate's config naming the key attributes its rows are written with. */
+export type RowKeyConfig = {
+  readonly pk: { readonly field: string }
+  readonly collection: {
+    readonly index?: string | undefined
+    readonly sk?: { readonly field: string } | undefined
+  }
+  readonly list?:
+    | { readonly pk: { readonly field: string }; readonly sk: { readonly field: string } }
+    | undefined
+}
+
+/**
+ * The key attributes the library writes on every row an aggregate writes, over a value's field of
+ * the same name (#241): `__edd_e__`, the partition key attribute, `sk` and, with a collection index,
+ * the collection sort key's copy.
+ */
+export const rowKeyAttributes = (config: RowKeyConfig): ReadonlyArray<RowKeyAttribute> => [
+  ["__edd_e__", "the attribute holding its entity type"],
+  [config.pk.field, "the attribute holding the partition key"],
+  ["sk", "the attribute holding its sort key"],
+  ...(config.collection.index === undefined || config.collection.sk === undefined
+    ? []
+    : [
+        [
+          config.collection.sk.field,
+          "the attribute holding the collection sort key's copy",
+        ] as const,
+      ]),
+]
+
+/**
+ * The root's list keys, written on its row only when every list composite has a value (they're
+ * sparse), over a field of the same name (#241).
+ */
+export const listKeyAttributes = (config: RowKeyConfig): ReadonlyArray<RowKeyAttribute> =>
+  config.list === undefined
+    ? []
+    : [
+        [config.list.pk.field, "the attribute holding its list partition key"],
+        [config.list.sk.field, "the attribute holding its list sort key"],
+      ]
+
+/**
+ * The key attributes the library writes on a row of `kind` (#241): those of every row
+ * ({@link rowKeyAttributes}) and, on the root's, its list keys (sparse, but named whether or not a
+ * write composes them).
+ */
+export const rowKeysOn = (kind: RowKind, config: RowKeyConfig): ReadonlyArray<RowKeyAttribute> => [
+  ...rowKeyAttributes(config),
+  ...(kind === "root" ? listKeyAttributes(config) : []),
+]
+
+/**
+ * The field names the value of each kind of row declares, for {@link readTakesOff}: the root's and
+ * a sub-aggregate's own fields (`own`, those no edge claims), a `one` edge's value (the field
+ * holding it), a `many` edge's element (none with a custom `decompose`). `undefined` where nothing
+ * is declared.
+ */
+export const declaredValueNames = {
+  own: (
+    fields: Record<string, Schema.Top> | undefined,
+    edges: Record<string, unknown>,
+  ): ReadonlyArray<string> =>
+    Object.keys(fields ?? {}).filter((name) => !Object.hasOwn(edges, name)),
+  one: (
+    fields: Record<string, Schema.Top> | undefined,
+    edgeName: string,
+  ): ReadonlySet<string> | undefined => {
+    const value = own(fields, edgeName)
+    return value === undefined ? undefined : storedFieldNames(value)
+  },
+  many: (
+    fields: Record<string, Schema.Top> | undefined,
+    edgeName: string,
+    edge: { readonly decompose?: unknown },
+  ): ReadonlySet<string> | undefined => {
+    if (edge.decompose !== undefined) return undefined
+    const element = manyElementSchema(fields, edgeName)
+    return element === undefined ? undefined : storedFieldNames(element)
+  },
 }
 
 /**
@@ -306,7 +539,7 @@ const deriveWithStamps = (
   for (const [name, fieldSchema] of Object.entries(fields)) {
     if (omit.has(name)) continue
 
-    const edge = edges[name]
+    const edge = own(edges, name)
     if (edge && "_tag" in edge) {
       const isOpt = isFieldOptional(fieldSchema)
 
@@ -317,33 +550,37 @@ const deriveWithStamps = (
         // Nothing to fetch by: no entity, or one no single id names (its key has two composites,
         // or none). `create` takes the value, and refuses an id for it (`EDD-9129`).
         const value = rowInput(optionalField(fieldSchema)?.inner ?? fieldSchema, stamps)
-        newFields[name] = isOpt ? Schema.optionalKey(value) : value
+        setOwn(newFields, name, isOpt ? Schema.optionalKey(value) : value)
       } else if (edge._tag === "RefEdge" || edge._tag === "OneEdge") {
         const id = refIdInput(edge.entity!)
         newFields[`${name}Id`] = isOpt ? Schema.optionalKey(id) : id
       } else if (edge._tag === "BoundSubAggregate") {
         const sub = (edge as BoundSubAggregate<any>).aggregate
         const subSchemas = deriveWithStamps(sub.schema, sub.edges, [], stamps)
-        newFields[name] = isOpt
-          ? Schema.optionalKey(subSchemas.inputSchema)
-          : subSchemas.inputSchema
+        setOwn(
+          newFields,
+          name,
+          isOpt ? Schema.optionalKey(subSchemas.inputSchema) : subSchemas.inputSchema,
+        )
       } else if (edge._tag === "ManyEdge") {
         const manyEdge = edge as ManyEdge
         const fieldKey = manyEdge.inputField ?? name
         const elemSchema = deriveElementInputSchema(fieldSchema, manyEdge.entity, stamps)
         if (elemSchema) {
-          newFields[fieldKey] = isOpt
-            ? Schema.optionalKey(Schema.Array(elemSchema))
-            : Schema.Array(elemSchema)
+          setOwn(
+            newFields,
+            fieldKey,
+            isOpt ? Schema.optionalKey(Schema.Array(elemSchema)) : Schema.Array(elemSchema),
+          )
         } else {
-          newFields[fieldKey] = keyedInput(fieldSchema, stamps)
+          setOwn(newFields, fieldKey, keyedInput(fieldSchema, stamps))
         }
       }
       continue
     }
 
     // Regular field → keep as-is (toCodecJson applied at the end handles Date)
-    newFields[name] = managed.has(name) ? stampInput(fieldSchema) : fieldSchema
+    setOwn(newFields, name, managed.has(name) ? stampInput(fieldSchema) : fieldSchema)
   }
 
   const inputSchema = Schema.toCodecJson(Schema.Struct(newFields as any))
@@ -351,9 +588,13 @@ const deriveWithStamps = (
   // Update schema: all fields optional
   const optionalFields: Record<string, unknown> = {}
   for (const [name, fieldSchema] of Object.entries(newFields)) {
-    optionalFields[name] = isFieldOptional(fieldSchema as Schema.Top)
-      ? fieldSchema
-      : Schema.optional(fieldSchema as Schema.Top)
+    setOwn(
+      optionalFields,
+      name,
+      isFieldOptional(fieldSchema as Schema.Top)
+        ? fieldSchema
+        : Schema.optional(fieldSchema as Schema.Top),
+    )
   }
   const updateSchema = Schema.toCodecJson(Schema.Struct(optionalFields as any))
 
@@ -429,24 +670,14 @@ export const refKeyComposite = (entity: RefEntity): string | undefined => {
 }
 
 /**
- * What a map the library builds or reads a definition from (a schema's fields) holds under `name`
- * itself, `undefined` where it holds nothing there. Never a member every object inherits: a field
- * or an edge named `constructor` or `toString` that the definition doesn't declare is not one.
+ * The attribute of `entity` an entity-level ref id (`Entity.make({ refs })`'s `${field}Id`) names:
+ * its {@link refKeyComposite}, as an aggregate edge's id (#214, #241). It's fetched under that, read
+ * back from the stored ref under that (`putValuesOf`, a row check), and a cascade from `entity` is
+ * keyed by it. An entity keyed by more than one composite has none: its identifier, as up to
+ * 1.40.0. `undefined` with neither.
  */
-const own = <A>(record: Readonly<Record<string, A>> | undefined, name: string): A | undefined =>
-  record !== undefined && Object.hasOwn(record, name) ? record[name] : undefined
-
-/**
- * What a caller's payload gives under `name`, read as 1.39.0 read it (`payload[name]`): its own
- * property, one its class gives it (a getter, a property of a prototype), or one a proxy answers
- * for. A function is not given: 1.39.0 took a string for an id, a list for a `many` edge and an
- * object for a sub-aggregate, never a function, so a method of the payload's class named like an id
- * is no id, and neither is a member every object inherits (`constructor`, `toString`).
- */
-export const given = (payload: object, name: string): unknown => {
-  const value = (payload as Record<string, unknown>)[name]
-  return typeof value === "function" ? undefined : value
-}
+export const refIdAttribute = (entity: RefEntity): string | undefined =>
+  refKeyComposite(entity) ?? getIdentifierField(entity.model as Schema.Top)?.name
 
 /**
  * The model field an id of `entity` is a value of (its {@link refKeyComposite}), `undefined` when
@@ -489,6 +720,16 @@ const jsonCodecOf = (field: Schema.Top): Schema.Top | null => {
 export const refIdValue = (entity: RefEntity, value: unknown): Option.Option<unknown> => {
   const field = refIdField(entity)
   if (field === undefined) return typeof value === "string" ? Option.some(value) : Option.none()
+  return keyValueOf(field, value)
+}
+
+/**
+ * A value given for a key composite whose field is `field`, as a value of that field: the value
+ * itself when it is one, or what it decodes to from its JSON or stored form. `None` when it is
+ * neither. What an aggregate edge's id ({@link refIdValue}) and an entity-level ref's
+ * `${field}Id` name are both read through it (#214, #241).
+ */
+export const keyValueOf = (field: Schema.Top, value: unknown): Option.Option<unknown> => {
   const codec = field as Schema.Codec<unknown>
   if (Schema.is(codec)(value)) return Option.some(value)
   const json = jsonCodecOf(field)
@@ -713,7 +954,7 @@ export const deriveElementInputSchema = (
       if (name === named) {
         byId[`${name}Id`] = isFieldOptional(field) ? Schema.optionalKey(id) : id
       } else {
-        byId[name] = field
+        setOwn(byId, name, field)
       }
     }
     return Schema.Union([
@@ -768,10 +1009,10 @@ const element139 = (
         : Schema.String
       hasChanges = true
     } else if (managed?.has(name) === true) {
-      newFields[name] = stampInput(field)
+      setOwn(newFields, name, stampInput(field))
       hasChanges = true
     } else {
-      newFields[name] = field
+      setOwn(newFields, name, field)
     }
   }
   return hasChanges ? Schema.Struct(newFields as any) : element
@@ -798,6 +1039,76 @@ export const manyEdgePaths = (
   }
   return paths
 }
+
+/**
+ * `[EDD-9153]`: an aggregate naming `__proto__` where every row it writes would hold it. A
+ * required sub-aggregate's discriminator is an attribute of each of its rows. A root's or a
+ * sub-aggregate root's required field is an attribute of its row, and so is a required `ref` edge
+ * (its entity is stored inline, under the edge's name); a required property of a required `one`
+ * edge's value is an attribute of the edge's row; and a required property of any of those, reached
+ * through containers each certain to hold a map, is a property of a stored map
+ * (`requiredProtoPropertyIn`). A JavaScript object can't take that name by assignment and the AWS
+ * SDK's marshaller drops an attribute or an entry so named, so 1.40.0 failed on such a value, or
+ * stored the row without it and then couldn't read it (#239). Wherever a container on the way may be
+ * left out or hold no map (an optional or nullable sub-aggregate, edge value or field, a union, a
+ * list, a record, an `Option`), the definition loads: a write that gives the name is refused when
+ * it's sent (`EDD-9165`). An edge's own name (a `one`, `many` or sub-aggregate edge) is no
+ * attribute: it may be `__proto__`. Nothing stored as JSON text is looked into. Thrown at `make`.
+ */
+export const refuseAggregateProtoName = (
+  entityType: string,
+  model: Schema.Top,
+  edges: Readonly<Record<string, unknown>> | undefined,
+): void => {
+  const refuse = (what: string) => protoRefusal("EDD-9153", `Aggregate "${entityType}"`, what)
+  const walk = (
+    node: Schema.Top,
+    nodeEdges: Readonly<Record<string, unknown>> | undefined,
+    path: string,
+  ): void => {
+    const fields = getSchemaFields(unwrapModel(node)) ?? {}
+    for (const name of Object.keys(fields)) {
+      const field = own(fields, name)!
+      const at = path === "" ? name : `${path}.${name}`
+      const edge = own(nodeEdges, name) as
+        | {
+            readonly _tag?: string
+            readonly discriminator?: Readonly<Record<string, unknown>>
+            readonly entity?: { readonly model: Schema.Top }
+            readonly aggregate?: {
+              readonly schema: Schema.Top
+              readonly edges?: Readonly<Record<string, unknown>>
+            }
+          }
+        | undefined
+      if (edge?._tag === "BoundSubAggregate" && edge.aggregate !== undefined) {
+        // A sub-aggregate's rows are written only where the aggregate holds one: an optional or a
+        // nullable sub-aggregate may leave them out, and then nothing below it is certain.
+        if (certainStruct(field.ast) === undefined) continue
+        if (Object.hasOwn(edge.discriminator ?? {}, "__proto__")) {
+          throw refuse(`a discriminator of "${at}"`)
+        }
+        walk(edge.aggregate.schema, edge.aggregate.edges, at)
+        continue
+      }
+      const ofEdge = edge?._tag === "OneEdge" || edge?._tag === "ManyEdge"
+      if (!ofEdge && name === "__proto__" && isRequiredStored(field.ast)) {
+        const of = path === "" ? "the root" : `"${path}"`
+        throw refuse(edge?._tag === "RefEdge" ? `a ref edge of ${of}` : `a field of ${of}`)
+      }
+      if (!ofEdge && packedOf(node).has(name)) continue
+      // A `one` edge's value is its row: its packed fields are the edge entity's.
+      const packed = edge?._tag === "OneEdge" ? packedOf(edge.entity?.model) : undefined
+      const property = requiredProtoPropertyIn(field.ast, at, packed)
+      if (property !== undefined) throw refuse(`the property at "${property}"`)
+    }
+  }
+  walk(model, edges, "")
+}
+
+/** The fields `model` stores as JSON text (`DynamoModel.Packed`). */
+const packedOf = (model: Schema.Top | undefined): ReadonlySet<string> =>
+  new Set(model === undefined ? [] : Object.keys(getPackedFields(model)))
 
 /**
  * Unwrap a ConfiguredModel to get the raw Schema.Class model.

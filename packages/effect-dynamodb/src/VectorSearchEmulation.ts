@@ -38,6 +38,7 @@ import type {
   UpdateTableCommandOutput,
 } from "@aws-sdk/client-dynamodb"
 import { DynamoValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import type {
   DistanceFunction,
   VectorIndexDefinition,
@@ -363,7 +364,8 @@ export const wrap = (
             // Sparse index semantics: no embedding ⇒ not in the index.
             const stored = readVector(record[index.vectorAttribute])
             if (stored === undefined) continue
-            if (!conditions.every((c) => attributeEquals(record[c.attribute], c.value))) continue
+            if (!conditions.every((c) => attributeEquals(ownValue(record, c.attribute), c.value)))
+              continue
             candidates.push({
               item: record,
               score: scoreVector(queryVector, stored, index.distance),
@@ -394,8 +396,8 @@ const project = (
 ): Record<string, AttributeValue> => {
   const projected: Record<string, AttributeValue> = {}
   for (const attribute of attributes) {
-    const value = item[attribute]
-    if (value !== undefined) projected[attribute] = value
+    const value = ownValue(item, attribute)
+    if (value !== undefined) setOwn(projected, attribute, value)
   }
   return projected
 }

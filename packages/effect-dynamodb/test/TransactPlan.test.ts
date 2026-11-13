@@ -19,6 +19,8 @@ const TestClient = mockDynamoClientLayer({
   putItem: () => Effect.sync(() => sends("putItem")) as any,
   updateItem: () => Effect.sync(() => sends("updateItem")) as any,
   transactWriteItems: () => Effect.sync(() => sends("transactWriteItems")) as any,
+  executeStatement: () => Effect.sync(() => sends("executeStatement")) as any,
+  executeTransaction: () => Effect.sync(() => sends("executeTransaction")) as any,
 })
 
 describe("planWrite", () => {
@@ -145,4 +147,26 @@ describe("planWrite", () => {
       expect(sends).not.toHaveBeenCalled()
     }).pipe(Effect.provide(TestClient)),
   )
+
+  for (const statement of ["executeStatement", "executeTransaction"] as const) {
+    it.effect(`a PartiQL ${statement} is a defect, and isn't sent`, () =>
+      Effect.gen(function* () {
+        const exit = yield* planWrite(
+          "test",
+          Effect.gen(function* () {
+            const client = yield* DynamoClient
+            yield* statement === "executeStatement"
+              ? client.executeStatement({ Statement: "INSERT INTO \"t\" VALUE {'pk': ?}" })
+              : client.executeTransaction({ TransactStatements: [] })
+          }),
+          ownKey,
+        ).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        const defect = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+        expect(defect).toBeInstanceOf(UnplannableWrite)
+        expect(sends).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestClient)),
+    )
+  }
 })

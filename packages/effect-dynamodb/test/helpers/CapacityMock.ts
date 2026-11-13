@@ -25,6 +25,8 @@ export type Command =
   | "TransactGetItems"
   | "TransactWriteItems"
   | "SearchVectors"
+  | "ExecuteStatement"
+  | "ExecuteTransaction"
 
 export const DATA_PLANE: ReadonlyArray<readonly [keyof DynamoClientService, Command]> = [
   ["getItem", "GetItem"],
@@ -38,6 +40,8 @@ export const DATA_PLANE: ReadonlyArray<readonly [keyof DynamoClientService, Comm
   ["transactGetItems", "TransactGetItems"],
   ["transactWriteItems", "TransactWriteItems"],
   ["searchVectors", "SearchVectors"],
+  ["executeStatement", "ExecuteStatement"],
+  ["executeTransaction", "ExecuteTransaction"],
 ]
 
 const READS = new Set<Command>(["GetItem", "Query", "Scan", "BatchGetItem", "TransactGetItems"])
@@ -46,6 +50,10 @@ const READS = new Set<Command>(["GetItem", "Query", "Scan", "BatchGetItem", "Tra
 export const tablesOf = (input: Record<string, any>): Array<string> => {
   const names = new Set<string>()
   if (typeof input.TableName === "string") names.add(input.TableName)
+  for (const statement of [input, ...(input.TransactStatements ?? [])]) {
+    const table = /^INSERT INTO "([^"]+)"/.exec(statement.Statement ?? "")?.[1]
+    if (table !== undefined) names.add(table)
+  }
   for (const name of Object.keys(input.RequestItems ?? {})) names.add(name)
   for (const item of input.TransactItems ?? []) {
     for (const part of Object.values(item as Record<string, any>)) {
@@ -79,7 +87,11 @@ const defaultCapacity = (command: Command, input: Record<string, any>): unknown 
   const each = tablesOf(input).map(
     (TableName): SdkConsumedCapacity => ({ TableName, CapacityUnits: units }),
   )
-  return command.startsWith("Batch") || command.startsWith("Transact") ? each : each[0]
+  return command.startsWith("Batch") ||
+    command.startsWith("Transact") ||
+    command === "ExecuteTransaction"
+    ? each
+    : each[0]
 }
 
 /**

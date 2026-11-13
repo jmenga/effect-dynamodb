@@ -13,6 +13,7 @@ import { describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as RekeyMoveRaces from "./helpers/RekeyMoveRaces.js"
 import * as RekeyRepair from "./helpers/RekeyRepair.js"
+import * as RekeyUnseenWrites from "./helpers/RekeyUnseenWrites.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -75,6 +76,13 @@ describeConnected("rekey's move of a row a write changed after rekey read it, on
     })
   }
   for (const scenario of RekeyMoveRaces.unstampedScenarios) {
+    it.live(scenario.name, () => scenario.run(harness))
+  }
+  for (const scenario of [
+    ...RekeyUnseenWrites.reembedScenarios,
+    ...RekeyUnseenWrites.nodeNameScenarios,
+    ...RekeyUnseenWrites.sparseScenarios,
+  ]) {
     it.live(scenario.name, () => scenario.run(harness))
   }
 })

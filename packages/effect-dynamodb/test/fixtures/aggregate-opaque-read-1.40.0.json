@@ -1,0 +1,1160 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0"
+ ],
+ "note": "Captured from published effect-dynamodb@1.40.0 on DynamoDB Local by running test/helpers/AggregateOpaqueRead.ts with its modules: each case's create, the rows it wrote, and a get. Never regenerate: it is what 1.40.0 did.",
+ "1.40.0": {
+  "union root, given \"caller\", escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "sk": "caller"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "union root, given none, escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "union root, given \"caller\", escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "sk": "caller"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "union root, given none, escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "suspended root, given \"caller\", escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "sk": "caller"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "suspended root, given none, escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "suspended root, given \"caller\", escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "sk": "caller"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "suspended root, given none, escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t"
+    }
+   }
+  },
+  "union sub-aggregate, given \"different\", escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "different",
+      "x": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   }
+  },
+  "union sub-aggregate, given \"t\", escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   }
+  },
+  "union sub-aggregate, given none, escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "x": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   }
+  },
+  "union sub-aggregate, given \"different\", escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "different",
+      "x": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   }
+  },
+  "union sub-aggregate, given \"t\", escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   }
+  },
+  "union sub-aggregate, given none, escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "x": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a"
+     }
+    }
+   }
+  },
+  "union sub-aggregate, an edge, given \"different\", escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "different",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#tag#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Tag"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "union sub-aggregate, an edge, given \"t\", escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#tag#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Tag"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "union sub-aggregate, an edge, given none, escapeKeys off": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#tag#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Tag"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "union sub-aggregate, an edge, given \"different\", escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "different",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#tag#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Tag"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "union sub-aggregate, an edge, given \"t\", escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#tag#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Tag"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  },
+  "union sub-aggregate, an edge, given none, escapeKeys on": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   },
+   "rows": [
+    {
+     "x": {
+      "S": "a"
+     },
+     "sk": {
+      "S": "$opq#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$opq#v1#tag#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$opq#v1#agg#a"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Tag"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "tenant": "t",
+     "part": {
+      "tenant": "t",
+      "x": "a",
+      "tag": {
+       "text": "n"
+      }
+     }
+    }
+   }
+  }
+ }
+}

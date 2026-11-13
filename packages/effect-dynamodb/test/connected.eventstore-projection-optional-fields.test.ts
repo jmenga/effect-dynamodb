@@ -223,8 +223,9 @@ describeConnected("EventStore projections over rows without their fields (connec
       yield* Unrevisioned.apply(events[0]!)
       const first = yield* raw("Summary", "o1")
       expect(first).toMatchObject({ orderId: "o1", total: 11, note: "kept", version: 1 })
+      // Two projections write `Summaries`, so its rows carry the row token (#237).
       expect(sorted(first)).toEqual(
-        ["__edd_e__", "note", "orderId", "pk", "sk", "total", "version"].sort(),
+        ["__edd_e__", "__edd_rt__", "note", "orderId", "pk", "sk", "total", "version"].sort(),
       )
 
       // Then version 2, and a redelivery of version 1 changes nothing.

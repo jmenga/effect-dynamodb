@@ -572,13 +572,18 @@ describe("#133 entity nested self dates — update values", () => {
         .pathSet({ segments: ["nullStamp", "at"], value: later, isPath: false })
         .pathSet({ segments: ["days", 0], value: later, isPath: false })
         .pathAppend({ segments: ["arrNull"], value: [later, null] })
-        .pathPrepend({ segments: ["days"], value: [later] })
         .pathIfNotExists({ segments: ["xform"], value: later })
       const values = lastUpdateValues()
-      expect(values.some(holdsMarshalledDate)).toBe(false)
+      // A second update: DynamoDB refuses one naming both `days[0]` and `days` (overlapping paths).
+      yield* client.entities.PlainFixtures.update({ id: "p1", when: dt } as any).pathPrepend({
+        segments: ["days"],
+        value: [later],
+      })
+      const prepended = lastUpdateValues()
+      expect([...values, ...prepended].some(holdsMarshalledDate)).toBe(false)
       expect(values).toContainEqual(S(LATER))
       expect(values).toContainEqual({ L: [S(LATER), { NULL: true }] })
-      expect(values).toContainEqual({ L: [S(LATER)] })
+      expect(prepended).toContainEqual({ L: [S(LATER)] })
     }).pipe(Effect.provide(TestLayer)),
   )
 

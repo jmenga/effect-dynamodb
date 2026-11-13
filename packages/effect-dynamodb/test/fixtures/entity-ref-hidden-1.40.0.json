@@ -1,0 +1,1064 @@
+{
+  "generatedFrom": [
+    "effect-dynamodb@1.40.0"
+  ],
+  "note": "Captured once from the published effect-dynamodb 1.40.0 on DynamoDB Local (#241): an entity whose ref names an entity with a DynamoModel.Hidden field, required or optional, per lifecycle kind. Steps: the target put (secret \"s\"), its get, the referencing put of p1 (teamId 5), its get, a cascade renaming the target, a get, and a put of p2; rows are the referencing entity's rows at the end (1.40.0's cascade missed a number-keyed ref, so p1 still holds what its put stored). Models: test/EntityRefHidden.test.ts. Never regenerate or fix this file.",
+  "cases": {
+    "plain hidden required": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "get": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "put2": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "rows": [
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    },
+    "plain hidden optional": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "get": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "put2": {
+        "ok": {
+          "id": "p2",
+          "email": "b",
+          "team": {
+            "id": 5,
+            "name": "After"
+          }
+        }
+      },
+      "rows": [
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    },
+    "retain hidden required": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "get": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "put2": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "rows": [
+        {
+          "__edd_i__": {
+            "S": "1e35219e-28ef-4778-9114-a154961a934a"
+          },
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "__edd_i__": {
+            "S": "1e35219e-28ef-4778-9114-a154961a934a"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "sk": {
+            "S": "$hid#v1#player#v#0000001"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "__edd_i__": {
+            "S": "7cce2cbf-4697-48ae-b99e-4f3ca647585e"
+          },
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "b"
+          }
+        },
+        {
+          "__edd_i__": {
+            "S": "7cce2cbf-4697-48ae-b99e-4f3ca647585e"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "sk": {
+            "S": "$hid#v1#player#v#0000001"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    },
+    "retain hidden optional": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          },
+          "version": 1
+        }
+      },
+      "get": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          },
+          "version": 1
+        }
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          },
+          "version": 1
+        }
+      },
+      "put2": {
+        "ok": {
+          "id": "p2",
+          "email": "b",
+          "team": {
+            "id": 5,
+            "name": "After"
+          },
+          "version": 1
+        }
+      },
+      "rows": [
+        {
+          "__edd_i__": {
+            "S": "83e0ab6a-14f7-423f-bcab-34d9e80e99d3"
+          },
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "__edd_i__": {
+            "S": "83e0ab6a-14f7-423f-bcab-34d9e80e99d3"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "sk": {
+            "S": "$hid#v1#player#v#0000001"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "__edd_i__": {
+            "S": "008e13eb-67c7-4344-97be-43ab552a2251"
+          },
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "b"
+          }
+        },
+        {
+          "__edd_i__": {
+            "S": "008e13eb-67c7-4344-97be-43ab552a2251"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "sk": {
+            "S": "$hid#v1#player#v#0000001"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "version": {
+            "N": "1"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    },
+    "unique hidden required": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "get": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "put2": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "rows": [
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    },
+    "unique hidden optional": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "get": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "put2": {
+        "ok": {
+          "id": "p2",
+          "email": "b",
+          "team": {
+            "id": 5,
+            "name": "After"
+          }
+        }
+      },
+      "rows": [
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    },
+    "soft hidden required": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "get": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "put2": {
+        "failed": "ValidationError",
+        "operation": "decode",
+        "cause": "Missing key\n  at [\"team\"][\"secret\"]"
+      },
+      "rows": [
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    },
+    "soft hidden optional": {
+      "teamGet": {
+        "ok": {
+          "id": 5,
+          "name": "Before"
+        }
+      },
+      "put": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "get": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "cascade": {
+        "ok": {
+          "id": 5,
+          "name": "After"
+        }
+      },
+      "getAfter": {
+        "ok": {
+          "id": "p1",
+          "email": "a",
+          "team": {
+            "id": 5,
+            "name": "Before"
+          }
+        }
+      },
+      "put2": {
+        "ok": {
+          "id": "p2",
+          "email": "b",
+          "team": {
+            "id": 5,
+            "name": "After"
+          }
+        }
+      },
+      "rows": [
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p1"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "Before"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p1"
+          },
+          "email": {
+            "S": "a"
+          }
+        },
+        {
+          "gsi1sk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "__edd_e__": {
+            "S": "Player"
+          },
+          "gsi1pk": {
+            "S": "$hid#v1#player#teamid_0000000000000005"
+          },
+          "sk": {
+            "S": "$hid#v1#player"
+          },
+          "id": {
+            "S": "p2"
+          },
+          "team": {
+            "M": {
+              "name": {
+                "S": "After"
+              },
+              "id": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$hid#v1#player#id_p2"
+          },
+          "email": {
+            "S": "b"
+          }
+        }
+      ]
+    }
+  }
+}

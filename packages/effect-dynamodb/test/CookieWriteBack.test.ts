@@ -100,16 +100,14 @@ const storedRow = (table: ReturnType<typeof makeRecordingTable>, row: Item) =>
   table.items.get(`${row.pk!.S}|${row.sk!.S}`)!
 
 /**
- * The writes of what was read. `guarded` marks the one whose request carries the stored value as a
- * condition's operand (an immutable field restated): the recording table compares maps by their
- * text, so there the operand is checked, and the outcome on DynamoDB Local
- * (`connected.unreadable.test.ts`).
+ * The writes of what was read. `immutableSetBack` restates an immutable field: its request carries
+ * the stored value as a condition's operand, which the recording table compares with the row by
+ * content, as DynamoDB does (#243).
  */
 const OPS: Record<
   string,
   {
     readonly immutable: boolean
-    readonly guarded?: boolean
     readonly run: (db: any, got: any) => Effect.Effect<unknown, unknown>
   }
 > = {
@@ -124,7 +122,6 @@ const OPS: Record<
   },
   immutableSetBack: {
     immutable: true,
-    guarded: true,
     run: (db, got) => db.entities.Rows.update({ id: got.id }).set({ f: got.f, n: 2 }).asEffect(),
   },
 }
@@ -155,7 +152,7 @@ describe("a cookie 1.39.0 stored reads back as 1.39.0 read it, unless it writes 
 
 describe("a value read from a cookie 1.39.0 stored is written back as 1.39.0 wrote it", () => {
   for (const name of Object.keys(fixture.entity)) {
-    for (const [op, { immutable, guarded, run }] of Object.entries(OPS)) {
+    for (const [op, { immutable, run }] of Object.entries(OPS)) {
       it.effect(`${name}: ${op}`, () =>
         onEntity(name, { immutable }, (db, table) =>
           Effect.gen(function* () {
@@ -164,12 +161,12 @@ describe("a value read from a cookie 1.39.0 stored is written back as 1.39.0 wro
             table.take()
             const exit = yield* Effect.exit(run(db, got))
             const expected = pinned.ops[op]!
-            if (guarded) {
+            if (op === "immutableSetBack") {
+              // The condition restating the immutable field names the value stored.
               const sent = table.requests.find(({ command }) => command === "UpdateItem")!
               expect(Object.values(sent.input.ExpressionAttributeValues as Item)).toContainEqual(
                 pinned.row.f,
               )
-              return
             }
             expect(outcomeOf(exit)).toBe(expected.outcome)
             const after = storedRow(table, pinned.row)
@@ -184,13 +181,14 @@ describe("a value read from a cookie 1.39.0 stored is written back as 1.39.0 wro
     it.effect(`${name}: a condition on what was read names what's stored`, () =>
       onEntity(name, { immutable: false }, (db, table) =>
         Effect.gen(function* () {
-          // 1.39.0's condition matched the row (`conditionBack`). The recording table compares maps
-          // by their text, so the operand is checked here and the match on DynamoDB Local.
+          // 1.39.0's condition matched the row (`conditionBack`): the recording table compares the
+          // operand with the stored map by content, as DynamoDB does (#243).
           const pinned = fixture.entity[name]!
-          expect(pinned.ops.conditionBack!.outcome).toBe("ok")
+          const expected = pinned.ops.conditionBack!
+          expect(expected.outcome).toBe("ok")
           const got = yield* db.entities.Rows.get({ id: pinned.row.id!.S })
           table.take()
-          yield* Effect.exit(
+          const exit = yield* Effect.exit(
             db.entities.Rows.update({ id: got.id })
               .set({ n: 1 })
               .condition({ f: got.f })
@@ -199,6 +197,10 @@ describe("a value read from a cookie 1.39.0 stored is written back as 1.39.0 wro
           const sent = table.requests.find(({ command }) => command === "UpdateItem")!
           const operands = Object.values(sent.input.ExpressionAttributeValues as Item)
           expect(operands).toContainEqual(pinned.row.f)
+          expect(outcomeOf(exit)).toBe(expected.outcome)
+          const after = storedRow(table, pinned.row)
+          expect(after.f).toEqual(expected.f)
+          expect(after.n ?? null).toEqual(expected.n)
         }),
       ),
     )

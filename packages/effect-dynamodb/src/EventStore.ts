@@ -51,6 +51,7 @@ import type {
   GlobalSecondaryIndex,
   LocalSecondaryIndex,
   Projection,
+  PutItemCommandInput,
 } from "@aws-sdk/client-dynamodb"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import { isPackedConfig, type PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
@@ -77,6 +78,7 @@ import {
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { classOf, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import {
   isDispatchEligible,
   packedShape,
@@ -158,6 +160,7 @@ import {
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import {
+  addTableKeyAttributes,
   DEFAULT_TTL_ATTRIBUTE_NAME,
   resolveTtlAttributeName,
   type Table,
@@ -279,6 +282,30 @@ const streamCodecRequirements = (
 
 /** The attributes a stream image reads by stored form: event `data` only. */
 const DATA_ATTRIBUTES: ReadonlyArray<string> = ["data"]
+
+/**
+ * The type an appended event is stored under, read as 1.40.0 read it: its `_tag`, else its
+ * constructor's `identifier`, else the constructor's `name`, `event.constructor` read for each.
+ * Only where `event.constructor` reads no function, where 1.40.0 stored no type, is the event
+ * asked for its class: a field named `constructor` (given by `Object.create`, a class with
+ * getters, or as a `Schema.Class` instance's own field, #239) stands where 1.40.0 looked for it,
+ * so the class is its nearest prototype's ({@link classOf}).
+ */
+const eventTypeOf = (event: unknown): string | undefined => {
+  const tag = (event as { readonly _tag?: string })._tag
+  if (tag !== undefined && tag !== null) return tag
+  const made = (event as { readonly constructor?: unknown }).constructor
+  if (typeof made === "function") {
+    return (
+      (made as { readonly identifier?: string }).identifier ??
+      (event as { readonly constructor: { readonly name: string } }).constructor.name
+    )
+  }
+  const eventClass = classOf(event as object) as
+    | { readonly identifier?: string; readonly name?: string }
+    | undefined
+  return eventClass?.identifier ?? eventClass?.name
+}
 
 const EventEnvelope = Schema.Struct({
   streamId: Schema.String,
@@ -1897,7 +1924,7 @@ const parseStreamIdWith = (
   }
   const id: Record<string, string> = {}
   fields.forEach((field, i) => {
-    id[field] = parts[i]!
+    setOwn(id, field, parts[i]!)
   })
   return Effect.succeed(id)
 }
@@ -2921,6 +2948,9 @@ export const makeStream = <
   const indexAttributes = streamIndexes.flatMap((idx) =>
     idx.type === "gsi" ? [idx.pk, idx.sk] : [idx.sk],
   )
+  // They are key attributes of the stream's table: the library adds none of its own under their
+  // names (`Table.tableKeyAttributes`, #237).
+  addTableKeyAttributes(config.table.Tag, indexAttributes)
 
   // Build union schema from event schemas for decoding
   const eventUnion: Schema.Top =
@@ -3070,7 +3100,7 @@ export const makeStream = <
                   new ValidationError({
                     entityType: errorEntityType,
                     operation,
-                    cause: notReadBack("The value", issue),
+                    cause: notReadBack(undefined, issue),
                   }),
               ),
             ),
@@ -3915,10 +3945,19 @@ export const makeStream = <
             const version = expectedVersion + i + 1
             // In Effect v4, Schema.Class instances don't have _tag as an own property.
             // The identifier is on the constructor (class) itself.
-            const evtType =
-              ((event as Record<string, unknown>)._tag as string | undefined) ??
-              (event as { constructor: { identifier?: string } }).constructor.identifier ??
-              (event as { constructor: { name: string } }).constructor.name
+            const evtType = eventTypeOf(event)
+            // An event item without a type is one no read decodes, and 1.40.0 died here before
+            // sending anything: an event that names none (no `_tag`, no class) is refused.
+            if (evtType === undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "EventStore.append",
+                cause:
+                  `events[${i}] names no event type: it has no \`_tag\`, and no class whose ` +
+                  "`identifier` or `name` gives one (an object without a prototype, say). " +
+                  "Nothing was written.",
+              })
+            }
 
             const wire = yield* encodeToWire(
               memberSchemaFor(event) as Schema.Codec<any>,
@@ -5411,7 +5450,6 @@ export const makeStream = <
     to: string,
     streamIdText: string,
     ttlAttribute: string,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -5480,34 +5518,94 @@ export const makeStream = <
       const cancelled = (error: DynamoClientError) =>
         isAwsConditionalCheckFailed(error.cause) ? Effect.succeed(false) : Effect.fail(error)
       /**
-       * Copy `row` to `to`: where nothing is (or only a row whose TTL has
-       * passed) — or, a snapshot, over an older one (`older`), so a copy never
-       * regresses it. `false` when a write got there first.
+       * The copy of `row` to `to` a move sends over `held`, what `to` holds at its key: where
+       * nothing is (or only a row whose TTL has passed), or, a snapshot, over an older one, so a
+       * copy never regresses it. `undefined` where `to` holds it already: a copy an earlier attempt
+       * or run made, or a snapshot as new.
        */
-      const copy = (row: Record<string, AttributeValue>, older?: Record<string, AttributeValue>) =>
-        client
-          .putItem({
+      const copyOver = (
+        row: Record<string, AttributeValue>,
+        held: Record<string, AttributeValue> | undefined,
+      ): PutItemCommandInput | undefined => {
+        if (held === undefined) {
+          return {
             TableName: ctx.tableName,
             Item: copyOf(row),
-            ...(older === undefined
-              ? {
-                  ConditionExpression: "attribute_not_exists(#pk) OR #ttl <= :now",
-                  ExpressionAttributeNames: { "#pk": "pk", "#ttl": ttlAttribute },
-                  ExpressionAttributeValues: { ":now": { N: String(nowSeconds) } },
-                }
-              : {
-                  ConditionExpression: "#asOf < :asOf",
-                  ExpressionAttributeNames: { "#asOf": "asOfVersion" },
-                  ExpressionAttributeValues: { ":asOf": row.asOfVersion ?? { N: "0" } },
-                }),
-          })
-          .pipe(Effect.as(true), Effect.catch(cancelled))
+            ConditionExpression: "attribute_not_exists(#pk) OR #ttl <= :now",
+            ExpressionAttributeNames: { "#pk": "pk", "#ttl": ttlAttribute },
+            ExpressionAttributeValues: { ":now": { N: String(nowSeconds) } },
+          }
+        }
+        if (skOf(row) !== snapshotSk || asOfOf(row) <= asOfOf(held)) return undefined
+        return {
+          TableName: ctx.tableName,
+          Item: copyOf(row),
+          ConditionExpression: "#asOf < :asOf",
+          ExpressionAttributeNames: { "#asOf": "asOfVersion" },
+          ExpressionAttributeValues: { ":asOf": row.asOfVersion ?? { N: "0" } },
+        }
+      }
+      /**
+       * A dry run's move of `rows`, planned over `there`, what `to` holds: each copy the real run
+       * sends ({@link copyOver}), and each row taken from `from`, as its copy, flip and drain
+       * leave them.
+       */
+      const planMove = (
+        rows: ReadonlyArray<Record<string, AttributeValue>>,
+        there: ReadonlyMap<string, Record<string, AttributeValue>>,
+      ): Rekey.RekeyTally => {
+        ctx.plan(
+          rows.flatMap((row): ReadonlyArray<TransactWriteItem> => {
+            const put = copyOver(row, there.get(skOf(row)))
+            return [
+              ...(put === undefined ? [] : [{ Put: put }]),
+              {
+                Delete: {
+                  TableName: ctx.tableName,
+                  Key: toAttributeMap({ pk: from, sk: skOf(row) }),
+                },
+              },
+            ]
+          }),
+        )
+        return Rekey.mergeTallies({ moved: { stream: rows.length } }, strongestGaps(rows))
+      }
+      /**
+       * Copy `row` to `to` over `held` ({@link copyOver}). `false` when a write got there first.
+       */
+      const copy = (
+        row: Record<string, AttributeValue>,
+        held: Record<string, AttributeValue> | undefined,
+      ) => {
+        const request = copyOver(row, held)
+        return request === undefined
+          ? Effect.succeed(true)
+          : client.putItem(request).pipe(Effect.as(true), Effect.catch(cancelled))
+      }
       /**
        * `row` as read, whole, or, a row too wide for that, the strongest guard that fits, as
        * 1.39.0 sent: only a stream already part-moved deletes one (`unguardedRows`).
        */
       const guardOfRow = (row: Record<string, AttributeValue>) =>
         wholeRowGuard(row, "pk", [], [], []) ?? asReadGuard(row, "pk", [])
+      /**
+       * The rows of `rows` too wide to guard whole, moved under the strongest guard that fits
+       * (`guardOfRow`): with writes going on, a write to an attribute it leaves out isn't seen
+       * ({@link RekeyGuardGaps} `strongest`).
+       */
+      const strongestGaps = (rows: ReadonlyArray<Record<string, AttributeValue>>) =>
+        Rekey.mergeTallies(
+          ...rows
+            .filter((row) => wholeRowGuard(row, "pk", [], [], []) === undefined)
+            .map((row) =>
+              Rekey.guardGap(ctx, "strongest", {
+                member: config.streamName,
+                kind: "stream",
+                key: { pk: from, sk: skOf(row) },
+                target: { pk: to, sk: skOf(row) },
+              }),
+            ),
+        )
       /**
        * With writes going on (`unprovable`), the rows of a stream nothing of which has moved that
        * are too wide to guard whole, each reported `unguarded`, before anything is copied: its rows
@@ -5539,6 +5637,38 @@ export const makeStream = <
           .pipe(Effect.as(true), Effect.catch(cancelled))
 
       /**
+       * What `to` holds, by sort key, once the stream lives there, and, when a row of `left` (its
+       * rows still under `from`) is held there differently, the conflicts: a row `to` holds
+       * differently (an event or sentinel written under both keys) is left with the rest. A
+       * snapshot only grows newer. The real run's drain and a dry run's plan both judge by it.
+       */
+      const toDrain = (left: ReadonlyArray<Record<string, AttributeValue>>) =>
+        Effect.map(readAll(to), (rows) => {
+          const there = new Map(rows.map((row) => [skOf(row), row]))
+          const differing = left.filter((row) => {
+            const held = there.get(skOf(row))
+            if (held === undefined || sameRow(copyOf(row), held)) return false
+            return skOf(row) !== snapshotSk
+          })
+          return {
+            there,
+            refused:
+              differing.length === 0
+                ? undefined
+                : Rekey.mergeTallies(
+                    ...differing.map((row) =>
+                      conflict(
+                        "bothKeys",
+                        "a row of it is under both partition keys, and the two differ; the rows " +
+                          "under its old key are left as they are.",
+                        skOf(row),
+                      ),
+                    ),
+                  ),
+          }
+        })
+
+      /**
        * Bring every row still under `from` over, once the stream lives at
        * `to`: a row `to` lacks is copied (a command sentinel written beside
        * the flip), a snapshot newer than `to`'s copied over it, and then each
@@ -5551,35 +5681,10 @@ export const makeStream = <
        */
       const drain = Effect.gen(function* () {
         const left = yield* readOwn
-        const there = new Map((yield* readAll(to)).map((row) => [skOf(row), row]))
-        const differing: Array<Record<string, AttributeValue>> = []
+        const { there, refused } = yield* toDrain(left)
+        if (refused !== undefined) return refused
         for (const row of left) {
-          const held = there.get(skOf(row))
-          if (held === undefined || sameRow(copyOf(row), held)) continue
-          if (skOf(row) === snapshotSk) continue
-          differing.push(row)
-        }
-        if (differing.length > 0) {
-          return Rekey.mergeTallies(
-            ...differing.map((row) =>
-              conflict(
-                "bothKeys",
-                "a row of it is under both partition keys, and the two differ; the rows " +
-                  "under its old key are left as they are.",
-                skOf(row),
-              ),
-            ),
-          )
-        }
-        for (const row of left) {
-          const held = there.get(skOf(row))
-          const copied =
-            held === undefined
-              ? yield* copy(row)
-              : skOf(row) === snapshotSk && asOfOf(row) > asOfOf(held)
-                ? yield* copy(row, held)
-                : true
-          if (!copied) return undefined
+          if (!(yield* copy(row, there.get(skOf(row))))) return undefined
         }
         const ordered = [
           ...left.filter((row) => versionOf(row) > 1).sort((a, b) => versionOf(b) - versionOf(a)),
@@ -5589,10 +5694,10 @@ export const makeStream = <
         for (const row of ordered) {
           if (!(yield* remove(row))) return undefined
         }
-        return { moved: { stream: left.length } } satisfies Rekey.RekeyTally
+        return Rekey.mergeTallies({ moved: { stream: left.length } }, strongestGaps(left))
       })
 
-      let tally: Rekey.RekeyTally = {}
+      const tally: Rekey.RekeyTally = {}
       for (let attempt = 0; attempt < STREAM_MOVE_ATTEMPTS; attempt++) {
         const rows = yield* readOwn
         // Moved since the scan read it.
@@ -5608,33 +5713,23 @@ export const makeStream = <
             const refused = unguardedRows(rows)
             if (refused !== undefined) return Rekey.mergeTallies(tally, refused)
           }
-          // Another stream under other key text moves out first.
+          // Another stream under other key text moves out first, judged as its own unit.
           const stale = atTarget.find(elsewhere)
           if (stale !== undefined) {
-            if (depth >= Rekey.DISPLACE_DEPTH) {
+            const judged = yield* judgeStream(stale, ctx)
+            // A dry run reads what its plan leaves (`Rekey.RekeyRowContext.plan`).
+            if ((yield* readAll(to)).some(elsewhere)) {
               return Rekey.mergeTallies(
                 tally,
-                conflict(
-                  "contended",
-                  "too many streams under other key text hold each other's current keys.",
-                ),
+                judged === "loop"
+                  ? conflict("contended", Rekey.LOOP_MESSAGE)
+                  : conflict(
+                      "taken",
+                      "rows of another stream are under its current partition key.",
+                    ),
               )
             }
-            const displaced = yield* Rekey.displace(ctx, (under) =>
-              rekeyStreamRow(stale, under, depth + 1),
-            )
-            tally = Rekey.mergeTallies(tally, displaced)
-            // A dry run moved nothing: what would stop that stream is what would leave it there.
-            const stillThere = ctx.dryRun
-              ? (displaced.conflicts ?? []).length > 0
-              : (yield* readAll(to)).some(elsewhere)
-            if (stillThere) {
-              return Rekey.mergeTallies(
-                tally,
-                conflict("taken", "rows of another stream are under its current partition key."),
-              )
-            }
-            if (!ctx.dryRun) continue
+            continue
           }
           const there = new Map(
             atTarget.filter((row) => !elsewhere(row)).map((row) => [skOf(row), row]),
@@ -5668,25 +5763,21 @@ export const makeStream = <
               )
             }
           }
-          if (ctx.dryRun) return Rekey.mergeTallies(tally, { moved: { stream: rows.length } })
+          if (ctx.dryRun) return Rekey.mergeTallies(tally, planMove(rows, there))
           // COPY
           let copiedAll = true
           for (const row of rows) {
-            const held = there.get(skOf(row))
-            const copied =
-              held === undefined
-                ? yield* copy(row)
-                : skOf(row) === snapshotSk && asOfOf(row) > asOfOf(held)
-                  ? yield* copy(row, held)
-                  : true
-            if (!copied) {
+            if (!(yield* copy(row, there.get(skOf(row))))) {
               copiedAll = false
               break
             }
           }
           if (!copiedAll) continue
           // FLIP — conditioned on the stream being as copied: no event past
-          // the head, the head (and its seal) and the snapshot unchanged.
+          // the head, the head (and its seal) and the snapshot unchanged. The
+          // first event and the head are this stream's: once a run started at
+          // the same time has moved this stream away, another stream's move can
+          // bring its rows here (#240), and the flip must not mark those.
           const head = rows.reduce((top, row) => Math.max(top, versionOf(row)), 1)
           const headRow = rows.find((row) => versionOf(row) === head)
           const snapshot = rows.find((row) => skOf(row) === snapshotSk)
@@ -5702,14 +5793,15 @@ export const makeStream = <
                 UpdateExpression: "SET #moved = :to",
                 ConditionExpression:
                   head === 1
-                    ? `attribute_exists(#pk) AND attribute_not_exists(#moved) AND ${sealClause}`
-                    : "attribute_exists(#pk) AND attribute_not_exists(#moved)",
+                    ? `attribute_exists(#pk) AND #sid = :sid AND attribute_not_exists(#moved) AND ${sealClause}`
+                    : "attribute_exists(#pk) AND #sid = :sid AND attribute_not_exists(#moved)",
                 ExpressionAttributeNames: {
                   "#pk": "pk",
+                  "#sid": "streamId",
                   "#moved": MOVED_ATTRIBUTE,
                   ...(head === 1 && { "#sealed": SEALED_ATTRIBUTE }),
                 },
-                ExpressionAttributeValues: toAttributeMap({ ":to": to }),
+                ExpressionAttributeValues: toAttributeMap({ ":to": to, ":sid": streamIdText }),
               },
             },
             {
@@ -5726,8 +5818,13 @@ export const makeStream = <
                     ConditionCheck: {
                       TableName: ctx.tableName,
                       Key: toAttributeMap({ pk: from, sk: composeEventSk(head) }),
-                      ConditionExpression: `attribute_exists(#pk) AND ${sealClause}`,
-                      ExpressionAttributeNames: { "#pk": "pk", "#sealed": SEALED_ATTRIBUTE },
+                      ConditionExpression: `attribute_exists(#pk) AND #sid = :sid AND ${sealClause}`,
+                      ExpressionAttributeNames: {
+                        "#pk": "pk",
+                        "#sid": "streamId",
+                        "#sealed": SEALED_ATTRIBUTE,
+                      },
+                      ExpressionAttributeValues: toAttributeMap({ ":sid": streamIdText }),
                     },
                   },
                 ]
@@ -5761,7 +5858,9 @@ export const makeStream = <
           // A write landed in between: copy again.
           if (!won) continue
         } else if (ctx.dryRun) {
-          return Rekey.mergeTallies(tally, { moved: { stream: rows.length } })
+          // The drain's judgement and copies, over the rows just read.
+          const { there, refused } = yield* toDrain(rows)
+          return Rekey.mergeTallies(tally, refused ?? planMove(rows, there))
         }
         // DELETE
         const drained = yield* drain
@@ -5773,11 +5872,61 @@ export const makeStream = <
       )
     })
 
-  /** One scanned row of the stream — or one at a key another stream's move needs. */
+  /**
+   * The unit a row of the stream under other key text is judged as, and its move: the stream moves
+   * whole, once per run, from whichever of its rows the scan reaches first, and rows left there
+   * after it moved move after it. `undefined` for a row under its current key, or not readable.
+   */
+  const streamMove = (
+    row: Record<string, AttributeValue>,
+    ctx: Rekey.RekeyRowContext,
+  ): Effect.Effect<
+    | {
+        readonly unit: string
+        readonly work: Effect.Effect<
+          Rekey.RekeyTally,
+          DynamoClientError,
+          DynamoClient | TableConfig
+        >
+      }
+    | undefined,
+    never,
+    TableConfig
+  > =>
+    Effect.gen(function* () {
+      const tableConfig = yield* config.table.Tag
+      const keys = streamKeys(row)
+      if (typeof keys !== "object") return undefined
+      const from = row.pk!.S!
+      if (from === keys.current) return undefined
+      const streamIdText = row.streamId?.S ?? ""
+      return {
+        unit: Rekey.identity("stream", config.streamName, from, streamIdText),
+        work: moveStream(
+          ctx,
+          from,
+          keys.current,
+          streamIdText,
+          resolveTtlAttributeName(tableConfig),
+        ),
+      }
+    })
+
+  /** Judge the stream a row at a key another stream's move needs belongs to, as its unit. */
+  const judgeStream = (
+    row: Record<string, AttributeValue>,
+    ctx: Rekey.RekeyRowContext,
+  ): Effect.Effect<Rekey.Judged, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.flatMap(streamMove(row, ctx), (move) =>
+      move === undefined
+        ? Effect.succeed<Rekey.Judged>("settled")
+        : ctx.judge(config.streamName, move.unit, move.work),
+    )
+
+  /** One scanned row of the stream. */
   const rekeyStreamRow = (
     row: Record<string, AttributeValue>,
     ctx: Rekey.RekeyRowContext,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const tableConfig = yield* config.table.Tag
@@ -5801,28 +5950,16 @@ export const makeStream = <
           ],
         }
       }
-      const from = row.pk!.S!
-      if (from === keys.current) return { unchanged: 1 }
-      // A stream moves whole, once per run, from whichever of its rows the scan reaches
-      // first, and rows left there after it moved move after it.
-      const streamIdText = row.streamId?.S ?? ""
-      return yield* ctx.once(
-        `${config.streamName}\u0000${from}\u0000${streamIdText}`,
-        moveStream(
-          ctx,
-          from,
-          keys.current,
-          streamIdText,
-          resolveTtlAttributeName(tableConfig),
-          depth,
-        ),
-      )
+      if (row.pk!.S! === keys.current) return { unchanged: 1 }
+      yield* judgeStream(row, ctx)
+      return {}
     })
 
   const rekeyHandler: Rekey.RekeyMember = {
     name: config.streamName,
     types: [entityType, snapshotEntityType, commandEntityType],
-    row: (row, ctx) => rekeyStreamRow(row, ctx, 0),
+    key: { pk: "pk", sk: "sk" },
+    row: (row, ctx) => rekeyStreamRow(row, ctx),
   }
 
   return {

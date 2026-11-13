@@ -1,0 +1,4982 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0"
+ ],
+ "note": "Captured once from the published effect-dynamodb 1.40.0 on DynamoDB Local (#241): an aggregate whose entity: many edges are keyed by dotted composites (nested.n, code.c) through fields the entity model encodes as a whole. Models and steps: test/helpers/AggregateDottedEdgeKeys.ts. Timestamps are <stamp>. (1.39.0 fetched an entity: edge element as a ref, so it failed RefNotFound here.) Never regenerate or fix this file.",
+ "on": [
+  {
+   "step": "create d1",
+   "outcome": {
+    "ok": {
+     "id": "d1",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "d1"
+          },
+          "title": {
+           "S": "t"
+          },
+          "__edd_e__": {
+           "S": "Dotted"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#dotted"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#5"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#12"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#62"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#63"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "create d2",
+   "outcome": {
+    "ok": {
+     "id": "d2",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "x"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "A"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 6
+       },
+       "code": {
+        "c": "a"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d3",
+       "nested": {
+        "n": 7
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l3"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "d2"
+          },
+          "title": {
+           "S": "t"
+          },
+          "__edd_e__": {
+           "S": "Dotted"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#dotted"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "78"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#5"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "41"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#41"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "6"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "61"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#61"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d3"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "7"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l3"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#62"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "get d1",
+   "outcome": {
+    "ok": {
+     "id": "d1",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$dots#v1#dotted#d1"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "get d2",
+   "outcome": {
+    "ok": {
+     "id": "d2",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "x"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "A"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 6
+       },
+       "code": {
+        "c": "a"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d3",
+       "nested": {
+        "n": 7
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l3"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$dots#v1#dotted#d2"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "update d1 title",
+   "outcome": {
+    "ok": {
+     "id": "d1",
+     "title": "t2",
+     "byNested": [
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$dots#v1#dotted#d1"
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "d1"
+          },
+          "title": {
+           "S": "t2"
+          },
+          "__edd_e__": {
+           "S": "Dotted"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#dotted"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#12"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#5"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#62"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#63"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t2"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  }
+ ],
+ "off": [
+  {
+   "step": "create d1",
+   "outcome": {
+    "ok": {
+     "id": "d1",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "d1"
+          },
+          "title": {
+           "S": "t"
+          },
+          "__edd_e__": {
+           "S": "Dotted"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#dotted"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#5"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#12"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#62"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#63"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "create d2",
+   "outcome": {
+    "ok": {
+     "id": "d2",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "x"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "A"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 6
+       },
+       "code": {
+        "c": "a"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d3",
+       "nested": {
+        "n": 7
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l3"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "d2"
+          },
+          "title": {
+           "S": "t"
+          },
+          "__edd_e__": {
+           "S": "Dotted"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#dotted"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         },
+         "ConditionExpression": "attribute_not_exists(#pk)",
+         "ExpressionAttributeNames": {
+          "#pk": "pk"
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "78"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#5"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "41"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#41"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "6"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "61"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#61"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d3"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "7"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l3"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d2"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#62"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "get d1",
+   "outcome": {
+    "ok": {
+     "id": "d1",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$dots#v1#dotted#d1"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "get d2",
+   "outcome": {
+    "ok": {
+     "id": "d2",
+     "title": "t",
+     "byNested": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "x"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "A"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 6
+       },
+       "code": {
+        "c": "a"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d3",
+       "nested": {
+        "n": 7
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l3"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$dots#v1#dotted#d2"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  },
+  {
+   "step": "update d1 title",
+   "outcome": {
+    "ok": {
+     "id": "d1",
+     "title": "t2",
+     "byNested": [
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      },
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      }
+     ],
+     "byCode": [
+      {
+       "dotId": "d1",
+       "nested": {
+        "n": 5
+       },
+       "code": {
+        "c": "b"
+       },
+       "label": "l1"
+      },
+      {
+       "dotId": "d2",
+       "nested": {
+        "n": 12
+       },
+       "code": {
+        "c": "c"
+       },
+       "label": "l2"
+      }
+     ]
+    }
+   },
+   "requests": [
+    {
+     "command": "Query",
+     "input": {
+      "TableName": "<table>",
+      "KeyConditionExpression": "#pk = :pk",
+      "ExpressionAttributeNames": {
+       "#pk": "pk"
+      },
+      "ExpressionAttributeValues": {
+       ":pk": {
+        "S": "$dots#v1#dotted#d1"
+       }
+      }
+     }
+    },
+    {
+     "command": "TransactWriteItems",
+     "input": {
+      "TransactItems": [
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "id": {
+           "S": "d1"
+          },
+          "title": {
+           "S": "t2"
+          },
+          "__edd_e__": {
+           "S": "Dotted"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#dotted"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#12"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByNested"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bynested#5"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d1"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "5"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "62"
+            }
+           }
+          },
+          "label": {
+           "S": "l1"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#62"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "dotId": {
+           "S": "d2"
+          },
+          "nested": {
+           "M": {
+            "n": {
+             "S": "12"
+            }
+           }
+          },
+          "code": {
+           "M": {
+            "c": {
+             "S": "63"
+            }
+           }
+          },
+          "label": {
+           "S": "l2"
+          },
+          "__edd_e__": {
+           "S": "ByCode"
+          },
+          "pk": {
+           "S": "$dots#v1#dotted#d1"
+          },
+          "sk": {
+           "S": "$dots#v1#bycode#63"
+          },
+          "createdAt": {
+           "S": "<stamp>"
+          },
+          "updatedAt": {
+           "S": "<stamp>"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ],
+   "rows": [
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#63"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "63"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#12"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "12"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d1"
+     },
+     "title": {
+      "S": "t2"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "41"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#41"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d2"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "61"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#61"
+     },
+     "label": {
+      "S": "l2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "6"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d3"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "62"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByCode"
+     },
+     "sk": {
+      "S": "$dots#v1#bycode#62"
+     },
+     "label": {
+      "S": "l3"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "7"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "dotId": {
+      "S": "d1"
+     },
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "code": {
+      "M": {
+       "c": {
+        "S": "78"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "ByNested"
+     },
+     "sk": {
+      "S": "$dots#v1#bynested#5"
+     },
+     "label": {
+      "S": "l1"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "nested": {
+      "M": {
+       "n": {
+        "S": "5"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    },
+    {
+     "createdAt": {
+      "S": "<stamp>"
+     },
+     "__edd_e__": {
+      "S": "Dotted"
+     },
+     "sk": {
+      "S": "$dots#v1#dotted"
+     },
+     "id": {
+      "S": "d2"
+     },
+     "pk": {
+      "S": "$dots#v1#dotted#d2"
+     },
+     "title": {
+      "S": "t"
+     },
+     "updatedAt": {
+      "S": "<stamp>"
+     }
+    }
+   ]
+  }
+ ]
+}

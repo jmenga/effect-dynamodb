@@ -1,0 +1,502 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (with effect@4.1.4), installed outside the repo and run by a scratch script against DynamoDB Local. Doc: a model field named a#b stored as `stored`, and a sparse map f stored under the prefix m, seeded with { id: 'a', 'a#b': 1, f: { k: { x: 1 } } }. Beside (the two cases named 'named as an entry'): an optional a#b stored as `stored`, beside a sparse map g stored under the prefix a, seeded with { id: 'a', 'a#b': 1, g: { b: 5 } }. For each operation, its outcome (a result as JSON, a failure or defect as its tag or name and the first line of its message), the expression parts of each request it sent, the row after it (keys and library attributes as stored) and what get read back. Never regenerate it: it is the record of what 1.39.0 did.",
+ "cases": {
+  "pathSet of the field": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "a#b": 1,
+     "f": {
+      "k": {
+       "x": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "UpdateExpression": "SET #ps0 = :ps1",
+     "ConditionExpression": "attribute_exists(#exists)",
+     "ExpressionAttributeNames": {
+      "#ps0": "a#b",
+      "#exists": "pk"
+     },
+     "ExpressionAttributeValues": {
+      ":ps1": {
+       "N": "9"
+      }
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Doc"
+    },
+    "a#b": {
+     "N": "9"
+    },
+    "id": {
+     "S": "a"
+    },
+    "m#k": {
+     "M": {
+      "x": {
+       "N": "1"
+      }
+     }
+    },
+    "pk": {
+     "S": "$hash#v1#doc#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#doc"
+    },
+    "stored": {
+     "N": "1"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 1,
+    "f": {
+     "k": {
+      "x": 1
+     }
+    }
+   }
+  },
+  "a condition on the field": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "UpdateExpression": "SET #u0 = :u0",
+     "ConditionExpression": "(#e0 = :e1) AND attribute_exists(#exists)",
+     "ExpressionAttributeNames": {
+      "#u0": "stored",
+      "#e0": "a#b",
+      "#exists": "pk"
+     },
+     "ExpressionAttributeValues": {
+      ":u0": {
+       "N": "2"
+      },
+      ":e1": {
+       "N": "1"
+      }
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Doc"
+    },
+    "id": {
+     "S": "a"
+    },
+    "m#k": {
+     "M": {
+      "x": {
+       "N": "1"
+      }
+     }
+    },
+    "pk": {
+     "S": "$hash#v1#doc#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#doc"
+    },
+    "stored": {
+     "N": "1"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 1,
+    "f": {
+     "k": {
+      "x": 1
+     }
+    }
+   }
+  },
+  "a filter on the field": {
+   "outcome": {
+    "ok": [
+     {
+      "id": "a",
+      "a#b": 1,
+      "f": {
+       "k": {
+        "x": 1
+       }
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "FilterExpression": "#eddE IN (:et0) AND (#e0 = :e1)",
+     "ExpressionAttributeNames": {
+      "#eddE": "__edd_e__",
+      "#e0": "stored"
+     },
+     "ExpressionAttributeValues": {
+      ":et0": {
+       "S": "Doc"
+      },
+      ":e1": {
+       "N": "1"
+      }
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Doc"
+    },
+    "id": {
+     "S": "a"
+    },
+    "m#k": {
+     "M": {
+      "x": {
+       "N": "1"
+      }
+     }
+    },
+    "pk": {
+     "S": "$hash#v1#doc#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#doc"
+    },
+    "stored": {
+     "N": "1"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 1,
+    "f": {
+     "k": {
+      "x": 1
+     }
+    }
+   }
+  },
+  "a projection of the field": {
+   "outcome": {
+    "ok": [
+     {
+      "a#b": 1
+     }
+    ]
+   },
+   "sent": [
+    {
+     "FilterExpression": "#eddE IN (:et0)",
+     "ProjectionExpression": "#proj0",
+     "ExpressionAttributeNames": {
+      "#eddE": "__edd_e__",
+      "#proj0": "stored"
+     },
+     "ExpressionAttributeValues": {
+      ":et0": {
+       "S": "Doc"
+      }
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Doc"
+    },
+    "id": {
+     "S": "a"
+    },
+    "m#k": {
+     "M": {
+      "x": {
+       "N": "1"
+      }
+     }
+    },
+    "pk": {
+     "S": "$hash#v1#doc#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#doc"
+    },
+    "stored": {
+     "N": "1"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 1,
+    "f": {
+     "k": {
+      "x": 1
+     }
+    }
+   }
+  },
+  "pathSet of an entry": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "a#b": 1,
+     "f": {
+      "k": {
+       "x": 9
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "UpdateExpression": "SET #ps0.#ps1 = :ps2",
+     "ConditionExpression": "attribute_exists(#exists)",
+     "ExpressionAttributeNames": {
+      "#ps0": "m#k",
+      "#ps1": "x",
+      "#exists": "pk"
+     },
+     "ExpressionAttributeValues": {
+      ":ps2": {
+       "N": "9"
+      }
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Doc"
+    },
+    "id": {
+     "S": "a"
+    },
+    "m#k": {
+     "M": {
+      "x": {
+       "N": "9"
+      }
+     }
+    },
+    "pk": {
+     "S": "$hash#v1#doc#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#doc"
+    },
+    "stored": {
+     "N": "1"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 1,
+    "f": {
+     "k": {
+      "x": 9
+     }
+    }
+   }
+  },
+  "a condition on an entry": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "a#b": 2,
+     "f": {
+      "k": {
+       "x": 1
+      }
+     }
+    }
+   },
+   "sent": [
+    {
+     "UpdateExpression": "SET #u0 = :u0",
+     "ConditionExpression": "(#e0.#e1 = :e2) AND attribute_exists(#exists)",
+     "ExpressionAttributeNames": {
+      "#u0": "stored",
+      "#e0": "m#k",
+      "#e1": "x",
+      "#exists": "pk"
+     },
+     "ExpressionAttributeValues": {
+      ":u0": {
+       "N": "2"
+      },
+      ":e2": {
+       "N": "1"
+      }
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Doc"
+    },
+    "id": {
+     "S": "a"
+    },
+    "m#k": {
+     "M": {
+      "x": {
+       "N": "1"
+      }
+     }
+    },
+    "pk": {
+     "S": "$hash#v1#doc#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#doc"
+    },
+    "stored": {
+     "N": "2"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 2,
+    "f": {
+     "k": {
+      "x": 1
+     }
+    }
+   }
+  },
+  "a filter on an entry": {
+   "outcome": {
+    "die": "Error",
+    "says": "PathBuilder.entry: field \"f\" is not configured as a sparse map"
+   },
+   "sent": [],
+   "row": {
+    "__edd_e__": {
+     "S": "Doc"
+    },
+    "id": {
+     "S": "a"
+    },
+    "m#k": {
+     "M": {
+      "x": {
+       "N": "1"
+      }
+     }
+    },
+    "pk": {
+     "S": "$hash#v1#doc#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#doc"
+    },
+    "stored": {
+     "N": "1"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 1,
+    "f": {
+     "k": {
+      "x": 1
+     }
+    }
+   }
+  },
+  "pathRemove of the field, named as an entry": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "a#b": 1,
+     "g": {}
+    }
+   },
+   "sent": [
+    {
+     "UpdateExpression": "REMOVE #pr0",
+     "ConditionExpression": "attribute_exists(#exists)",
+     "ExpressionAttributeNames": {
+      "#pr0": "a#b",
+      "#exists": "pk"
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Beside"
+    },
+    "id": {
+     "S": "a"
+    },
+    "pk": {
+     "S": "$hash#v1#beside#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#beside"
+    },
+    "stored": {
+     "N": "1"
+    }
+   },
+   "read": {
+    "id": "a",
+    "a#b": 1,
+    "g": {}
+   }
+  },
+  ".remove() of the field, named as an entry": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "g": {
+      "b": 5
+     }
+    }
+   },
+   "sent": [
+    {
+     "UpdateExpression": "REMOVE #r0",
+     "ConditionExpression": "attribute_exists(#exists)",
+     "ExpressionAttributeNames": {
+      "#r0": "stored",
+      "#exists": "pk"
+     }
+    }
+   ],
+   "row": {
+    "__edd_e__": {
+     "S": "Beside"
+    },
+    "a#b": {
+     "N": "5"
+    },
+    "id": {
+     "S": "a"
+    },
+    "pk": {
+     "S": "$hash#v1#beside#id_a"
+    },
+    "sk": {
+     "S": "$hash#v1#beside"
+    }
+   },
+   "read": {
+    "id": "a",
+    "g": {
+     "b": 5
+    }
+   }
+  }
+ }
+}

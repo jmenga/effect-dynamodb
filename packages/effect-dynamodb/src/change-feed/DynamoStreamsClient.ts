@@ -37,7 +37,10 @@ import {
   acquireSdkClient,
   type ClientOptions,
   type ClientOptionsFromConfig,
+  type Credentials,
   readClientOptions,
+  readCredentials,
+  sdkCredentials,
 } from "../internal/ClientOptions.js"
 import { redactCredentialRefusal } from "../internal/CredentialRefusal.js"
 import { ShardIteratorExpired, StreamDataTrimmed } from "./Errors.js"
@@ -96,8 +99,6 @@ export const classifyStreamsError =
     return new DynamoError({ operation, cause })
   }
 
-type Credentials = { readonly accessKeyId: string; readonly secretAccessKey: string }
-
 /**
  * Static client configuration accepted by {@link DynamoStreamsClient.layer}, with
  * the HTTP handler's options and `maxAttempts`, as `DynamoClient.layer` takes them.
@@ -152,7 +153,7 @@ const buildService = (
   Effect.gen(function* () {
     const clientConfig: ConstructorParameters<typeof DynamoDBStreamsClient>[0] = { region }
     if (endpoint !== undefined) clientConfig.endpoint = endpoint
-    if (credentials !== undefined) clientConfig.credentials = credentials
+    if (credentials !== undefined) clientConfig.credentials = sdkCredentials(credentials)
     if (options.requestHandler !== undefined) clientConfig.requestHandler = options.requestHandler
     if (options.maxAttempts !== undefined) clientConfig.maxAttempts = options.maxAttempts
     const client = yield* acquireSdkClient(() => new DynamoDBStreamsClient(clientConfig))
@@ -188,7 +189,13 @@ export class DynamoStreamsClient extends Context.Service<
     client: DynamoDBStreamsClient,
   ): Layer.Layer<DynamoStreamsClient> => Layer.succeed(DynamoStreamsClient, fromSdkClient(client))
 
-  /** A live layer reading its configuration from Effect `Config` providers. */
+  /**
+   * A live layer reading its configuration from Effect `Config` providers. As
+   * on `DynamoClient.layerConfig`, `credentials` wholly missing leaves the
+   * SDK's default credential chain, and `credentials` given in part fails the
+   * layer with the `Config`'s error for what is missing, under the same rule
+   * for what counts as a part.
+   */
   static readonly layerConfig = (
     config: DynamoStreamsClientConfigFromConfig,
   ): Layer.Layer<DynamoStreamsClient, Config.ConfigError> =>
@@ -197,14 +204,12 @@ export class DynamoStreamsClient extends Context.Service<
       Effect.gen(function* () {
         const region = yield* config.region
         const endpoint = config.endpoint ? yield* Config.option(config.endpoint) : undefined
-        const credentials = config.credentials
-          ? yield* Config.option(config.credentials)
-          : undefined
+        const credentials = yield* readCredentials(config.credentials)
         const options = yield* readClientOptions(config)
         return yield* buildService(
           region,
           endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
-          credentials && credentials._tag === "Some" ? credentials.value : undefined,
+          credentials,
           options,
         )
       }),

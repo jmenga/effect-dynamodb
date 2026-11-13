@@ -1850,7 +1850,7 @@ describeConnected("a many edge's collection is rows, not a stored value", () => 
 describeConnected("a cookie 1.39.0 stored, read and written back", () => {
   // Rows as published 1.39.0 stored them, and what it did writing back what it read
   // (`fixtures/cookie-writeback-1.39.0.json`, never regenerated). `CookieWriteBack.test.ts` holds
-  // the same cases on a recording table, which compares maps by their text.
+  // the same cases on a recording table.
   type Item = Record<string, AttributeValue>
   const fixture = JSON.parse(
     readFileSync(new URL("./fixtures/cookie-writeback-1.39.0.json", import.meta.url), "utf8"),

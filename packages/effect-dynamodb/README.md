@@ -13,7 +13,7 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 pnpm add effect-dynamodb effect @aws-sdk/client-dynamodb @aws-sdk/util-dynamodb
 ```
 
-`effect` is a peer dependency (`^4.1.0`) — install the version your application uses.
+`effect` is a peer dependency (`^4.1.3`) — install the version your application uses.
 
 ## Quick start
 

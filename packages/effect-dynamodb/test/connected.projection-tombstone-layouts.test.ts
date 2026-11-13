@@ -2,7 +2,7 @@
  * Several projections on one read model (#154), against DynamoDB Local: `create` over a tombstone
  * carries the checkpoints of the projection that wrote it, single-item and in a transaction. Every
  * scenario of `ProjectionTombstoneShared.ts` sends, stores and returns what the published 1.39.0
- * did, but for what `create` now carries. A sparse checkpoint map's tombstone is refused as its row
+ * did, but for what `create` now carries and what the row token (#237) changes (`since`). A sparse checkpoint map's tombstone is refused as its row
  * is. A read model with one projection sends and stores exactly what the published 1.39.0 did.
  *
  * Prerequisites:

@@ -1,0 +1,2765 @@
+{
+ "generatedFrom": [
+  "effect-dynamodb@1.40.0",
+  "effect-dynamodb@1.39.0"
+ ],
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @1.39.0 (each with its @effect-dynamodb/schema and effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local: never regenerate or \"fix\" it. An aggregate (schema `keyf` v1, partition key `pk` composed from `id` unless the shape says otherwise, collection `keyf`, root `Root`) whose root, `one` edge value, `many` element or sub-aggregate declares a field named like an attribute the library writes on that row (helpers/AggregateRowKeyFields.ts): the partition key attribute, `sk`, `__edd_e__`, a list key, the collection sort key's copy, or a discriminator. Per shape: `create`'s outcome, the partition's rows (by sort key), `get`, a no-op `update` and `get` after it. A defect's message is cut to its first line.",
+ "1.40.0": {
+  "root declares pk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "pk": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root declares pk (optional), given none": {
+   "create": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root's composite id is the pk attribute": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "title": "t"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "$keyf#v1#keyf#a",
+     "title": "t"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "$keyf#v1#keyf#a",
+     "title": "t"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "$keyf#v1#keyf#a",
+     "title": "t"
+    }
+   }
+  },
+  "root declares sk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "sk": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root declares __edd_e__ (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "__edd_e__": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root declares the list pk attribute status": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "status": "open"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "lsk": {
+      "S": "$keyf#v1#bystatus#a"
+     },
+     "status": {
+      "S": "$keyf#v1#bystatus#open"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "status": "$keyf#v1#bystatus#open"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "status": "$keyf#v1#bystatus#open"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "status": "$keyf#v1#bystatus#open"
+    }
+   }
+  },
+  "root declares the list sk attribute rank": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "rank": "r1"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "rank": {
+      "S": "$keyf#v1#byrank#r1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "lpk": {
+      "S": "$keyf#v1#byrank"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "rank": "$keyf#v1#byrank#r1"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "rank": "$keyf#v1#byrank#r1"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "rank": "$keyf#v1#byrank#r1"
+    }
+   }
+  },
+  "root declares the list sk attribute rank (optional), given none": {
+   "create": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root declares the list sk attribute lsk, given mine, its list composite prio given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lsk": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "lsk": {
+      "S": "mine"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "lsk": "mine"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "lsk": "mine"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "lsk": "mine"
+    }
+   }
+  },
+  "root declares the list sk attribute lsk, given mine, its list composite prio given": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lsk": "mine",
+     "prio": "p1"
+    }
+   },
+   "rows": [
+    {
+     "lsk": {
+      "S": "$keyf#v1#byprio#p1"
+     },
+     "lpk": {
+      "S": "$keyf#v1#byprio"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     },
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "prio": {
+      "S": "p1"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "lsk": "$keyf#v1#byprio#p1",
+     "prio": "p1"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "lsk": "$keyf#v1#byprio#p1",
+     "prio": "p1"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "lsk": "$keyf#v1#byprio#p1",
+     "prio": "p1"
+    }
+   }
+  },
+  "root declares the list pk attribute gsi1pk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "gsi1pk": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "gsi1pk": {
+      "S": "mine"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "one edge value declares sk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "sk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   }
+  },
+  "one edge value declares pk (optional), given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   }
+  },
+  "many element declares sk as its sort key composite": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "sk": "x",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#line#x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"lines\"][0][\"sk\"]"
+   },
+   "noop": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"lines\"][0][\"sk\"]"
+   },
+   "getAfterUpdate": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"lines\"][0][\"sk\"]"
+   }
+  },
+  "many element declares __edd_e__ (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1,
+       "__edd_e__": "mine"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#line#0000000000000001"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "sub-aggregate declares pk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   }
+  },
+  "one edge value declares csk, the collection sk mirror, given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note"
+     },
+     "csk": {
+      "S": "$keyf#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "csk": {
+      "S": "$keyf#v1#keyf"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "$keyf#v1#note"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "$keyf#v1#note"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "$keyf#v1#note"
+     }
+    }
+   }
+  },
+  "one edge value declares its discriminator kind, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "b"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#kind#a"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   }
+  },
+  "one edge value declares its discriminator kind, given it": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#kind#a"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   }
+  },
+  "one edge value declares its discriminator kind (optional), given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#kind#a"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   }
+  },
+  "one edge value declares its numeric discriminator n as NumberFromString, given it": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#n#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   }
+  },
+  "many element under a sub-aggregate declares its discriminator side, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "y"
+       }
+      ]
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#line#side#x#0000000000000001"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "x"
+       }
+      ]
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "x"
+       }
+      ]
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "x"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "sub-aggregate declares its discriminator side, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "y"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   }
+  },
+  "sub-aggregate declares its discriminator side, given it": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   }
+  }
+ },
+ "1.39.0": {
+  "root declares pk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "pk": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root declares pk (optional), given none": {
+   "create": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root's composite id is the pk attribute": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "title": "t"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "title": {
+      "S": "t"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "$keyf#v1#keyf#a",
+     "title": "t"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "$keyf#v1#keyf#a",
+     "title": "t"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "$keyf#v1#keyf#a",
+     "title": "t"
+    }
+   }
+  },
+  "root declares sk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "sk": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root declares __edd_e__ (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "__edd_e__": "mine"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a"
+    }
+   }
+  },
+  "root declares the list pk attribute status": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "status": "open"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "lsk": {
+      "S": "$keyf#v1#bystatus#a"
+     },
+     "status": {
+      "S": "$keyf#v1#bystatus#open"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "status": "$keyf#v1#bystatus#open"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "status": "$keyf#v1#bystatus#open"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "status": "$keyf#v1#bystatus#open"
+    }
+   }
+  },
+  "root declares the list sk attribute rank": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "rank": "r1"
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "rank": {
+      "S": "$keyf#v1#byrank#r1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "lpk": {
+      "S": "$keyf#v1#byrank"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "rank": "$keyf#v1#byrank#r1"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "rank": "$keyf#v1#byrank#r1"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "rank": "$keyf#v1#byrank#r1"
+    }
+   }
+  },
+  "root declares the list sk attribute rank (optional), given none": {
+   "create": {
+    "died": "Error: Missing composite attribute \"rank\" in record"
+   },
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "noop": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "getAfterUpdate": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "root declares the list sk attribute lsk, given mine, its list composite prio given none": {
+   "create": {
+    "died": "Error: Missing composite attribute \"prio\" in record"
+   },
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "noop": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "getAfterUpdate": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "root declares the list sk attribute lsk, given mine, its list composite prio given": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lsk": "mine",
+     "prio": "p1"
+    }
+   },
+   "rows": [
+    {
+     "lsk": {
+      "S": "$keyf#v1#byprio#p1"
+     },
+     "lpk": {
+      "S": "$keyf#v1#byprio"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     },
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "prio": {
+      "S": "p1"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "lsk": "$keyf#v1#byprio#p1",
+     "prio": "p1"
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "lsk": "$keyf#v1#byprio#p1",
+     "prio": "p1"
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "lsk": "$keyf#v1#byprio#p1",
+     "prio": "p1"
+    }
+   }
+  },
+  "root declares the list pk attribute gsi1pk (optional), given mine": {
+   "create": {
+    "died": "Error: Missing composite attribute \"prio\" in record"
+   },
+   "rows": [],
+   "get": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "noop": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   },
+   "getAfterUpdate": {
+    "failed": "AggregateAssemblyError",
+    "cause": "",
+    "reason": "No items found for aggregate key"
+   }
+  },
+  "one edge value declares sk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "sk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   }
+  },
+  "one edge value declares pk (optional), given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   }
+  },
+  "many element declares sk as its sort key composite": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "sk": "x",
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#line#x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"lines\"][0][\"sk\"]"
+   },
+   "noop": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"lines\"][0][\"sk\"]"
+   },
+   "getAfterUpdate": {
+    "failed": "ValidationError",
+    "operation": "aggregate.assemble",
+    "cause": "Missing key\n  at [\"lines\"][0][\"sk\"]"
+   }
+  },
+  "many element declares __edd_e__ (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1,
+       "__edd_e__": "mine"
+      }
+     ]
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#line#0000000000000001"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1
+      }
+     ]
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "lines": [
+      {
+       "qty": 1
+      }
+     ]
+    }
+   }
+  },
+  "sub-aggregate declares pk (optional), given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "pk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p"
+     }
+    }
+   }
+  },
+  "one edge value declares csk, the collection sk mirror, given mine": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "mine"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note"
+     },
+     "csk": {
+      "S": "$keyf#v1#note"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "csk": {
+      "S": "$keyf#v1#keyf"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "$keyf#v1#note"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "$keyf#v1#note"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "csk": "$keyf#v1#note"
+     }
+    }
+   }
+  },
+  "one edge value declares its discriminator kind, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "b"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#kind#a"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   }
+  },
+  "one edge value declares its discriminator kind, given it": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#kind#a"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   }
+  },
+  "one edge value declares its discriminator kind (optional), given none": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n"
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#kind#a"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "kind": "a"
+     }
+    }
+   }
+  },
+  "one edge value declares its numeric discriminator n as NumberFromString, given it": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#note#n#0000000000000001"
+     },
+     "text": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "n": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Note"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "note": {
+      "text": "n",
+      "n": 1
+     }
+    }
+   }
+  },
+  "many element under a sub-aggregate declares its discriminator side, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "y"
+       }
+      ]
+     }
+    }
+   },
+   "rows": [
+    {
+     "sk": {
+      "S": "$keyf#v1#line#side#x#0000000000000001"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "x"
+       }
+      ]
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "x"
+       }
+      ]
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "lines": [
+       {
+        "qty": 1,
+        "side": "x"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "sub-aggregate declares its discriminator side, given another": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "y"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   }
+  },
+  "sub-aggregate declares its discriminator side, given it": {
+   "create": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "rows": [
+    {
+     "name": {
+      "S": "p"
+     },
+     "sk": {
+      "S": "$keyf#v1#part#side#x"
+     },
+     "side": {
+      "S": "x"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$keyf#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$keyf#v1#keyf#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "get": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "noop": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   },
+   "getAfterUpdate": {
+    "ok": {
+     "id": "a",
+     "part": {
+      "name": "p",
+      "side": "x"
+     }
+    }
+   }
+  }
+ }
+}

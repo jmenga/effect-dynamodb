@@ -1,0 +1,644 @@
+/**
+ * `rekey` over one seeded table gives one outcome whatever order its scan hands the rows over
+ * (#240): every segment count, every order within a page, one row at a time or several at once. The
+ * table holds each shape whose outcome once depended on that order — rows whose keys chain (each
+ * one's current key where the next is stored), two items holding each other's current sentinel
+ * keys under different constraints, aggregates sharing a partition whose rows chain across owners,
+ * aggregates whose partitions chain, and a unique sentinel no row holds where a moving sentinel goes —
+ * and every run must report the same, leave the same rows, agree with its dry run, and leave a
+ * second run nothing to do. With `releaseOrphanedReservations` the sentinel no row holds is released
+ * and the moving one takes its key; without, the move is refused, whichever of the two the scan
+ * meets first, and the sentinel is reported with `reservations`, or counted `unrecognizedKey` as
+ * 1.40.0 counted it.
+ */
+
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { Effect, Layer, Schema } from "effect"
+import { TestClock } from "effect/testing"
+import * as Aggregate from "../src/Aggregate.js"
+import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
+import * as Table from "../src/Table.js"
+import { gatedLayer } from "./helpers/GatedClient.js"
+import { cutShort, OUTBOX_INDEX, partMovedWorld, writtenOff } from "./helpers/PartMoved.js"
+import { keyText, makeRecordingTable } from "./helpers/RecordingTable.js"
+import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
+import {
+  RESERVED,
+  REUSED_ROWS,
+  reservedOf,
+  reusedWorld,
+  SENTINELS_ON,
+  sentinelsOf,
+  writeReusedKeys,
+} from "./helpers/ReusedKeys.js"
+import { storedRows } from "./helpers/StoredRows.js"
+
+type Row = Record<string, AttributeValue>
+
+const Plain = Schema.Struct({ id: Schema.String, note: Schema.String })
+const Member = Schema.Struct({ id: Schema.String, email: Schema.String, nick: Schema.String })
+const Line = Schema.Struct({ lid: Schema.String, owner: Schema.String, note: Schema.String })
+const Route = Schema.Struct({ id: Schema.String, area: Schema.String })
+
+const world = (escapeKeys: boolean) => {
+  const schema = DynamoSchema.make({ name: "order", version: 1, escapeKeys })
+  const Rows = Entity.make({
+    model: Plain,
+    entityType: "Row",
+    primaryKey: { pk: { field: "pk", composite: [] }, sk: { field: "sk", composite: ["id"] } },
+  })
+  const Members = Entity.make({
+    model: Member,
+    entityType: "Member",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    unique: { email: ["email"], nick: ["nick"] },
+  })
+  const MainTable = Table.make({ schema, entities: { Rows, Members } })
+  const owner = (name: string) =>
+    Aggregate.make(Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) }), {
+      schema,
+      table: MainTable,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "shared" },
+      root: { entityType: `Root${name}` },
+      edges: {
+        lines: Aggregate.many({
+          entityType: "Line",
+          sk: { composite: ["lid"] },
+          assemble: (lines) =>
+            (lines as ReadonlyArray<typeof Line.Type>).filter((line) => line.owner === name),
+          decompose: (lines) => lines as ReadonlyArray<unknown>,
+        }),
+      },
+    })
+  const Routes = Aggregate.make(Route, {
+    schema,
+    table: MainTable,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "routes" },
+    root: { entityType: "Route" },
+    edges: {},
+  })
+  const aggregates = { A: owner("a"), B: owner("b"), C: owner("c"), Routes }
+  return {
+    MainTable,
+    client: DynamoClient.make({ entities: { Rows, Members }, aggregates, tables: { MainTable } }),
+  }
+}
+
+/** The table as written with escaping off: under on, each shape's keys chain. */
+const seeded = Effect.gen(function* () {
+  const table = makeRecordingTable()
+  const off = world(false)
+  yield* Effect.gen(function* () {
+    const db = yield* off.client
+    // `a b`'s current key is where `a%20b` is stored, whose current key is `a%2520b`'s.
+    for (const id of ["a b", "a%20b", "a%2520b"]) {
+      yield* db.entities.Rows.put({ id, note: id }).asEffect()
+    }
+    // m1's email goes where m2's is stored, and m2's nick where m1's is.
+    yield* db.entities.Members.put({ id: "m1", email: "foo bar", nick: "x%20y" }).asEffect()
+    yield* db.entities.Members.put({ id: "m2", email: "foo%20bar", nick: "x y" }).asEffect()
+    // m3's email goes where m4's is stored, and m4 is gone: its sentinels are held by no row.
+    yield* db.entities.Members.put({ id: "m3", email: "baz qux", nick: "m3" }).asEffect()
+    yield* db.entities.Members.put({ id: "m4", email: "baz%20qux", nick: "m4" }).asEffect()
+    // One partition: a's line goes where b's is stored, b's where c's is.
+    const lids = { a: "x y", b: "x%20y", c: "x%2520y" } as const
+    for (const name of ["a", "b", "c"] as const) {
+      yield* db.aggregates[name.toUpperCase() as "A"].create({
+        id: "p",
+        lines: [{ lid: lids[name], owner: name, note: name }],
+      })
+    }
+    // `q r`'s partition goes where `q%20r`'s is stored.
+    yield* db.aggregates.Routes.create({ id: "q r", area: "one" })
+    yield* db.aggregates.Routes.create({ id: "q%20r", area: "two" })
+  }).pipe(Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))))
+  for (const [key, row] of table.items) {
+    if (row.__edd_e__?.S === "Member" && row.id?.S === "m4") table.items.delete(key)
+  }
+  return [...table.items.values()]
+})
+
+/** A seeded shuffle: the same `seed` gives the same order. */
+const shuffled = <A>(items: ReadonlyArray<A>, seed: number): Array<A> => {
+  let state = seed >>> 0
+  const next = () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let t = state
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+  const out = [...items]
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(next() * (i + 1))
+    ;[out[i], out[j]] = [out[j]!, out[i]!]
+  }
+  return out
+}
+
+/** Scans whose pages come back in an order of `seed`'s (0: as read). */
+const scanOrder =
+  (seed: number): Parameters<typeof gatedLayer>[1] =>
+  (command, _input, send) => {
+    if (command !== "scan" || seed === 0) return send
+    let page = 0
+    return Effect.map(send, (output: any) => ({
+      ...output,
+      Items: shuffled(output.Items ?? [], seed * 7919 + page++),
+    }))
+  }
+
+/** What a run decided, conflicts in an order of their own. */
+const decided = (report: Table.RekeyReport) => {
+  const { conflicts, ...rest } = rekeyOutcome(report)
+  return {
+    ...rest,
+    conflicts: [...conflicts].sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1)),
+  }
+}
+
+/** The stored rows, every attribute's typed value included ({@link storedRows}). */
+const storedOf = (rows: Iterable<Row>) => storedRows(rows)
+
+describe.each([
+  ["releasing", "release"],
+  ["reporting", "report"],
+  ["leaving", "leave"],
+] as const)("rekey's outcome doesn't depend on the order it meets the rows in, %s orphans", (_, mode) => {
+  const release = mode === "release"
+  const first = new Map<string, unknown>()
+  for (const segments of [1, 2, 3, 5]) {
+    for (const seed of [0, 1, 2, 3]) {
+      for (const concurrency of [1, 4]) {
+        it.effect(`${segments} segment(s), order ${seed}, ${concurrency} at once`, () =>
+          Effect.gen(function* () {
+            const rows = yield* seeded
+            const table = makeRecordingTable()
+            for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+            const on = world(true)
+            const layer = Layer.merge(
+              gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+              on.MainTable.layer({ name: "t" }),
+            )
+            const options = {
+              segments,
+              concurrency,
+              pageSize: 3,
+              ...(mode === "release" && { releaseOrphanedReservations: true, writesStopped: true }),
+              ...(mode === "report" && { reservations: true }),
+            }
+            const runs = yield* Effect.gen(function* () {
+              const db = yield* on.client
+              const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
+              const untouched = storedOf(table.items.values())
+              const real = yield* db.tables.MainTable.rekey(options)
+              const after = storedOf(table.items.values())
+              const again = yield* db.tables.MainTable.rekey(options)
+              return { dry, untouched, real, after, again }
+            }).pipe(Effect.provide(layer))
+
+            // A dry run writes nothing and says what the run does.
+            expect(runs.untouched).toEqual(storedOf(rows))
+            expect(decided(runs.dry)).toEqual(decided(runs.real))
+            // Every chain moves in one run, every row counted once. m4's sentinels are released,
+            // and m3's email takes its key; or they're reported, or counted `unrecognizedKey`, and
+            // m3's stays where it is.
+            expect(runs.real.reservations).toMatchObject(
+              mode === "release"
+                ? { orphaned: 2, released: 2, skipped: 0, raced: 0, undecided: 0 }
+                : mode === "report"
+                  ? { orphaned: 2, released: 0, skipped: 0, raced: 0, undecided: 0 }
+                  : { orphaned: 0, released: 0, skipped: 0, raced: 0, undecided: 0 },
+            )
+            expect(runs.real.skipped.unrecognizedKey).toBe(mode === "leave" ? 2 : 0)
+            expect(runs.real.conflicts.map((conflict) => conflict.reason)).toEqual(
+              release ? [] : ["taken"],
+            )
+            expect(runs.real.scanned).toBe(rows.length)
+            // A second run finds nothing to move.
+            expect(runs.again.moved).toEqual({
+              item: 0,
+              snapshot: 0,
+              tombstone: 0,
+              outbox: 0,
+              event: 0,
+              aggregate: 0,
+              stream: 0,
+            })
+            expect(runs.again.sentinelsMoved).toBe(0)
+            expect(runs.again.conflicts).toEqual(runs.real.conflicts)
+            expect(runs.again.reservations.released).toBe(0)
+            expect(storedOf(table.items.values())).toEqual(runs.after)
+            // The same report and the same rows whatever the order.
+            const outcome = { report: decided(runs.real), rows: runs.after }
+            const seen = first.get("outcome")
+            if (seen === undefined) first.set("outcome", outcome)
+            else expect(outcome).toEqual(seen)
+          }),
+        )
+      }
+    }
+  }
+})
+
+/** The rows of {@link writeReusedKeys}, as written with escaping off. */
+const reusedSeeded = Effect.gen(function* () {
+  const table = makeRecordingTable()
+  const off = reusedWorld(false)
+  yield* writeReusedKeys(off, TestClock.adjust("1 second")).pipe(
+    Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))),
+  )
+  return [...table.items.values()]
+})
+
+describe.each([
+  ["reporting", { reservations: true }],
+  ["leaving", {}],
+] as const)("rekey over keys used again after a delete reaches one outcome in one run, %s", (_, mode) => {
+  const first = new Map<string, unknown>()
+  for (const segments of [1, 2, 3]) {
+    for (const seed of [0, 1, 2, 3, 4, 5]) {
+      for (const concurrency of [1, 4]) {
+        it.effect(`${segments} segment(s), order ${seed}, ${concurrency} at once`, () =>
+          Effect.gen(function* () {
+            const rows = yield* reusedSeeded
+            const table = makeRecordingTable()
+            for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+            const on = reusedWorld(true)
+            const layer = Layer.merge(
+              gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+              on.MainTable.layer({ name: "t" }),
+            )
+            const options = { segments, concurrency, pageSize: 3, ...mode }
+            const runs = yield* Effect.gen(function* () {
+              const db = yield* on.client
+              const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
+              const untouched = storedOf(table.items.values())
+              const real = yield* db.tables.MainTable.rekey(options)
+              const after = storedOf(table.items.values())
+              const sentinels = sentinelsOf(table.items.values())
+              const again = yield* db.tables.MainTable.rekey(options)
+              // Every live value and every value a tombstone under `preserveUnique` holds is
+              // still reserved.
+              const taken = yield* reservedOf(db)
+              return { dry, untouched, real, after, sentinels, again, taken }
+            }).pipe(Effect.provide(layer))
+
+            expect(runs.untouched).toEqual(storedOf(rows))
+            expect(decided(runs.dry)).toEqual(decided(runs.real))
+            expect(runs.real.conflicts).toEqual([])
+            expect(rows).toHaveLength(REUSED_ROWS)
+            expect(runs.real.scanned).toBe(REUSED_ROWS)
+            // Each value's sentinel is under its current key, naming the item.
+            expect(runs.sentinels).toEqual(SENTINELS_ON)
+            expect(runs.taken).toEqual(RESERVED.map(() => "reserved"))
+            // A second run finds nothing to move.
+            expect(runs.again.sentinelsMoved).toBe(0)
+            expect(Object.values(runs.again.moved).every((n) => n === 0)).toBe(true)
+            expect(runs.again.conflicts).toEqual([])
+            // The same report and the same rows whatever the order.
+            const outcome = { report: decided(runs.real), rows: runs.after }
+            const seen = first.get("outcome")
+            if (seen === undefined) first.set("outcome", outcome)
+            else expect(outcome).toEqual(seen)
+          }),
+        )
+      }
+    }
+  }
+})
+
+/** A seeded generator of whole numbers below `n`. */
+const draws = (seed: number) => {
+  let state = (seed * 97 + 13) >>> 0
+  return (n: number) => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let t = state
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n)
+  }
+}
+
+/** A seeded hash of a row's key text. */
+const hashOf = (text: string, seed: number) => {
+  let h = (seed * 2654435761) >>> 0
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 16777619) >>> 0
+  }
+  h ^= h >>> 13
+  h = Math.imul(h, 0x5bd1e995) >>> 0
+  h ^= h >>> 15
+  return h >>> 0
+}
+
+/**
+ * DynamoDB's scan over `items` as they are when each page is read, in the order of a seeded hash
+ * of each row's key, a segment a range of hashes; and every other request delayed by a seeded
+ * number of turns on its way out and on its way back, so answers come back out of turn.
+ */
+const hashOrder = (items: Map<string, Row>, seed: number): Parameters<typeof gatedLayer>[1] => {
+  const draw = draws(seed)
+  const turns = (n: number) =>
+    Effect.forEach(Array.from({ length: n }), () => Effect.yieldNow, { discard: true })
+  return (command, input, send) => {
+    if (command !== "scan") {
+      return Effect.gen(function* () {
+        yield* turns(draw(20))
+        const output = yield* send
+        yield* turns(draw(20))
+        return output
+      })
+    }
+    return Effect.sync(() => {
+      const span = 2 ** 32 / (input.TotalSegments ?? 1)
+      const segment = input.Segment ?? 0
+      const rows = [...items.entries()]
+        .map(([text, item]) => ({ h: hashOf(text, seed), text, item }))
+        .filter(({ h }) => h >= segment * span && h < (segment + 1) * span)
+        .sort((a, b) => a.h - b.h || (a.text < b.text ? -1 : 1))
+      const start = input.ExclusiveStartKey
+      const after =
+        start === undefined
+          ? rows
+          : (() => {
+              const text = keyText(start.pk?.S ?? "", start.sk?.S ?? "")
+              const h = hashOf(text, seed)
+              return rows.filter((row) => row.h > h || (row.h === h && row.text > text))
+            })()
+      const page = after.slice(0, input.Limit ?? after.length)
+      const last = page[page.length - 1]
+      return {
+        Items: page.map(({ item }) => item),
+        Count: page.length,
+        ScannedCount: page.length,
+        ...(after.length > page.length &&
+          last !== undefined && { LastEvaluatedKey: { pk: last.item.pk!, sk: last.item.sk! } }),
+      }
+    })
+  }
+}
+
+describe("rekey over keys used again after a delete, its requests answered out of turn", () => {
+  // Each case once gave a real run a report its dry run didn't: seed 33, a tombstone's pass
+  // reporting its own sentinel `taken` when another visit had moved it there; seed 0, a sentinel
+  // counted twice when the move taking it was answered after its visit; seed 390, the run's own
+  // sentinel counted when the take before it was answered while its put was on its way.
+  for (const [segments, seed] of [
+    [1, 33],
+    [3, 0],
+    [3, 390],
+  ] as const) {
+    for (const reservations of [false, true]) {
+      it.effect(`${segments} segment(s), seed ${seed}, reservations ${reservations}`, () =>
+        Effect.gen(function* () {
+          const rows = yield* reusedSeeded
+          const table = makeRecordingTable()
+          for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+          const on = reusedWorld(true)
+          const layer = Layer.merge(
+            gatedLayer(table.client as DynamoClientService, hashOrder(table.items, seed)),
+            on.MainTable.layer({ name: "t" }),
+          )
+          const options = { segments, pageSize: 3, ...(reservations && { reservations }) }
+          const runs = yield* Effect.gen(function* () {
+            const db = yield* on.client
+            const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
+            const real = yield* db.tables.MainTable.rekey(options)
+            const sentinels = sentinelsOf(table.items.values())
+            return { dry, real, sentinels }
+          }).pipe(Effect.provide(layer))
+          expect(decided(runs.dry)).toEqual(decided(runs.real))
+          expect(runs.real.conflicts).toEqual([])
+          expect(runs.real.scanned).toBe(REUSED_ROWS)
+          expect(runs.sentinels).toEqual(SENTINELS_ON)
+        }),
+      )
+    }
+  }
+})
+
+describe("rekey under one setting throughout leaves a live item's sentinel to it", () => {
+  // `a%20b`'s tombstone holds `a b`, whose key text under the other setting is where the live
+  // item `a%2520b` holds `a%20b`, under the key its item's text has under that setting too.
+  for (const seed of [0, 1, 2, 3]) {
+    it.effect(`order ${seed}`, () =>
+      Effect.gen(function* () {
+        const table = makeRecordingTable()
+        const off = reusedWorld(false)
+        const layer = Layer.merge(
+          gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+          off.MainTable.layer({ name: "t" }),
+        )
+        const runs = yield* Effect.gen(function* () {
+          const db = yield* off.client
+          for (const entity of [db.entities.Softs, db.entities.Keeps]) {
+            yield* entity.put({ id: "a%20b", code: "a b" }).asEffect()
+            yield* entity.delete({ id: "a%20b" }).asEffect()
+            yield* entity.put({ id: "a%2520b", code: "a%20b" }).asEffect()
+          }
+          const before = storedOf(table.items.values())
+          const dry = yield* db.tables.MainTable.rekey({ pageSize: 2, dryRun: true })
+          const real = yield* db.tables.MainTable.rekey({ pageSize: 2 })
+          const after = storedOf(table.items.values())
+          const taken = yield* Effect.forEach([db.entities.Softs, db.entities.Keeps], (entity) =>
+            Effect.map(
+              Effect.exit(entity.put({ id: "second", code: "a%20b" }).asEffect()),
+              (exit) => exit._tag,
+            ),
+          )
+          const restored = yield* Effect.exit(
+            db.entities.Keeps.put({ id: "third", code: "a b" }).asEffect(),
+          )
+          return { before, dry, real, after, taken, restored: restored._tag }
+        }).pipe(Effect.provide(layer))
+        expect(decided(runs.dry)).toEqual(decided(runs.real))
+        expect(runs.real.sentinelsMoved).toBe(0)
+        expect(runs.real.conflicts).toEqual([])
+        expect(runs.after).toEqual(runs.before)
+        // Both live values stay reserved, and so does the one the `preserveUnique` tombstone holds.
+        expect(runs.taken).toEqual(["Failure", "Failure"])
+        expect(runs.restored).toBe("Failure")
+      }),
+    )
+  }
+})
+
+/** A dry run, a run and a second run with escaping on over `rows`, in an order of `seed`'s. */
+const runOn = (
+  rows: ReadonlyArray<Row>,
+  options: { readonly segments: number; readonly concurrency: number },
+  seed: number,
+) =>
+  Effect.gen(function* () {
+    const table = makeRecordingTable({ indexes: OUTBOX_INDEX })
+    for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+    const on = partMovedWorld(true)
+    const layer = Layer.merge(
+      gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+      on.MainTable.layer({ name: "t" }),
+    )
+    const run = { ...options, pageSize: 3, streams: on.streams }
+    return yield* Effect.gen(function* () {
+      const db = yield* on.client
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ ...run, dryRun: true })
+      const untouched = storedOf(table.items.values())
+      const real: Table.RekeyReport = yield* db.tables.MainTable.rekey(run)
+      const after = storedOf(table.items.values())
+      const again: Table.RekeyReport = yield* db.tables.MainTable.rekey(run)
+      return { dry, untouched, real, after, again }
+    }).pipe(Effect.provide(layer)) as Effect.Effect<{
+      dry: Table.RekeyReport
+      untouched: ReadonlyArray<string>
+      real: Table.RekeyReport
+      after: ReadonlyArray<string>
+      again: Table.RekeyReport
+    }>
+  })
+
+describe("rekey from a table a run cut short left part-moved finishes it in one run", () => {
+  // Every unit kind, cut after each of the writes a run sends, in an order of its own: the next
+  // run, in any order, says in its dry run what it does, and leaves the rows an uncut run leaves.
+  for (const segments of [1, 2, 3, 5]) {
+    for (const seed of [0, 1, 2, 3]) {
+      for (const concurrency of [1, 4]) {
+        it.effect(
+          `${segments} segment(s), order ${seed}, ${concurrency} at once`,
+          () =>
+            Effect.gen(function* () {
+              const written = yield* writtenOff
+              const finished = yield* runOn(written, { segments: 1, concurrency: 1 }, 0)
+              expect(finished.real.conflicts).toEqual([])
+              const cut = { segments: 6 - segments, concurrency: 5 - concurrency }
+              let after = 0
+              for (; ; after++) {
+                const start = yield* cutShort(written, after, cut, scanOrder(seed + 1))
+                if (start === undefined) break
+                const runs = yield* runOn(start, { segments, concurrency }, seed)
+                const at = `cut after ${after} write(s)`
+                expect(runs.untouched, at).toEqual(storedOf(start))
+                expect(decided(runs.dry), at).toEqual(decided(runs.real))
+                expect(runs.real.conflicts, at).toEqual([])
+                expect(runs.real.scanned, at).toBe(start.length)
+                expect(runs.after, at).toEqual(finished.after)
+                expect(
+                  Object.values(runs.again.moved).every((n) => n === 0),
+                  at,
+                ).toBe(true)
+                expect(runs.again.sentinelsMoved, at).toBe(0)
+                expect(runs.again.conflicts, at).toEqual([])
+              }
+              // A run sends a write or more for each unit: the run was cut at each.
+              expect(after).toBeGreaterThan(20)
+            }),
+          // Three runs from each of 20-odd cuts: up to a second here, several times that on CI.
+          30_000,
+        )
+      }
+    }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// guardGaps names the rows it counts
+// ---------------------------------------------------------------------------
+
+/** Items with a sparse map: each is guarded whole, so a write adding an entry isn't seen. */
+const taggedWorld = (escapeKeys: boolean) => {
+  const schema = DynamoSchema.make({ name: "gaps", version: 1, escapeKeys })
+  const Tagged = Entity.make({
+    model: DynamoModel.configure(
+      Schema.Struct({ id: Schema.String, tags: Schema.Record(Schema.String, Schema.String) }),
+      { tags: { storedAs: DynamoModel.SparseMap() } },
+    ),
+    entityType: "Tagged",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const MainTable = Table.make({ schema, entities: { Tagged } })
+  return { MainTable, client: DynamoClient.make({ entities: { Tagged }, tables: { MainTable } }) }
+}
+
+/** More items than the report names, and than it holds before cutting the list, written off. */
+const TAGGED = 250
+
+const taggedRows = Effect.gen(function* () {
+  const table = makeRecordingTable()
+  const off = taggedWorld(false)
+  yield* Effect.gen(function* () {
+    const db = yield* off.client
+    for (let i = 0; i < TAGGED; i++) {
+      yield* db.entities.Tagged.put({ id: `a b ${String(i).padStart(3, "0")}`, tags: { a: "1" } })
+    }
+  }).pipe(Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))))
+  return [...table.items.values()]
+})
+
+describe("guardGaps names the rows it counts: the first 100 by key, whatever the order", () => {
+  let first: unknown
+  const runs = [
+    ...[1, 3].flatMap((segments) =>
+      [0, 1, 2].flatMap((seed) =>
+        [1, 4].map((concurrency) => ({ segments, seed, concurrency, writesStopped: false })),
+      ),
+    ),
+    { segments: 3, seed: 1, concurrency: 4, writesStopped: true },
+  ]
+  for (const { segments, seed, concurrency, writesStopped } of runs) {
+    const label = writesStopped ? ", writes stopped" : ""
+    it.effect(`${segments} segment(s), order ${seed}, ${concurrency} at once${label}`, () =>
+      Effect.gen(function* () {
+        const rows = yield* taggedRows
+        const table = makeRecordingTable()
+        for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+        const on = taggedWorld(true)
+        const layer = Layer.merge(
+          gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+          on.MainTable.layer({ name: "t" }),
+        )
+        const options = { segments, concurrency, pageSize: 7, writesStopped }
+        const { dry, real } = yield* Effect.gen(function* () {
+          const db = yield* on.client
+          const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
+          const real = yield* db.tables.MainTable.rekey(options)
+          return { dry, real }
+        }).pipe(Effect.provide(layer))
+        expect(real.moved.item).toBe(TAGGED)
+        expect(real.conflicts).toEqual([])
+        expect(dry.guardGaps).toEqual(real.guardGaps)
+        if (writesStopped) {
+          expect(real.guardGaps).toEqual({ stamp: 0, sparse: 0, strongest: 0, rows: [] })
+          return
+        }
+        // Every row is counted, and the first 100 by key are named.
+        expect(real.byMember.Tagged!.guardGaps).toEqual({ stamp: 0, sparse: TAGGED, strongest: 0 })
+        const { rows: named, ...counts } = real.guardGaps
+        expect(counts).toEqual({ stamp: 0, sparse: TAGGED, strongest: 0 })
+        const keys = rows.map((row) => row.pk!.S!).sort()
+        expect(named.map((row) => row.key.pk)).toEqual(keys.slice(0, 100))
+        const stored = new Set([...table.items.keys()])
+        for (const row of named) {
+          const before = rows.find((r) => r.pk!.S === row.key.pk)!
+          expect(row).toEqual({
+            member: "Tagged",
+            kind: "item",
+            gap: "sparse",
+            key: { pk: before.pk!.S, sk: before.sk!.S },
+            target: { pk: expect.any(String), sk: expect.any(String) },
+          })
+          // Its current key: where the run moved it.
+          expect(row.target).not.toEqual(row.key)
+          expect(stored.has(`${row.target.pk}|${row.target.sk}`)).toBe(true)
+        }
+        first ??= real.guardGaps
+        expect(real.guardGaps).toEqual(first)
+      }),
+    )
+  }
+})

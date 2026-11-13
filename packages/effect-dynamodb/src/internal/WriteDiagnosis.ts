@@ -47,6 +47,7 @@ import {
   TRANSACT_WRITE_ITEMS_LIMIT,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { toHex } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import {
   MAX_DIMENSIONS,
@@ -65,6 +66,7 @@ import {
   IN_MAX_OPERANDS,
   largestInOperands,
 } from "./ExpressionLimits.js"
+import { STATEMENT_MAX_LENGTH } from "./InsertStatement.js"
 import {
   attributeBytes,
   batchWriteBodyBytes,
@@ -178,6 +180,8 @@ export type SentWrite =
       readonly target: () => TransactItemTarget
       readonly callerCondition?: (() => string | undefined) | undefined
       readonly input?: Readonly<Record<string, unknown>> | undefined
+      /** The PartiQL statement it was sent as, when it wasn't sent as `item` itself. */
+      readonly statements?: ReadonlyArray<string> | undefined
     }
   | {
       readonly _tag: "Transaction"
@@ -185,6 +189,8 @@ export type SentWrite =
       readonly targets: () => ReadonlyArray<TransactItemTarget>
       readonly callerCondition?: ((index: number) => string | undefined) | undefined
       readonly input?: Readonly<Record<string, unknown>> | undefined
+      /** The PartiQL statement each entry was sent as, when not as `items` themselves. */
+      readonly statements?: ReadonlyArray<string> | undefined
     }
   | {
       readonly _tag: "Batch"
@@ -335,6 +341,13 @@ export type Diagnosis =
         | undefined
     }
   | {
+      /** A PartiQL `INSERT` over the statement length limit: it lists every attribute name. */
+      readonly _tag: "StatementTooLong"
+      readonly target: TransactItemTarget
+      readonly length: number
+      readonly attributes: number
+    }
+  | {
       /** A write puts an empty string (or binary) in a key attribute. */
       readonly _tag: "EmptyKey"
       readonly target: TransactItemTarget
@@ -353,6 +366,21 @@ export type Diagnosis =
       readonly attribute: string
       /** The write whose condition holds it; `undefined` for a read's filter. */
       readonly target: TransactItemTarget | undefined
+    }
+  | {
+      /**
+       * A write's condition compares a value of a type its operator doesn't take: `<` on a
+       * map, a list, a boolean or null (#242). DynamoDB refuses the request whatever the item
+       * holds. Only a site naming it in `optIn` gets it ({@link diagnoseFailure}).
+       */
+      readonly _tag: "OperandType"
+      readonly target: TransactItemTarget
+      /** The operator DynamoDB named: `<`, `<=`, `>`, `>=` or `BETWEEN`. */
+      readonly operator: string
+      /** The type DynamoDB named: `M`, `L`, `BOOL`, `NULL`, … */
+      readonly operandType: string
+      /** The attribute (path) the value is compared with, as stored. */
+      readonly attribute: string
     }
   | {
       /** A query's key condition compares a key attribute with an empty value. */
@@ -471,6 +499,14 @@ const CONSISTENT_GSI =
 // The message names no attribute: confirmed by finding the `IN ()` in the
 // request.
 const EMPTY_IN = /Syntax error; token: "\)", near: "\(\)/i
+// A comparison of a value of a type its operator doesn't take (#242). DynamoDB Local: 'Invalid
+// ConditionExpression: Incorrect operand type for operator or function; operator or function: <,
+// operand type: M'. Request-wide, whatever the item holds; the message names no attribute:
+// confirmed by finding, in a condition sent, that operator comparing a value of that type.
+const OPERAND_TYPE =
+  /Incorrect operand type for operator or function; operator or function: ([^,]+), operand type: (\w+)/i
+const COMPARISON = /([#:][\w#.[\]]*)\s*(<=|>=|<|>)\s*([#:][\w#.[\]]*)/g
+const BETWEEN_OPERANDS = /(#[\w#.[\]]*)\s+BETWEEN\s+(:\w+)\s+AND\s+(:\w+)/gi
 const EMPTY_IN_OPERAND = /((?:size\(\s*)?[#\w.[\]]+\)?)\s+IN\s*\(\s*\)/i
 // A vector index's dimensions or a vector search's TopK outside DynamoDB's
 // range. DynamoDB Local has neither vector indexes nor `SearchVectors`, so
@@ -589,7 +625,7 @@ const writtenAttributes = (item: TransactWriteItem): Record<string, AttributeVal
     for (const match of setClause.matchAll(/(#[\w]+)\s*=\s*(:[\w]+)\s*(?=,|$)/g)) {
       const name = names[match[1]!]
       const value = values[match[2]!]
-      if (name !== undefined && value !== undefined) written[name] = value
+      if (name !== undefined && value !== undefined) setOwn(written, name, value)
     }
   }
   return written
@@ -858,6 +894,69 @@ const emptyInCondition = (sent: SentWrite): Diagnosis | undefined => {
 }
 
 /**
+ * The attribute a condition compares, with `operator`, against a value stored as `operandType`:
+ * the first such comparison, its path as stored. `undefined` when the condition holds none.
+ */
+const comparedOfType = (
+  entry:
+    | {
+        readonly ConditionExpression?: string | undefined
+        readonly ExpressionAttributeNames?: Record<string, string> | undefined
+        readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+      }
+    | undefined,
+  operator: string,
+  operandType: string,
+): string | undefined => {
+  const expression = entry?.ConditionExpression ?? ""
+  const names = entry?.ExpressionAttributeNames ?? {}
+  const values = entry?.ExpressionAttributeValues ?? {}
+  const ofType = (token: string) =>
+    token.startsWith(":") &&
+    values[token] !== undefined &&
+    Object.keys(values[token]!)[0] === operandType
+  const pathOf = (token: string) => token.replace(/#\w+/g, (name) => names[name] ?? name)
+  if (operator.toUpperCase() === "BETWEEN") {
+    for (const [, path, low, high] of expression.matchAll(BETWEEN_OPERANDS)) {
+      if (ofType(low!) || ofType(high!)) return pathOf(path!)
+    }
+    return undefined
+  }
+  for (const [, left, compared, right] of expression.matchAll(COMPARISON)) {
+    if (compared !== operator) continue
+    if (ofType(right!) && left!.startsWith("#")) return pathOf(left!)
+    if (ofType(left!) && right!.startsWith("#")) return pathOf(right!)
+  }
+  return undefined
+}
+
+/**
+ * An operand-type rejection, confirmed (#242): the first entry, or the entry at `at`, whose
+ * condition compares a value of the type DynamoDB named with the operator it named.
+ */
+const operandTypeCondition = (
+  message: string,
+  sent: SentWrite,
+  at?: number,
+): Diagnosis | undefined => {
+  const named = OPERAND_TYPE.exec(message)
+  if (named === null) return undefined
+  const operator = named[1]!.trim()
+  const operandType = named[2]!
+  for (const [index, item] of entriesOf(sent).entries()) {
+    if (at !== undefined && index !== at) continue
+    const entry = item.Put ?? item.Update ?? item.Delete ?? item.ConditionCheck
+    const attribute = comparedOfType(entry, operator, operandType)
+    if (attribute === undefined) continue
+    const target = targetAt(sent, index)
+    return target === undefined
+      ? undefined
+      : { _tag: "OperandType", target, operator, operandType, attribute }
+  }
+  return undefined
+}
+
+/**
  * An expression-limit rejection, confirmed: the first entry whose expression
  * of the kind DynamoDB named (either, if it named none) breaks that limit.
  */
@@ -996,12 +1095,33 @@ const oversizedRequest = (sent: SentWrite): Diagnosis | undefined => {
   }
 }
 
+/** The first statement sent over the length limit, measured from the request. */
+const statementTooLong = (sent: SentWrite): Diagnosis | undefined => {
+  if ((sent._tag !== "Item" && sent._tag !== "Transaction") || sent.statements === undefined) {
+    return undefined
+  }
+  const index = sent.statements.findIndex((statement) => statement.length > STATEMENT_MAX_LENGTH)
+  if (index < 0) return undefined
+  const item = sent._tag === "Item" ? sent.item : sent.items[index]
+  const target = sent._tag === "Item" ? sent.target() : sent.targets()[index]
+  return item === undefined || target === undefined
+    ? undefined
+    : {
+        _tag: "StatementTooLong",
+        target,
+        length: (sent.statements[index] as string).length,
+        attributes: Object.keys(writtenAttributes(item)).length,
+      }
+}
+
 const diagnoseRequest = (
   failure: { readonly message: string; readonly tooLarge: boolean },
   sent: SentWrite,
   keys: KeyAttributes,
 ): Diagnosis | undefined => {
   const message = failure.message
+  const overLong = statementTooLong(sent)
+  if (overLong !== undefined) return overLong
   if (failure.tooLarge) return oversizedRequest(sent)
   if (REQUEST_SIZE.test(message)) {
     const found = oversizedRequest(sent)
@@ -1044,6 +1164,11 @@ const diagnoseRequest = (
   if (EMPTY_IN.test(message)) {
     return EXPRESSION_KIND.exec(message)?.[1]?.toLowerCase() === "condition"
       ? emptyInCondition(sent)
+      : undefined
+  }
+  if (OPERAND_TYPE.test(message)) {
+    return EXPRESSION_KIND.exec(message)?.[1]?.toLowerCase() === "condition"
+      ? operandTypeCondition(message, sent)
       : undefined
   }
   if (
@@ -1091,6 +1216,11 @@ const diagnoseCancellation = (
     if (item === undefined) continue
     if (KEY_SIZE.test(message)) {
       const found = keyAt(sent, index, keys, keySizeKinds(message))
+      if (found !== undefined) return found
+      continue
+    }
+    if (OPERAND_TYPE.test(message)) {
+      const found = operandTypeCondition(message, sent, index)
       if (found !== undefined) return found
       continue
     }
@@ -1303,6 +1433,13 @@ export const explainDiagnosis = (
       ? `This request wrote nothing; ${options.committed}.`
       : "Nothing was written."
   switch (diagnosis._tag) {
+    case "StatementTooLong":
+      return (
+        `${operation}: DynamoDB rejected the PartiQL statement for ${named(diagnosis.target)}: ` +
+        `it is ${diagnosis.length} characters, over the limit of ${STATEMENT_MAX_LENGTH}. ` +
+        `An INSERT statement lists every attribute name, and this item has ` +
+        `${diagnosis.attributes}. put() and create() have no such limit. ${outcome}`
+      )
     case "ItemTooLarge":
       return (
         `${operation}: DynamoDB rejected the write because an item exceeds its limit of ` +
@@ -1441,6 +1578,13 @@ export const explainDiagnosis = (
             `"${diagnosis.attribute}" in its condition has no values, and DynamoDB rejects the ` +
             "`IN ()` it compiles to as a syntax error. Give isIn() at least one value, or " +
             `leave the condition out. ${outcome}`
+    case "OperandType":
+      return (
+        `${operation}: DynamoDB rejected ${named(diagnosis.target)}: its condition compares ` +
+        `"${diagnosis.attribute}" with ${diagnosis.operator} to a value stored as ` +
+        `${storedTypeName(diagnosis.operandType)}, and ${diagnosis.operator} compares only ` +
+        `numbers, strings and binary. ${outcome}`
+      )
     case "EmptyKeyBound":
       return (
         `${operation}: DynamoDB rejected the query: its key condition compares the key ` +
@@ -1509,6 +1653,26 @@ export const explainDiagnosis = (
   }
 }
 
+/** A DynamoDB attribute type as an error names it: `M` is "a map (M)". */
+export const storedTypeName = (type: string): string => {
+  switch (type) {
+    case "M":
+      return "a map (M)"
+    case "L":
+      return "a list (L)"
+    case "BOOL":
+      return "a boolean (BOOL)"
+    case "NULL":
+      return "null (NULL)"
+    case "SS":
+    case "NS":
+    case "BS":
+      return `a set (${type})`
+    default:
+      return type
+  }
+}
+
 /**
  * An `Error` carrying `message`, with DynamoDB's error one step down as its
  * own `cause` — what a diagnosed error stores in its `cause`, so the readable
@@ -1524,6 +1688,8 @@ export const diagnosedEntityType = (diagnosis: Diagnosis, fallback: string): str
     case "KeyTooLong":
     case "ExpressionTooLarge":
     case "EmptyKey":
+    case "OperandType":
+    case "StatementTooLong":
       return diagnosis.target.entityType
     case "EmptyIn":
       return diagnosis.target?.entityType ?? fallback
@@ -1556,6 +1722,15 @@ export const diagnosedValidationError = (
 // Wiring
 // ---------------------------------------------------------------------------
 
+/**
+ * The diagnoses a site gets only by naming them in `optIn` (#242). `OperandType`: the time-series
+ * `append` rewrites it, as its `orderBy` (`EDD-9163`); elsewhere DynamoDB's
+ * `DynamoValidationError` passes through, as it did.
+ */
+export type OptInDiagnosis = "OperandType"
+
+const isOptIn = (tag: Diagnosis["_tag"]): tag is OptInDiagnosis => tag === "OperandType"
+
 /** `sent`, carrying the request input as sent when the failure recorded it. */
 const asSent = (sent: Sent, input: Readonly<Record<string, unknown>> | undefined): Sent =>
   input !== undefined &&
@@ -1576,12 +1751,15 @@ const asSent = (sent: Sent, input: Readonly<Record<string, unknown>> | undefined
  * a lost race. A diagnosis is terminal: no retry loop sees it.
  *
  * `only` limits the rewrite to those diagnoses; any other passes through.
+ * `optIn` names the diagnoses a site gets only by asking ({@link OptInDiagnosis}): any other
+ * site passes those rejections through as before.
  */
 export const diagnoseFailure =
   <E2>(options: {
     readonly sent: () => Sent
     readonly keys?: (() => KeyAttributes) | undefined
     readonly only?: ReadonlyArray<Diagnosis["_tag"]> | undefined
+    readonly optIn?: ReadonlyArray<OptInDiagnosis> | undefined
     readonly rewrite: (diagnosis: Diagnosis, original: unknown) => E2
   }) =>
   <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E | E2, R> =>
@@ -1594,6 +1772,9 @@ export const diagnoseFailure =
       )
       if (diagnosis === undefined) return Effect.fail(error)
       if (options.only !== undefined && !options.only.includes(diagnosis._tag)) {
+        return Effect.fail(error)
+      }
+      if (isOptIn(diagnosis._tag) && !(options.optIn ?? []).includes(diagnosis._tag)) {
         return Effect.fail(error)
       }
       return Effect.fail(options.rewrite(diagnosis, error))

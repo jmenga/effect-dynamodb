@@ -14,7 +14,7 @@
 
 import { Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
 import { SecureRandom } from "effect/crypto"
-import { failureOf, type Outcome, plain } from "./Against139.js"
+import { failureOf, type Outcome, plain, type Since139 } from "./Against139.js"
 import { makeRecordingTable } from "./RecordingTable.js"
 
 /** The library's public modules, of whichever release is under test. */
@@ -703,3 +703,46 @@ export const capture = (
     ),
   ) as unknown as Effect.Effect<Captured>
 }
+
+/**
+ * The cases where 1.39.0 wrote a row that didn't read, at a position the read schema resolves
+ * exactly (#236), and what this source does instead: refuse an operand no reader there reads (or
+ * one the union's members would store differently, `rivals`), or store the one form they read
+ * back (a number where its reader stores a set of it).
+ */
+export const RESOLVED: ReadonlyMap<
+  string,
+  readonly [Since139, (readonly [was: unknown, now: unknown])?]
+> = new Map([
+  [
+    "refused: append to a union of lists, of elements no list takes",
+    ["refuses what wouldn't read"],
+  ],
+  ["unchecked: entry: pathSet of a value its schema refuses", ["refuses what wouldn't read"]],
+  [
+    "unchecked: entry: pathSet of a value no member of its union takes",
+    ["refuses what wouldn't read"],
+  ],
+  [
+    "unchecked: entry: pathSet of a number its union's members store as text",
+    ["refuses what wouldn't read"],
+  ],
+  [
+    "unchecked: entry: pathSet of a number where the schema stores a set",
+    ["stores what reads", [{ N: "2" }, { NS: ["2"] }]],
+  ],
+  ["unchecked: entry: pathSet of a value nothing reads", ["refuses what wouldn't read"]],
+  [
+    "unchecked: pathAppend to a union of lists, of elements no list takes",
+    ["refuses what wouldn't read"],
+  ],
+  // The row lacks `meta.optional`: the operand would be stored there.
+  ["refused: pathIfNotExists", ["refused where stored"]],
+  [
+    "refused: pathIfNotExists holding a copy's properties, of a value its schema refuses",
+    ["refused where stored"],
+  ],
+])
+
+/** A case's name: its key without the entity's kind and how it was sent. */
+export const nameOf = (key: string): string => key.split(" / ").slice(0, -2).join(" / ")

@@ -1,22 +1,24 @@
 /**
  * A clear below a field, refused only when the row couldn't be read afterwards. Published 1.39.0
  * refused none of these: it sent each, and some left a row it then couldn't read
- * (`fixtures/union-clears-1.39.0.json`, `fixtures/tuple-clears-1.39.0.json`, which also keep the
- * requests each step sent where a step has them). Every clear 1.39.0 completed with a row that
- * reads back does what it did, standalone, in a transaction and on a retained entity, and the
- * tuple clears and the clears marked `everyMode` on an entity with a unique constraint too. One
- * whose row couldn't be read is refused before anything is sent where the schema shows no stored
- * value survives it, and sent as 1.39.0 sent it where which value is stored decides (a tagged
- * union's member, how many positions a tuple holds), which only a read would say. A list position
- * is judged by length alone, so a removal that leaves a length the field accepts is sent as 1.39.0
- * sent it even where what's left can't be read (a value in a position that can't hold it, a list
- * only a member its tag rules out accepts). A clear whose way to the path passes a node the guard
- * doesn't model (`Schema.Unknown`, a record with two index signatures, a tuple with elements
- * after its rest) is sent as 1.39.0 sent it, whatever the row reads. Run on a recording table
- * (`Kept139.test.ts`) and on DynamoDB Local (`connected.kept-1.39.0.test.ts`).
+ * (`fixtures/union-clears-1.39.0.json`, `fixtures/tuple-clears-1.39.0.json`,
+ * `fixtures/sparse-entry-clears-1.39.0.json`, which also keep the requests each step sent where a
+ * step has them). Every clear 1.39.0 completed with a row that reads back does what it did,
+ * standalone, in a transaction and on a retained entity, and the tuple and sparse entry clears
+ * and the clears marked `everyMode` on an entity with a unique constraint too. One whose row
+ * couldn't be read is refused before anything is sent where the schema shows no stored value
+ * survives it, and sent as 1.39.0 sent it where which value is stored decides (a tagged union's
+ * member, how many positions a tuple holds), which only a read would say. A list position is
+ * judged by the lists that may read what's left: their lengths, their elements against the ones
+ * that moved, and a tag beside the list (#238). A record is judged by the signatures its key
+ * matches, and a path below a sparse map's entry (`m#k`, then `x`) as a read rebuilds the map
+ * (#238). A clear whose way to the path passes a node the guard doesn't model (`Schema.Unknown`, a
+ * tuple with elements after its rest) is sent as 1.39.0 sent it, whatever the row reads. Run on a
+ * recording table (`Kept139.test.ts`) and on DynamoDB Local (`connected.kept-1.39.0.test.ts`).
  */
 
 import { it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Schema } from "effect"
 import { expect } from "vitest"
@@ -91,6 +93,25 @@ const fields: Record<string, Schema.Top> = {
     Schema.Struct({ a: XY, b: Schema.String }),
     Schema.Struct({ b: Schema.String }),
   ]),
+  // Sparse maps, each entry stored as an attribute of its own (`m#<key>`).
+  "sparse Record<string, { x, y }>": Schema.Record(Schema.String, XY),
+  "sparse Record<string, { x?, y }>": Schema.Record(
+    Schema.String,
+    Schema.Struct({ x: Schema.optional(Schema.Number), y: Schema.String }),
+  ),
+  "sparse Record<string, [string, number?]>": Schema.Record(
+    Schema.String,
+    Schema.Tuple([Schema.String, Schema.optional(Schema.Number)]),
+  ),
+}
+
+/** How each sparse map field is configured. */
+const sparse: Record<string, { readonly storedAs: unknown }> = {
+  "sparse Record<string, { x, y }>": { storedAs: DynamoModel.SparseMap({ prefix: "m" }) },
+  "sparse Record<string, { x?, y }>": { storedAs: DynamoModel.SparseMap({ prefix: "m" }) },
+  "sparse Record<string, [string, number?]>": {
+    storedAs: DynamoModel.SparseMap({ prefix: "m" }),
+  },
 }
 
 type Update = any
@@ -102,6 +123,11 @@ const removeF: Op = ["remove f", (u) => u.remove(["f"])]
 const pathRemoveAt = (...path: ReadonlyArray<string | number>): Op => [
   `pathRemove f${path.map((segment) => (typeof segment === "number" ? `[${segment}]` : `.${segment}`)).join("")}`,
   (u) => u.pathRemove(["f", ...path]),
+]
+/** A path naming stored attributes, as given: `m#k` is the sparse map entry `k`. */
+const pathRemoveStored = (...path: ReadonlyArray<string | number>): Op => [
+  `pathRemove ${path.map((segment, i) => (typeof segment === "number" ? `[${segment}]` : i === 0 ? segment : `.${segment}`)).join("")}`,
+  (u) => u.pathRemove(path),
 ]
 const tagged = { kind: "a", p: ["first", "second"] }
 
@@ -211,21 +237,21 @@ const clears: Record<string, ReadonlyArray<Clear>> = {
     { field: "Union([[string, string], unknown])", seed: ["first", "second"], op: pathRemoveAt(0) },
     // The same removal, on a list holding only the required position: only a read would tell.
     { field: "[string, string?]", seed: ["first"], op: pathRemoveAt(0), unreadable: true },
-    // What's left is a length the field accepts: length alone can't see that "second"'s place
-    // holds a number, or that the tag rules out the member reading a list of one.
-    { field: "[string, number?]", seed: ["first", 1], op: pathRemoveAt(0), unreadable: true },
-    // A record with two index signatures isn't modelled, so this is sent whatever the row reads.
+    // What's left is a length the field accepts, but no list reads it (#238): the number moves
+    // into the string's place, the key's signature reads only lists of two, and the tag rules out
+    // the member reading a list of one.
+    { field: "[string, number?]", seed: ["first", 1], op: pathRemoveAt(0), refused: true },
     {
       field: "{ [open-*]: [string, string?], [fixed-*]: [string, string] }",
       seed: { "fixed-k": ["first", "second"] },
       op: pathRemoveAt("fixed-k", 0),
-      unreadable: true,
+      refused: true,
     },
     {
       field: 'Union([{ kind: "a", p: [string, string] }, { kind: "b", p: [string] }])',
       seed: tagged,
       op: pathRemoveAt("p", 0),
-      unreadable: true,
+      refused: true,
     },
     // No value survives these: no list one shorter is a length the field accepts.
     { field: "[string, string]", seed: ["first", "second"], op: pathRemoveAt(0), refused: true },
@@ -244,6 +270,35 @@ const clears: Record<string, ReadonlyArray<Clear>> = {
     { field: "[string, string?]", seed: ["first", "second"], op: setUndefined, refused: true },
     { field: "[string, string?]", seed: ["first", "second"], op: removeF, refused: true },
   ],
+  "sparse-entry-clears": [
+    // The read rebuilds the map from its entries, so a path below one is judged against the
+    // map's own schema: the entry `k` without `x` can't be read (#238).
+    {
+      field: "sparse Record<string, { x, y }>",
+      seed: { k: { x: 1, y: "kept" } },
+      op: pathRemoveStored("m#k", "x"),
+      retained: true,
+      refused: true,
+    },
+    {
+      field: "sparse Record<string, [string, number?]>",
+      seed: { k: ["first", 1] },
+      op: pathRemoveStored("m#k", 0),
+      refused: true,
+    },
+    // What's left reads: sent as 1.39.0 sent it.
+    {
+      field: "sparse Record<string, { x?, y }>",
+      seed: { k: { x: 1, y: "kept" } },
+      op: pathRemoveStored("m#k", "x"),
+      retained: true,
+    },
+    {
+      field: "sparse Record<string, [string, number?]>",
+      seed: { k: ["first", 1] },
+      op: pathRemoveStored("m#k", 1),
+    },
+  ],
 }
 
 interface Mode {
@@ -258,11 +313,11 @@ const nameOf = (clear: Clear, { transaction, retain, unique }: Mode) =>
   `${unique ? ", with a unique constraint" : ""}`
 
 /**
- * Standalone and in a transaction; the tuple clears and those marked `everyMode` also on a
- * retained entity and on a unique one.
+ * Standalone and in a transaction; the tuple and sparse entry clears and those marked
+ * `everyMode` also on a retained entity and on a unique one.
  */
 const modesOf = (name: keyof typeof clears, clear: Clear): ReadonlyArray<Mode> => {
-  const every = name === "tuple-clears" || clear.everyMode === true
+  const every = name !== "union-clears" || clear.everyMode === true
   return [
     {},
     { transaction: true },
@@ -301,12 +356,16 @@ export const pathClearSuite = (name: keyof typeof clears) => (open: OpenTable) =
             : `${scenario}: does what ${fixture.generatedFrom} did`,
         () =>
           Effect.gen(function* () {
+            const model = Schema.Struct({
+              id: Schema.String,
+              ...(mode.unique ? { email: Schema.String } : {}),
+              f: fields[clear.field]!,
+            })
             const Doc = Entity.make({
-              model: Schema.Struct({
-                id: Schema.String,
-                ...(mode.unique ? { email: Schema.String } : {}),
-                f: fields[clear.field]!,
-              }),
+              model:
+                sparse[clear.field] === undefined
+                  ? model
+                  : DynamoModel.configure(model, { f: sparse[clear.field] } as never),
               entityType: "Doc",
               primaryKey: {
                 pk: { field: "pk", composite: ["id"] },
