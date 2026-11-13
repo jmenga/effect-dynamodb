@@ -365,6 +365,118 @@ describe("Marshaller", () => {
     })
   })
 
+  describe("[EDD-9165] a map entry keyed __proto__", () => {
+    /** An object holding each entry as its own property, `__proto__` included. */
+    const own = (entries: ReadonlyArray<readonly [string, unknown]>): Record<string, unknown> => {
+      const out: Record<string, unknown> = {}
+      for (const [key, value] of entries) {
+        Object.defineProperty(out, key, {
+          value,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        })
+      }
+      return out
+    }
+    const thrownBy = (attempt: () => unknown): unknown => {
+      try {
+        attempt()
+      } catch (error) {
+        return error
+      }
+      return undefined
+    }
+
+    it("marshalling drops it: that's what's refused", () => {
+      const marshalled = marshall({
+        data: own([
+          ["__proto__", 1],
+          ["ok", 2],
+        ]),
+      })
+      expect(Object.keys(marshalled.data!.M!)).toEqual(["ok"])
+      expect(Object.getPrototypeOf(marshalled.data!.M!)).not.toBe(Object.prototype)
+    })
+
+    const held = [
+      [
+        "a record's entry",
+        {
+          data: own([
+            ["__proto__", 1],
+            ["ok", 2],
+          ]),
+        },
+        ["data", "__proto__"],
+      ],
+      ["one holding a map", { data: own([["__proto__", { x: 1 }]]) }, ["data", "__proto__"]],
+      ["one holding null", { data: own([["__proto__", null]]) }, ["data", "__proto__"]],
+      ["a Map's entry", { data: new Map([["__proto__", 1]]) }, ["data", "__proto__"]],
+      [
+        "one nested in a list",
+        { data: [{ m: own([["__proto__", "v"]]) }] },
+        ["data", 0, "m", "__proto__"],
+      ],
+      ["one at the top", own([["__proto__", 1]]), ["__proto__"]],
+    ] as const
+
+    for (const [what, item, path] of held) {
+      it(`${what}: refused, naming the field and the key`, () => {
+        const thrown = thrownBy(() => toAttributeMap(item))
+        expect(isUnstorableValue(thrown)).toBe(true)
+        expect((thrown as UnstorableValue).path).toEqual(path)
+        expect((thrown as UnstorableValue).code).toBe("EDD-9165")
+        expect((thrown as UnstorableValue).message).toMatch(
+          /^".*__proto__": an attribute or a map entry named "__proto__" is lost: .* \[EDD-9165\]$/,
+        )
+        expect(unstorableIn(item)?.code).toBe("EDD-9165")
+      })
+    }
+
+    it("a single value names itself", () => {
+      const thrown = thrownBy(() => toAttributeValue(own([["__proto__", 1]]), "data"))
+      expect((thrown as UnstorableValue).path).toEqual(["data", "__proto__"])
+      expect((thrown as UnstorableValue).describe()).toContain("[EDD-9165]")
+    })
+
+    it("an entry it only inherits, and every other inherited name, are stored as before", () => {
+      const names = Object.getOwnPropertyNames(Object.prototype).filter((n) => n !== "__proto__")
+      const data = own(names.map((name, at) => [name, at] as const))
+      expect(unstorableIn({ data })).toBeUndefined()
+      expect(toAttributeMap({ data })).toEqual(marshall({ data }))
+      expect(Object.keys(toAttributeMap({ data }).data!.M!)).toEqual(names)
+      // Every object inherits `__proto__`: a plain one, a class instance, a null-prototype one.
+      expect(toAttributeMap({ data: { ok: 1 } })).toEqual({ data: { M: { ok: { N: "1" } } } })
+      expect(
+        unstorableIn({
+          data: new Location({
+            timestamp: 1,
+            geometry: new Point({ type: "Point", coordinates: [0] }),
+          }),
+        }),
+      ).toBeUndefined()
+      expect(unstorableIn({ data: Object.assign(Object.create(null), { ok: 1 }) })).toBeUndefined()
+    })
+
+    it("a write path refuses it with a ValidationError, nothing marshalled", () => {
+      const exit = Effect.runSyncExit(
+        marshalOrFail("Doc", "put", () => toAttributeMap({ data: own([["__proto__", 1]]) })),
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      const error = Cause.squash((exit as Exit.Failure<unknown, unknown>).cause)
+      expect(error).toBeInstanceOf(ValidationError)
+      expect(String((error as ValidationError).cause)).toContain('"data.__proto__"')
+      expect(String((error as ValidationError).cause)).toContain("[EDD-9165]")
+    })
+
+    it("a condition holding it compiles as 1.40.0 compiled it, the entry left out; it is refused where it is sent", () => {
+      const compiled = Expression.condition({ eq: { data: own([["__proto__", 1]]) } })
+      expect(compiled.expression).toBe("#data = :v0")
+      expect(compiled.values).toEqual({ ":v0": { M: {} } })
+    })
+  })
+
   describe("toAttributeMap / fromAttributeMap", () => {
     it("round-trips a simple object", () => {
       const obj = { name: "Alice", age: 30, active: true }

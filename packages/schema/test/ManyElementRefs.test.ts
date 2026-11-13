@@ -480,15 +480,33 @@ describe("a `one` edge's id follows the rule a `many` element's does (`holdsRefI
     // So is the entity whole: beside it, an id of another type than a string isn't fetched.
     const inherits = Object.assign(Object.create({ numbered: whole }), { numberedId: 5 })
     expect(holdsRefId(fields, "numbered", NumberedLines, inherits)).toBe(false)
-    // So is one a proxy's `get` trap answers for, which the payload doesn't hold at all.
+    // So is one a proxy answers for, which the payload doesn't hold at all.
     const proxy = new Proxy(
+      {},
+      {
+        has: (target, key) => key === "numberedId" || Reflect.has(target, key),
+        get: (target, key, receiver) =>
+          key === "numberedId" ? 5 : Reflect.get(target, key, receiver),
+      },
+    )
+    expect(holdsRefId(fields, "numbered", NumberedLines, proxy)).toBe(true)
+    // And one its `get` trap alone answers for, as 1.39.0 read it.
+    const getOnly = new Proxy(
       {},
       {
         get: (target, key, receiver) =>
           key === "numberedId" ? 5 : Reflect.get(target, key, receiver),
       },
     )
-    expect(holdsRefId(fields, "numbered", NumberedLines, proxy)).toBe(true)
+    expect(holdsRefId(fields, "numbered", NumberedLines, getOnly)).toBe(true)
+    // A proxy that throws for a name it doesn't hold gives none: it is read as it is.
+    const strict = new Proxy(Object.assign(Object.create(null), { numberedId: 5 }), {
+      get: (target, key) => {
+        if (!Object.hasOwn(target, key)) throw new Error(`no ${String(key)}`)
+        return target[key]
+      },
+    })
+    expect(holdsRefId(fields, "numbered", NumberedLines, strict)).toBe(true)
     // A method of the payload's class named like the id is no id, as 1.39.0 took it for none.
     class WithMethod {
       numberedId() {
