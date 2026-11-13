@@ -5434,7 +5434,9 @@ key form's record and each earlier reading (`keyForm139`, `givenZoneReading`,
 `restoredObjectReading`) to `keyReadings` (`internal/KeyReadings.ts`), which reads each
 composite as the key form does or as any earlier reading does, in every combination: the key
 form's reading first, then each earlier reading by itself, then the other combinations, fewest
-composites changed first, no reading twice. Each reading is composed under every form of key
+composites changed first, no reading twice (told apart by their values, not by the key text
+they compose: two composing one text, say under casing, are both tried and both count
+towards the cap; named, `KeyReadings.test.ts`). Each reading is composed under every form of key
 text (1.36's, 1.37's, the escaped one, the inverted index's), as every reading was, so the
 product covers both. The readings are capped at `READINGS_BOUND`, 64 per row: every
 combination of six composites read two ways, or three read four ways. Past it, the

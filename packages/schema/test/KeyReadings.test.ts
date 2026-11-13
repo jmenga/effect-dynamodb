@@ -24,6 +24,14 @@ describe("keyReadings", () => {
     ])
   })
 
+  it("named: tells readings apart by their values, not by the key text they compose", () => {
+    // Left as is: two readings whose values compose one key text (here under the default
+    // lowercase casing) are two readings, each tried and each counted towards READINGS_BOUND.
+    const keyForm = { id: "a", at: "…[UTC]" }
+    const other = { ...keyForm, at: "…[utc]" }
+    expect(keyReadings(keyForm, [other])).toEqual([keyForm, other])
+  })
+
   it("reads a composite an earlier reading leaves out as the key form does", () => {
     const keyForm = { id: "a", d: "x" }
     expect(keyReadings(keyForm, [{ d: "x:x" }])).toEqual([keyForm, { id: "a", d: "x:x" }])
