@@ -24,7 +24,7 @@ import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import { gatedLayer } from "./helpers/GatedClient.js"
 import { cutShort, OUTBOX_INDEX, partMovedWorld, writtenOff } from "./helpers/PartMoved.js"
-import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { keyText, makeRecordingTable } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 import {
   RESERVED,
@@ -310,6 +310,117 @@ describe.each([
           }),
         )
       }
+    }
+  }
+})
+
+/** A seeded generator of whole numbers below `n`. */
+const draws = (seed: number) => {
+  let state = (seed * 97 + 13) >>> 0
+  return (n: number) => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let t = state
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n)
+  }
+}
+
+/** A seeded hash of a row's key text. */
+const hashOf = (text: string, seed: number) => {
+  let h = (seed * 2654435761) >>> 0
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 16777619) >>> 0
+  }
+  h ^= h >>> 13
+  h = Math.imul(h, 0x5bd1e995) >>> 0
+  h ^= h >>> 15
+  return h >>> 0
+}
+
+/**
+ * DynamoDB's scan over `items` as they are when each page is read, in the order of a seeded hash
+ * of each row's key, a segment a range of hashes; and every other request delayed by a seeded
+ * number of turns on its way out and on its way back, so answers come back out of turn.
+ */
+const hashOrder = (items: Map<string, Row>, seed: number): Parameters<typeof gatedLayer>[1] => {
+  const draw = draws(seed)
+  const turns = (n: number) =>
+    Effect.forEach(Array.from({ length: n }), () => Effect.yieldNow, { discard: true })
+  return (command, input, send) => {
+    if (command !== "scan") {
+      return Effect.gen(function* () {
+        yield* turns(draw(20))
+        const output = yield* send
+        yield* turns(draw(20))
+        return output
+      })
+    }
+    return Effect.sync(() => {
+      const span = 2 ** 32 / (input.TotalSegments ?? 1)
+      const segment = input.Segment ?? 0
+      const rows = [...items.entries()]
+        .map(([text, item]) => ({ h: hashOf(text, seed), text, item }))
+        .filter(({ h }) => h >= segment * span && h < (segment + 1) * span)
+        .sort((a, b) => a.h - b.h || (a.text < b.text ? -1 : 1))
+      const start = input.ExclusiveStartKey
+      const after =
+        start === undefined
+          ? rows
+          : (() => {
+              const text = keyText(start.pk?.S ?? "", start.sk?.S ?? "")
+              const h = hashOf(text, seed)
+              return rows.filter((row) => row.h > h || (row.h === h && row.text > text))
+            })()
+      const page = after.slice(0, input.Limit ?? after.length)
+      const last = page[page.length - 1]
+      return {
+        Items: page.map(({ item }) => item),
+        Count: page.length,
+        ScannedCount: page.length,
+        ...(after.length > page.length &&
+          last !== undefined && { LastEvaluatedKey: { pk: last.item.pk!, sk: last.item.sk! } }),
+      }
+    })
+  }
+}
+
+describe("rekey over keys used again after a delete, its requests answered out of turn", () => {
+  // Each case once gave a real run a report its dry run didn't: seed 33, a tombstone's pass
+  // reporting its own sentinel `taken` when another visit had moved it there; seed 0, a sentinel
+  // counted twice when the move taking it was answered after its visit; seed 390, the run's own
+  // sentinel counted when the take before it was answered while its put was on its way.
+  for (const [segments, seed] of [
+    [1, 33],
+    [3, 0],
+    [3, 390],
+  ] as const) {
+    for (const reservations of [false, true]) {
+      it.effect(`${segments} segment(s), seed ${seed}, reservations ${reservations}`, () =>
+        Effect.gen(function* () {
+          const rows = yield* reusedSeeded
+          const table = makeRecordingTable()
+          for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+          const on = reusedWorld(true)
+          const layer = Layer.merge(
+            gatedLayer(table.client as DynamoClientService, hashOrder(table.items, seed)),
+            on.MainTable.layer({ name: "t" }),
+          )
+          const options = { segments, pageSize: 3, ...(reservations && { reservations }) }
+          const runs = yield* Effect.gen(function* () {
+            const db = yield* on.client
+            const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
+            const real = yield* db.tables.MainTable.rekey(options)
+            const sentinels = sentinelsOf(table.items.values())
+            return { dry, real, sentinels }
+          }).pipe(Effect.provide(layer))
+          expect(decided(runs.dry)).toEqual(decided(runs.real))
+          expect(runs.real.conflicts).toEqual([])
+          expect(runs.real.scanned).toBe(REUSED_ROWS)
+          expect(runs.sentinels).toEqual(SENTINELS_ON)
+        }),
+      )
     }
   }
 })

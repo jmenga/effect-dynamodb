@@ -4,5 +4,6 @@ export default defineConfig({
   test: {
     include: ["test/connected.test.ts"],
     testTimeout: 30000,
+    hookTimeout: 60000,
   },
 })
