@@ -469,13 +469,14 @@ export const suite = (
             // `rekey` reads each stored ref's id as a value of the key: that key is the one it finds
             // lagging, and every cascade key is what a put writes. 1.40.0 read a date key stored as
             // epoch milliseconds as stored, so `repairIndexKeys` judged a correct row's cascade key
-            // lagging too, and rewrote it as epoch text, which a cascade then missed.
+            // lagging too, and rewrote it as epoch text, which a cascade then missed. A dry run
+            // counts what it finds and repairs nothing.
             expect(ran.steps.rekey!.outcome.ok.indexKeys).toEqual({
               missing: 0,
               truncated: 0,
               lagging: 1,
               ambiguous: 0,
-              repaired: 1,
+              repaired: 0,
               skipped: 0,
             })
           }),
