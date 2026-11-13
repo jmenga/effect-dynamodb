@@ -45,6 +45,7 @@ import {
   stepsOf,
   sweepShapes,
   TYPE,
+  valueCopiesAsRoot,
 } from "./AggregateUpgradeSweep.js"
 
 const published: {
@@ -293,22 +294,14 @@ const copiesAsRoot = (rows: ReadonlyArray<Row>, names: ReadonlyArray<string>) =>
   })
 }
 
-/** A value read with each nested copy of a context attribute (`names`) the root's. */
-const valueCopiesAsRoot = (value: unknown, names: ReadonlyArray<string>): unknown => {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return value
-  const root = value as Record<string, unknown>
-  const walk = (inner: unknown): unknown => {
-    if (Array.isArray(inner)) return inner.map(walk)
-    if (inner === null || typeof inner !== "object") return inner
-    const out: Record<string, unknown> = {}
-    for (const [key, v] of Object.entries(inner)) {
-      out[key] = names.includes(key) && Object.hasOwn(root, key) ? root[key] : walk(v)
-    }
-    return out
-  }
-  const out: Record<string, unknown> = {}
-  for (const [key, v] of Object.entries(root)) out[key] = names.includes(key) ? v : walk(v)
-  return out
+/**
+ * The shapes whose edge has a custom `decompose` and `assemble` (#241): an `update` can't tell
+ * which of its rows an element's copy of a context attribute came from, so it hands the copy back
+ * as 1.40.0 did, the value before the write.
+ */
+const CUSTOM_EDGE: Readonly<Record<string, string>> = {
+  "held: context: a custom decompose and assemble": "lines",
+  "context: an Unknown element with a custom assemble holding another tenantId": "lines",
 }
 
 /** The sort keys of the rows holding a copy of a context attribute other than the root row's. */
@@ -600,10 +593,18 @@ export const sweepSuite = (
               ...id,
               get: outcome(copies(was.get)),
             })
-            // What a `get` right after reads (#241); where 1.40.0's update failed, as it failed.
+            // 1.40.0's result (#241), each copy of a context attribute a value holds as its row
+            // holds it after the write: the root's value.
+            const returned = (value: Outcome) =>
+              shape.context !== undefined && value.ok !== undefined
+                ? {
+                    ...value,
+                    ok: valueCopiesAsRoot(asValue(value.ok), shape.context, CUSTOM_EDGE[label]),
+                  }
+                : value
             expect({ ...id, update: outcome(step.update) }).toEqual({
               ...id,
-              update: outcome(was.update.failed !== undefined ? was.update : step.get),
+              update: outcome(returned(was.update)),
             })
             // The transactions writing the rows left behind that 1.40.0 didn't send: only at the
             // retry, and every such row's group.

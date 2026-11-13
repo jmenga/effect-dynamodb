@@ -1227,3 +1227,31 @@ export const runSweep = (
     return { ...created, get, steps }
   }) as unknown as Effect.Effect<Run, unknown>
 }
+
+/**
+ * A value read with each nested copy of a context attribute (`names`) the root's: what `update`
+ * returns where 1.40.0 returned the copy as it was before the write (#241). `skip` names an edge
+ * left as 1.40.0 returned it (a custom `decompose` and `assemble`).
+ */
+export const valueCopiesAsRoot = (
+  value: unknown,
+  names: ReadonlyArray<string>,
+  skip?: string,
+): unknown => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value
+  const root = value as Record<string, unknown>
+  const walk = (inner: unknown): unknown => {
+    if (Array.isArray(inner)) return inner.map(walk)
+    if (inner === null || typeof inner !== "object") return inner
+    const out: Record<string, unknown> = {}
+    for (const [key, v] of Object.entries(inner)) {
+      out[key] = names.includes(key) && Object.hasOwn(root, key) ? root[key] : walk(v)
+    }
+    return out
+  }
+  const out: Record<string, unknown> = {}
+  for (const [key, v] of Object.entries(root)) {
+    out[key] = names.includes(key) || key === skip ? v : walk(v)
+  }
+  return out
+}

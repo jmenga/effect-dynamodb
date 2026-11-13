@@ -690,9 +690,9 @@ export const suite = (
     // read filled in can't be told from what the caller set. A value given where the library writes
     // another is replaced by the library's, as on 1.40.0. 1.40.0 returned the state as mutated
     // (`update`), which a get after it doesn't read: the read hands back the library's value (a
-    // discriminator, a list key's text) or takes the attribute off. The update now returns what that
-    // get reads (`read`, DESIGN.md §11 "What `update` returns"). The upgrade sweep compares each with
-    // what published 1.40.0 sent and stored.
+    // discriminator, a list key's text) or takes the attribute off (`read`). The update returns
+    // 1.40.0's object, none of these being a context copy (DESIGN.md §11 "What `update` returns").
+    // The upgrade sweep compares each with what published 1.40.0 sent and stored.
     const updates: ReadonlyArray<{
       readonly label: string
       readonly from: string
@@ -751,7 +751,7 @@ export const suite = (
       },
     ]
     for (const { label, from, change, commands, update, read } of updates) {
-      it(`${label}: written as on 1.40.0, the library's value over it; returns what a get after it reads`, () =>
+      it(`${label}: written as on 1.40.0, the library's value over it; returns 1.40.0's result`, () =>
         Effect.runPromise(
           harness.onTable((tableName) =>
             Effect.gen(function* () {
@@ -764,7 +764,7 @@ export const suite = (
               )
               expect(yield* harness.commands(tableName)).toEqual(commands)
               expect(update).not.toEqual(read)
-              expect(result).toEqual({ ok: read })
+              expect(result).toEqual({ ok: update })
               expect(outcome(yield* Effect.exit(A.get({ id: "a" })))).toEqual({ ok: read })
             }),
           ),

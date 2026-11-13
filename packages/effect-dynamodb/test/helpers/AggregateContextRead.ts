@@ -26,7 +26,13 @@ import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
-import { CONTEXT, customOverRow, givenOverRow, MIRRORED } from "./AggregateUpgradeSweep.js"
+import {
+  CONTEXT,
+  customOverRow,
+  givenOverRow,
+  MIRRORED,
+  valueCopiesAsRoot,
+} from "./AggregateUpgradeSweep.js"
 
 type Row = Record<string, AttributeValue>
 type Outcome = { readonly ok?: unknown; readonly failed?: string; readonly operation?: string }
@@ -262,7 +268,7 @@ export const suite = (
           ))
         continue
       }
-      it(`${label}: stores and reads back what 1.40.0 did; a no-op update returns what a get after it reads`, () =>
+      it(`${label}: stores and reads back what 1.40.0 did; a no-op update returns 1.40.0's result`, () =>
         Effect.runPromise(
           harness.onTable((tableName) =>
             Effect.gen(function* () {
@@ -285,8 +291,13 @@ export const suite = (
               ] as const) {
                 expect({ step, ...judged(now) }).toEqual({ step, ...judged(then[step]) })
               }
-              // What a `get` right after reads (#241).
-              expect(judged(noop)).toEqual(judged(getAfterUpdate))
+              // 1.40.0's result, each context copy as its row holds it (#241): on rows nobody left
+              // half-written, the root's.
+              expect(judged(noop)).toEqual(
+                then.noop.ok === undefined
+                  ? judged(then.noop)
+                  : { ok: valueCopiesAsRoot(then.noop.ok, shape.context ?? ["tenantId"]) },
+              )
             }),
           ),
         ))

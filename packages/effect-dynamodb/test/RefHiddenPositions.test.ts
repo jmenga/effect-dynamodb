@@ -288,3 +288,69 @@ describe("a ref to an entity with a DynamoModel.Hidden field, at every position 
     }
   }
 })
+
+/**
+ * Named, not changed (#241): a ref two levels deep whose innermost target holds a required hidden
+ * field. `Team` (hidden `secret`, required) is held by `Club` as what a read of it returns, but
+ * `League`'s ref to `Club` decodes the club it reads through `Club`'s class, whose constructor checks
+ * `team` as a `Team`, so every `League` write fails, as on 1.40.0. One level deep it works (above).
+ */
+describe("a two-level ref chain whose innermost target holds a required hidden field", () => {
+  it.effect(
+    "the outer entity's write fails, as on 1.40.0, and stores nothing",
+    () =>
+      Effect.gen(function* () {
+        const key = {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        } as const
+        class Team extends Schema.Class<Team>("ChainTeam")({
+          id: Schema.String.pipe(DynamoModel.identifier),
+          name: Schema.String,
+          secret: Schema.String.pipe(DynamoModel.Hidden),
+        }) {}
+        const Teams = Entity.make({
+          model: Team,
+          entityType: "Team",
+          primaryKey: key,
+        } as never) as any
+        class Club extends Schema.Class<Club>("ChainClub")({
+          id: Schema.String.pipe(DynamoModel.identifier),
+          team: Team.pipe(DynamoModel.ref),
+        }) {}
+        const Clubs = Entity.make({
+          model: Club,
+          entityType: "Club",
+          primaryKey: key,
+          refs: { team: { entity: Teams } },
+        } as never) as any
+        class League extends Schema.Class<League>("ChainLeague")({
+          id: Schema.String.pipe(DynamoModel.identifier),
+          club: Club.pipe(DynamoModel.ref),
+        }) {}
+        const Leagues = Entity.make({
+          model: League,
+          entityType: "League",
+          primaryKey: key,
+          refs: { club: { entity: Clubs } },
+        } as never) as any
+        const schema = DynamoSchema.make({ name: "chain", version: 1 })
+        const Main = Table.make({ schema, entities: { Teams, Clubs, Leagues } })
+        const table = makeRecordingTable()
+        const db: any = yield* DynamoClient.make({
+          entities: { Teams, Clubs, Leagues },
+          tables: { Main },
+        }).pipe(
+          Effect.provide(Layer.merge(table.layer, Main.layer({ name: "chain" }))),
+        ) as Effect.Effect<any, unknown, never>
+        yield* db.entities.Teams.put({ id: "t", name: "team", secret: "s" })
+        yield* db.entities.Clubs.put({ id: "c", teamId: "t" })
+        const league = yield* Effect.exit(
+          db.entities.Leagues.put({ id: "l", clubId: "c" }).asEffect(),
+        )
+        expect(Exit.isFailure(league)).toBe(true)
+        const types = [...table.items.values()].map((row: any) => row.__edd_e__?.S).sort()
+        expect(types).toEqual(["Club", "Team"])
+      }) as Effect.Effect<void, unknown, never>,
+  )
+})

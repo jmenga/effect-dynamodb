@@ -36,6 +36,7 @@ import {
   type ReadBack,
   SORT,
   TYPE,
+  valueCopiesAsRoot,
 } from "./AggregateUpgradeSweep.js"
 
 type Row = Record<string, AttributeValue>
@@ -414,6 +415,13 @@ const outcome = (exit: Exit.Exit<unknown, unknown>): Outcome => {
     ...(error.operation !== undefined && { operation: error.operation }),
   }
 }
+/**
+ * The shapes whose edge has a custom `decompose` and `assemble`: `update` can't tell which of its
+ * rows an element's copy of a context attribute came from, so it returns the copy as 1.40.0 did.
+ */
+const CUSTOM_EDGE: Readonly<Record<string, string>> = {
+  "context: a custom decompose and assemble": "lines",
+}
 const judged = (result: Outcome): Outcome =>
   result.failed === undefined
     ? { ok: result.ok }
@@ -522,11 +530,15 @@ export const suite = (
                   const get = outcome(yield* Effect.exit(A.get({ id: "a" })))
                   yield* harness.requests(tableName)
                   expect({ step, ...judged(get) }).toEqual({ step, ...judged(was.get) })
-                  // What a `get` right after reads (#241); where 1.40.0's update failed, as it
-                  // failed.
+                  // 1.40.0's result, each context copy the root's as its row now holds it (#241);
+                  // a custom decompose's copies as 1.40.0 returned them.
                   expect({ step, ...judged(update) }).toEqual({
                     step,
-                    ...(was.update.ok === undefined ? judged(was.update) : judged(get)),
+                    ...(was.update.ok === undefined || shape.context === undefined
+                      ? judged(was.update)
+                      : {
+                          ok: valueCopiesAsRoot(was.update.ok, shape.context, CUSTOM_EDGE[label]),
+                        }),
                   })
                 }
               }),
