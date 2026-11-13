@@ -311,13 +311,13 @@ interface ResolvedNode {
   readonly placed?: Placed | undefined
   /**
    * An edge or a sub-aggregate only: the schema of the field holding its value in its parent's
-   * (`fieldSchema`), and of the value at one row's place (`valueSchema`: a `one` edge's value, a
+   * (`fieldSchema`), and of the value at one row's place (`valueReadSchema`: a `one` edge's value, a
    * `many` edge's element, a sub-aggregate's value). A read decodes them as assembly does:
    * `create`'s judgement of a value given (`EDD-9159`) reads a value its schema can't place exactly
    * as a whole, and a custom edge's whole field (#241).
    */
   readonly fieldSchema?: Schema.Top | undefined
-  readonly valueSchema?: Schema.Top | undefined
+  readonly valueReadSchema?: Schema.Top | undefined
   /**
    * A `many` edge only: the name `create`'s input holds its value under, where it isn't the field's
    * (`inputField`). See {@link inputFor}.
@@ -2899,8 +2899,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
       )(Object.hasOwn(value, name) ? { [name]: value[name] } : {})
       return "fails" in read ? read : { read: ownAt(read.ok, name) }
     }
-    if (node.valueSchema === undefined) return undefined
-    const read = wholeRead(node.valueSchema)(value)
+    if (node.valueReadSchema === undefined) return undefined
+    const read = wholeRead(node.valueReadSchema)(value)
     return "fails" in read ? read : { read: ownAt(read.ok, name) }
   }
 
@@ -2986,7 +2986,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (given(input, name) !== undefined) {
         if (placed === "any") return [{ name, given: true }]
         if (placed !== undefined) return Object.hasOwn(placed, name) ? [{ name, given: true }] : []
-        return (node.valueSchema !== undefined || whole) && ownAt(item.value, name) !== undefined
+        return (node.valueReadSchema !== undefined || whole) &&
+          ownAt(item.value, name) !== undefined
           ? [{ name, given: true }]
           : []
       }
@@ -5839,7 +5840,8 @@ interface ResolveNodeArgs {
   /** Where its value holds what it's given (`placedFields`). */
   readonly placed?: Placed | undefined
   readonly fieldSchema?: Schema.Top | undefined
-  readonly valueSchema?: Schema.Top | undefined
+  /** What a read decodes one row's value with (`ResolvedNode.valueReadSchema`). */
+  readonly valueReadSchema?: Schema.Top | undefined
   readonly inputField?: string | undefined
   /** The aggregate's config, for the key attributes its rows are written with (`rowKeysOn`). */
   readonly rowKeys: RowKeyConfig
@@ -5972,7 +5974,8 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             readRow: readRowOf("edge", args.rowKeys, declaredValueNames.one(parentFields, field)),
             placed: placedFields(parentField),
             fieldSchema: parentField,
-            valueSchema: parentField === undefined ? undefined : unwrapOptionalField(parentField),
+            valueReadSchema:
+              parentField === undefined ? undefined : unwrapOptionalField(parentField),
             ...edgeStorage(
               edgePackedFields(
                 field,
@@ -6047,7 +6050,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
                 ? undefined
                 : placedFields(manyElementSchema(parentFields, field)),
             fieldSchema: parentField,
-            valueSchema: manyElementSchema(parentFields, field),
+            valueReadSchema: manyElementSchema(parentFields, field),
             inputField: edge.inputField,
             keyAttrEncoders: recomposed && escaped ? {} : entityKeyEncoders,
             ...(recomposed && {
@@ -6108,7 +6111,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           // What a read decodes its value with: the field holding it in its parent, else its own
           // schema (#241, `EDD-9159` reads a value its schema can't place exactly as a whole).
           fieldSchema: parentFields?.[field] ?? bound.aggregate.schema,
-          valueSchema:
+          valueReadSchema:
             parentFields?.[field] === undefined
               ? bound.aggregate.schema
               : unwrapOptionalField(parentFields[field]),
@@ -6137,7 +6140,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     readRow: args.readRow,
     ...(args.placed !== undefined && { placed: args.placed }),
     ...(args.fieldSchema !== undefined && { fieldSchema: args.fieldSchema }),
-    ...(args.valueSchema !== undefined && { valueSchema: args.valueSchema }),
+    ...(args.valueReadSchema !== undefined && { valueReadSchema: args.valueReadSchema }),
     ...(args.inputField !== undefined &&
       args.inputField !== fieldName && { inputField: args.inputField }),
     children,
