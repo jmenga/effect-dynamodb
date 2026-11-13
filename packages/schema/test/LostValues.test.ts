@@ -25,6 +25,16 @@ class Point extends Data.Class<{ readonly x: number }> {}
 class Boom extends Data.TaggedError("Boom")<{ readonly message: string }> {}
 class Quiet extends Data.TaggedError("Quiet")<{ readonly n: number }> {}
 
+class BufferSub extends ArrayBuffer {}
+// A DataView's constructor is generic, which a class can't extend as it is.
+class ViewSub extends (DataView as new (buffer: ArrayBuffer) => DataView) {}
+class BlobSub extends Blob {}
+class Int8Sub extends Int8Array {}
+class BigSub extends BigInt64Array {}
+class Uint8Sub extends Uint8Array {}
+const Float16 = (globalThis as { readonly Float16Array?: new (values: Array<number>) => object })
+  .Float16Array
+
 const hole = () => {
   const list: Array<number> = [1]
   list[2] = 3
@@ -85,6 +95,13 @@ const LOST: ReadonlyArray<readonly [string, () => unknown, readonly [string, str
       () => new SharedArrayBuffer(1),
       ["binary data (SharedArrayBuffer)", "f"],
     ],
+    // A Blob, a File, and a subclass of a kind holding its bytes outside its properties: stored
+    // without them (as empty bytes, or the map of its enumerable properties).
+    ["a Blob", () => new Blob(["x"]), ["binary data (Blob)", "f"]],
+    ["a File", () => new File(["x"], "f"), ["binary data (File)", "f"]],
+    ["an ArrayBuffer subclass", () => new BufferSub(1), ["binary data (BufferSub)", "f"]],
+    ["a DataView subclass", () => new ViewSub(new ArrayBuffer(1)), ["binary data (ViewSub)", "f"]],
+    ["a Blob subclass", () => new BlobSub(["x"]), ["binary data (BlobSub)", "f"]],
     [
       "an Exit dying of an Error",
       () => Exit.die(new Error("x")),
@@ -97,6 +114,14 @@ const LOST: ReadonlyArray<readonly [string, () => unknown, readonly [string, str
     ["a hole in a list", hole, undefined],
     ["a plain struct", () => ({ a: 1, b: ["x", null] }), undefined],
     ["a Uint8Array", () => new Uint8Array([1, 2]), undefined],
+    // A typed array the AWS SDK doesn't take for bytes is stored as the map of its elements, as
+    // 1.40.0 stored it: a Float16Array, a subclass of any typed array, and a kind a runtime adds.
+    ["an Int8Array subclass", () => new Int8Sub([1]), undefined],
+    ["a BigInt64Array subclass", () => new BigSub([1n]), undefined],
+    ["a Uint8Array subclass", () => new Uint8Sub([1]), undefined],
+    ...(Float16 === undefined
+      ? []
+      : [["a Float16Array", () => new Float16([1.5]), undefined] as const]),
     ["a Set of strings", () => new Set(["a"]), undefined],
     ["a Map with string keys", () => new Map([["a", 1]]), undefined],
     ["an Error with neither", () => new Error(), undefined],

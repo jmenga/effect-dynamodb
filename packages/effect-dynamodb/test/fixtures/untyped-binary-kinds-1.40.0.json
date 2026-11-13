@@ -1,0 +1,315 @@
+{
+  "generatedFrom": "effect-dynamodb@1.40.0",
+  "note": "Captured once from published effect-dynamodb 1.40.0 on DynamoDB Local, with effect@4.1.2 and with effect@4.1.3 (identical), Node v24.22.0. Never regenerate it.",
+  "describes": "Each binary kind the runtime has, holding the bytes 1, 2, 3 (an ArrayBuffer or a SharedArrayBuffer of them, a DataView over one, a Blob or a File of them, a typed array of the numbers), in a Schema.Unknown field: `put` is ok or the error tag, `stored` the attribute stored (a B value as its bytes), `read` what get read back, and `updateSet` an update's .set of the same value, which stored the same attribute. A subclass is an empty class extending the kind. The kinds are UntypedBinaryKinds.test.ts's.",
+  "kinds": {
+    "ArrayBuffer": {
+      "put": "ok",
+      "stored": {
+        "B": {
+          "bytes": []
+        }
+      },
+      "read": {
+        "bytes": []
+      },
+      "updateSet": "ok"
+    },
+    "SharedArrayBuffer": {
+      "put": "ok",
+      "stored": {
+        "M": {}
+      },
+      "read": {},
+      "updateSet": "ok"
+    },
+    "DataView": {
+      "put": "ok",
+      "stored": {
+        "B": {
+          "bytes": []
+        }
+      },
+      "read": {
+        "bytes": []
+      },
+      "updateSet": "ok"
+    },
+    "Uint8Array": {
+      "put": "ok",
+      "stored": {
+        "B": {
+          "bytes": [
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      "read": {
+        "bytes": [
+          1,
+          2,
+          3
+        ]
+      },
+      "updateSet": "ok"
+    },
+    "Int8Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Uint8ClampedArray": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Int16Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Uint16Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Int32Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Uint32Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Float16Array": {
+      "put": "ok",
+      "stored": {
+        "M": {
+          "0": {
+            "N": "1"
+          },
+          "1": {
+            "N": "2"
+          },
+          "2": {
+            "N": "3"
+          }
+        }
+      },
+      "read": {
+        "0": 1,
+        "1": 2,
+        "2": 3
+      },
+      "updateSet": "ok"
+    },
+    "Float32Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Float64Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "BigInt64Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "BigUint64Array": {
+      "put": "DynamoError",
+      "stored": null,
+      "read": null,
+      "updateSet": "DynamoError"
+    },
+    "Buffer": {
+      "put": "ok",
+      "stored": {
+        "B": {
+          "bytes": [
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      "read": {
+        "bytes": [
+          1,
+          2,
+          3
+        ]
+      },
+      "updateSet": "ok"
+    },
+    "Blob": {
+      "put": "ok",
+      "stored": {
+        "B": {
+          "bytes": []
+        }
+      },
+      "read": {
+        "bytes": []
+      },
+      "updateSet": "ok"
+    },
+    "File": {
+      "put": "ok",
+      "stored": {
+        "B": {
+          "bytes": []
+        }
+      },
+      "read": {
+        "bytes": []
+      },
+      "updateSet": "ok"
+    },
+    "Int8Array subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {
+          "0": {
+            "N": "1"
+          },
+          "1": {
+            "N": "2"
+          },
+          "2": {
+            "N": "3"
+          }
+        }
+      },
+      "read": {
+        "0": 1,
+        "1": 2,
+        "2": 3
+      },
+      "updateSet": "ok"
+    },
+    "Float16Array subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {
+          "0": {
+            "N": "1"
+          },
+          "1": {
+            "N": "2"
+          },
+          "2": {
+            "N": "3"
+          }
+        }
+      },
+      "read": {
+        "0": 1,
+        "1": 2,
+        "2": 3
+      },
+      "updateSet": "ok"
+    },
+    "ArrayBuffer subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {}
+      },
+      "read": {},
+      "updateSet": "ok"
+    },
+    "Uint8Array subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {
+          "0": {
+            "N": "1"
+          },
+          "1": {
+            "N": "2"
+          },
+          "2": {
+            "N": "3"
+          }
+        }
+      },
+      "read": {
+        "0": 1,
+        "1": 2,
+        "2": 3
+      },
+      "updateSet": "ok"
+    },
+    "DataView subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {}
+      },
+      "read": {},
+      "updateSet": "ok"
+    },
+    "Blob subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {
+          "type": {
+            "S": ""
+          },
+          "size": {
+            "N": "3"
+          }
+        }
+      },
+      "read": {
+        "type": "",
+        "size": 3
+      },
+      "updateSet": "ok"
+    },
+    "SharedArrayBuffer subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {}
+      },
+      "read": {},
+      "updateSet": "ok"
+    },
+    "BigInt64Array subclass": {
+      "put": "ok",
+      "stored": {
+        "M": {
+          "0": {
+            "N": "1"
+          },
+          "1": {
+            "N": "2"
+          },
+          "2": {
+            "N": "3"
+          }
+        }
+      },
+      "read": {
+        "0": 1,
+        "1": 2,
+        "2": 3
+      },
+      "updateSet": "ok"
+    }
+  }
+}

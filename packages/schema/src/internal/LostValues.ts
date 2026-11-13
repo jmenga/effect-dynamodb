@@ -14,9 +14,11 @@
  * `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`, whose content isn't in its properties;
  * an `Error` holding a `message` or a `cause` that isn't one of its enumerable properties; Effect's
  * `Redacted`, whose value is held outside it; a `Map` with a key that isn't a string, whose keys are
- * stored as text; and binary data other than a `Uint8Array`: an `ArrayBuffer` or a `DataView` is
- * stored as empty bytes, a `SharedArrayBuffer` as an empty map, and the AWS SDK fails to send any
- * other typed array (a `TypeError`). A cookie's expiry is the exception to a `Date`: the marshaller writes it as ISO text.
+ * stored as text; and binary data measured on 1.40.0 to be stored as less than it is or not sent: an
+ * `ArrayBuffer`, a `DataView` or a `Blob` is stored as empty bytes, a `SharedArrayBuffer` as an empty
+ * map, a subclass of any of them without its bytes, and the AWS SDK fails to send ten typed arrays
+ * (a `TypeError`), named one by one. Any other binary kind is stored as it was. A cookie's expiry is
+ * the exception to a `Date`: the marshaller writes it as ISO text.
  * `undefined`, a function or a hole in a list isn't one: the list closes up, as it always has, and a
  * caller can rely on that (a documented limit). Everything is read from descriptors, so no getter is
  * called.
@@ -92,6 +94,45 @@ const errorHolds = (error: Error): "message" | "cause" | undefined => {
   return undefined
 }
 
+/**
+ * Binary data whose bytes are held outside its properties: an instance of any of these, a subclass's
+ * included, is stored without them. Measured on 1.40.0: an `ArrayBuffer`, a `DataView` and a `Blob`
+ * (a `File` is one) were stored as empty bytes, a `SharedArrayBuffer` as an empty map, and a subclass
+ * of each as the map of its enumerable properties, which holds none of its bytes.
+ */
+const HELD_BYTES: ReadonlyArray<Function> = [
+  ArrayBuffer,
+  DataView,
+  ...(typeof SharedArrayBuffer === "function" ? [SharedArrayBuffer] : []),
+  ...(typeof Blob === "function" ? [Blob] : []),
+]
+
+/**
+ * The typed arrays the AWS SDK fails to send (a `TypeError` while serialising), each by its own
+ * prototype: measured on 1.40.0, each failed the write with a `DynamoError`. Any other kind, a
+ * `Float16Array` and a subclass of one of these included, is stored as the map of its elements, which
+ * reads back as their numbers, as it was, and so is a kind a later runtime adds.
+ */
+const UNSENT_ARRAYS: ReadonlySet<object> = new Set([
+  Int8Array.prototype,
+  Uint8ClampedArray.prototype,
+  Int16Array.prototype,
+  Uint16Array.prototype,
+  Int32Array.prototype,
+  Uint32Array.prototype,
+  Float32Array.prototype,
+  Float64Array.prototype,
+  BigInt64Array.prototype,
+  BigUint64Array.prototype,
+])
+
+/** Whether DynamoDB is sent less of this binary value than it is, or fails to be sent it. */
+const isLostBinary = (value: object): boolean => {
+  if (ArrayBuffer.isView(value) && UNSENT_ARRAYS.has(Object.getPrototypeOf(value))) return true
+  for (const kind of HELD_BYTES) if (value instanceof kind) return true
+  return false
+}
+
 const binaryName = (value: object): string => {
   const kind: unknown = descriptorOf(value, "constructor")?.value
   const name = typeof kind === "function" ? kind.name : ""
@@ -150,11 +191,7 @@ export const lostAs = (value: object): Lost | undefined => {
       }
     }
   }
-  if (
-    value instanceof ArrayBuffer ||
-    (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) ||
-    (ArrayBuffer.isView(value) && !(value instanceof Uint8Array))
-  ) {
+  if (isLostBinary(value)) {
     return {
       what: binaryName(value),
       why: "only a Uint8Array is stored as its bytes, and a read hands back a Uint8Array",
