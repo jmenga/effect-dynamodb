@@ -281,6 +281,11 @@ const pathProxy = (
     get(_target, prop) {
       if (prop === PathTag) return PathTag
       if (prop === "segments") return segments
+      // An accessor's own `apply` / `call` / `bind`, so code that calls a function through them
+      // (`flow(t.roster.at, …)`) performs the accessor as a direct call does.
+      if (call !== undefined && (prop === "apply" || prop === "call" || prop === "bind")) {
+        return Function.prototype[prop].bind(proxy as never)
+      }
       if (prop === "_Root" || prop === "_Value") return undefined
       if (prop === "size") {
         return below("size", () => ({
@@ -340,7 +345,8 @@ const pathProxy = (
     },
   }
   // A function target only where the path is also an accessor: every other path stays an object.
-  return new Proxy(call === undefined ? {} : () => undefined, handler)
+  const proxy: object = new Proxy(call === undefined ? {} : () => undefined, handler)
+  return proxy
 }
 
 /**

@@ -18,7 +18,7 @@
  */
 
 import { it } from "@effect/vitest"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, flow, Layer, Schema } from "effect"
 import { describe, expect } from "vitest"
 import * as Expression from "../src/Expression.js"
 import * as Lib from "../src/index.js"
@@ -178,6 +178,34 @@ describe("a model field named size, at or entry", () => {
             .select((t: any) => [t.size, t.at, t.entry, t.box.size])
             .collect()
           expect(selected).toEqual([{ size: 5, at: "x", entry: "y", box: { size: 6 } }])
+        }),
+    ),
+  )
+
+  it.effect("is the accessor when called through apply, call or bind, as through 1.41.0", () =>
+    onTable(
+      Lib.Entity.make({
+        model: Configured,
+        entityType: "Doc",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      }),
+      row,
+      (db, take) =>
+        Effect.gen(function* () {
+          // `flow` calls its first function through `apply`.
+          const found = yield* db.entities.Docs.scan()
+            .filter((t: any, { eq }: any) => {
+              const nameAt = flow(t.roster.at, (member: any) => member.name)
+              return eq(nameAt(0), "Ann")
+            })
+            .collect()
+          expect(found.map((doc: any) => doc.id)).toEqual(["a"])
+          expect(expressionsOf(take())).toMatchObject([
+            { command: "Scan", FilterExpression: "#eddE IN (:et0) AND (#e0[0].#e1 = :e2)" },
+          ])
+          const t = pathBuilderOf<Model>([Configured])
+          expect(t.tags.size.call(undefined)).toEqual(t.tags.size())
+          expect(t.roster.at.bind(undefined)(0).segments).toEqual(["roster", 0])
         }),
     ),
   )
