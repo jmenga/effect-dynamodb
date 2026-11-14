@@ -60,6 +60,19 @@ class Selection extends Schema.Class<Selection>("KeepSelection")({
  */
 type Mode = "plain" | "retain" | "unique"
 
+const indexes = {
+  byTeam: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["teamId"] },
+    sk: { field: "gsi1sk", composite: ["season"] },
+  },
+  byAll: {
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: [] },
+    sk: { field: "gsi2sk", composite: ["season", "series", "teamId", "playerId"] },
+  },
+} as const
+
 const entities = (mode: Mode) => {
   const Teams = Entity.make({
     model: DynamoModel.configure(Team, { id: { identifier: true } }),
@@ -79,21 +92,43 @@ const entities = (mode: Mode) => {
     }),
     entityType: "Selection",
     primaryKey: byId,
-    indexes: {
-      byTeam: {
-        name: "gsi1",
-        pk: { field: "gsi1pk", composite: ["teamId"] },
-        sk: { field: "gsi1sk", composite: ["season"] },
-      },
-      byAll: {
-        name: "gsi2",
-        pk: { field: "gsi2pk", composite: [] },
-        sk: { field: "gsi2sk", composite: ["season", "series", "teamId", "playerId"] },
-      },
-    },
+    indexes,
     refs: { team: { entity: Teams }, player: { entity: Players } },
     ...(mode === "retain" ? { versioned: { retain: true } } : {}),
     ...(mode === "unique" ? { unique: { code: ["code"] } } : {}),
+  } as never) as any
+  return { Teams, Players, Selections }
+}
+
+/** A player keyed by a number stored as text: the stored ref holds `"5"`, the key `…0005`. */
+class NumberedPlayer extends Schema.Class<NumberedPlayer>("KeepNumberedPlayer")({
+  id: Schema.NumberFromString,
+  name: Schema.String,
+}) {}
+class NumberedSelection extends Schema.Class<NumberedSelection>("KeepNumberedSelection")({
+  id: Schema.String,
+  season: Schema.String,
+  series: Schema.String,
+  team: Team,
+  player: NumberedPlayer,
+}) {}
+const numberedEntities = () => {
+  const { Teams } = entities("plain")
+  const Players = Entity.make({
+    model: DynamoModel.configure(NumberedPlayer, { id: { identifier: true } }),
+    entityType: "Player",
+    primaryKey: byId,
+  })
+  const Selections = Entity.make({
+    model: DynamoModel.configure(NumberedSelection, {
+      id: { identifier: true },
+      team: { ref: true },
+      player: { ref: true },
+    }),
+    entityType: "Selection",
+    primaryKey: byId,
+    indexes,
+    refs: { team: { entity: Teams }, player: { entity: Players } },
   } as never) as any
   return { Teams, Players, Selections }
 }
@@ -455,6 +490,70 @@ export const suite = (
             expect(failure(h.exit)?._tag).toBe("TransactionCancelled")
             expect(commands(h.sent).at(-1)).toBe("TransactWriteItems")
             expect(yield* row("h")).toEqual(before)
+          }),
+        ),
+      ))
+
+    it(".keepRefs() compares a transformed ref id in the form the stored ref holds it", () =>
+      Effect.runPromise(
+        harness.onTable((tableName) =>
+          Effect.gen(function* () {
+            const { Teams, Players, Selections } = numberedEntities()
+            const Main = Table.make({
+              schema,
+              entities: { Teams, Players, Selections },
+            } as never) as any
+            const exec = <A, E>(op: any): Effect.Effect<A, E> =>
+              harness.provide(tableName, Main, op.asEffect?.() ?? op)
+            const db: any = yield* exec(
+              DynamoClient.make({
+                entities: { Teams, Players, Selections },
+                tables: { Main },
+              } as never),
+            )
+            const S = db.entities.Selections
+            yield* exec(db.entities.Teams.put({ id: "t1", name: "Team One" }))
+            yield* exec(db.entities.Teams.put({ id: "t2", name: "Team Two" }))
+            for (const id of [5, 6]) yield* exec(db.entities.Players.put({ id, name: `P${id}` }))
+            for (const [id, playerId] of [
+              ["n", 5],
+              ["o", 6],
+            ] as const) {
+              yield* exec(S.create({ id, season: "2025", series: "final", teamId: "t1", playerId }))
+            }
+            const row = (id: string) =>
+              Effect.map(
+                harness.rows(tableName),
+                (rows) => rows.find((r) => r.pk?.S === key(`id_${id}`) && r.sk?.S === prefix)!,
+              )
+            // `5` keys the index as `…0005`; the stored ref holds `"5"`, which the guard compares.
+            yield* harness.requests(tableName)
+            const kept = yield* Effect.exit(
+              exec(
+                S.update({ id: "n" })
+                  .set({ season: "2025", series: "final", teamId: "t2" })
+                  .keepRefs({ playerId: 5 }),
+              ),
+            )
+            const write = ((yield* harness.requests(tableName)) as Array<Sent>).at(-1)!.input
+            expect(Exit.isSuccess(kept)).toBe(true)
+            expect(write.ConditionExpression).toBe("(#e0.#e1 = :e2) AND attribute_exists(#exists)")
+            expect(write.ExpressionAttributeValues[":e2"]).toEqual({ S: "5" })
+            expect((yield* row("n")).player?.M?.id).toEqual({ S: "5" })
+            expect((yield* row("n")).gsi2sk).toEqual({
+              S: key("season_2025#series_final#teamid_t2#playerid_0000000000000005"),
+            })
+            // A row holding player 6 fails it, and nothing is written.
+            const before = yield* row("o")
+            const other = yield* Effect.exit(
+              exec(
+                S.update({ id: "o" })
+                  .set({ season: "2025", series: "final", teamId: "t2" })
+                  .keepRefs({ playerId: 5 }),
+              ),
+            )
+            expect(failure(other)?._tag).toBe("ConditionalCheckFailed")
+            expect(yield* row("o")).toEqual(before)
           }),
         ),
       ))

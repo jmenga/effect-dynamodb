@@ -5688,8 +5688,10 @@ method and the pipeable `Entity.keepRefs`, typed `KeptRefIds`) gives the id for 
 composition only: encoded as `.set()` encodes it, it is laid over the composer's key record
 (`withKeptRefIds`), so it keys every half it is a composite of and fills a half the payload
 touches, without being hydrated or written. The write is conditioned on the row holding that
-ref (`keptRefsOf`: `#player.#id = :id` through `compileOwnCondition`, the stored copy's key
-compared in the referenced entity's stored form), ANDed with `patch`'s guard and the caller's
+ref (`keptRefsOf`: `#player.#id = :id` through `compileOwnCondition`, the id encoded as the
+stored copy holds it, through the referenced entity's own field, `storedRefKeyOf`, the inverse of
+`storedRefIdOf`: `"5"` of a `NumberFromString`, which the key composes as `…0005`), ANDed with
+`patch`'s guard and the caller's
 condition and replaced by no `.condition()`; a row holding another fails it
 (`ConditionalCheckFailed`, read as the caller's condition: in a planned `transactWrite`
 update the plan's `callerCondition`, so `TransactionCancelled`). No read is added on any

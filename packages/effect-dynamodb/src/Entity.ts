@@ -2671,6 +2671,24 @@ const storedRefId = (ref: Parameters<typeof storedRefIdOf>[0], stored: unknown):
   Option.getOrElse(storedRefIdOf(ref, stored), () => stored)
 
 /**
+ * @internal {@link storedRefIdOf}'s inverse (#263): a ref's id as the stored ref holds it, encoded
+ * through the referenced entity's own field, as {@link refDataOf} encodes the item a ref stores
+ * (`5` of a `NumberFromString` is `"5"`). The id as given where that field is unknown or doesn't
+ * take it.
+ */
+const storedRefKeyOf = (
+  ref: Parameters<typeof storedRefIdOf>[0],
+  id: unknown,
+): Effect.Effect<unknown> => {
+  const field = getSchemaFields(ref.refEntity.schemas.modelSchema)?.[ref.keyField]
+  return field === undefined
+    ? Effect.succeed(id)
+    : Schema.encodeUnknownEffect(field as Schema.Codec<any>)(id).pipe(
+        Effect.orElseSucceed(() => id),
+      )
+}
+
+/**
  * @internal What a ref stores of the item it names: the referenced entity's domain item encoded
  * through that entity's `modelSchema`, so transform fields are in their wire form (a
  * `Schema.Redacted` its string, a date its declared encoding, a `NumberFromString` its string),
@@ -8710,22 +8728,25 @@ const makeImpl = <
         Object.fromEntries(named.map((name) => [name, given[name]])),
         "update.keepRefs",
       )) as globalThis.Record<string, unknown>
-      // The row holds the ref when its stored key is the id: compared as a `.condition()` on the
-      // ref's key compares, through the referenced entity's own field.
-      const holds = kept.map(
-        (ref) =>
-          ({
-            [ExprTag]: ExprTag,
-            _tag: "eq",
-            left: { _tag: "path", segments: [ref.fieldName, ref.keyField] },
-            right: {
-              _tag: "value",
-              value: Option.getOrElse(
-                keyValueOf(ref.keySchema, ids[ref.idFieldName]),
-                () => ids[ref.idFieldName],
-              ),
-            },
-          }) as Expr,
+      // The row holds the ref when its stored key is the id: the id in the form the stored ref
+      // holds it (`"5"` of a `NumberFromString`), not the key form the index keys take.
+      const holds = yield* Effect.forEach(kept, (ref) =>
+        Effect.map(
+          storedRefKeyOf(
+            ref,
+            Option.getOrElse(
+              keyValueOf(ref.keySchema, ids[ref.idFieldName]),
+              () => ids[ref.idFieldName],
+            ),
+          ),
+          (value) =>
+            ({
+              [ExprTag]: ExprTag,
+              _tag: "eq",
+              left: { _tag: "path", segments: [ref.fieldName, ref.keyField] },
+              right: { _tag: "value", value },
+            }) as Expr,
+        ),
       )
       const guard: Expr =
         holds.length === 1 ? holds[0]! : ({ [ExprTag]: ExprTag, _tag: "and", exprs: holds } as Expr)

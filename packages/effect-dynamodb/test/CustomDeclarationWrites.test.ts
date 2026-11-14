@@ -445,8 +445,9 @@ describe("a new write path can't go unnoticed", () => {
         "`refuseNotReadBack` reads",
     ],
     "Entity.ts": [
-      6,
-      "two probes that store nothing, a key (2), a ref's stored row, a history bound's key text",
+      7,
+      "two probes that store nothing, a key (2), a ref's stored row, a history bound's key text, " +
+        "a kept ref's id as its stored row holds it, compared in a condition (`storedRefKeyOf`)",
     ],
     "EventStore.ts": [2, "`encodeToWire`, which checks"],
     "StorageEncoding.ts": [4, "a public helper: what's done with its value is the caller's"],
