@@ -9,27 +9,27 @@ on:
   # scoped to `main`, which is the guarantee that actually matters.
   pull_request:
 
+# A new push to a pull request cancels the run it supersedes. Runs that are not
+# for a pull request (none today) are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# The suites run in parallel jobs, each on its own runner and, for the connected
+# suites, its own DynamoDB Local. The `CI` job at the end is the one check that
+# says whether all of them passed.
 jobs:
-  ci:
-    name: Typecheck, Lint, Test, Build
+  static:
+    name: Lint, build, type check, policy gates
     runs-on: ubuntu-latest
     permissions:
       contents: read
       # The release-order gate lists other open PRs to check whether release work
       # is still pending before a version bump merges.
       pull-requests: read
-    services:
-      dynamodb-local:
-        image: amazon/dynamodb-local:latest
-        ports:
-          - 8000:8000
-      # A second instance for the escaped connected pass. Run against the instance
-      # the plain pass has filled, that pass is several times slower and its
-      # larger tests time out.
-      dynamodb-local-escaped:
-        image: amazon/dynamodb-local:latest
-        ports:
-          - 8001:8000
     steps:
       - uses: actions/checkout@v6
         with:
@@ -52,7 +52,8 @@ jobs:
       # Build must run before `check` and `test` — @effect-dynamodb/geo imports
       # `effect-dynamodb` as a workspace dependency that resolves to
       # `dist/index.d.ts`. Without a build, `tsc` can't find the types and the
-      # check step fails with TS2307 on a fresh checkout.
+      # check step fails with TS2307 on a fresh checkout. This job builds every
+      # package, the docs site included.
       - name: Build
         run: pnpm build
 
@@ -69,41 +70,6 @@ jobs:
 
       - name: Type check
         run: pnpm check
-
-      - name: Test
-        run: pnpm test
-
-      - name: Test with escapeKeys on
-        run: pnpm -r --if-present test:escape-on
-
-      - name: Wait for DynamoDB Local
-        run: |
-          for i in {1..30}; do
-            if curl -sSf -o /dev/null -w "%{http_code}" http://localhost:8000 | grep -qE '^(200|400|404)$'; then
-              echo "DynamoDB Local is reachable"
-              exit 0
-            fi
-            echo "Waiting for DynamoDB Local... ($i/30)"
-            sleep 1
-          done
-          echo "DynamoDB Local did not become reachable in time"
-          exit 1
-
-      - name: Integration tests (connected)
-        env:
-          DYNAMODB_ENDPOINT: http://localhost:8000
-          AWS_REGION: us-east-1
-          AWS_ACCESS_KEY_ID: dummy
-          AWS_SECRET_ACCESS_KEY: dummy
-        run: pnpm -r --if-present test:connected
-
-      - name: Integration tests (connected, escapeKeys on)
-        env:
-          DYNAMODB_ENDPOINT: http://localhost:8001
-          AWS_REGION: us-east-1
-          AWS_ACCESS_KEY_ID: dummy
-          AWS_SECRET_ACCESS_KEY: dummy
-        run: pnpm -r --if-present test:connected:escape-on
 
       # Enforce Option A (see CLAUDE.md > Release Workflow): any PR declaring a
       # release must run `pnpm changeset version` as part of that same PR, so
@@ -247,3 +213,112 @@ jobs:
           fi
 
           echo "No other open release work — safe to merge the version bump."
+
+  unit:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Unit tests
+            command: pnpm test
+          - name: Unit tests, escapeKeys on
+            command: pnpm -r --if-present test:escape-on
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The tests import the libraries' `dist`. The docs site is built in `static`.
+      - name: Build
+        run: pnpm -r --filter '!@effect-dynamodb/docs' build
+
+      - name: Test
+        run: ${{ matrix.command }}
+
+  connected:
+    name: ${{ matrix.pass.name }} (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    # Every job has a DynamoDB Local of its own. Run against an instance another
+    # pass has filled, the escaped pass is several times slower and its larger
+    # tests time out.
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+    strategy:
+      fail-fast: false
+      matrix:
+        pass:
+          - name: Connected tests
+            script: test:connected
+          - name: Connected tests, escapeKeys on
+            script: test:connected:escape-on
+        # Keep the `/4` in the test command in step with this list.
+        shard: [1, 2, 3, 4]
+    env:
+      DYNAMODB_ENDPOINT: http://localhost:8000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: dummy
+      AWS_SECRET_ACCESS_KEY: dummy
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The tests import the libraries' `dist`. The docs site is built in `static`.
+      - name: Build
+        run: pnpm -r --filter '!@effect-dynamodb/docs' build
+
+      - name: Wait for DynamoDB Local
+        run: |
+          for i in {1..30}; do
+            if curl -sSf -o /dev/null -w "%{http_code}" http://localhost:8000 | grep -qE '^(200|400|404)$'; then
+              echo "DynamoDB Local is reachable"
+              exit 0
+            fi
+            echo "Waiting for DynamoDB Local... ($i/30)"
+            sleep 1
+          done
+          echo "DynamoDB Local did not become reachable in time"
+          exit 1
+
+      # vitest's `--shard` splits each package's test files by a hash of their
+      # paths, so across the four shards every file runs exactly once. A package
+      # with fewer files than shards (doctest has one) has none in some shards,
+      # which `--passWithNoTests` lets through.
+      - name: Test
+        run: pnpm -r --if-present ${{ matrix.pass.script }} --shard=${{ matrix.shard }}/4 --passWithNoTests
+
+  ci:
+    name: CI
+    # Runs whatever the jobs it needs concluded, and fails unless all succeeded,
+    # so this one check stands for the whole workflow.
+    if: always()
+    needs: [static, unit, connected]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' > /dev/null
