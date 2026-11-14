@@ -55,9 +55,12 @@ import {
   allCompositeAttributes,
   buildDerivedSchemas,
   buildFieldEncodings,
+  configuredStorageOf,
+  configuredStorageWasIgnored,
   type DerivedSchemas,
   getFields,
   getSchemaFields,
+  holdStorage,
   optionalField,
   type ResolvedSystemFields,
   resolveFieldEncoding,
@@ -1434,6 +1437,22 @@ export const buildEntityDefinition = (config: {
 
   // Resolve effective field encodings.
   const fieldEncodings = buildFieldEncodings(modelFields, configuredAttributes)
+  // A key composed from an optional date whose `configure` storage releases up to 1.41.0 didn't
+  // apply (`configuredStorageWasIgnored`) holds the ISO text they stored, so such a field is still
+  // stored that way: the key text of the rows they wrote doesn't move.
+  const keyedAsBefore = [...composedInto.keys()].filter((attr) => {
+    const field = ownValue(modelFields, attr)
+    return field !== undefined && configuredStorageWasIgnored(field)
+  })
+  const appliedStorage = <A>(
+    storage: Readonly<globalThis.Record<string, A>>,
+  ): globalThis.Record<string, A> => {
+    const applied: globalThis.Record<string, A> = {}
+    for (const [name, value] of Object.entries(storage)) {
+      if (!keyedAsBefore.includes(name)) setOwn(applied, name, value)
+    }
+    return applied
+  }
 
   const generatedIdField =
     config.generatedId !== undefined && config.generatedId !== null
@@ -1452,12 +1471,21 @@ export const buildEntityDefinition = (config: {
     immutableFields,
     resolvedIdentifier,
     config.timeSeries,
-    fieldEncodings,
+    keyedAsBefore.length === 0 ? fieldEncodings : appliedStorage(fieldEncodings),
     generatedIdField,
     (ownValue(
       configuredAttributes as globalThis.Record<string, { readonly field?: string }>,
       "__proto__",
     )?.field ?? "__proto__") !== "__proto__",
+  )
+  // What a ref to this entity holds its fields in (`refDataOf`): the storage its schemas apply.
+  const configuredStorage = configuredStorageOf(config.model)
+  holdStorage(
+    schemas,
+    configuredStorage === undefined || keyedAsBefore.length === 0
+      ? configuredStorage
+      : appliedStorage(configuredStorage),
+    resolvedRefs,
   )
 
   const entityType = config.entityType

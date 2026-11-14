@@ -77,6 +77,8 @@ const EmployeeModel = DynamoModel.configure(Employee, {
 
 Available date schemas: `DynamoModel.DateString` (ISO), `DynamoModel.DateEpochMs`, `DynamoModel.DateEpochSeconds`, `DynamoModel.DateTimeZoned`. See [Advanced](/effect-dynamodb/guides/advanced/) for the full date schema reference.
 
+On an optional date, such as `Schema.optionalKey(Schema.DateTimeUtc)`, `Schema.optional(Schema.DateTimeUtc)` or `Schema.optionalKey(Schema.NullOr(Schema.DateTimeUtc))`, the override applies to the date and the field stays optional. Up to 1.41.0 an `optionalKey` date became required, and an `optional` one, like the date in `optionalKey(NullOr(...))`, was stored as ISO text. A row stored that way still reads as the date it holds, but a condition or filter on the field sends the configured form and doesn't match it until the field is written again (`update(...).set({ ... })` or a `put`). Where such a field is part of a key (a primary key or index composite, a unique constraint, a time-series `orderBy`), it's still stored as ISO text, so the keys of rows already written don't move.
+
 #### Self schemas vs. transforms
 
 **Storage overrides only apply to self date schemas.** If you declared a transform schema (e.g. `Schema.DateTimeUtcFromString`), that transform IS the wire format — `storedAs` and other `DynamoEncoding` annotations are rejected at `Entity.make()` time. The two configuration paths are mutually exclusive: either declare a self schema (`Schema.DateTimeUtc`) and let the annotation drive storage, OR declare a transform and own the wire format yourself.

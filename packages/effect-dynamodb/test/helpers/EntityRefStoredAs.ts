@@ -8,7 +8,8 @@
  * `NullOr` date, a condition or filter on `player.born` sent ISO text that never matched, and
  * `pathSet(["player", "born"], …)` wrote ISO text into the ref. A `field:` rename doesn't travel:
  * the ref holds the player by its domain names. A ref whose entity configures no storage (the team)
- * is sent as 1.41.0 sent it.
+ * is sent as 1.41.0 sent it. A ref the referenced entity holds in turn is held in its own entity's
+ * storage, two levels down too.
  *
  * One suite, run on a recording table (`EntityRefKeys.test.ts`) and against DynamoDB Local
  * (`connected.entity-ref-keys.test.ts`), with their harnesses.
@@ -77,6 +78,45 @@ const entities = () => {
     refs: { team: { entity: Teams }, player: { entity: Players } },
   } as never) as any
   return { Teams, Players, Selections }
+}
+
+/** A ref two levels down: `Roster` → `Member` → `Squad`, `Squad` configuring `founded`. */
+class Squad extends Schema.Class<Squad>("StoredAsSquad")({
+  id: Schema.String,
+  founded: Schema.DateTimeUtc,
+}) {}
+class Member extends Schema.Class<Member>("StoredAsMember")({
+  id: Schema.String,
+  squad: Squad,
+}) {}
+class Roster extends Schema.Class<Roster>("StoredAsRoster")({
+  id: Schema.String,
+  season: Schema.String,
+  member: Member,
+}) {}
+
+const deepEntities = () => {
+  const Squads = Entity.make({
+    model: DynamoModel.configure(Squad, {
+      id: { identifier: true },
+      founded: { storedAs: DynamoModel.DateEpochSeconds },
+    }),
+    entityType: "Squad",
+    primaryKey: byId,
+  })
+  const Members = Entity.make({
+    model: DynamoModel.configure(Member, { id: { identifier: true }, squad: { ref: true } }),
+    entityType: "Member",
+    primaryKey: byId,
+    refs: { squad: { entity: Squads } },
+  } as never) as any
+  const Rosters = Entity.make({
+    model: DynamoModel.configure(Roster, { id: { identifier: true }, member: { ref: true } }),
+    entityType: "Roster",
+    primaryKey: byId,
+    refs: { member: { entity: Members } },
+  } as never) as any
+  return { Squads, Members, Rosters }
 }
 
 const at = (iso: string) => DateTime.makeUnsafe(iso)
@@ -276,6 +316,92 @@ export const suite = (
             expect((yield* row("a")).player).toEqual({
               M: { ...player, born: seconds(BORN_5), retired: { NULL: true } },
             })
+          }),
+        ),
+      ))
+
+    it("a ref two levels down holds the date in its own entity's storage", () =>
+      Effect.runPromise(
+        harness.onTable((tableName) =>
+          Effect.gen(function* () {
+            // Up to 1.41.0 the roster's copy of `member.squad` was read with the default storage:
+            // `founded` as milliseconds, a date in 1970, and a condition or `pathSet` on it sent
+            // ISO text.
+            const { Squads, Members, Rosters } = deepEntities()
+            const Main = Table.make({
+              schema,
+              entities: { Squads, Members, Rosters },
+            } as never) as any
+            const exec = <A, E>(op: any): Effect.Effect<A, E> =>
+              harness.provide(
+                tableName,
+                Main,
+                typeof op.asEffect === "function" ? op.asEffect() : op,
+              )
+            const db: any = yield* exec(
+              DynamoClient.make({
+                entities: { Squads, Members, Rosters },
+                tables: { Main },
+              } as never),
+            )
+            const step = (op: any) =>
+              Effect.gen(function* () {
+                yield* harness.requests(tableName)
+                const exit = yield* Effect.exit(exec<any, any>(op))
+                return { exit, sent: [...(yield* harness.requests(tableName))] as Array<Sent> }
+              })
+            yield* exec(db.entities.Squads.put({ id: "s1", founded: at(FOUNDED) }))
+            yield* exec(db.entities.Members.put({ id: "m1", squadId: "s1" }))
+            const R = db.entities.Rosters
+            const roster = "$storedas#v1#roster"
+
+            // What hydration stores, as it stored it before.
+            const put = yield* step(R.put({ id: "r1", season: "2025", memberId: "m1" }))
+            expect(Exit.isSuccess(put.exit)).toBe(true)
+            expect(put.sent.find((request) => request.command === "PutItem")!.input).toEqual({
+              TableName: "<table>",
+              Item: {
+                id: { S: "r1" },
+                season: { S: "2025" },
+                member: {
+                  M: {
+                    id: { S: "m1" },
+                    squad: { M: { id: { S: "s1" }, founded: seconds(at(FOUNDED)) } },
+                  },
+                },
+                __edd_e__: { S: "Roster" },
+                pk: { S: `${roster}#id_r1` },
+                sk: { S: roster },
+              },
+            })
+
+            // Read, compared and path-written in the squad's storage.
+            const read = yield* step(R.get({ id: "r1" }))
+            if (Exit.isFailure(read.exit)) throw read.exit
+            same(read.exit.value.member.squad.founded, at(FOUNDED))
+            const held = yield* step(
+              R.update({ id: "r1" })
+                .set({ season: "2026" })
+                .condition((t: any, { eq }: any) => eq(t.member.squad.founded, at(FOUNDED))),
+            )
+            expect(Exit.isSuccess(held.exit)).toBe(true)
+            expect(Object.values(held.sent.at(-1)!.input.ExpressionAttributeValues)).toContainEqual(
+              seconds(at(FOUNDED)),
+            )
+            const moved = at("1991-01-01T00:00:00.000Z")
+            const set = yield* step(
+              R.update({ id: "r1" }).pathSet({
+                segments: ["member", "squad", "founded"],
+                value: moved,
+              }),
+            )
+            expect(Exit.isSuccess(set.exit)).toBe(true)
+            expect(Object.values(set.sent.at(-1)!.input.ExpressionAttributeValues)).toEqual([
+              seconds(moved),
+            ])
+            const after = yield* step(R.get({ id: "r1" }))
+            if (Exit.isFailure(after.exit)) throw after.exit
+            same(after.exit.value.member.squad.founded, moved)
           }),
         ),
       ))
