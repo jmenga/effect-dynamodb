@@ -55,6 +55,7 @@ import {
   containedOperand,
   containsWireTransform,
   type DeepSubstitutionOptions,
+  keepsAsGiven,
   matchDateRepresentation,
   optionalField,
   refHeldTarget,
@@ -117,6 +118,7 @@ import * as Capacity from "./internal/Capacity.js"
 import { decodeKeyCursor, encodeKeyCursor } from "./internal/Cursor.js"
 import { digest } from "./internal/Digest.js"
 import {
+  and as andExpr,
   type CompileResult,
   type ConditionOps,
   type ConditionShorthand,
@@ -125,7 +127,6 @@ import {
   type Expr,
   emptyPartProblem,
   isEmptyExpr,
-  isPrimitiveOperand,
   parseSimpleShorthand,
   type StoredFormAt,
 } from "./internal/Expr.js"
@@ -492,7 +493,8 @@ export interface ListOptions<Model = Record<string, unknown>> {
    * number has no text prefix: on a numeric composite it matches the whole value, as without the
    * option. A date (any composite whose schema transforms its value) is read as a whole value of
    * its type, so this is for text composites. With no list sort key composite given, it changes
-   * nothing.
+   * nothing, and neither does it when a value is given after a composite left out: such a value
+   * is matched whole, by its key text, as it would be in the key.
    */
   readonly prefix?: boolean
 }
@@ -665,7 +667,14 @@ export interface Aggregate<
    * Requires `list` config on the aggregate. Queries the list collection GSI using
    * filter as key composites. PK composites are required (or empty for shared
    * partition); leading SK composites narrow the list to those values, each
-   * matched whole, or the last one as a prefix with `options.prefix`.
+   * matched whole, or the last one as a prefix with `options.prefix`. A value
+   * given after an SK composite left out can't be in the key condition, and
+   * matches a root row as it would there: where the key text composed from it
+   * is the text composed from the row's value (the schema's casing, `escapeKeys`,
+   * number and date key text alike), whole. A number, or any value under a
+   * casing that doesn't fold text, is compared in the root-item
+   * `FilterExpression`; text under a folding casing (the default `lowercase`) is
+   * matched on the root items read, before any is assembled.
    *
    * Supports cursor-based pagination via `options.limit` and `options.cursor`.
    * When `limit` is specified, returns at most that many aggregates plus a cursor
@@ -2319,12 +2328,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * schema's. The value itself where the field has no encoder or it doesn't take the value, or
    * what it gives DynamoDB can't store, and at a nested path (the encoders are per attribute). A
    * list filter's operand that is one of Effect's instances or a `Date` is sent in this form
-   * (`operandsAsStored`).
+   * (`operandsAsStored`), and so is a primitive the row stores as a primitive of another type (`5`
+   * where a `Schema.NumberFromString` stores `"5"`), as an entity's operand is (`keepsAsGiven`):
+   * up to 1.42.1 every primitive was sent as given, and compared with that field matched nothing.
+   * Text where text is stored could be a substring or a prefix, so it is still sent as given.
    */
   const rootStoredFormAt: StoredFormAt = (segments, value, kind) => {
-    // A primitive is sent as given, as up to 1.41.0: the root's encoders don't tell a value the
-    // attribute stores as another type from one it doesn't, as an entity's `operand` does.
-    if (isPrimitiveOperand(value)) return value
     const name = String(segments[0])
     const encode = segments.length === 1 ? attrEncoders[name] : undefined
     const field = schemaFields?.[name]
@@ -2347,7 +2356,32 @@ const makeAggregate = <TSchema extends Schema.Top>(
             const list = storedOf([element])?.stored
             return Array.isArray(list) && list.length === 1 ? { stored: list[0] } : undefined
           })(value)
-    return stored === undefined ? value : stored.stored
+    return stored === undefined || keepsAsGiven(value, stored.stored) ? value : stored.stored
+  }
+
+  /**
+   * What a write of `value` in the root field `name` stores on the root row: its attribute
+   * encoder's form, as `create` stores it, or the value itself where the field has no encoder.
+   * Undefined where the encoder doesn't take the value or gives what DynamoDB can't store. A list
+   * key's value after a gap is a whole value, so where it can be it's compared with this (`list`),
+   * where a filter operand could be a substring or a prefix and keeps text as given
+   * (`rootStoredFormAt`).
+   */
+  const rootStoredValue = (
+    name: string,
+    value: unknown,
+  ): { readonly stored: unknown } | undefined => {
+    const encode = ownValue(attrEncoders, name)
+    if (encode === undefined) return { stored: value }
+    let asGiven = false
+    try {
+      const stored = encode(value, () => {
+        asGiven = true
+      })
+      return asGiven || unstorableIn({ stored }) !== undefined ? undefined : { stored }
+    } catch {
+      return undefined
+    }
   }
 
   // Decode schema for read/assemble + input validation. Mirrors the raw `schema`
@@ -2606,10 +2640,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // assembly decodes the root row. `create` composes the key from the value it holds, so a key
   // composed again from a stored row (`list`, `rekey`) is composed from these, never from the
   // stored form: a transformation that isn't its own inverse on the other side (a value stored
-  // divided by ten, an `Option` holding one) keys the stored form elsewhere.
-  const decodeRootKey = (() => {
+  // divided by ten, an `Option` holding one) keys the stored form elsewhere. The list sort key's
+  // composites are read the same way where `list` matches a value given after a gap (`gapMatch`).
+  const decodeAsRead = (attrs: ReadonlyArray<string>) => {
     const fields: Record<string, Schema.Top> = {}
-    for (const attr of config.pk.composite) {
+    for (const attr of attrs) {
       const field = ownValue(schemaFields, attr)
       if (field !== undefined) setOwn(fields, attr, field)
     }
@@ -2621,7 +2656,63 @@ const makeAggregate = <TSchema extends Schema.Top>(
         absentReads: true,
       }) as unknown as Schema.Codec<Record<string, unknown>>,
     )
-  })()
+  }
+  const decodeRootKey = decodeAsRead(config.pk.composite)
+  // A list sort key composite's value as a read takes it, one composite at a time (built when
+  // first asked): `list` reads only the composites a key gives after a gap, so a row from an index
+  // that doesn't project the others is still matched.
+  const listCompositeReads = new Map<string, ReturnType<typeof decodeAsRead>>()
+  const readListComposite = (row: Record<string, unknown>, attr: string): unknown => {
+    const stored = ownValue(row, attr)
+    if (stored == null) return undefined
+    let read = listCompositeReads.get(attr)
+    if (read === undefined) {
+      read = decodeAsRead([attr])
+      listCompositeReads.set(attr, read)
+    }
+    const given: Record<string, unknown> = {}
+    setOwn(given, attr, stored)
+    const value = read(given)
+    return Option.isSome(value) ? ownValue(value.value, attr) : undefined
+  }
+
+  /**
+   * Does a root row `list` read hold, for each composite named, the key text given? Its text is the
+   * one `create` composed into its list sort key: its value as a read takes it, through the key
+   * encoder and the key form. Only the composites named are read. A row without a readable value
+   * for one (the index doesn't project it, or a read can't take what it holds) has no such text,
+   * so it's neither kept nor dropped: the call is refused (`EDD-9168`).
+   */
+  const listGapMatch =
+    (texts: ReadonlyArray<readonly [attr: string, text: string]>) =>
+    (row: Record<string, unknown>): boolean => {
+      const keyed: Record<string, unknown> = {}
+      for (const [attr] of texts) {
+        const value = readListComposite(row, attr)
+        if (value == null) {
+          throw new KeyValueError({
+            value: ownValue(row, attr),
+            reason: `the list index row holds no readable value for "${attr}"`,
+            message:
+              `[EDD-9168] Aggregate "${aggregateName}" list: the list index row of a root item ` +
+              `holds no readable value for "${attr}", a list sort key composite given after a ` +
+              `gap, so it has no key text to match against. Project "${attr}" onto the list ` +
+              "index, or give the key without the gap. Nothing was returned.",
+          })
+        }
+        const encode = ownValue(keyAttrEncoders, attr)
+        setOwn(keyed, attr, encode !== undefined ? encode(value) : value)
+      }
+      const composites = keyRecord(keyed)
+      return texts.every(
+        ([attr, text]) =>
+          KeyComposer.keyValueText(
+            config.schema,
+            ownValue(composites, attr),
+            config.schema.casing,
+          ) === text,
+      )
+    }
   /**
    * `row` (a stored root row) with its partition key composites as a read takes them. A row whose
    * composites a read can't take is left as it is: its key composes as the stored form does, and its
@@ -5535,16 +5626,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const limit = options?.limit
           const pageSize = options?.pageSize
 
-          // Root-item FilterExpression. Compiled once — the same two forms
-          // `BoundQuery.filter()` takes, through the same `Expr` compiler, so
-          // there is one filter vocabulary rather than a second dialect here.
-          const rootFilter = yield* compileListFilter(
-            options?.filter,
-            aggregateName,
-            rootStoredFormAt,
-            storedBelowFields(schemaFields),
-            schema,
-          )
+          // Root-item FilterExpression — the same two forms `BoundQuery.filter()` takes, through
+          // the same `Expr` compiler, so there is one filter vocabulary rather than a second dialect
+          // here. Compiled below, with the key's values after a gap.
+          const userFilter = yield* listFilterExpr(options?.filter, aggregateName, schema)
 
           // Attribute names that make up a resume key on the list index: the index
           // key plus the table key. A `LastEvaluatedKey` supplies them when there
@@ -5591,12 +5676,64 @@ const makeAggregate = <TSchema extends Schema.Top>(
             else break // Stop at first gap (prefix matching)
           }
           const skComplete = skValues.length === listConfig.sk.composite.length
+          // A value for a composite after the first one not given can't be in the key condition,
+          // which holds only the leading values. It matches a row as it would there: where the key
+          // text composed from it is the text composed from the row's value for that composite
+          // (up to 1.42.1 it was dropped, and the list returned aggregates of every value there).
+          // Where comparing the stored attribute is that test (a casing that doesn't fold text, or
+          // a number, whose key text is a function of it), the value is compared in the root-item
+          // filter with what a write of it stores (`rootStoredValue`). Otherwise DynamoDB can't
+          // compare it: the root items read are matched on their key text (`gapMatch`), before
+          // any is assembled, which reads the same capacity as a filter.
+          const afterGap: Array<Expr> = []
+          const gapTexts: Array<readonly [attr: string, text: string]> = []
+          for (const attr of listConfig.sk.composite.slice(skValues.length)) {
+            const keyForm = ownValue(listSkFilter, attr)
+            if (keyForm === undefined) continue
+            const value = rootStoredValue(attr, givenEntry(filter ?? {}, attr)?.value)
+            if (
+              value !== undefined &&
+              (config.schema.casing === "preserve" || !KeyComposer.matchesTextPrefix(keyForm))
+            ) {
+              afterGap.push(parseSimpleShorthand({ [attr]: value.stored }))
+            } else {
+              gapTexts.push([
+                attr,
+                KeyComposer.keyValueText(config.schema, keyForm, config.schema.casing),
+              ])
+            }
+          }
+          const gapMatch = gapTexts.length === 0 ? undefined : listGapMatch(gapTexts)
+          const filterBy = options?.filterBy
+          const accept =
+            gapMatch === undefined || filterBy === undefined
+              ? (gapMatch ?? filterBy)
+              : (row: Record<string, unknown>) => gapMatch(row) && filterBy(row)
+          // A value no condition can compare (`NaN`) is refused as a filter's is, nothing sent.
+          const gapProblem =
+            afterGap.length === 0 ? undefined : emptyPartProblem(andExpr(...afterGap))
+          if (gapProblem !== undefined) {
+            return yield* new ValidationError({
+              entityType: aggregateName,
+              operation: "list",
+              cause: `Aggregate "${aggregateName}" list key: ${gapProblem} Nothing was sent.`,
+            })
+          }
+          const rootFilter = compileListFilter(
+            afterGap,
+            userFilter,
+            rootStoredFormAt,
+            storedBelowFields(schemaFields),
+          )
           // `prefix: true` matches the last value given as a prefix of its key text, unless it's a
           // number, which has no text prefix and is matched whole (`matchesTextPrefix`, the rule
-          // an entity's `.where()` `beginsWith` follows).
+          // an entity's `.where()` `beginsWith` follows), or it sits after a gap, where every value
+          // is matched whole.
           const lastGiven = listConfig.sk.composite[skValues.length - 1]
           const skPrefix =
             options?.prefix === true &&
+            afterGap.length === 0 &&
+            gapTexts.length === 0 &&
             lastGiven !== undefined &&
             KeyComposer.matchesTextPrefix(ownValue(listSkFilter, lastGiven))
 
@@ -5644,7 +5781,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   limit,
                   pageSize,
                   filter: rootFilter,
-                  accept: options?.filterBy,
+                  accept,
                   reverse: options?.reverse === true,
                   keyFields: listKeyFields,
                 },
@@ -5686,7 +5823,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 pageSize,
                 startKey,
                 filter: rootFilter,
-                accept: options?.filterBy,
+                accept,
                 reverse: options?.reverse === true,
                 keyFields: listKeyFields,
               },
@@ -9538,7 +9675,7 @@ const DELETE_BASE_DELAY_MS = 100
 // ---------------------------------------------------------------------------
 
 /**
- * @internal Compile a {@link ListFilter} to a `FilterExpression` fragment.
+ * @internal A {@link ListFilter} as an expression, `undefined` for one that asserts nothing.
  *
  * Both forms route through the same `Expr` compiler `BoundQuery.filter()` uses,
  * so `{ status: "shipped" }` and `(t, { eq }) => eq(t.status, "shipped")` mean
@@ -9547,17 +9684,14 @@ const DELETE_BASE_DELAY_MS = 100
  * empty part directly under `and` is left out, and one anywhere else — or an
  * `or()` with no parts — is refused with a `ValidationError` before anything
  * is sent. An `isIn` with no values is sent, and DynamoDB's rejection of its
- * `IN ()` diagnosed (#144). Each path is named as an entity query's filter names it (#238): below
- * a field, a struct that renames its keys as it's stored is named by its stored names (`below`).
+ * `IN ()` diagnosed (#144).
  */
-const compileListFilter = <Model>(
+const listFilterExpr = <Model>(
   filter: ListFilter<Model> | undefined,
   aggregateName: string,
-  storedAt: StoredFormAt,
-  below: StoredBelow,
   /** The aggregate's model: a callback's `.entry()` resolves on its sparse maps (`pathBuilderOf`). */
   model: unknown,
-): Effect.Effect<CompileResult | undefined, ValidationError> => {
+): Effect.Effect<Expr | undefined, ValidationError> => {
   if (filter === undefined) return Effect.succeed(undefined)
   const expr =
     typeof filter === "function"
@@ -9573,10 +9707,29 @@ const compileListFilter = <Model>(
       }),
     )
   }
-  // Its operands in the form the root row holds (#242), named as an entity query's filter names
-  // them (#238).
-  const named = entityNaming(undefined, storedAt, undefined, below).renameExpr?.(expr) ?? expr
-  return Effect.succeed(isEmptyExpr(expr) ? undefined : compileExpr(named))
+  return Effect.succeed(isEmptyExpr(expr) ? undefined : expr)
+}
+
+/**
+ * @internal The root-item `FilterExpression` of a list: the key's conditions on the values after a
+ * gap (their operands already in the root row's stored form), then the list's own `filter`, ANDed,
+ * or none. The filter's operands are sent in the form the root row holds them (#242), and each of
+ * its paths named as an entity query's filter names it (#238): below a field, a struct that renames
+ * its keys as it's stored is named by its stored names (`below`).
+ */
+const compileListFilter = (
+  keyParts: ReadonlyArray<Expr>,
+  filter: Expr | undefined,
+  storedAt: StoredFormAt,
+  below: StoredBelow,
+): CompileResult | undefined => {
+  const named =
+    filter === undefined
+      ? undefined
+      : (entityNaming(undefined, storedAt, undefined, below).renameExpr?.(filter) ?? filter)
+  const parts = named === undefined ? keyParts : [...keyParts, named]
+  if (parts.length === 0) return undefined
+  return compileExpr(parts.length === 1 ? parts[0]! : andExpr(...parts))
 }
 
 // ---------------------------------------------------------------------------

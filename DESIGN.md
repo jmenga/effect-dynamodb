@@ -3472,7 +3472,40 @@ language service's params (a collection query pins no sort key composites); `Agg
 `#`). Its `prefix: true` option (#264) sends 1.36's bare `begins_with(<key text>)`, so
 the last value given matches as a prefix, as `.where(beginsWith)` does on an entity; a
 numeric last value has no text prefix and keeps the rule above
-(`KeyComposer.matchesTextPrefix`). A full pin on a time-series entity's primary accessor reads the current item
+(`KeyComposer.matchesTextPrefix`). The list key's sort key condition holds the
+leading values only, up to the first composite not given. A value given after
+that gap matches a root row as it would in the key: where the key text composed
+from it (`keyValueText` of its key form, as the leading values) is the text
+composed from the row's value for that composite, the text `create` put in the
+row's list sort key (the value as a read takes it, `decodeAsRead`, through the
+key encoders and the key form). Schema casing, `escapeKeys`, number and date
+key text all apply, so a gap value behaves as the same value would in the
+leading run. Where comparing the stored attribute is that test, the value is
+an equality ANDed into the root-item `FilterExpression` ahead of the list's own
+`filter`, sent as `create` stores it (`rootStoredValue`: `2025` on a
+`Schema.NumberFromString` as `"2025"`): a number, or any value under a casing
+that doesn't fold text (`preserve`), where the root's encoder takes it whole.
+Otherwise (text under `lowercase` or `uppercase`, which DynamoDB can't compare
+case-insensitively, or a value the encoder doesn't take, such as a date given as
+ISO text) the root items the query returns are matched on their key text
+(`listGapMatch`) before any is assembled, through the `accept` predicate
+`filterBy` uses (ANDed ahead of it), so no condition for it is sent. Only the
+composites matched are read off the row, so a list index that projects just
+them (`INCLUDE`) works. Read capacity is the same either way: a
+`FilterExpression` runs after the read. A row with no readable value for a
+composite matched (not projected, or held as something its field can't read)
+has no key text, and the call is a `ValidationError` (`EDD-9168`) rather than a
+guess. A composite compared in the filter must be projected onto the list index
+too: the library doesn't know the index's projection, and DynamoDB's filter
+matches nothing on an attribute the index row doesn't hold. A value no condition can
+compare (`NaN`) is a `ValidationError` (`EDD-9124`), nothing sent. `prefix` then
+changes nothing. `limit` and the cursor follow the filtered-list rules: rows are
+dropped after the read either way, and the cursor is rebuilt from the last
+aggregate returned.
+Up to 1.42.1 such a value was dropped, so `list({ league, name })` on
+`sk: [league, season, name]` returned every aggregate of the league. A key
+without a gap sends what it sent (`AggregateListGap.test.ts`,
+`connected.aggregate-list-gap.test.ts`). A full pin on a time-series entity's primary accessor reads the current item
 only, never its `#e#` rows. Z-order halves pin prefix segments only and are
 unaffected. An index whose sort key has no composites (an empty-composite half)
 pins nothing: its accessor sends the partition key alone, and on the primary key
@@ -3935,10 +3968,15 @@ entity's model, which the stored ref holds in its stored form, so
 `eq(t.player.id, 5)` on a player keyed by a `NumberFromString` compares the
 `"5"` the ref holds. Up to 1.41.0 every primitive was sent as given, so such a
 comparison never held (a number against text; `ne` always held). An aggregate's
-`list` filter still sends a primitive as given: the root's attribute encoders
-are left as they were. Pinned by `OperandsAsStored.test.ts`,
-`TransactionCheckOperands.test.ts` and `helpers/EntityRefOperands.ts`
-(recording table and DynamoDB Local).
+`list` filter follows the same rule against its root's attribute encoders, the
+encoders its writes store the root row with (`buildAttrEncoders`, a `storedAs`
+date included): `eq(t.caps, 7)` on a root
+`Schema.NumberFromString` sends `"7"` (#124). Through 1.42.1 every primitive
+there was sent as given, and such a comparison never held; an instance (the
+issue's `DateTime.Utc` against a `Schema.DateTimeUtcFromString`) has been sent
+in the stored form since 1.41.0. Pinned by `OperandsAsStored.test.ts`,
+`TransactionCheckOperands.test.ts`, `AggregateListGap.test.ts` and
+`helpers/EntityRefOperands.ts` (recording table and DynamoDB Local).
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first
@@ -9014,6 +9052,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9165` | `Marshaller.ts` (`protoEntryAt`, in the walk `marshallStorable` makes of every item it marshals; `fromAttributeMap` and `fromAttributeValue` on the read), through `marshalOrFail` and `unstorableIn`; `Entity.ts` (`protoAttributeIn` and `unstorableFields` for an update's record operations, `unstorableOperand` for a path operation's segments); `internal/Expr.ts`; `internal/EntitySchemas.ts` (schema, `protoAbsent`, a payload's decode or encode through a derived struct, see `EDD-9152`) | An attribute or a map entry named `__proto__` that a write would send: an own map entry keyed `__proto__` at any depth (a `Schema.Record` entry, a `Map` entry, any object marshalled as a map), and an attribute so named: an optional model field stored under that name given a value (a packed one included), a field stored under an attribute so named given a value, an index key attribute so named given a key (its composites present: a key attribute with no value, `KeyValueError` in `KeyComposer`'s `keyAttribute`, made a `ValidationError` where a write composes its keys), `.set()`, `.add()`, `.subtract()` or `.append()` of it, and a path operation with a segment `__proto__`, naming the attribute or an entry of a map (every one but `pathRemove`). The AWS SDK's marshaller and unmarshaller assign each to a plain object, and assigning `__proto__` sets that object's prototype instead, so it is never sent, and one stored otherwise is never read back. A `ValidationError` naming the field and the key, on any write, condition or filter (`Transaction.check`'s included, `TransactWriteOps`), with nothing written (an aggregate `update` reads its state first). The `Expression` builders, which have no error channel, compile such an entry as 1.40.0 did (left out of the map: `unsent` in `internal/Expr.ts` remembers it), and the operation sending the result refuses it; 1.40.0 sent it, and DynamoDB refused it ("Supplied AttributeValue is empty"). `Marshaller.toAttributeValue` and `toAttributeMap` throw `UnstorableValue` with this code. Only that name, and only an own property: the `__proto__` every object inherits is not one, every other `Object.prototype` name is an entry like any other, and a sparse map's entry keyed `__proto__` (its own attribute, `field#__proto__`) and one in JSON text (a packed field, `Schema.fromJsonString`, never marshalled as a map) are stored and read back as any other. 1.40.0 stored an item without an attribute so named (an index key so named left the row out of the index; a field stored under it failed every `put` and `get`, and `upsert` died), sent a write holding such an entry for DynamoDB to refuse ("Supplied AttributeValue is empty"), and a path operation stored the entry. A row holding one (stored before, or by another writer) is read without it, whatever it holds: the reader leaves it out before the AWS SDK's unmarshaller sees it, where 1.40.0's set the row's or the map's prototype from a map stored there (any read of a row holding such an attribute died, whatever it held; a struct field holding such an entry read the entry's map as its own fields). `pathRemove` removes it |
 | `EDD-9166` | `Entity.ts` (`keptRefsOf`), at `update` / `patch` and a planned `transactWrite` update (`ValidationError`, `operation: "update.keepRefs"`, nothing sent) | `.keepRefs()` naming something that is no ref id an update can give: a model field, a typo, or a ref's id that is a primary key composite (no update changes the key). Typed callers can't write one (`KeptRefIds`). The message lists the ids it takes (#263). |
 | `EDD-9167` | `Entity.ts` (`keptRefsOf`), as `EDD-9166` | `.keepRefs()` keeping a ref the same update reassigns (`.set({ playerId })`) or removes (`.remove(["player"])`): keep it or change it, not both (#263). |
+| `EDD-9168` | `Aggregate.ts` (`listGapMatch`), at `list` (`ValidationError`, through `Capacity.refusalsFail`; nothing returned) | An aggregate `list` key giving a value after a list sort key composite left out, matched on the root items read (text under a folding casing), meets a list index row with no readable value for that composite: the index doesn't project it, or the row holds something its field can't read (`readListComposite`). Such a row has no key text to compare, so the call is refused rather than the row kept or dropped. The message names the composite, to project onto the list index. Only the composites matched are read: one the key doesn't give after the gap is never asked for. |
 | `EDD-9172` | `Entity.ts` (schema, the `unique` check in `make`), pure and operational | A `unique` constraint naming a ref (`"team"` for `refs: { team }`, or a field the model marks `ref: true`). The ref's value is the referenced item's data, which composed the key text `[object object]` for every item, so the first item written took the value for all of them (#266). Refused at load, naming the constraint and the ref and saying to write its id (`teamId`), which a constraint takes as an index composite does. The `unique` type leaves refs out, so it is a compile error too. |
 
 Next free code: `9111`, else none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9114`–`9120` are taken on branches in flight, and `9107` and `9113` are retired, don't reuse them); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
