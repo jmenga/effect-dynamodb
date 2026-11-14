@@ -8591,38 +8591,66 @@ const makeImpl = <
   }
 
   /**
-   * An update's index key record, given the whole row, with the id of a ref the row holds beside
-   * the ref (#263), as `toDomainView` reads it, where an index half holding that id also holds a
-   * composite the update gives or removes: that half composes from the ref the row holds, as a
-   * `put` of the row would, rather than stopping before the id. A half the update doesn't touch
-   * stays as stored: the id the row holds may be spelled other than the one the half was composed
-   * from (a ref read through a key that folds case). A copy, so the row written back stores no id.
+   * The refs an update holding the whole row keys its indexes from as the row holds them (#263):
+   * each whose id an index half holds that also holds a composite the update gives or removes, so
+   * the half composes from the ref the row holds, as a `put` of the row would, rather than
+   * stopping before the id. Not a ref whose id the update has otherwise (given, kept, or a
+   * primary key composite), nor one only a half the update doesn't touch holds: the id the row
+   * holds may be spelled other than the one that half was composed from (a ref read through a key
+   * that folds case). An id read here is guarded as read (`heldRefGuard`).
    */
-  const withHeldRefIds = (
+  const heldRefsOf = (
     row: globalThis.Record<string, unknown>,
     payload: globalThis.Record<string, unknown>,
     removed: ReadonlySet<string> | undefined,
-  ): globalThis.Record<string, unknown> => {
-    if (!hasRefs) return row
+    kept: { readonly ids: globalThis.Record<string, unknown> } | undefined,
+  ): ReadonlyArray<{ readonly ref: ResolvedRef; readonly id: unknown }> => {
+    if (!hasRefs) return []
     const touched = (attr: string) =>
       (Object.hasOwn(payload, attr) && payload[attr] !== undefined) || removed?.has(attr) === true
     const beside = new Set<string>()
     for (const [name, index] of Object.entries(allIndexes)) {
       if (name === "primary") continue
       for (const [, composites] of halvesOf(index)) {
-        if (!composites.some(touched)) continue
-        for (const attr of composites) beside.add(attr)
+        if (composites.some(touched)) for (const attr of composites) beside.add(attr)
       }
     }
-    const keyed = { ...row }
-    for (const ref of resolvedRefs) {
-      if (!beside.has(ref.idFieldName)) continue
+    return resolvedRefs.flatMap((ref) => {
+      const name = ref.idFieldName
+      if (!beside.has(name) || touched(name) || isPrimaryComposite(name)) return []
+      if (kept !== undefined && Object.hasOwn(kept.ids, name)) return []
       const held = ownValue(row, ref.fieldName)
-      if (held === null || typeof held !== "object") continue
+      if (held === null || typeof held !== "object") return []
       const id = ownValue(held as globalThis.Record<string, unknown>, ref.keyField)
-      if (id !== undefined) keyed[ref.idFieldName] = storedRefId(ref, id)
-    }
-    return keyed
+      return id === undefined ? [] : [{ ref, id: storedRefId(ref, id) }]
+    })
+  }
+
+  /** A row's index key record with the ids `heldRefsOf` read beside their refs. A copy. */
+  const withHeldRefIds = (
+    row: globalThis.Record<string, unknown>,
+    held: ReadonlyArray<{ readonly ref: ResolvedRef; readonly id: unknown }>,
+  ): globalThis.Record<string, unknown> =>
+    held.length === 0
+      ? row
+      : { ...row, ...Object.fromEntries(held.map(({ ref, id }) => [ref.idFieldName, id])) }
+
+  /**
+   * The guard that a ref `heldRefsOf` read is still the one read (#263): its id inside the stored
+   * ref (`#team.#id = :id`), as read. An unversioned update guards each composite it read as read;
+   * a ref's id isn't an attribute of the row, so a guard on it would hold whatever the ref is.
+   * `undefined` where the stored ref has no id to compare (the update then guards as before).
+   */
+  const heldRefGuard = (
+    ref: ResolvedRef,
+    read: globalThis.Record<string, AttributeValue>,
+  ):
+    | { readonly attribute: string; readonly key: string; readonly id: AttributeValue }
+    | undefined => {
+    const attribute = compositeAttribute(ref.idFieldName)
+    const stored = ownValue(read, attribute) as AttributeValue | undefined
+    const id = stored?.M === undefined ? undefined : ownValue(stored.M, ref.keyField)
+    return id === undefined ? undefined : { attribute, key: ref.keyField, id: id as AttributeValue }
   }
 
   /**
@@ -10464,16 +10492,19 @@ const makeImpl = <
         // here. Recompose all keys with the updated attributes.
         //
         // Primary key always recomposes from `newItem` (Put-style), a ref's id in it the caller's:
-        // a row stores the ref, not the id. In an index half the update touches, every other ref's
-        // id is the one the merged row holds (`withHeldRefIds`, #263): a reassigned ref's is the one
-        // the update gives, the others' the stored refs', so the half composes as a `put` of the row
-        // would. Up to 1.41.0 they were missing here, so such a half was truncated before the first.
+        // a row stores the ref, not the id. In an index half the update touches, a ref's id the
+        // update doesn't give is the one the row holds (`heldRefsOf`, #263), so the half composes
+        // as a `put` of the row would, guarded as read below. Up to 1.41.0 those ids were missing
+        // here, so such a half was truncated before the first.
         const retainRemovedSet = removedSetOf(uState.remove)
+        const heldRefs = heldRefsOf(
+          newItem,
+          withRefIds(hydratedUpdates, encodedUpdates),
+          retainRemovedSet,
+          prepared.kept,
+        )
         const keyedItem = withKeptRefIds(
-          withRefIds(
-            withHeldRefIds(newItem, withRefIds(hydratedUpdates, encodedUpdates), retainRemovedSet),
-            encodedKey,
-          ),
+          withRefIds(withHeldRefIds(newItem, heldRefs), encodedKey),
           prepared.kept,
         )
         const primaryKeyMap = composePrimaryKey(keyedItem)
@@ -10709,6 +10740,8 @@ const makeImpl = <
         // and a concurrent change to an input is refused.
         const condParts: Array<string> = []
         const inputs: Array<string> = []
+        // The refs whose ids a key was composed from as read, guarded by the id in the ref.
+        const heldGuards: Array<NonNullable<ReturnType<typeof heldRefGuard>>> = []
         if (systemFields.version) {
           condParts.push(versionIs(currentVersion, writeNames, writeValues, "#ver", ":expectedVer"))
           const incarnation = incarnationGuard(currentItem, writeNames, writeValues)
@@ -10762,6 +10795,16 @@ const makeImpl = <
             if (written.has(definition.partitionField)) add(definition.partition)
           }
           for (const [i, field] of inputs.entries()) {
+            const held = heldRefs.find(({ ref }) => ref.idFieldName === field)
+            const asRead = held === undefined ? undefined : heldRefGuard(held.ref, currentItem)
+            if (asRead !== undefined) {
+              writeNames[`#g${i}`] = asRead.attribute
+              writeNames[`#g${i}k`] = asRead.key
+              writeValues[`:g${i}`] = asRead.id
+              condParts.push(`#g${i}.#g${i}k = :g${i}`)
+              heldGuards.push(asRead)
+              continue
+            }
             const attr = resolveDbName(field)
             writeNames[`#g${i}`] = attr
             const read = ownValue(currentItem, attr)
@@ -10871,20 +10914,30 @@ const makeImpl = <
             )
           }
           if (stored === undefined) return missingItem()
-          const changed = guardedAttrs.filter(
-            (attr) =>
-              !attributeValueEquals(
-                ownValue(stored, attr) as AttributeValue | undefined,
-                ownValue(currentItem, attr),
-              ),
-          )
-          if (changed.length === 0 && userCond) {
+          const changed = new Set([
+            ...guardedAttrs.filter(
+              (attr) =>
+                !attributeValueEquals(
+                  ownValue(stored, attr) as AttributeValue | undefined,
+                  ownValue(currentItem, attr),
+                ),
+            ),
+            // A ref is guarded by its id: another ref is a change, a refreshed copy isn't.
+            ...heldGuards
+              .filter((guard) => {
+                const ref = ownValue(stored, guard.attribute) as AttributeValue | undefined
+                const id = ref?.M === undefined ? undefined : ownValue(ref.M, guard.key)
+                return !attributeValueEquals(id as AttributeValue | undefined, guard.id)
+              })
+              .map((guard) => guard.attribute),
+          ])
+          if (changed.size === 0 && userCond) {
             return new ConditionalCheckFailed({ entityType, key: encodedKey })
           }
           return new ConcurrentModification({
             entityType,
             key: encodedKey,
-            attributes: changed.map(domainNameOf),
+            attributes: [...changed].map(domainNameOf),
             current: Option.none(),
           })
         }

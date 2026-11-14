@@ -10,10 +10,11 @@
  * - `.keepRefs({ playerId })` gives the id for key composition only: nothing is fetched or written
  *   for it, and the write is conditioned on the row holding that player, so a row holding another
  *   fails it (`ConditionalCheckFailed`; in a transaction, `TransactionCancelled`).
- * - An update that reads the row first (`versioned: { retain: true }`) composes each half it touches
- *   from the refs the row holds, as a `put` of the row would. Up to 1.41.0 it read their ids as
- *   missing and truncated a half holding one. A half it doesn't touch stays as stored
- *   (`RefIdPrimaryKey.test.ts`).
+ * - An update that reads the row first (`versioned: { retain: true }`, or a unique field changed)
+ *   composes each half it touches from the refs the row holds, as a `put` of the row would. Up to
+ *   1.41.0 it read their ids as missing and truncated a half holding one. A half it doesn't touch
+ *   stays as stored (`RefIdPrimaryKey.test.ts`). Unversioned, each ref so read is guarded by its id
+ *   as read, so a ref reassigned between the read and the write fails the update.
  *
  * One suite, run on a recording table (`EntityRefKeys.test.ts`) and against DynamoDB Local
  * (`connected.entity-ref-keys.test.ts`), with their harnesses.
@@ -50,9 +51,16 @@ class Selection extends Schema.Class<Selection>("KeepSelection")({
   series: Schema.String,
   team: Team,
   player: Player,
+  code: Schema.optionalKey(Schema.String),
 }) {}
 
-const entities = (versioned: boolean) => {
+/**
+ * `plain` reads no row to update one; `retain` and `unique` (an optional unique `code`, unversioned)
+ * read it first.
+ */
+type Mode = "plain" | "retain" | "unique"
+
+const entities = (mode: Mode) => {
   const Teams = Entity.make({
     model: DynamoModel.configure(Team, { id: { identifier: true } }),
     entityType: "Team",
@@ -84,7 +92,8 @@ const entities = (versioned: boolean) => {
       },
     },
     refs: { team: { entity: Teams }, player: { entity: Players } },
-    ...(versioned ? { versioned: { retain: true } } : {}),
+    ...(mode === "retain" ? { versioned: { retain: true } } : {}),
+    ...(mode === "unique" ? { unique: { code: ["code"] } } : {}),
   } as never) as any
   return { Teams, Players, Selections }
 }
@@ -97,7 +106,7 @@ const reassigned = key("season_2025#series_final#teamid_t2#playerid_p1")
 /** On a fresh table: teams t1 and t2, player p1, and `body` with the steps it takes. */
 const onTable = (
   harness: Harness,
-  versioned: boolean,
+  mode: Mode,
   body: (t: {
     readonly db: any
     readonly Selections: any
@@ -107,11 +116,16 @@ const onTable = (
     readonly fresh: (id: string) => Effect.Effect<void, unknown>
     /** The selection's stored row. */
     readonly row: (id: string) => Effect.Effect<Row>
+    /** Run `op(db)` as `step` does, with `between` run once after it first reads a selection. */
+    readonly racing: (
+      op: (db: any) => any,
+      between: any,
+    ) => Effect.Effect<{ exit: Exit.Exit<any, any>; sent: Array<Sent> }>
   }) => Effect.Effect<void, unknown>,
 ) =>
   harness.onTable((tableName) =>
     Effect.gen(function* () {
-      const { Teams, Players, Selections } = entities(versioned)
+      const { Teams, Players, Selections } = entities(mode)
       const Main = Table.make({ schema, entities: { Teams, Players, Selections } } as never) as any
       const exec = <A, E>(op: any): Effect.Effect<A, E> =>
         harness.provide(tableName, Main, typeof op.asEffect === "function" ? op.asEffect() : op)
@@ -142,7 +156,31 @@ const onTable = (
           harness.rows(tableName),
           (rows) => rows.find((r) => r.pk?.S === key(`id_${id}`) && r.sk?.S === prefix)!,
         )
-      yield* body({ db, Selections, step, fresh, row })
+      const racing = (op: (db: any) => any, between: any) =>
+        step(
+          Effect.gen(function* () {
+            const raw = yield* DynamoClient
+            let ran = false
+            const client = new Proxy(raw, {
+              get: (target, property, receiver) =>
+                property === "getItem"
+                  ? (input: any) =>
+                      Effect.tap(raw.getItem(input), () => {
+                        if (ran || input.Key?.sk?.S !== prefix) return Effect.void
+                        ran = true
+                        return exec(between)
+                      })
+                  : Reflect.get(target, property, receiver),
+            })
+            const raced: any = yield* DynamoClient.make({
+              entities: { Teams, Players, Selections },
+              tables: { Main },
+            } as never).pipe(Effect.provideService(DynamoClient, client))
+            const target = op(raced)
+            return yield* typeof target.asEffect === "function" ? target.asEffect() : target
+          }),
+        )
+      yield* body({ db, Selections, step, fresh, row, racing })
     }),
   )
 
@@ -161,7 +199,7 @@ export const suite = (
   describeIt("an update reassigning one ref of an index half holding two refs' ids (#263)", () => {
     it("a plain update composes the half under the index policy, as 1.41.0 did", () =>
       Effect.runPromise(
-        onTable(harness, false, ({ db, step, fresh, row }) =>
+        onTable(harness, "plain", ({ db, step, fresh, row }) =>
           Effect.gen(function* () {
             const S = db.entities.Selections
             // A: the half holds no composite the payload gives but `teamId`: kept as stored.
@@ -228,7 +266,7 @@ export const suite = (
 
     it(".keepRefs() keys the half from the kept id, fetching and re-copying nothing", () =>
       Effect.runPromise(
-        onTable(harness, false, ({ db, step, fresh, row }) =>
+        onTable(harness, "plain", ({ db, step, fresh, row }) =>
           Effect.gen(function* () {
             const S = db.entities.Selections
             yield* fresh("e")
@@ -284,7 +322,7 @@ export const suite = (
 
     it("a retain update composes the half from the refs the row holds", () =>
       Effect.runPromise(
-        onTable(harness, true, ({ db, step, fresh, row }) =>
+        onTable(harness, "retain", ({ db, step, fresh, row }) =>
           Effect.gen(function* () {
             const S = db.entities.Selections
             // `.set({ teamId })` alone: the rest of the half is the row's. 1.41.0 truncated it to
@@ -323,9 +361,72 @@ export const suite = (
         ),
       ))
 
+    it("an unversioned update that reads the row guards each ref it keys a half from, as read", () =>
+      Effect.runPromise(
+        onTable(harness, "unique", ({ db, step, fresh, row, racing }) =>
+          Effect.gen(function* () {
+            const S = db.entities.Selections
+            // Changing the unique `code` reads the row. Each ref's id the update doesn't give is
+            // the row's, and guarded by the id in the stored ref: a guard on `teamId` would hold
+            // whatever the row's team is, as the row stores no such attribute.
+            yield* fresh("u")
+            const u = yield* step(S.update({ id: "u" }).set({ season: "2026", code: "c1" }))
+            expect(Exit.isSuccess(u.exit)).toBe(true)
+            expect(commands(u.sent)).toEqual(["GetItem", "TransactWriteItems"])
+            const update = u.sent[1]!.input.TransactItems[0].Update
+            expect(update.ConditionExpression).toBe(
+              "attribute_exists(#pk) AND #g0 = :g0 AND #g1.#g1k = :g1 AND #g2.#g2k = :g2 " +
+                "AND attribute_not_exists(#g3)",
+            )
+            expect(update.ExpressionAttributeNames).toMatchObject({
+              "#g0": "series",
+              "#g1": "team",
+              "#g1k": "id",
+              "#g2": "player",
+              "#g2k": "id",
+              "#g3": "code",
+            })
+            expect(update.ExpressionAttributeValues).toMatchObject({
+              ":g0": { S: "final" },
+              ":g1": { S: "t1" },
+              ":g2": { S: "p1" },
+            })
+            expect((yield* row("u")).gsi2sk).toEqual({
+              S: key("season_2026#series_final#teamid_t1#playerid_p1"),
+            })
+
+            // The team reassigned (keyed whole) between the update's read and its write: the guard
+            // fails, nothing is written, and no key names the team the update read.
+            yield* fresh("v")
+            const v = yield* racing(
+              (raced) =>
+                raced.entities.Selections.update({ id: "v" }).set({ season: "2026", code: "c2" }),
+              S.update({ id: "v" })
+                .set({ season: "2025", series: "final", teamId: "t2" })
+                .keepRefs({ playerId: "p1" }),
+            )
+            // The row read; the team fetched and the row written by the other writer; this write.
+            expect(commands(v.sent)).toEqual([
+              "GetItem",
+              "GetItem",
+              "UpdateItem",
+              "TransactWriteItems",
+            ])
+            expect(failure(v.exit)).toMatchObject({
+              _tag: "ConcurrentModification",
+              attributes: ["team"],
+            })
+            const stored = yield* row("v")
+            expect(stored.team?.M?.id).toEqual({ S: "t2" })
+            expect(stored.gsi1pk).toEqual({ S: key("teamid_t2") })
+            expect(stored.gsi2sk).toEqual({ S: reassigned })
+          }),
+        ),
+      ))
+
     it("in a transaction, .keepRefs() keys the half, and a row holding another player cancels it", () =>
       Effect.runPromise(
-        onTable(harness, false, ({ db, Selections, step, fresh, row }) =>
+        onTable(harness, "plain", ({ db, Selections, step, fresh, row }) =>
           Effect.gen(function* () {
             yield* fresh("g")
             yield* fresh("h")
@@ -360,7 +461,7 @@ export const suite = (
 
     it("refuses a name that is no ref id, and a ref the same update reassigns, sending nothing", () =>
       Effect.runPromise(
-        onTable(harness, false, ({ db, step, fresh }) =>
+        onTable(harness, "plain", ({ db, step, fresh }) =>
           Effect.gen(function* () {
             const S = db.entities.Selections
             yield* fresh("r")

@@ -5698,16 +5698,27 @@ composite the writer doesn't give but knows already sits. Refused before anythin
 name that is no ref id an update can give (`EDD-9166`), and a ref the same update reassigns
 or removes (`EDD-9167`). An update that holds the whole row (the read-then-write path: a
 retained entity, a unique field changed, a computed index composite, both images) composes its
-halves from the merged row, and the merged row holds each ref, not its id: `withHeldRefIds`
-puts a ref's id beside it (`storedRefId`, as `toDomainView` reads it) in the key record where a
-half holding that id also holds a composite the update gives or removes, so such an update keys
-a half it touches as a `put` of the row would. Up to 1.41.0 those ids were missing there, so the
-half was truncated before the first of them (`.set({ season })` on a retained entity dropped
-both ids from the half above); `rekey({ repairIndexKeys: true })` rewrites rows left that way. A
-half the update doesn't touch is left as stored, as before: the id the stored copy holds may be
-spelled other than the one the half was composed from (a ref read through a key that folds
-case, `RefIdPrimaryKey.test.ts`), so recomposing it from the copy would move a key no write
-asked to move. Requests for an update without `.keepRefs()` are unchanged on every other path
+halves from the merged row, and the merged row holds each ref, not its id: `heldRefsOf` reads a
+ref's id from the row (`storedRefId`, as `toDomainView` reads it) where a half holding that id
+also holds a composite the update gives or removes, and the update doesn't have the id
+otherwise (given, kept, a primary key composite), and `withHeldRefIds` puts it in the key
+record, so such an update keys a half it touches as a `put` of the row would. Up to 1.41.0
+those ids were missing there, so the half was truncated before the first of them
+(`.set({ season })` on a retained entity dropped both ids from the half above);
+`rekey({ repairIndexKeys: true })` rewrites rows left that way. An id so read is guarded as
+read. Versioned, by the version, as every input. Unversioned, the guard of each composite of a
+written half (`#gN = :gN`, or `attribute_not_exists(#gN)` where it was absent) would name the id,
+which the row never stores, and hold whatever the ref is: for an id read from the row it is
+`#gN.#gNk = :gN` instead, the id inside the stored ref (`compositeAttribute`) as read
+(`heldRefGuard`). A ref reassigned between the read and the write fails it, reported as the
+plain-field guard's failure is (`ConcurrentModification` naming the ref; a planned
+`transactWrite` update plans again), and the key never names the ref read. A refreshed copy of
+the same ref doesn't fail it. Only a request whose key this read already changed carries it:
+`attribute_not_exists` on an id the write gives itself stays as it was. A half the update
+doesn't touch is left as stored, as before: the id the stored copy holds may be spelled other
+than the one the half was composed from (a ref read through a key that folds case,
+`RefIdPrimaryKey.test.ts`), so recomposing it from the copy would move a key no write asked to
+move. Requests for an update without `.keepRefs()` are unchanged on every other path
 (`helpers/EntityRefKeep.ts`, `EntityKeepRefs.types.test.ts`).
 
 **A ref's id may be a primary key composite.** With `primaryKey: { pk: ["projectId"] }`
