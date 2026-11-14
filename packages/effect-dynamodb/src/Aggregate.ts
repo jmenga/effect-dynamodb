@@ -494,7 +494,7 @@ export interface ListOptions<Model = Record<string, unknown>> {
    * option. A date (any composite whose schema transforms its value) is read as a whole value of
    * its type, so this is for text composites. With no list sort key composite given, it changes
    * nothing, and neither does it when a value is given after a composite left out: such a value
-   * is matched whole, against the value the root row stores.
+   * is matched whole, by its key text, as it would be in the key.
    */
   readonly prefix?: boolean
 }
@@ -668,10 +668,13 @@ export interface Aggregate<
    * filter as key composites. PK composites are required (or empty for shared
    * partition); leading SK composites narrow the list to those values, each
    * matched whole, or the last one as a prefix with `options.prefix`. A value
-   * given after an SK composite left out can't be in the key condition: it is
-   * matched whole against the value the root row stores, in the root-item
-   * `FilterExpression` (in the case given, where the key follows the schema's
-   * casing).
+   * given after an SK composite left out can't be in the key condition, and
+   * matches a root row as it would there: where the key text composed from it
+   * is the text composed from the row's value (the schema's casing, `escapeKeys`,
+   * number and date key text alike), whole. A number, or any value under a
+   * casing that doesn't fold text, is compared in the root-item
+   * `FilterExpression`; text under a folding casing (the default `lowercase`) is
+   * matched on the root items read, before any is assembled.
    *
    * Supports cursor-based pagination via `options.limit` and `options.cursor`.
    * When `limit` is specified, returns at most that many aggregates plus a cursor
@@ -2358,22 +2361,26 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   /**
    * What a write of `value` in the root field `name` stores on the root row: its attribute
-   * encoder's form, as `create` stores it. The value itself where the field has no encoder, or the
-   * encoder doesn't take the value or gives what DynamoDB can't store. A list key's value after a
-   * gap is a whole value, so it is compared with this (`list`), where a filter operand could be a
-   * substring or a prefix and keeps text as given (`rootStoredFormAt`).
+   * encoder's form, as `create` stores it, or the value itself where the field has no encoder.
+   * Undefined where the encoder doesn't take the value or gives what DynamoDB can't store. A list
+   * key's value after a gap is a whole value, so where it can be it's compared with this (`list`),
+   * where a filter operand could be a substring or a prefix and keeps text as given
+   * (`rootStoredFormAt`).
    */
-  const rootStoredValue = (name: string, value: unknown): unknown => {
+  const rootStoredValue = (
+    name: string,
+    value: unknown,
+  ): { readonly stored: unknown } | undefined => {
     const encode = ownValue(attrEncoders, name)
-    if (encode === undefined) return value
+    if (encode === undefined) return { stored: value }
     let asGiven = false
     try {
       const stored = encode(value, () => {
         asGiven = true
       })
-      return asGiven || unstorableIn({ stored }) !== undefined ? value : stored
+      return asGiven || unstorableIn({ stored }) !== undefined ? undefined : { stored }
     } catch {
-      return value
+      return undefined
     }
   }
 
@@ -2633,10 +2640,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // assembly decodes the root row. `create` composes the key from the value it holds, so a key
   // composed again from a stored row (`list`, `rekey`) is composed from these, never from the
   // stored form: a transformation that isn't its own inverse on the other side (a value stored
-  // divided by ten, an `Option` holding one) keys the stored form elsewhere.
-  const decodeRootKey = (() => {
+  // divided by ten, an `Option` holding one) keys the stored form elsewhere. The list sort key's
+  // composites are read the same way where `list` matches a value given after a gap (`gapMatch`).
+  const decodeAsRead = (attrs: ReadonlyArray<string>) => {
     const fields: Record<string, Schema.Top> = {}
-    for (const attr of config.pk.composite) {
+    for (const attr of attrs) {
       const field = ownValue(schemaFields, attr)
       if (field !== undefined) setOwn(fields, attr, field)
     }
@@ -2648,7 +2656,50 @@ const makeAggregate = <TSchema extends Schema.Top>(
         absentReads: true,
       }) as unknown as Schema.Codec<Record<string, unknown>>,
     )
-  })()
+  }
+  const decodeRootKey = decodeAsRead(config.pk.composite)
+  const decodeListSortKey = decodeAsRead(config.list?.sk.composite ?? [])
+
+  /**
+   * Does a root row `list` read hold, for each composite named, the key text given? Its text is the
+   * one `create` composed into its list sort key: its values as a read takes them, through the key
+   * encoders and the key form. A row whose values a read can't take has no such text, so it's
+   * neither kept nor dropped: the call is refused (`EDD-9168`).
+   */
+  const listGapMatch =
+    (texts: ReadonlyArray<readonly [attr: string, text: string]>) =>
+    (row: Record<string, unknown>): boolean => {
+      const stored: Record<string, unknown> = {}
+      for (const attr of config.list?.sk.composite ?? []) {
+        if (hasOwnName(row, attr)) setOwn(stored, attr, row[attr])
+      }
+      const read = decodeListSortKey(stored)
+      if (Option.isNone(read)) {
+        throw new KeyValueError({
+          value: stored,
+          reason: "a read of the root row can't take its list sort key values",
+          message:
+            `[EDD-9168] Aggregate "${aggregateName}" list: a root row's list sort key values ` +
+            `(${Object.keys(stored).join(", ")}) are not ones its fields read, so they have no ` +
+            "key text to match a value given after a gap against. Nothing was returned.",
+        })
+      }
+      const keyed: Record<string, unknown> = {}
+      for (const [attr] of texts) {
+        const value = ownValue(read.value, attr)
+        const encode = ownValue(keyAttrEncoders, attr)
+        setOwn(keyed, attr, encode !== undefined && value != null ? encode(value) : value)
+      }
+      const composites = keyRecord(keyed)
+      return texts.every(
+        ([attr, text]) =>
+          KeyComposer.keyValueText(
+            config.schema,
+            ownValue(composites, attr),
+            config.schema.casing,
+          ) === text,
+      )
+    }
   /**
    * `row` (a stored root row) with its partition key composites as a read takes them. A row whose
    * composites a read can't take is left as it is: its key composes as the stored form does, and its
@@ -5613,15 +5664,38 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
           const skComplete = skValues.length === listConfig.sk.composite.length
           // A value for a composite after the first one not given can't be in the key condition,
-          // which holds only the leading values: each is matched whole, in the root-item filter,
-          // against what a write of it stores on the root row (`rootStoredValue`). Up to 1.42.1 it
-          // was dropped, and the list returned aggregates of every value there.
+          // which holds only the leading values. It matches a row as it would there: where the key
+          // text composed from it is the text composed from the row's value for that composite
+          // (up to 1.42.1 it was dropped, and the list returned aggregates of every value there).
+          // Where comparing the stored attribute is that test (a casing that doesn't fold text, or
+          // a number, whose key text is a function of it), the value is compared in the root-item
+          // filter with what a write of it stores (`rootStoredValue`). Otherwise DynamoDB can't
+          // compare it: the root items read are matched on their key text (`gapMatch`), before
+          // any is assembled, which reads the same capacity as a filter.
           const afterGap: Array<Expr> = []
+          const gapTexts: Array<readonly [attr: string, text: string]> = []
           for (const attr of listConfig.sk.composite.slice(skValues.length)) {
-            if (ownValue(listSkFilter, attr) === undefined) continue
+            const keyForm = ownValue(listSkFilter, attr)
+            if (keyForm === undefined) continue
             const value = rootStoredValue(attr, givenEntry(filter ?? {}, attr)?.value)
-            afterGap.push(parseSimpleShorthand({ [attr]: value }))
+            if (
+              value !== undefined &&
+              (config.schema.casing === "preserve" || !KeyComposer.matchesTextPrefix(keyForm))
+            ) {
+              afterGap.push(parseSimpleShorthand({ [attr]: value.stored }))
+            } else {
+              gapTexts.push([
+                attr,
+                KeyComposer.keyValueText(config.schema, keyForm, config.schema.casing),
+              ])
+            }
           }
+          const gapMatch = gapTexts.length === 0 ? undefined : listGapMatch(gapTexts)
+          const filterBy = options?.filterBy
+          const accept =
+            gapMatch === undefined || filterBy === undefined
+              ? (gapMatch ?? filterBy)
+              : (row: Record<string, unknown>) => gapMatch(row) && filterBy(row)
           // A value no condition can compare (`NaN`) is refused as a filter's is, nothing sent.
           const gapProblem =
             afterGap.length === 0 ? undefined : emptyPartProblem(andExpr(...afterGap))
@@ -5646,6 +5720,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const skPrefix =
             options?.prefix === true &&
             afterGap.length === 0 &&
+            gapTexts.length === 0 &&
             lastGiven !== undefined &&
             KeyComposer.matchesTextPrefix(ownValue(listSkFilter, lastGiven))
 
@@ -5693,7 +5768,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   limit,
                   pageSize,
                   filter: rootFilter,
-                  accept: options?.filterBy,
+                  accept,
                   reverse: options?.reverse === true,
                   keyFields: listKeyFields,
                 },
@@ -5735,7 +5810,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 pageSize,
                 startKey,
                 filter: rootFilter,
-                accept: options?.filterBy,
+                accept,
                 reverse: options?.reverse === true,
                 keyFields: listKeyFields,
               },

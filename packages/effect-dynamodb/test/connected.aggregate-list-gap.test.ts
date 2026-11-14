@@ -1,10 +1,11 @@
 /**
  * `Aggregate.list` against DynamoDB Local: a list key with a gap, and filter operands in the root
- * row's stored form (#124). A value given after a list sort key composite left out is matched whole
- * against the value the root row stores, so `{ league, name }` on `sk: [league, season, name]`
- * returns only that name's aggregates, page by page; up to 1.42.1 the value was dropped. A filter
- * comparing a `DateTime.Utc` with a `Schema.DateTimeUtcFromString` field, or a number with a
- * `Schema.NumberFromString` one, matches the rows that hold it.
+ * row's stored form (#124). A value given after a list sort key composite left out matches a row as
+ * it would in the key, casing included, so `{ league, name }` on `sk: [league, season, name]`
+ * returns only that name's aggregates, in any case, page by page; up to 1.42.1 the value was
+ * dropped. Text under the default casing is matched on the root items read, a number in the
+ * root-item filter. A filter comparing a `DateTime.Utc` with a `Schema.DateTimeUtcFromString`
+ * field, or a number with a `Schema.NumberFromString` one, matches the rows that hold it.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -152,26 +153,44 @@ describeConnected("Aggregate.list with a gap in its key, and #124 filter operand
     )
   }, 15000)
 
-  it.effect("a value after the gap is matched, page by page", () =>
+  it.effect("a value after the gap is matched as in the key, page by page", () =>
     Effect.gen(function* () {
-      const bblSmith = yield* walk({ league: "bbl", name: "Smith" }, { limit: 1 })
-      expect(bblSmith.flat()).toEqual(["p1", "p3", "p5", "p6"])
-      expect(bblSmith.length).toBeGreaterThan(1)
-      expect(bblSmith.every((page) => page.length <= 1)).toBe(true)
+      // Text, in whatever case: matched on the root items read, so rows are dropped after the read.
+      for (const key of [
+        { league: "bbl", name: "Smith" },
+        { league: "bbl", name: "smith" },
+        { league: "BBL", name: "SMITH" },
+      ]) {
+        const pages = yield* walk(key, { limit: 1 })
+        expect(pages.flat()).toEqual(["p1", "p3", "p5", "p6"])
+        expect(pages.length).toBeGreaterThan(1)
+        expect(pages.every((page) => page.length <= 1)).toBe(true)
+      }
 
-      const smith = yield* walk({ name: "Smith" }, { limit: 2, pageSize: 2 })
-      expect(smith.flat().sort()).toEqual(["p1", "p3", "p5", "p6", "p7"])
-      expect(smith.every((page) => page.length <= 2)).toBe(true)
+      for (const pageSize of [1, 2, 3]) {
+        const smith = yield* walk({ name: "sMITH" }, { limit: 2, pageSize })
+        expect(smith.flat().sort()).toEqual(["p1", "p3", "p5", "p6", "p7"])
+        expect(smith.every((page) => page.length <= 2)).toBe(true)
+      }
 
-      expect(yield* listed({ season: 2025, name: "Smith" })).toEqual(["p5", "p7"])
-      expect(yield* listed({ league: "BBL", name: "Smith" }, { prefix: true })).toEqual([
+      // A number after the gap, in the root-item filter, and with text after it.
+      expect(yield* listed({ season: 2024 })).toEqual(["p2", "p3"])
+      expect(yield* listed({ season: 2025, name: "smith" })).toEqual(["p5", "p7"])
+      const mixed = yield* walk({ season: 2025, name: "SMITH" }, { limit: 1, pageSize: 1 })
+      expect(mixed.flat().sort()).toEqual(["p5", "p7"])
+
+      // `prefix` changes nothing after a gap: the value is matched whole.
+      expect(yield* listed({ league: "BBL", name: "smith" }, { prefix: true })).toEqual([
         "p1",
         "p3",
         "p5",
         "p6",
       ])
-      // Matched as stored: the case given.
-      expect(yield* listed({ league: "bbl", name: "smith" })).toEqual([])
+      expect(yield* listed({ league: "bbl", name: "smi" }, { prefix: true })).toEqual([])
+      // With `filterBy`, which sees only the rows the key matches.
+      expect(
+        yield* listed({ name: "smith" }, { filterBy: (root) => root.league === "ipl" }),
+      ).toEqual(["p7"])
       // A key without a gap, as before.
       expect(yield* listed({ league: "bbl", season: 2024 })).toEqual(["p2", "p3"])
     }).pipe(provide),
@@ -198,7 +217,7 @@ describeConnected("Aggregate.list with a gap in its key, and #124 filter operand
       ])
       // With a gap, and on a later page.
       const walked = yield* walk(
-        { league: "bbl", name: "Smith" },
+        { league: "bbl", name: "smith" },
         { limit: 1, filter: (t, { gte }) => gte(t.startDate, day(9)) },
       )
       expect(walked.flat()).toEqual(["p3", "p5", "p6"])

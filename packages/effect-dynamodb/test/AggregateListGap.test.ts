@@ -3,9 +3,11 @@
  *
  * A list key with a gap: the list sort key composites are taken in order, and up to 1.42.1 a value
  * given after one not given was dropped, so `list({ league, name })` on `sk: [league, season,
- * name]` returned every aggregate of the league. Each value after the gap is now matched whole
- * against the value the root row stores, in the root-item `FilterExpression`; `prefix` changes
- * nothing then. A key without a gap sends what 1.42.1 sent.
+ * name]` returned every aggregate of the league. A value after the gap now matches a row as it
+ * would in the key: where its key text is the row's for that composite, casing included. A number,
+ * or any value under a casing that doesn't fold text, is compared in the root-item
+ * `FilterExpression`; text under a folding casing is matched on the root items read, before
+ * assembly. `prefix` changes nothing then. A key without a gap sends what 1.42.1 sent.
  *
  * A `list` filter operand (#124): one of Effect's instances has been sent as the root row stores it
  * since 1.41.0 (the issue's `DateTime.Utc` against a `Schema.DateTimeUtcFromString` field), but a
@@ -45,8 +47,18 @@ const PLAYERS = [
   ["p5", "bbl", 2026, "Lee", 7, 30],
 ] as const
 
-const setup = (options: { readonly cardinality?: number } = {}) => {
-  const schema = DynamoSchema.make({ name: "gap", version: 1 })
+const setup = (
+  options: {
+    readonly cardinality?: number
+    readonly casing?: DynamoSchema.Casing
+    readonly sk?: ReadonlyArray<"league" | "season" | "name" | "startDate">
+  } = {},
+) => {
+  const schema = DynamoSchema.make({
+    name: "gap",
+    version: 1,
+    ...(options.casing === undefined ? {} : { casing: options.casing }),
+  })
   const Tags = Entity.make({
     model: Tag,
     entityType: "Tag",
@@ -62,7 +74,7 @@ const setup = (options: { readonly cardinality?: number } = {}) => {
       index: "gsi1",
       name: "playerList",
       pk: { field: "gsi1pk", composite: [] },
-      sk: { field: "gsi1sk", composite: ["league", "season", "name"] },
+      sk: { field: "gsi1sk", composite: [...(options.sk ?? ["league", "season", "name"])] },
       ...(options.cardinality === undefined ? {} : { cardinality: options.cardinality }),
     },
     root: { entityType: "PlayerItem" },
@@ -90,7 +102,7 @@ const setup = (options: { readonly cardinality?: number } = {}) => {
     table.take()
     return Players
   })
-  return { players, layer, listReads }
+  return { players, layer, listReads, table }
 }
 
 const ids = (page: Aggregate.ListResult<{ readonly id: string }>) => page.data.map((p) => p.id)
@@ -100,60 +112,97 @@ const base = { TableName: "players", IndexName: "gsi1", ExclusiveStartKey: undef
 const PK = { ":pk": { S: "$gap#v1#playerlist" } }
 
 describe("Aggregate.list with a gap in its key", () => {
-  it.effect("a value after the gap is matched, not dropped", () => {
+  it.effect("a value after the gap is matched as it would be in the key, casing included", () => {
     const { players, layer, listReads } = setup()
     return Effect.gen(function* () {
       const Players = yield* players
 
-      expect(sorted(yield* Players.list({ league: "bbl", name: "Smith" }))).toEqual(["p1", "p3"])
-      expect(listReads()).toStrictEqual([
-        {
+      // Text under the default `lowercase` casing: DynamoDB can't fold case, so the root items
+      // read are matched on their key text, and the read carries no condition for `name`.
+      for (const key of [
+        { league: "bbl", name: "Smith" },
+        { league: "bbl", name: "smith" },
+        { league: "BBL", name: "SMITH" },
+      ]) {
+        expect(sorted(yield* Players.list(key))).toEqual(["p1", "p3"])
+      }
+      const reads = listReads()
+      expect(reads).toHaveLength(3)
+      for (const read of reads) {
+        expect(read).toStrictEqual({
           ...base,
           KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
-          ExpressionAttributeNames: { "#pk": "gsi1pk", "#sk": "gsi1sk", "#e0": "name" },
-          ExpressionAttributeValues: {
-            ...PK,
-            ":skPrefix": { S: "$gap#v1#playerlist#bbl#" },
-            ":e1": { S: "Smith" },
-          },
-          FilterExpression: "#e0 = :e1",
-        },
-      ])
+          ExpressionAttributeNames: { "#pk": "gsi1pk", "#sk": "gsi1sk" },
+          ExpressionAttributeValues: { ...PK, ":skPrefix": { S: "$gap#v1#playerlist#bbl#" } },
+        })
+      }
 
       // The first composite missing: the key condition is the partition alone.
-      expect(sorted(yield* Players.list({ name: "Smith" }))).toEqual(["p1", "p3", "p4"])
-      // Two values after the gap, the first stored as text (`NumberFromString`): sent as `"2025"`.
-      expect(sorted(yield* Players.list({ season: 2025, name: "Smith" }))).toEqual(["p3", "p4"])
-      const [nameOnly, both] = listReads()
-      expect(nameOnly?.KeyConditionExpression).toBe("#pk = :pk")
-      expect(nameOnly?.FilterExpression).toBe("#e0 = :e1")
-      expect(both?.FilterExpression).toBe("(#e0 = :e1) AND (#e2 = :e3)")
-      expect(both?.ExpressionAttributeNames).toEqual({
-        "#pk": "gsi1pk",
-        "#e0": "season",
-        "#e2": "name",
-      })
-      expect(both?.ExpressionAttributeValues).toEqual({
-        ...PK,
-        ":e1": { S: "2025" },
-        ":e3": { S: "Smith" },
-      })
+      expect(sorted(yield* Players.list({ name: "sMiTh" }))).toEqual(["p1", "p3", "p4"])
+      expect(listReads()[0]?.KeyConditionExpression).toBe("#pk = :pk")
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("matched whole, as stored: the case given, and `prefix` changes nothing", () => {
+  it.effect("a number after the gap is compared in the root-item filter, as stored", () => {
     const { players, layer, listReads } = setup()
     return Effect.gen(function* () {
       const Players = yield* players
+      // `season` is a `Schema.NumberFromString`: its key text is a function of the number, so the
+      // stored `"2025"` is compared. `name`, text, is matched on the rows read.
+      expect(sorted(yield* Players.list({ season: 2025 }))).toEqual(["p2", "p3", "p4"])
+      expect(sorted(yield* Players.list({ season: 2025, name: "SMITH" }))).toEqual(["p3", "p4"])
+      for (const read of listReads()) {
+        expect(read.FilterExpression).toBe("#e0 = :e1")
+        expect(read.ExpressionAttributeNames).toEqual({ "#pk": "gsi1pk", "#e0": "season" })
+        expect(read.ExpressionAttributeValues).toEqual({ ...PK, ":e1": { S: "2025" } })
+      }
+    }).pipe(Effect.provide(layer))
+  })
 
-      // The leading value follows the schema's casing, the value after the gap the stored text.
-      expect(sorted(yield* Players.list({ league: "BBL", name: "Smith" }))).toEqual(["p1", "p3"])
+  it.effect("under a casing that doesn't fold text, the match is exact, in the filter", () => {
+    const { players, layer, listReads } = setup({ casing: "preserve" })
+    return Effect.gen(function* () {
+      const Players = yield* players
+      expect(sorted(yield* Players.list({ league: "bbl", name: "Smith" }))).toEqual(["p1", "p3"])
       expect(ids(yield* Players.list({ league: "bbl", name: "smith" }))).toEqual([])
+      const [read] = listReads()
+      expect(read?.FilterExpression).toBe("#e0 = :e1")
+      expect(read?.ExpressionAttributeValues[":e1"]).toEqual({ S: "Smith" })
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("a date after the gap, as a `DateTime` or as ISO text", () => {
+    const iso = "2026-01-09T00:00:00Z" as unknown as DateTime.Utc
+    const run = (casing: "lowercase" | "preserve") => {
+      const { players, layer, listReads } = setup({ casing, sk: ["league", "startDate", "name"] })
+      return Effect.gen(function* () {
+        const Players = yield* players
+        expect(ids(yield* Players.list({ startDate: day(9) }))).toEqual(["p3"])
+        // Text a read of the field takes, in another spelling than the stored one, keys alike.
+        expect(ids(yield* Players.list({ startDate: iso }))).toEqual(["p3"])
+        return listReads()
+      }).pipe(Effect.provide(layer))
+    }
+    return Effect.gen(function* () {
+      // The key's text is the stored ISO text cased: matched on the rows read.
+      const [folded] = yield* run("lowercase")
+      expect(folded?.FilterExpression).toBeUndefined()
+      // Not folded: the stored text, compared in the filter.
+      const [exact] = yield* run("preserve")
+      expect(exact?.FilterExpression).toBe("#e0 = :e1")
+      expect(exact?.ExpressionAttributeValues[":e1"]).toEqual({ S: "2026-01-09T00:00:00.000Z" })
+    })
+  })
+
+  it.effect("`prefix` changes nothing after a gap", () => {
+    const { players, layer, listReads } = setup()
+    return Effect.gen(function* () {
+      const Players = yield* players
       expect(ids(yield* Players.list({ league: "bbl", name: "Smi" }, { prefix: true }))).toEqual([])
       expect(
-        sorted(yield* Players.list({ league: "bbl", name: "Smith" }, { prefix: true })),
+        sorted(yield* Players.list({ league: "bbl", name: "smith" }, { prefix: true })),
       ).toEqual(["p1", "p3"])
-      const [, , prefixed, whole] = listReads()
+      const [prefixed, whole] = listReads()
       // The leading value keeps its delimiter: `bbl` doesn't match `bblx` under `prefix`.
       expect(prefixed?.ExpressionAttributeValues[":skPrefix"]).toEqual({
         S: "$gap#v1#playerlist#bbl#",
@@ -162,44 +211,59 @@ describe("Aggregate.list with a gap in its key", () => {
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("ANDed with the list's own filter", () => {
+  it.effect("with the list's own `filter` and `filterBy`", () => {
     const { players, layer, listReads } = setup()
     return Effect.gen(function* () {
       const Players = yield* players
       const page = yield* Players.list(
-        { league: "bbl", name: "Smith" },
+        { league: "bbl", name: "smith" },
         { filter: (t, { gte }) => gte(t.startDate, day(4)) },
       )
       expect(ids(page)).toEqual(["p3"])
       const [read] = listReads()
-      expect(read?.FilterExpression).toBe("(#e0 = :e1) AND (#e2 >= :e3)")
-      expect(read?.ExpressionAttributeValues[":e3"]).toEqual({ S: "2026-01-04T00:00:00.000Z" })
+      expect(read?.FilterExpression).toBe("#e0 >= :e1")
+      expect(read?.ExpressionAttributeValues[":e1"]).toEqual({ S: "2026-01-04T00:00:00.000Z" })
+      const seen: Array<unknown> = []
+      const kept = yield* Players.list(
+        { name: "smith" },
+        {
+          filterBy: (root) => {
+            seen.push(root.id)
+            return root.league === "ipl"
+          },
+        },
+      )
+      expect(ids(kept)).toEqual(["p4"])
+      // `filterBy` sees only the rows the key matches.
+      expect(seen.sort()).toEqual(["p1", "p3", "p4"])
     }).pipe(Effect.provide(layer))
   })
 
   it.effect("`limit` counts aggregates and the cursor resumes after the last one returned", () => {
-    const { players, layer } = setup()
+    const { players, layer, listReads } = setup()
     return Effect.gen(function* () {
       const Players = yield* players
-      for (const pageSize of [undefined, 1]) {
-        const walked: Array<string> = []
-        let cursor: string | undefined
-        for (let page = 0; page < 10; page++) {
-          const result: Aggregate.ListResult<Player> = yield* Players.list(
-            { name: "Smith" },
-            {
+      // `name` matched on the rows read, `season` in the filter: both drop rows.
+      for (const key of [{ name: "SMITH" }, { season: 2025, name: "smith" }]) {
+        for (const pageSize of [undefined, 1, 2]) {
+          const walked: Array<string> = []
+          let cursor: string | undefined
+          for (let page = 0; page < 10; page++) {
+            const result: Aggregate.ListResult<Player> = yield* Players.list(key, {
               limit: 1,
               ...(pageSize === undefined ? {} : { pageSize }),
               ...(cursor === undefined ? {} : { cursor }),
-            },
-          )
-          expect(result.data.length).toBeLessThanOrEqual(1)
-          walked.push(...ids(result))
-          if (Option.isNone(result.cursor)) break
-          cursor = result.cursor.value
+            })
+            expect(result.data.length).toBeLessThanOrEqual(1)
+            walked.push(...ids(result))
+            if (Option.isNone(result.cursor)) break
+            cursor = result.cursor.value
+          }
+          expect(walked).toEqual("season" in key ? ["p3", "p4"] : ["p1", "p3", "p4"])
         }
-        expect(walked).toEqual(["p1", "p3", "p4"])
       }
+      // With a row matched on its key text, `limit` is not DynamoDB's `Limit`.
+      expect(listReads().every((read) => read.Limit === undefined || read.Limit <= 2)).toBe(true)
     }).pipe(Effect.provide(layer))
   })
 
@@ -214,18 +278,32 @@ describe("Aggregate.list with a gap in its key", () => {
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("a sharded list sends the condition to every shard", () => {
+  it.effect("a root row whose value a read can't take is refused (EDD-9168)", () => {
+    const { players, layer, table } = setup()
+    return Effect.gen(function* () {
+      const Players = yield* players
+      for (const [text, item] of [...table.items.entries()]) {
+        if (item.id?.S === "p5" && item.gsi1sk !== undefined) {
+          table.items.set(text, { ...item, name: { N: "5" } })
+        }
+      }
+      const error = yield* Effect.flip(Players.list({ league: "bbl", name: "smith" }))
+      expect(error._tag).toBe("ValidationError")
+      expect(String((error as { cause?: unknown }).cause)).toContain("EDD-9168")
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("a sharded list matches every shard's rows", () => {
     const { players, layer, listReads } = setup({ cardinality: 3 })
     return Effect.gen(function* () {
       const Players = yield* players
-      expect(sorted(yield* Players.list({ league: "bbl", name: "Smith" }))).toEqual(["p1", "p3"])
+      expect(sorted(yield* Players.list({ league: "BBL", name: "smith" }))).toEqual(["p1", "p3"])
       const shards = listReads()
       expect(shards).toHaveLength(3)
-      for (const read of shards) {
-        expect(read.FilterExpression).toBe("#e0 = :e1")
-        expect(read.ExpressionAttributeValues[":e1"]).toEqual({ S: "Smith" })
-      }
-      const limited = yield* Players.list({ name: "Smith" }, { limit: 2 })
+      for (const read of shards) expect(read.FilterExpression).toBeUndefined()
+      expect(sorted(yield* Players.list({ season: 2025, name: "Smith" }))).toEqual(["p3", "p4"])
+      for (const read of listReads()) expect(read.FilterExpression).toBe("#e0 = :e1")
+      const limited = yield* Players.list({ name: "SMITH" }, { limit: 2 })
       expect(limited.data).toHaveLength(2)
       expect(Option.isNone(limited.cursor)).toBe(true)
     }).pipe(Effect.provide(layer))
