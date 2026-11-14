@@ -6,7 +6,8 @@
  * another order. The chain scenarios (`helpers/RekeyChains.ts`), in 1 and 4 segments: the dry
  * run reports what the run does, and what both report is what the table held before them, not the
  * order the run met its rows in. `connected.rekey-chains.test.ts` runs the same scenarios with
- * nothing slowed.
+ * nothing slowed. One stem a scenario here; `RekeyInterleavings.test.ts` runs each scenario's
+ * stems, its requests interleaving at random, on a recording table.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -132,7 +133,7 @@ const harnessAt = (seed: number): RekeyChains.Harness => ({
   },
 })
 
-const STEMS = ["foo", "beta", "kappa"]
+const STEMS = ["foo"]
 
 describeConnected("#240 rekey with its requests answered at random speeds, on DynamoDB", () => {
   for (const [s, scenario] of RekeyChains.chainScenarios.entries()) {

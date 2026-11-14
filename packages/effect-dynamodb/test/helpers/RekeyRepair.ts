@@ -11,13 +11,34 @@ import { readFileSync } from "node:fs"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Clock, Effect, Layer, Option, Schema } from "effect"
 import { expect } from "vitest"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../../src/Marshaller.js"
 import * as Table from "../../src/Table.js"
 import { rekeyOutcome } from "./RekeyOutcome.js"
+
+/**
+ * `effect` with the clock two seconds ahead: a stamp it writes is a later second than one written
+ * before it, as after a sleep, without the wait.
+ */
+const secondsLater = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Clock.clockWith((clock) => {
+    const ahead = 2_000
+    const later: Clock.Clock = {
+      currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe() + ahead,
+      currentTimeMillis: Effect.sync(() => clock.currentTimeMillisUnsafe() + ahead),
+      currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe() + BigInt(ahead) * 1_000_000n,
+      currentTimeNanos: Effect.sync(
+        () => clock.currentTimeNanosUnsafe() + BigInt(ahead) * 1_000_000n,
+      ),
+      monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+      monotonicTimeNanos: clock.monotonicTimeNanos,
+      sleep: (duration) => clock.sleep(duration),
+    }
+    return Effect.provideService(effect, Clock.Clock, later)
+  })
 
 type StoredRow = Record<string, any>
 
@@ -1738,8 +1759,9 @@ export const stampedScenarios: ReadonlyArray<RepairScenario> = [
         expect([...bare.gsi1sk.B]).toEqual([...whole.gsi1sk.B])
         expect(rows.find((row) => row.id?.S === "priceless")!.gsi1sk).toBeUndefined()
         // An update naming no dimension moves `updatedAt`, and the address is left: expected.
-        yield* Effect.sleep("1100 millis")
-        yield* db.entities.Listings.update({ id: "priced" }).set({ note: "n" }).asEffect()
+        yield* secondsLater(
+          db.entities.Listings.update({ id: "priced" }).set({ note: "n" }).asEffect(),
+        )
         const noted = (yield* table.rows()).find((row) => row.id?.S === "priced")!
         expect([...noted.gsi1sk.B]).toEqual([...priced.gsi1sk.B])
         expect(noted.updatedAt).not.toEqual(priced.updatedAt)

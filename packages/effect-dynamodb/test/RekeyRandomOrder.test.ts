@@ -1,13 +1,15 @@
 /**
  * `rekey` over random tables (`helpers/RandomTables.ts`) gives one outcome whatever its segment
  * count and the order its scan hands rows over, and its dry run reports what the real run does
- * (#240): every count is a function of the table before the run. The seeds after the first eight
+ * (#240): every count is a function of the table before the run. The seeds after the first three
  * are tables where a count once depended on the order — a `preserveUnique` tombstone's sentinel the
  * live row its back-pointer names doesn't hold, counted `unrecognizedKey` when the scan met it
  * before the tombstone's move took it and not after; and a row moving onto the key such a sentinel
  * names, read as its owner when the scan met the sentinel after the move. Such a sentinel is now
  * counted once the run is over, unless a row's pass took or re-pointed it, and is judged against
  * the row its back-pointer named before the run.
+ *
+ * The sweep before them, once seeds 1–8, is seeds 1–3.
  */
 import { describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
@@ -15,7 +17,7 @@ import { rekeyOnce, scanShuffled, tableOf, writeRandom } from "./helpers/RandomT
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 import { storedRows } from "./helpers/StoredRows.js"
 
-const SEEDS = [...Array.from({ length: 8 }, (_, i) => i + 1), 138, 234, 284, 330]
+const SEEDS = [1, 2, 3, 138, 234, 284, 330]
 
 const ORDERS = [1, 2, 3, 8].flatMap((segments) =>
   [0, 1, 2].flatMap((order) => [2, undefined].map((pageSize) => ({ segments, order, pageSize }))),

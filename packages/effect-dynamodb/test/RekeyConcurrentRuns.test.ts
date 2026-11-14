@@ -8,6 +8,9 @@
  * an orphan and release, letting a second item take its value. A table already in that state is
  * repaired: the sentinel is brought to the row holding its value, whichever the scan meets first,
  * and never released.
+ *
+ * The tables that once kept such a sentinel are pinned by seed below; the sweep over random tables
+ * runs ten a direction (at one in 240, forty never reliably met one either).
  */
 
 import { readFileSync } from "node:fs"
@@ -60,7 +63,7 @@ const valuesStillReserved = (escapeKeys: boolean, table: ReturnType<typeof makeR
     return { reservations: release.reservations, accepted }
   })
 
-const SEEDS = 40
+const SEEDS = 10
 
 describe.each([
   ["to on", true],

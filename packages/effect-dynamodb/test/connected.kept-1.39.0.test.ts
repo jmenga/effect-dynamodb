@@ -14,14 +14,9 @@
  *   (or set DYNAMODB_ENDPOINT to another port)
  */
 
-import {
-  CreateTableCommand,
-  DeleteTableCommand,
-  DynamoDBClient,
-  ScanCommand,
-} from "@aws-sdk/client-dynamodb"
+import { DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb"
 import { Config, Effect } from "effect"
-import { describe } from "vitest"
+import { afterAll, describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
@@ -59,6 +54,7 @@ import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { sparseEntryValuesSuite } from "./helpers/SparseEntryValues.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
+import { makeTablePool } from "./helpers/TablePool.js"
 import { unionMemberWritesSuite } from "./helpers/UnionMemberWrites.js"
 import { unionPathWritesPassedSuite, unionPathWritesSuite } from "./helpers/UnionPathWrites.js"
 import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
@@ -85,19 +81,14 @@ const ClientLayer = DynamoClient.layer({ region: "us-east-1", endpoint: ENDPOINT
 const send = <A>(make: () => Promise<A>) =>
   Effect.tryPromise(make).pipe(Effect.orDie) as Effect.Effect<A>
 
-let tables = 0
+// Each case on an empty table of its definition, one at a time: reused, emptied between cases.
+const pool = makeTablePool(raw, "kept-139")
+afterAll(() => pool.drain())
+
 const openTable: OpenTable = (MainTable) =>
   Effect.gen(function* () {
-    const TableName = `kept-139-${Date.now()}-${tables++}`
-    yield* send(() =>
-      raw.send(
-        new CreateTableCommand({
-          TableName,
-          BillingMode: "PAY_PER_REQUEST",
-          ...Table.definition(MainTable),
-        }),
-      ),
-    )
+    const shape = Table.definition(MainTable)
+    const TableName = yield* pool.take(shape)
     return {
       name: TableName,
       layer: ClientLayer,
@@ -105,7 +96,7 @@ const openTable: OpenTable = (MainTable) =>
         send(() => raw.send(new ScanCommand({ TableName, ConsistentRead: true }))),
         (out) => (out.Items ?? []) as ReadonlyArray<Row>,
       ),
-      close: Effect.asVoid(send(() => raw.send(new DeleteTableCommand({ TableName })))),
+      close: pool.give(TableName, shape),
     }
   })
 

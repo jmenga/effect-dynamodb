@@ -191,6 +191,12 @@ export interface UpdateState {
    * nothing is stored (an immutable field, `createdAt`).
    */
   readonly upsertOver?: { readonly fill: globalThis.Record<string, unknown> } | undefined
+  /**
+   * `.keepRefs()`: refs the update keeps, by their ids (`{ playerId }`), as the caller gives them.
+   * Each id keys the indexes it is a composite of; nothing is fetched or written for it, and the
+   * write is conditioned on the row holding that ref (#263).
+   */
+  readonly keepRefs?: globalThis.Record<string, unknown> | undefined
 }
 
 /** @internal Path-based SET operation */

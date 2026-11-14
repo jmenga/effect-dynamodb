@@ -16,6 +16,7 @@ import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { indexesOf } from "./DynamoExpressions.js"
 import { makeRecordingTable } from "./RecordingTable.js"
+import type { TablePool } from "./TablePool.js"
 
 export const schema = DynamoSchema.make({ name: "clears", version: 1 })
 
@@ -84,8 +85,11 @@ export const recordingHarness: Harness = {
 
 let connectedTables = 0
 
-/** DynamoDB at `endpoint`, a fresh table per scenario: its indexes are the real thing. */
-export const connectedHarness = (endpoint: string): Harness => {
+/**
+ * DynamoDB at `endpoint`, an empty table per scenario: its indexes are the real thing. From `pool`
+ * when one is given (a table reused, emptied between scenarios), else created and deleted.
+ */
+export const connectedHarness = (endpoint: string, pool?: TablePool): Harness => {
   const ClientLayer = DynamoClient.layer({
     region: "us-east-1",
     endpoint,
@@ -93,7 +97,6 @@ export const connectedHarness = (endpoint: string): Harness => {
   })
   return {
     on: (world, body) => {
-      const tableName = `clears-${Date.now()}-${connectedTables++}`
       let sent = 0
       return Effect.gen(function* () {
         const raw = yield* DynamoClient
@@ -108,7 +111,7 @@ export const connectedHarness = (endpoint: string): Harness => {
               : value
           },
         })
-        const scan = (index?: string) =>
+        const scan = (tableName: string, index?: string) =>
           Effect.gen(function* () {
             const found: Array<StoredRow> = []
             let start: StoredRow | undefined
@@ -123,18 +126,27 @@ export const connectedHarness = (endpoint: string): Harness => {
             } while (start !== undefined)
             return found
           })
+        const shape = Table.definition(world.MainTable)
+        const acquire: Effect.Effect<string, unknown> =
+          pool === undefined
+            ? Effect.gen(function* () {
+                const tableName = `clears-${Date.now()}-${connectedTables++}`
+                yield* raw.createTable({
+                  TableName: tableName,
+                  BillingMode: "PAY_PER_REQUEST",
+                  ...shape,
+                })
+                return tableName
+              })
+            : pool.take(shape)
         return yield* Effect.acquireUseRelease(
-          raw.createTable({
-            TableName: tableName,
-            BillingMode: "PAY_PER_REQUEST",
-            ...Table.definition(world.MainTable),
-          }),
-          () =>
+          acquire,
+          (tableName) =>
             Effect.gen(function* () {
               const db = yield* clientOf(world)
               return yield* body(db, {
-                rows: () => scan(),
-                inIndex: (index) => scan(index),
+                rows: () => scan(tableName),
+                inIndex: (index) => scan(tableName, index),
                 sent: () => sent,
               })
             }).pipe(
@@ -145,7 +157,10 @@ export const connectedHarness = (endpoint: string): Harness => {
                 ),
               ),
             ),
-          () => raw.deleteTable({ TableName: tableName }).pipe(Effect.ignore),
+          (tableName) =>
+            pool === undefined
+              ? raw.deleteTable({ TableName: tableName }).pipe(Effect.ignore)
+              : pool.give(tableName, shape),
         )
       }).pipe(Effect.provide(ClientLayer)) as never
     },

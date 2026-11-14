@@ -2186,6 +2186,17 @@ export const composeSortKeyBeginsWith = (
 }
 
 /**
+ * Whether a `beginsWith` on a composite whose value is `keyForm` (its key form) matches a prefix of
+ * the value's key text. A number's or a bigint's has no text prefix: its key text isn't its digits
+ * (`-3` is `-9999999999999996:`), and an integer's text prefixes its fractions' (3 of 3.14), so a
+ * `beginsWith` on a numeric composite means the whole value, `eq`. Every `beginsWith` on a
+ * composite follows this one rule: an index accessor's `.where()`, a history's `.where()`, and
+ * `Aggregate.list`'s `prefix`.
+ */
+export const matchesTextPrefix = (keyForm: unknown): boolean =>
+  typeof keyForm !== "number" && typeof keyForm !== "bigint"
+
+/**
  * Above every key below a complete sort key prefix: the delimiter is followed by
  * a composite's label, and no label reaches U+FFFF.
  */

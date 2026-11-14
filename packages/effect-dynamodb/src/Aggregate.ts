@@ -125,6 +125,7 @@ import {
   type Expr,
   emptyPartProblem,
   isEmptyExpr,
+  isPrimitiveOperand,
   parseSimpleShorthand,
   type StoredFormAt,
 } from "./internal/Expr.js"
@@ -478,6 +479,22 @@ export interface ListOptions<Model = Record<string, unknown>> {
   readonly filterBy?: (rootItem: Record<string, unknown>) => boolean
   /** Walk the list index in descending order (`ScanIndexForward: false`). */
   readonly reverse?: boolean
+  /**
+   * Match the last list sort key composite the key gives as a **prefix** of its value, rather than
+   * the whole value. For a list keyed `sk: [league, name]`, `list({ league: "big" })` returns the
+   * aggregates whose league is `big`; with `prefix: true` it also returns `Big Bash` and
+   * `Big Bash League`. Every composite before the last given is still matched whole, so
+   * `list({ league: "Big Bash", name: "fin" }, { prefix: true })` returns the `Big Bash` aggregates
+   * whose name starts with `fin`.
+   *
+   * The prefix is composed as the key is, so it follows the schema's casing (case-insensitive
+   * under the default lowercase) and `escapeKeys`, and the list pages with its own cursor. A
+   * number has no text prefix: on a numeric composite it matches the whole value, as without the
+   * option. A date (any composite whose schema transforms its value) is read as a whole value of
+   * its type, so this is for text composites. With no list sort key composite given, it changes
+   * nothing.
+   */
+  readonly prefix?: boolean
 }
 
 /** Result of a paginated list query */
@@ -647,7 +664,8 @@ export interface Aggregate<
    *
    * Requires `list` config on the aggregate. Queries the list collection GSI using
    * filter as key composites. PK composites are required (or empty for shared
-   * partition), SK composites enable prefix filtering.
+   * partition); leading SK composites narrow the list to those values, each
+   * matched whole, or the last one as a prefix with `options.prefix`.
    *
    * Supports cursor-based pagination via `options.limit` and `options.cursor`.
    * When `limit` is specified, returns at most that many aggregates plus a cursor
@@ -2304,6 +2322,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * (`operandsAsStored`).
    */
   const rootStoredFormAt: StoredFormAt = (segments, value, kind) => {
+    // A primitive is sent as given, as up to 1.41.0: the root's encoders don't tell a value the
+    // attribute stores as another type from one it doesn't, as an entity's `operand` does.
+    if (isPrimitiveOperand(value)) return value
     const name = String(segments[0])
     const encode = segments.length === 1 ? attrEncoders[name] : undefined
     const field = schemaFields?.[name]
@@ -5570,6 +5591,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
             else break // Stop at first gap (prefix matching)
           }
           const skComplete = skValues.length === listConfig.sk.composite.length
+          // `prefix: true` matches the last value given as a prefix of its key text, unless it's a
+          // number, which has no text prefix and is matched whole (`matchesTextPrefix`, the rule
+          // an entity's `.where()` `beginsWith` follows).
+          const lastGiven = listConfig.sk.composite[skValues.length - 1]
+          const skPrefix =
+            options?.prefix === true &&
+            lastGiven !== undefined &&
+            KeyComposer.matchesTextPrefix(ownValue(listSkFilter, lastGiven))
 
           let rootItems: Array<Record<string, unknown>>
           let nextKey: Record<string, AttributeValue> | undefined
@@ -5611,6 +5640,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   ]),
                   skValues,
                   skComplete,
+                  skPrefix,
                   limit,
                   pageSize,
                   filter: rootFilter,
@@ -5651,6 +5681,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 pkValue: composeCollectionKey(config.schema, listConfig.name, listPkComposites),
                 skValues,
                 skComplete,
+                skPrefix,
                 limit,
                 pageSize,
                 startKey,
@@ -9578,6 +9609,8 @@ interface ListPartitionOptions {
   readonly skValues: ReadonlyArray<string>
   /** Whether `skValues` holds every list SK composite: the key is complete. */
   readonly skComplete: boolean
+  /** Match the last of `skValues` as a prefix of its value (`ListOptions.prefix`). */
+  readonly skPrefix: boolean
   /** At most this many items — accumulated across requests, filter or not. */
   readonly limit?: number | undefined
   /** DynamoDB `Limit` per request (rows examined). */
@@ -9647,11 +9680,15 @@ const queryListPartition = (
     // accessors: a complete key is matched with `=`, a partial one with
     // `begins_with` on the prefix and the delimiter. A bare `begins_with` on
     // the composed values matches longer siblings — `alice` also matching
-    // `alicex`, and `rate: 3` matching 3.5, whose key text extends 3's.
+    // `alicex`, and `rate: 3` matching 3.5, whose key text extends 3's. That
+    // bare `begins_with` is what `prefix: true` asks for (`skPrefix`).
     if (skValues.length > 0) {
       const skText = composeCollectionKey(schema, listConfig.name, skValues)
       exprNames["#sk"] = listConfig.sk.field
-      if (options.skComplete) {
+      if (options.skPrefix) {
+        exprValues[":skPrefix"] = toAttributeValue(skText)
+        keyCondition += " AND begins_with(#sk, :skPrefix)"
+      } else if (options.skComplete) {
         exprValues[":sk"] = toAttributeValue(skText)
         keyCondition += " AND #sk = :sk"
       } else {

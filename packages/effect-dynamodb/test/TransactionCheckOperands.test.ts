@@ -3,8 +3,9 @@
  * one of Effect's instances in the form the field stores it (#236), through the encoder a
  * condition on the entity uses (`operandsAsStored`, #242). The builder has no entity, so a
  * `DateTime` was marshalled as its own map, which no row holds: on a `Schema.DateTimeUtc` field,
- * stored as ISO text, `eq` never held and `ne` always did. A condition holding no such operand
- * sends the request it sent before, byte for byte.
+ * stored as ISO text, `eq` never held and `ne` always did. So is a primitive the field doesn't hold
+ * as given (`3` on a `Schema.NumberFromString`, which stores `"3"`). A condition holding no such
+ * operand sends the request it sent before, byte for byte.
  */
 
 import { it } from "@effect/vitest"
@@ -23,7 +24,12 @@ const at = DateTime.makeUnsafe("2024-01-02T03:04:05.000Z")
 /** Sends a check of `a` with `condition` beside a put of `b`: how it ended, and the check sent. */
 const run = (condition: Expression.ExpressionResult) => {
   const E = Entity.make({
-    model: Schema.Struct({ id: Schema.String, at: Schema.DateTimeUtc, n: Schema.Number }),
+    model: Schema.Struct({
+      id: Schema.String,
+      at: Schema.DateTimeUtc,
+      n: Schema.Number,
+      c: Schema.NumberFromString,
+    }),
     entityType: "E",
     primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
   } as never) as any
@@ -34,12 +40,12 @@ const run = (condition: Expression.ExpressionResult) => {
   const table = makeRecordingTable()
   return Effect.gen(function* () {
     const db: any = yield* DynamoClient.make({ entities: { E }, tables: { Main } } as never)
-    yield* db.entities.E.put({ id: "a", at, n: 1 }).asEffect()
+    yield* db.entities.E.put({ id: "a", at, n: 1, c: 3 }).asEffect()
     table.take()
     const exit = yield* Effect.exit(
       Transaction.transactWrite([
         Transaction.check(db.entities.E.get({ id: "a" }), condition),
-        db.entities.E.put({ id: "b", at, n: 2 }),
+        db.entities.E.put({ id: "b", at, n: 2, c: 4 }),
       ]),
     )
     const write = table.requests.find((request) => request.command === "TransactWriteItems")!
@@ -123,6 +129,14 @@ describe("Transaction.check sends an Effect instance operand as its field stores
           ":v3": { S: "a" },
         },
       })
+      holds(got.exit)
+    }),
+  )
+
+  it.effect("a number on a NumberFromString field: the text it stores, and the check holds", () =>
+    Effect.gen(function* () {
+      const got = yield* run(Expression.condition({ eq: { c: 3 } }))
+      expect(got.sent.ExpressionAttributeValues).toEqual({ ":v0": { S: "3" } })
       holds(got.exit)
     }),
   )

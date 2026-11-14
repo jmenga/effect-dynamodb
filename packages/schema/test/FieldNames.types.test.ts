@@ -355,6 +355,60 @@ describe("definition attribute names are typed from the model", () => {
       )
     })
 
+    it("unique fields, a ref's id but not the ref", () => {
+      class Player extends Schema.Class<Player>("Player")({
+        playerId: Schema.String,
+        season: Schema.String,
+        team: Team,
+      }) {}
+      const model = DynamoModel.configure(Player, {
+        playerId: { identifier: true },
+        team: { ref: true },
+      })
+      const primaryKey = {
+        pk: { field: "pk", composite: ["playerId"] },
+        sk: { field: "sk", composite: [] },
+      } as const
+      const refs = { team: { entity: Teams } }
+      Entity.make({
+        model,
+        entityType: "Player",
+        primaryKey,
+        refs,
+        unique: { perTeam: ["season", "teamId"], byTeam: { fields: ["teamId"] } },
+      })
+      expect(() =>
+        Entity.make({
+          model,
+          entityType: "Player",
+          primaryKey,
+          refs,
+          // @ts-expect-error not a model field or ref id
+          unique: { perTeam: ["season", "teemId"] },
+        }),
+      ).toThrow(/\[EDD-9002\] .*unknown attribute "teemId"\. Valid attributes: .*teamId/)
+      expect(() =>
+        Entity.make({
+          model,
+          entityType: "Player",
+          primaryKey,
+          refs,
+          // @ts-expect-error the ref itself: its id is the value
+          unique: { perTeam: ["season", "team"] },
+        }),
+      ).toThrow(/\[EDD-9172\] .*names ref "team".*Name the ref's id instead: "teamId"\./)
+      // Without `refs`, there is no ref's id to name.
+      expect(() =>
+        Entity.make({
+          model,
+          entityType: "Player",
+          primaryKey,
+          // @ts-expect-error no refs declared
+          unique: { perTeam: ["season", "teamId"] },
+        }),
+      ).toThrow(/\[EDD-9002\]/)
+    })
+
     it("timeSeries orderBy and appendInput", () => {
       const appendInput = Schema.Struct({
         listingId: Schema.String,

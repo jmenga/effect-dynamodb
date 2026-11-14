@@ -1,5 +1,7 @@
 /**
  * `escapeKeys` (#183) on DynamoDB Local. The scenarios are in `helpers/EscapeKeyScenarios.ts`.
+ * The rekeys of stored release rows start from 1.37.0's (1.38.0 stored the same keys); the unit
+ * file runs both releases'.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -142,7 +144,9 @@ describeConnected("escapeKeys", () => {
     }
   })
   describe("rows the published 1.37.0 and 1.38.0 stored", () => {
-    for (const scenario of releaseRowScenarios) {
+    // 1.38.0 stored every key 1.37.0 did (the first scenario), so here the rekeys start from
+    // 1.37.0's rows; `EscapeKeys.test.ts` runs both releases'.
+    for (const scenario of releaseRowScenarios.filter((s) => !s.name.startsWith("1.38.0, "))) {
       it.live(scenario.name, () => scenario.run(harness))
     }
   })

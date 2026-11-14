@@ -3445,7 +3445,10 @@ siblings. The rule covers the primary accessor, every GSI accessor (on an
 isolated or a clustered collection index too), `Entity.query.<index>` and the
 language service's params (a collection query pins no sort key composites); `Aggregate.list` applies the same rule to its list sort key
 (`=` when every list sk composite is given, else `begins_with` with a trailing
-`#`). A full pin on a time-series entity's primary accessor reads the current item
+`#`). Its `prefix: true` option (#264) sends 1.36's bare `begins_with(<key text>)`, so
+the last value given matches as a prefix, as `.where(beginsWith)` does on an entity; a
+numeric last value has no text prefix and keeps the rule above
+(`KeyComposer.matchesTextPrefix`). A full pin on a time-series entity's primary accessor reads the current item
 only, never its `#e#` rows. Z-order halves pin prefix segments only and are
 unaffected. An index whose sort key has no composites (an empty-composite half)
 pins nothing: its accessor sends the partition key alone, and on the primary key
@@ -3881,7 +3884,7 @@ and an aggregate's `list` filter (the root's attribute encoder for a top-level
 field, `contains` included; anywhere deeper, as given). An instance whose map is
 the stored form (a zone, a `Duration`, a `BigDecimal`, an `Option` of a number,
 any value of an untyped field) is the bytes 1.40.0 sent, and an operand that
-isn't an instance or a `Date` (a primitive, a plain map or list, even one holding
+isn't an instance, a `Date` or a primitive (a plain map or list, even one holding
 instances, a path) and a `begins_with` prefix are sent as given: reading inside
 a plain container would read the caller's values a second time. Finding an
 instance reads the operand's prototype once. A `.where()` bound composes key text
@@ -3891,6 +3894,27 @@ through the key form, as it did. `Transaction.check` takes a condition
 has no stored form to give: their operands are sent as given. Pinned by
 `OperandsAsStored.test.ts`, `OperandStoredForm.test.ts` and
 `connected.operands-as-stored.test.ts`.
+
+*A primitive* (text, a number, a `bigint`, a boolean) goes to `operand` too
+(`isPrimitiveOperand`), and is put in its stored form only where a write of it
+stores a primitive of another DynamoDB type (`keepsAsGiven`): `5` where a
+`Schema.NumberFromString` stores `"5"`, `5n` on a `BigIntFromString`, a number
+on a date stored as ISO text. Everywhere else it is sent as given, as 1.41.0
+sent it: text where text is stored could be the stored text, a substring for
+`contains` or a prefix, which the library can't tell apart, so `"aGVsbG8="` and
+`"bG"` on a `Schema.StringFromBase64` (a set's member included) and a partial ISO
+`"2026-01"` on a date are the same bytes; so is a number where a number is
+stored, and a primitive where what's stored is no primitive. The same holds for
+each `isIn` value and `between` bound, and for a `contains` operand against a
+list's element or a set's member. A path into a ref follows the referenced
+entity's model, which the stored ref holds in its stored form, so
+`eq(t.player.id, 5)` on a player keyed by a `NumberFromString` compares the
+`"5"` the ref holds. Up to 1.41.0 every primitive was sent as given, so such a
+comparison never held (a number against text; `ne` always held). An aggregate's
+`list` filter still sends a primitive as given: the root's attribute encoders
+are left as they were. Pinned by `OperandsAsStored.test.ts`,
+`TransactionCheckOperands.test.ts` and `helpers/EntityRefOperands.ts`
+(recording table and DynamoDB Local).
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first
@@ -4001,10 +4025,17 @@ the model declares (`Object.hasOwn`): the tables a definition looks fields up in
 1.40.0 an update of it beside a sparse map wrote `undefined#…` attributes and returned the old
 value). Path operations take segments, not a callback; segments a builder's `.entry()` built
 carry the mark that they name an entry (`entryOfPath`). A model field named like one of the
-builder's own members (`at`, `size`, `entry`, `segments`, `_tag`, `pipe`, `then`, `toJSON`) is
-the member in a callback, not the field, as through 1.40.0 (named, not changed): an equality
-shorthand (`{ eq: { at: 1 } }`, `.filter({ at: 1 })`), a record operation (`.set({ at })`) and a
-path operation's segments (`["at"]`) reach it (`test/PathBuilderMembers.test.ts`). A
+builder's accessors (`size`, `at`, `entry`) is the field in a callback, at the root and below a
+struct (`t.size`, `t.box.size`), and, called, the accessor on the path before it
+(`t.box.size()`, `t.roster.at(0)`, `t.zones.entry("k")`): that path is a function whose call
+performs the accessor, and `isPath` takes it. Through 1.41.0 it was only the accessor, so
+`eq(t.size, 5)` sent an operand with no value, which DynamoDB rejected. A field named `_tag` (a
+tagged struct's tag, `t.box._tag`) is the field too: a path is recognised by its `PathTag`, and
+through 1.41.0 `_tag` was the text `"Path"`, so a condition on it never held. A field named like
+one of the builder's other members (`segments`, `pipe`, `then`, `toJSON`) is still the member: an
+equality shorthand (`{ eq: { segments: 1 } }`, `.filter({ segments: 1 })`), a record operation
+(`.set({ segments })`) and a path operation's segments (`["segments"]`) reach it
+(`test/PathBuilderMembers.test.ts`). A
 filter on `t.g.entry("b")` names the attribute a condition names, and asks the
 row where it holds a map a `field:` rename stores whole (`entryForms`). In a
 collection each member names the entry by its own prefix, a member that holds
@@ -5656,6 +5687,43 @@ default fills one in), and fails as on 1.40.0 where they don't (`get.decode`,
 (`fixtures/entity-ref-keys-encoding-default-1.40.0.json`). The identifier is
 still required at `Entity.make`, as before.
 
+**A ref holds a field in the storage its entity's `configure` gives it.** `refDataOf`
+encodes the referenced item through the target's `modelSchema`, which applies the
+target's `DynamoModel.configure` overrides, so a ref copy holds a field `storedAs` a date
+schema (`DateEpochSeconds`, say) in that storage, as the target's own row does. The
+referencing entity builds its ref schemas from the target's raw model, so they apply the
+same storage: the write and read fields (`refHeldSchema` with
+`DeepSubstitutionOptions.configuredStorage`, from `configuredStorageOf`) and the path
+encoder behind conditions, filters and `pathSet` (`makePathValueEncoder`'s `refStorage`),
+by the tests `substituteSchemas` applies the entity's own storage by (a date, an
+`optionalKey` one, one beneath a decoding default, a union's date member). Up to 1.41.0 they
+applied the default: a date stored as epoch seconds read back as milliseconds (a 1970
+date), a `NullOr` date so stored failed the `put` that wrote it and every read of its row, a
+condition or filter on it sent ISO text and matched no row, and `pathSet` wrote ISO text into
+the copy. What hydration stores is unchanged, and a ref whose entity configures no storage
+sends what 1.41.0 sent (`helpers/EntityRefStoredAs.ts`, `EntityRefKeys.test.ts`,
+`connected.entity-ref-keys.test.ts`). A copy holding ISO text, as `pathSet` wrote it up to
+1.41.0, reads as the date it holds, as it did on 1.41.0: a read takes the field's own storage
+beside the configured one, by the kind of value stored (`readsDeclaredStorage`, set on read
+schemas only). Out of a union the date's transform reads text as ISO text already; in one, the
+member is a union of the configured transform and the declared one, each strict, the way an
+aggregate's member reads two storages, and a member either one takes canonically is decoded
+first (`declaredStoragePlan`), so a `Union([String, DateTimeUtc])` reads ISO text as the date,
+as 1.41.0 did (`RefConfiguredStorage.test.ts`). Writes and operands encode the configured form
+only. Where both storages are numbers (a field declared in epoch milliseconds that `configure`
+stores in seconds) the kind can't tell them apart, and the configured scale is read. A condition
+on a copy holding ISO text sends the configured form and doesn't match it; rewriting the ref
+(`.set({ playerId })`, or an update of the target with `.cascade()`) stores it again. Named, not
+changed: the storage is the target's own fields', not that of a ref the
+target holds in turn. With `Selection` → `Player` → `Team`, `Team` configuring `founded`,
+`Player` now stores and reads its copy of `team` right, so `Selection`'s copy of `player.team`
+holds `founded` in `Team`'s storage, which `Selection` reads with the default (a 1970 date, as
+1.41.0 read the ISO text it stored of the 1970 date `Player` read). A whole-ref
+`pathSet(["player"], value)` the ref's schema refuses as a whole is encoded part by part over
+the raw model, without the storage. An aggregate's ref and `one` edge copies are encoded by the
+aggregate's own encoders over the raw model (`buildAttrEncoders`), so they hold the default
+form and read it back with the same: consistent, and unchanged.
+
 **Every write keys a ref's indexes from the id given (#241).** `put` composes an
 index keyed by `${field}Id` from the id in its input; `upsert` and `update` /
 `patch` / a planned `transactWrite` update compose from the hydrated payload,
@@ -5678,6 +5746,51 @@ an index keyed by its id stored) and the ref may be removed by its field
 `${field}Id`, is still refused by `.remove()`
 (`fixtures/entity-ref-writes-1.40.0.json`, `helpers/EntityRefWrites.ts`).
 
+**Reassigning one ref of a half that holds two (#263).** An update composes a half from its
+payload and its key record, under the index policy (§7): a plain update reads no row, so
+`.set({ teamId })` on a half `[season, series, teamId, playerId]` leaves it as stored, and
+`.set({ season, series, teamId })` truncates it before `playerId`. For an ordinary composite
+the remedy is to give the unchanged value; for a ref, giving the unchanged `playerId` fetches
+the player again and rewrites the stored copy. `.keepRefs({ playerId })` (a `BoundUpdate`
+method and the pipeable `Entity.keepRefs`, typed `KeptRefIds`) gives the id for key
+composition only: encoded as `.set()` encodes it, it is laid over the composer's key record
+(`withKeptRefIds`), so it keys every half it is a composite of and fills a half the payload
+touches, without being hydrated or written. The write is conditioned on the row holding that
+ref (`keptRefsOf`: `#player.#id = :id` through `compileOwnCondition`, the id encoded as the
+stored copy holds it, through the referenced entity's own field, `storedRefKeyOf`, the inverse of
+`storedRefIdOf`: `"5"` of a `NumberFromString`, which the key composes as `…0005`), ANDed with
+`patch`'s guard and the caller's
+condition and replaced by no `.condition()`; a row holding another fails it
+(`ConditionalCheckFailed`, read as the caller's condition: in a planned `transactWrite`
+update the plan's `callerCondition`, so `TransactionCancelled`). No read is added on any
+path, and the per-half gate is unchanged: the kept id sits in the key record, where a
+composite the writer doesn't give but knows already sits. Refused before anything is sent: a
+name that is no ref id an update can give (`EDD-9166`), and a ref the same update reassigns
+or removes (`EDD-9167`). An update that holds the whole row (the read-then-write path: a
+retained entity, a unique field changed, a computed index composite, both images) composes its
+halves from the merged row, and the merged row holds each ref, not its id: `heldRefsOf` reads a
+ref's id from the row (`storedRefId`, as `toDomainView` reads it) where a half holding that id
+also holds a composite the update gives or removes, and the update doesn't have the id
+otherwise (given, kept, a primary key composite), and `withHeldRefIds` puts it in the key
+record, so such an update keys a half it touches as a `put` of the row would. Up to 1.41.0
+those ids were missing there, so the half was truncated before the first of them
+(`.set({ season })` on a retained entity dropped both ids from the half above);
+`rekey({ repairIndexKeys: true })` rewrites rows left that way. An id so read is guarded as
+read. Versioned, by the version, as every input. Unversioned, the guard of each composite of a
+written half (`#gN = :gN`, or `attribute_not_exists(#gN)` where it was absent) would name the id,
+which the row never stores, and hold whatever the ref is: for an id read from the row it is
+`#gN.#gNk = :gN` instead, the id inside the stored ref (`compositeAttribute`) as read
+(`heldRefGuard`). A ref reassigned between the read and the write fails it, reported as the
+plain-field guard's failure is (`ConcurrentModification` naming the ref; a planned
+`transactWrite` update plans again), and the key never names the ref read. A refreshed copy of
+the same ref doesn't fail it. Only a request whose key this read already changed carries it:
+`attribute_not_exists` on an id the write gives itself stays as it was. A half the update
+doesn't touch is left as stored, as before: the id the stored copy holds may be spelled other
+than the one the half was composed from (a ref read through a key that folds case,
+`RefIdPrimaryKey.test.ts`), so recomposing it from the copy would move a key no write asked to
+move. Requests for an update without `.keepRefs()` are unchanged on every other path
+(`helpers/EntityRefKeep.ts`, `EntityKeepRefs.types.test.ts`).
+
 **A ref's id may be a primary key composite.** With `primaryKey: { pk: ["projectId"] }`
 and `refs: { project: ... }`, the key schema (`keySchema`, `Entity.Key`) takes the id as
 the input does, so `get`, `update`, `delete` and every other key-taking operation name
@@ -5691,6 +5804,22 @@ caller's id wins (`withRefIds`). Up to 1.40.0 the key schema dropped the
 id, so every key-taking operation but `put` and `create` died with
 `Missing composite attribute "projectId"`, and `restore` wrote no key for an index keyed
 by a ref's id (`RefIdPrimaryKey.test.ts`, `connected.ref-id-primary-key.test.ts`).
+
+**A ref's id may be a unique constraint's field (#266).** `unique: { identity: ["season",
+"teamId"] }` reserves the id, as an index composite takes it. Its sentinel is composed
+from the id the stored ref holds on every path (`composeUniqueSentinel` in `makeImpl`,
+which reads `storedRefId` off the ref when the source holds one, and takes the id as given
+only from a put's input before hydration), so `put`, an update reassigning the ref (which
+moves the reservation like any other unique field: setting `teamId` touches the
+constraint), `delete`, soft delete, `restore`, a planned transaction write and `rekey`
+compose one key. A guard on the constraint's fields as read names the ref's attribute,
+which is what holds the id (`compositeAttribute`). An entity whose constraints name no ref
+composes as before. Naming the ref itself (`"team"`) is refused at `make` (`EDD-9172`):
+up to 1.41.0 it composed the hydrated object's text, `[object object]`, for every item,
+so the first item took the value for all of them, and the id was refused (`EDD-9002`).
+Those sentinels are not migrated: `rekey({ reservations: true })` reports each as
+`orphaned` (no row's values compose its key), and `releaseOrphanedReservations` deletes
+them (`UniqueOverRefs.test.ts`, `connected.unique-over-refs.test.ts`).
 
 Every id is judged before anything is fetched. An entity keyed by more than
 one distinct composite, or none, has nothing one id names: `create` fails with
@@ -8719,7 +8848,7 @@ for unrelated errors and the collision was caught only at review.
 | Code | Raised in | Condition |
 |------|-----------|-----------|
 | `EDD-9001` | `Entity.ts` | Primary key declares no composite attribute in either `pk` or `sk` |
-| `EDD-9002` | `Entity.ts`, `DynamoClient.ts` | An index composite names an attribute the model doesn't have (incl. Z-order prefix composites and dimensions), a `unique` constraint names one, or a required partition-key composite is missing for an index (accessor) |
+| `EDD-9002` | `Entity.ts`, `DynamoClient.ts` | An index composite names an attribute the model doesn't have (incl. Z-order prefix composites and dimensions), a `unique` constraint names one (a ref's id, `${ref}Id`, is one it may name), or a required partition-key composite is missing for an index (accessor) |
 | `EDD-9003` | `KeyComposer.ts` | Malformed `GsiConfig` — missing `name`/`pk`/`sk`, or the pre-v3 `index` property |
 | `EDD-9004` | `DynamoClient.ts` | Sort-key composite supplied without its prior composites (prefix ordering) |
 | `EDD-9005` | `Entity.ts` | TTL string is not a valid duration, or resolves to a non-finite duration |
@@ -8852,6 +8981,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9162` | `internal/ObjectKeyText.ts` (schema, `defaultObjectText`, `objectKeyRefusal`, `judgeObjectKeyText`), decided where a key is composed (`KeyComposer.siteCompositeText`) under a write's own schema (`Entity.ts` `ownSchema`, `DynamoSchema.objectKeys`) | A write composing a key from an object whose key text is its default `[object …]` tag (a struct, a `Data` class, a class of one's own without a `toString`), which every such object composes alike: in the primary key, an index, a unique constraint, a vector partition or a time-series `orderBy`, on `put`, `create`, `upsert`, an update recomposing an index key, `append`, and a transaction's and a batch's put. A `ValidationError` naming the field and what composes it, with nothing written. A key-taking read or delete (`get`, `delete`, a query accessor, an update's own key record, `restore`) still composes the text, to reach a row an earlier release wrote under it. A value with a key form isn't refused. A key the write doesn't compose (sparse, a half an update leaves) refuses nothing. An aggregate's `create` and `update` too, through `Aggregate.ts` (`ownKeys`, `buildDynamoItems`): the partition key (`create`), the collection sort key, the list keys and a row's static discriminators; an `update` keeps a root composite equal to the one read. |
 | `EDD-9163` | `internal/WriteDiagnosis.ts` (`OperandType`, a site's opt-in diagnosis), rewritten by `Entity.ts` (the time-series `append`, `orderByRefusal`) | A time-series `append` whose `orderBy` value is stored as a type DynamoDB's `<` doesn't take: a map (an `Option`, a `Result`, a `Duration`, a `BigDecimal`, a zone), a list, a boolean or null. The append guards on the stored `orderBy` being below the new one (`#_tsob < :_tsNewOb`), and DynamoDB refuses that condition whatever the item holds, so such an entity can never `append` (a nullable one, each append holding null). It isn't checked: the append is sent, and DynamoDB's refusal (`Incorrect operand type for operator or function; operator or function: <, operand type: M`), confirmed on the request sent (the guard `#_tsob < :_tsNewOb` is in its condition and `:_tsNewOb` is of the type DynamoDB named), is rewritten into a `ValidationError` naming `timeSeries.orderBy`, its field and the type, with DynamoDB's error as the cause and nothing written. A refusal of the caller's own condition is DynamoDB's error, unchanged. A struct's `orderBy` is refused before that, as its key text (`EDD-9162`). |
 | `EDD-9165` | `Marshaller.ts` (`protoEntryAt`, in the walk `marshallStorable` makes of every item it marshals; `fromAttributeMap` and `fromAttributeValue` on the read), through `marshalOrFail` and `unstorableIn`; `Entity.ts` (`protoAttributeIn` and `unstorableFields` for an update's record operations, `unstorableOperand` for a path operation's segments); `internal/Expr.ts`; `internal/EntitySchemas.ts` (schema, `protoAbsent`, a payload's decode or encode through a derived struct, see `EDD-9152`) | An attribute or a map entry named `__proto__` that a write would send: an own map entry keyed `__proto__` at any depth (a `Schema.Record` entry, a `Map` entry, any object marshalled as a map), and an attribute so named: an optional model field stored under that name given a value (a packed one included), a field stored under an attribute so named given a value, an index key attribute so named given a key (its composites present: a key attribute with no value, `KeyValueError` in `KeyComposer`'s `keyAttribute`, made a `ValidationError` where a write composes its keys), `.set()`, `.add()`, `.subtract()` or `.append()` of it, and a path operation with a segment `__proto__`, naming the attribute or an entry of a map (every one but `pathRemove`). The AWS SDK's marshaller and unmarshaller assign each to a plain object, and assigning `__proto__` sets that object's prototype instead, so it is never sent, and one stored otherwise is never read back. A `ValidationError` naming the field and the key, on any write, condition or filter (`Transaction.check`'s included, `TransactWriteOps`), with nothing written (an aggregate `update` reads its state first). The `Expression` builders, which have no error channel, compile such an entry as 1.40.0 did (left out of the map: `unsent` in `internal/Expr.ts` remembers it), and the operation sending the result refuses it; 1.40.0 sent it, and DynamoDB refused it ("Supplied AttributeValue is empty"). `Marshaller.toAttributeValue` and `toAttributeMap` throw `UnstorableValue` with this code. Only that name, and only an own property: the `__proto__` every object inherits is not one, every other `Object.prototype` name is an entry like any other, and a sparse map's entry keyed `__proto__` (its own attribute, `field#__proto__`) and one in JSON text (a packed field, `Schema.fromJsonString`, never marshalled as a map) are stored and read back as any other. 1.40.0 stored an item without an attribute so named (an index key so named left the row out of the index; a field stored under it failed every `put` and `get`, and `upsert` died), sent a write holding such an entry for DynamoDB to refuse ("Supplied AttributeValue is empty"), and a path operation stored the entry. A row holding one (stored before, or by another writer) is read without it, whatever it holds: the reader leaves it out before the AWS SDK's unmarshaller sees it, where 1.40.0's set the row's or the map's prototype from a map stored there (any read of a row holding such an attribute died, whatever it held; a struct field holding such an entry read the entry's map as its own fields). `pathRemove` removes it |
+| `EDD-9166` | `Entity.ts` (`keptRefsOf`), at `update` / `patch` and a planned `transactWrite` update (`ValidationError`, `operation: "update.keepRefs"`, nothing sent) | `.keepRefs()` naming something that is no ref id an update can give: a model field, a typo, or a ref's id that is a primary key composite (no update changes the key). Typed callers can't write one (`KeptRefIds`). The message lists the ids it takes (#263). |
+| `EDD-9167` | `Entity.ts` (`keptRefsOf`), as `EDD-9166` | `.keepRefs()` keeping a ref the same update reassigns (`.set({ playerId })`) or removes (`.remove(["player"])`): keep it or change it, not both (#263). |
+| `EDD-9172` | `Entity.ts` (schema, the `unique` check in `make`), pure and operational | A `unique` constraint naming a ref (`"team"` for `refs: { team }`, or a field the model marks `ref: true`). The ref's value is the referenced item's data, which composed the key text `[object object]` for every item, so the first item written took the value for all of them (#266). Refused at load, naming the constraint and the ref and saying to write its id (`teamId`), which a constraint takes as an index composite does. The `unique` type leaves refs out, so it is a compile error too. |
 
 Next free code: `9111`, else none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9114`–`9120` are taken on branches in flight, and `9107` and `9113` are retired, don't reuse them); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 

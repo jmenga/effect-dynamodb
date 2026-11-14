@@ -136,3 +136,41 @@ describe("PathBuilder — top and opaque types map as in 1.25.0", () => {
     expect(true).toBe(true)
   })
 })
+
+describe("PathBuilder — a field named size, at or entry", () => {
+  const Named = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      size: Schema.Number,
+      at: Schema.String,
+      entry: Schema.String,
+      box: Schema.Struct({ size: Schema.Number }),
+      tags: Schema.Array(Schema.String),
+    }),
+    entityType: "Named",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+
+  it("is the field's path, at the root and below a struct", () => {
+    Named.condition((t, { and, eq }) =>
+      and(eq(t.size, 5), eq(t.at, "x"), eq(t.entry, "y"), eq(t.box.size, 5)),
+    )
+    // @ts-expect-error — `size` holds a number
+    Named.condition((t, { eq }) => eq(t.size, "5"))
+    // @ts-expect-error — `box.size` holds a number
+    Named.filter((t, { eq }) => eq(t.box.size, "5"))
+    // @ts-expect-error — `at` holds a string
+    Named.condition((t, { eq }) => eq(t.at, 1))
+    Named.select((t) => [t.size, t.at, t.entry, t.box.size])
+    expect(true).toBe(true)
+  })
+
+  it("is the accessor where it is called on an attribute, and nowhere else", () => {
+    Named.condition((t, { and, gt, eq }) =>
+      and(gt(t.box.size(), 0), gt(t.tags.size(), 1), eq(t.tags.at(0), "x")),
+    )
+    // @ts-expect-error — the root is the item, not an attribute: `t.size` is only the field
+    Named.condition((t, { gt }) => gt(t.size(), 0))
+    expect(true).toBe(true)
+  })
+})

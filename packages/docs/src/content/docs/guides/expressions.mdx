@@ -668,6 +668,8 @@ Products.condition((t, ops) => {
 | `t.items.at(0).name` | Nested in array | `["items", 0, "name"]` | `#items[0].#name` |
 | `t.tags.size()` | Size function | `["tags"]` | `size(#tags)` |
 
+A field your model names `size`, `at` or `entry` is reached like any other: `t.size` and `t.box.size` are paths to that field. Called, the name is still the accessor on the path before it, so `t.box.size()` is the size of `box`.
+
 All string segments are automatically aliased through `ExpressionAttributeNames` to handle DynamoDB reserved words.
 
 A `field:` rename from `DynamoModel.configure` names a top-level attribute, so it applies to a path's first segment only. Below it a value is stored whole, under its own property names. With `count` stored as `renamed`, `t.count` is `#renamed`, and `t.meta.count` is `#meta.#count`, which is where `put` stored it. That holds for an update's path operations, a condition, a filter and a projection alike.

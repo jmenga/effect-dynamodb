@@ -1202,6 +1202,13 @@ export interface DeepSubstitutionOptions {
    */
   readonly resolveRef?: ((name: string, field: Schema.Top) => Schema.Top | undefined) | undefined
   /**
+   * The storage `DynamoModel.configure` gives immediate fields of the passed model (`storedAs` a
+   * date schema), by name (applied only at the top level), as the model's own entity applies it
+   * ({@link substituteSchemas}): a ref to that entity stores its item as the entity's read schema
+   * encodes it (`refDataOf`), so it holds such a field in that storage ({@link configuredStorageOf}).
+   */
+  readonly configuredStorage?: Readonly<globalThis.Record<string, DynamoEncoding>> | undefined
+  /**
    * Also substitute Pattern B transform date schemas (e.g.
    * `Schema.DateTimeUtcFromString`) with a TOLERANT date transform that accepts
    * the domain value too on decode. Propagated through the whole recursion.
@@ -1258,6 +1265,12 @@ export interface DeepSubstitutionOptions {
   readonly unionDateOverride?: DynamoEncoding | undefined
   /** Set internally from `unionDateOverride` on the union's members. */
   readonly dateEncodingOverride?: DynamoEncoding | undefined
+  /**
+   * Set internally, beside a ref's `configuredStorage` on a READ schema: the date also reads the
+   * form its own storage writes, which a ref copy holds where a path write put it there up to
+   * 1.41.0 ({@link declaredStoragePlan}). Goes where the override goes.
+   */
+  readonly readsDeclaredStorage?: boolean | undefined
   /** The field path being substituted, for error messages. */
   readonly path?: ReadonlyArray<string> | undefined
   /**
@@ -1500,6 +1513,7 @@ const childOptions = (
     strictWireKind: true,
     collidingKinds,
     ...(opts?.unionDateOverride ? { dateEncodingOverride: opts.unionDateOverride } : {}),
+    ...(opts?.unionDateOverride && opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
   }
 }
 
@@ -1604,6 +1618,7 @@ const throughOptional = (
         ...(opts.unionDateOverride ? { unionDateOverride: opts.unionDateOverride } : {}),
         ...(opts.collidingKinds ? { collidingKinds: opts.collidingKinds } : {}),
         ...(opts.dateEncodingOverride ? { dateEncodingOverride: opts.dateEncodingOverride } : {}),
+        ...(opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
       }
     : deeper
 }
@@ -1647,16 +1662,50 @@ const selfDatePlan = (
   return { encoding, canonicalOnly }
 }
 
+/**
+ * Under `readsDeclaredStorage`, in a union: the plan of the storage the date declares, where the
+ * override reads another kind of value (see `readsDeclaredStorage`). Out of a union the override's
+ * transform reads a value by its kind already, text as ISO text and a number in its own scale.
+ */
+const declaredStoragePlan = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): ReturnType<typeof selfDatePlan> => {
+  if (!opts?.readsDeclaredStorage || !opts.strictWireKind || !opts.dateEncodingOverride) {
+    return undefined
+  }
+  const own = getEncoding(schema) ?? inferDefaultEncoding(schema)
+  const text = (encoding: DynamoEncoding) => encoding.storage === "string"
+  if (own === undefined || text(own) === text(opts.dateEncodingOverride)) return undefined
+  try {
+    return selfDatePlan(schema, { ...opts, dateEncodingOverride: undefined })
+  } catch {
+    // An epoch beside a number member (EDD-9058) is refused where it's the storage, not here.
+    return undefined
+  }
+}
+
 const selfDateSubstitute = (
   schema: Schema.Top,
   opts: DeepSubstitutionOptions | undefined,
 ): Schema.Top => {
   const plan = selfDatePlan(schema, opts)
   if (plan === undefined) return schema
-  return buildDateTransform(plan.encoding, {
+  const substitute = buildDateTransform(plan.encoding, {
     strictWireKind: opts?.strictWireKind,
     canonicalOnly: plan.canonicalOnly,
   })
+  // Encodes as the override, and reads either form, as an aggregate's union member does.
+  const declared = declaredStoragePlan(schema, opts)
+  return declared === undefined
+    ? substitute
+    : (Schema.Union([
+        substitute as Schema.Codec<any>,
+        buildDateTransform(declared.encoding, {
+          strictWireKind: true,
+          canonicalOnly: declared.canonicalOnly,
+        }) as Schema.Codec<any>,
+      ]) as unknown as Schema.Top)
 }
 
 /**
@@ -1672,7 +1721,12 @@ const isCanonicalDateMember = (
   opts: DeepSubstitutionOptions | undefined,
 ): boolean => {
   const inner = optionalField(member)?.inner ?? member
-  if (isSelfDateSchema(inner)) return selfDatePlan(inner, opts)?.canonicalOnly === true
+  if (isSelfDateSchema(inner)) {
+    return (
+      selfDatePlan(inner, opts)?.canonicalOnly === true ||
+      declaredStoragePlan(inner, opts)?.canonicalOnly === true
+    )
+  }
   // A nested union holding such a member (`NullOr(DateTimeUtc)` next to a
   // `String`) is decoded first for the same reason.
   const container = walkedContainer(inner)
@@ -2372,7 +2426,15 @@ export const substituteSchemaDeep = (
         const sub = substituteSchemaDeep(refTarget, atField(deeper, opts, name))
         setOwn(subFields, name, fieldNamed(name, fieldOpt ? fieldOpt.rewrap(sub) : sub, field))
       } else {
-        const sub = substituteSchemaDeep(field, atField(deeper, opts, name))
+        const sub = substituteSchemaDeep(
+          field,
+          withConfiguredStorage(
+            atField(deeper, opts, name),
+            name,
+            field,
+            ownValue(opts?.configuredStorage, name),
+          ),
+        )
         setOwn(
           subFields,
           name,
@@ -2816,6 +2878,45 @@ const unionDateOverride = (
 }
 
 /**
+ * @internal The storage `DynamoModel.configure` gives a model's fields (`storedAs` a date schema),
+ * by name, or `undefined` for a model with none. What a ref to the model's entity holds such a
+ * field in (`DeepSubstitutionOptions.configuredStorage`).
+ */
+export const configuredStorageOf = (
+  model: unknown,
+): Readonly<globalThis.Record<string, DynamoEncoding>> | undefined => {
+  if (!isConfiguredModel(model)) return undefined
+  const storage: globalThis.Record<string, DynamoEncoding> = {}
+  for (const [name, attribute] of Object.entries(model.attributes)) {
+    if (attribute.encoding !== undefined) setOwn(storage, name, attribute.encoding)
+  }
+  return Object.keys(storage).length === 0 ? undefined : storage
+}
+
+/**
+ * A field's substitution options with the storage `encoding` its model's `DynamoModel.configure`
+ * gives it, where its entity applies that storage ({@link substituteSchemas} decides by the same
+ * tests): a date (a `Schema.optionalKey` one too, or one beneath a decoding default), or a union's
+ * date member. Elsewhere, and without one, `options` as given. A read (`legacyReads`) also takes
+ * the form the date's own storage writes (`readsDeclaredStorage`).
+ */
+const withConfiguredStorage = (
+  options: DeepSubstitutionOptions,
+  name: string,
+  field: Schema.Top,
+  encoding: DynamoEncoding | undefined,
+): DeepSubstitutionOptions => {
+  if (encoding === undefined) return options
+  const reads = options.legacyReads ? { readsDeclaredStorage: true } : {}
+  const defaulted = decodingDefaultField(field)
+  if (isSelfDateSchema(field) || (defaulted !== undefined && isSelfDateSchema(defaulted.inner))) {
+    return { ...options, dateEncodingOverride: encoding, ...reads }
+  }
+  const union = unionDateOverride(name, field, encoding)
+  return union === undefined ? options : { ...options, unionDateOverride: union, ...reads }
+}
+
+/**
  * Validate that no model field combines a transform schema with a storage
  * override. The two configuration paths are mutually exclusive: either declare
  * a self schema (`Schema.DateTimeUtc`) and let the annotation drive storage,
@@ -3053,8 +3154,17 @@ export const buildDerivedSchemas = (
     const optional = optionalField(ownValue(modelFields, ref.fieldName) as Schema.Top)
     const asDeclared = (target: Schema.Top) =>
       optional === undefined ? target : optional.rewrap(target)
+    // In the storage the target's `DynamoModel.configure` gives its fields, which the ref holds them
+    // in (`refDataOf`). Up to 1.41.0 the default: a date stored as epoch seconds read back as
+    // milliseconds, and a condition or `pathSet` on it sent ISO text.
+    const storage = configuredStorageOf(targetModel)
+    const configured = storage === undefined ? {} : { configuredStorage: storage }
     // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
-    setOwn(fields, ref.fieldName, asDeclared(refHeldSchema(resolved, { enforceChecks: true })))
+    setOwn(
+      fields,
+      ref.fieldName,
+      asDeclared(refHeldSchema(resolved, { enforceChecks: true, ...configured })),
+    )
     setOwn(
       readFields,
       ref.fieldName,
@@ -3062,6 +3172,7 @@ export const buildDerivedSchemas = (
         refHeldSchema(resolved, {
           legacyReads: true,
           absentReads: true,
+          ...configured,
         }),
       ),
     )
@@ -3508,6 +3619,27 @@ const asStored = (value: unknown): unknown => {
   return out
 }
 
+/** Text, a number, a `bigint` or a boolean. */
+const isPrimitive = (value: unknown): boolean => {
+  const type = typeof value
+  return type === "string" || type === "number" || type === "bigint" || type === "boolean"
+}
+
+/** The type DynamoDB holds a primitive as: text, a number (a `bigint` too), or a boolean. */
+const dynamoTypeOf = (value: unknown): "S" | "N" | "BOOL" =>
+  typeof value === "string" ? "S" : typeof value === "boolean" ? "BOOL" : "N"
+
+/**
+ * Whether a condition's or filter's `operand` is sent as given where a write of it stores `stored`
+ * (#242): a primitive is, unless what's stored is a primitive of another type, which no row holds
+ * the operand as (`5` where a `NumberFromString` stores `"5"`). Text where text is stored could be
+ * the stored text itself, a substring for `contains` or a prefix, which the library can't tell
+ * apart, so it is sent as 1.41.0 sent it; so is a number where a number is stored, and a primitive
+ * where what's stored is no primitive.
+ */
+const keepsAsGiven = (operand: unknown, stored: unknown): boolean =>
+  isPrimitive(operand) && (!isPrimitive(stored) || dynamoTypeOf(stored) === dynamoTypeOf(operand))
+
 /** A plain object or class instance whose fields a path value can be walked by. */
 const isWalkableObject = (value: unknown): value is object =>
   value !== null &&
@@ -3532,8 +3664,10 @@ export const containedKindOf = (field: Schema.Top): "list" | "set" | "text" => {
 /**
  * A `contains` operand in the form the field stores what it compares (#242), from what a write of
  * a whole value there stores (`value`) and of one list element (`element`): the element as a list
- * stores it; the single member of a write of a set holding it; the text a write of it stores, when
- * that's text. `undefined` when the field doesn't take it so, and the operand is sent as given.
+ * stores it; the single member of a write of a set holding it (a primitive member as given, unless
+ * the set stores it as a primitive of another type: {@link keepsAsGiven}); the text a write of it
+ * stores, when that's text. `undefined` when the field doesn't take it so, and the operand is sent
+ * as given.
  *
  * @internal
  */
@@ -3547,7 +3681,9 @@ export const containedOperand =
     if (kind === "list") return element(operand)
     if (kind === "set") {
       const set = value(new Set([operand]))?.stored
-      return set instanceof Set && set.size === 1 ? { stored: [...set][0] } : undefined
+      if (!(set instanceof Set) || set.size !== 1) return undefined
+      const member = [...set][0]
+      return { stored: keepsAsGiven(operand, member) ? operand : member }
     }
     const text = value(operand)
     return typeof text?.stored === "string" ? text : undefined
@@ -3710,6 +3846,11 @@ export const makePathValueEncoder = (
   storable?: (encoded: unknown) => boolean,
   /** The entity's READ schemas of the model's fields, which a row is decoded by (`readsAsGiven`). */
   readFields: SchemaFields = {},
+  /**
+   * The storage the `DynamoModel.configure` of each ref's target gives its fields
+   * (`configuredStorageOf`), keyed by ref field: the ref holds them in it, as its schemas do.
+   */
+  refStorage: globalThis.Record<string, Readonly<globalThis.Record<string, DynamoEncoding>>> = {},
 ): {
   /**
    * A condition's or filter's operand as the attribute at `segments` holds it (#242): the one
@@ -3719,7 +3860,8 @@ export const makePathValueEncoder = (
    * alone determines it — every position a row can hold the path under that takes the value stores
    * it in the same form (`declaredAt`). Anywhere else (union members that store it differently, an
    * `Unknown` or `Any`, a suspended schema or a declaration the walk doesn't follow, a value no
-   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it.
+   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it. A primitive is
+   * the value itself unless a write of it stores a primitive of another type ({@link keepsAsGiven}).
    */
   readonly operand: (
     segments: ReadonlyArray<string | number>,
@@ -3930,6 +4072,22 @@ export const makePathValueEncoder = (
     }
     return current === undefined ? undefined : { schema: current, asDeclared }
   }
+  /**
+   * `original`, the model's schema at `segments` (below a field), as a write stores it: a field of a
+   * ref's target in the storage its `DynamoModel.configure` gives it, which the ref holds it in
+   * (`refStorage`), as the ref's own schemas do.
+   */
+  const storedSchema = (segments: ReadonlyArray<string | number>, original: Schema.Top) => {
+    const [head, name] = segments
+    const encoding =
+      segments.length === 2 && typeof head === "string" && typeof name === "string"
+        ? ownValue(ownValue(refStorage, head), name)
+        : undefined
+    return substituteSchemaDeep(
+      original,
+      withConfiguredStorage({ enforceChecks: true }, name as string, original, encoding),
+    )
+  }
   const schemaAt = (segments: ReadonlyArray<string | number>) => {
     const at = originalAt(segments)
     if (at === undefined) return undefined
@@ -3940,7 +4098,7 @@ export const makePathValueEncoder = (
         ? ownValue(recordFields, head)
         : at.asDeclared
           ? original
-          : substituteSchemaDeep(original, { enforceChecks: true })
+          : storedSchema(segments, original)
     return stored === undefined ? undefined : { original, stored }
   }
   const validators = new Map<string, ((encoded: unknown) => unknown) | null>()
@@ -3982,7 +4140,7 @@ export const makePathValueEncoder = (
   ): ReadonlyArray<{ readonly schema: Schema.Top; readonly asDeclared: boolean }> | undefined => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return undefined
-    const top = refTargets[head] ?? modelFields[head]
+    const top = ownValue(refTargets, head) ?? ownValue(modelFields, head)
     if (top === undefined) return undefined
     type Position = { readonly schema: Schema.Top; readonly asDeclared: boolean }
     const holdsNoPath = new Set([
@@ -4097,15 +4255,28 @@ export const makePathValueEncoder = (
             const original = position.schema
             const stored =
               segments.length === 1
-                ? recordFields[head]
+                ? ownValue(recordFields, head)
                 : position.asDeclared
                   ? original
-                  : substituteSchemaDeep(original, { enforceChecks: true })
+                  : storedSchema(segments, original)
             if (stored === undefined) return []
             const formOf = (from: Schema.Top, to: Schema.Top) => {
               const encode = leafAwareEncoder(from, to)
               const decode = Schema.decodeUnknownExit(to as Schema.Codec<any>)
               return (value: unknown): { readonly stored: unknown } | undefined => {
+                if (isPrimitive(value)) {
+                  // A primitive is put in its stored form only where that is a primitive of
+                  // another type (`5` where a `NumberFromString` stores `"5"`), and is sent as
+                  // given anywhere else, as up to 1.41.0 ({@link keepsAsGiven}).
+                  const encoded = encode(value)
+                  const issue = issueOf(() => decode(asStored(encoded)))
+                  if (issue === CANT_SAY) return { stored: value }
+                  if (issue !== undefined) return undefined
+                  if (keepsAsGiven(value, encoded)) return { stored: value }
+                  return storable === undefined || storable(encoded)
+                    ? { stored: encoded }
+                    : undefined
+                }
                 const encoded = encode(value)
                 if (decode(asStored(encoded))._tag !== "Success") return undefined
                 if (storable !== undefined && !storable(encoded)) return undefined
@@ -4136,7 +4307,7 @@ export const makePathValueEncoder = (
   const waysTo = (segments: ReadonlyArray<string | number>): ReadonlyArray<UnionWay> => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return []
-    const start: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    const start: Schema.Top | undefined = ownValue(refTargets, head) ?? ownValue(modelFields, head)
     if (start === undefined) return []
     const ways: Array<UnionWay> = []
     const walk = (
@@ -4341,7 +4512,10 @@ export const makePathValueEncoder = (
   }
   const reads = (clauses: ReadonlyArray<UnionClause>, strict: boolean): boolean => {
     const head = clauses[0]?.segments[0]
-    const start = typeof head === "string" ? (refTargets[head] ?? modelFields[head]) : undefined
+    const start =
+      typeof head === "string"
+        ? (ownValue(refTargets, head) ?? ownValue(modelFields, head))
+        : undefined
     // A field the walk can't follow is one the schema can't judge.
     if (start === undefined || clauses.some((clause) => clause.segments[0] !== head)) {
       return !strict

@@ -387,7 +387,7 @@ for (const task of Object.values(tasks)) {
   yield* db.entities.Employees.put(employees.jlowe)
 ```
 
-Because Employee has `softDelete: true`, the delete doesn't destroy the record — it archives it. The employee vanishes from all GSI queries but remains retrievable for audit. See [Requirement 10](#requirement-10-termination--rehire) for the full soft delete workflow.
+Because Employee has `softDelete: true`, the delete doesn't destroy the record — it archives it. The employee vanishes from all GSI queries but remains retrievable for audit. See [Requirement 10](#requirement-10-termination--rehire-soft-delete--restore) for the full soft delete workflow.
 
 ### Requirement 2: Office + Employees (Workplaces Collection)
 

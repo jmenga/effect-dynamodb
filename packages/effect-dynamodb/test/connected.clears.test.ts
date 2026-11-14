@@ -3,11 +3,13 @@
  * `Entity.clears.test.ts`, over a real table and its real secondary indexes.
  */
 
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import { Config, Effect } from "effect"
-import { describe } from "vitest"
+import { afterAll, describe } from "vitest"
 import * as Clears from "./helpers/ClearScenarios.js"
 import * as NoStoredForm from "./helpers/NoStoredFormScenarios.js"
+import { makeTablePool } from "./helpers/TablePool.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -24,7 +26,18 @@ try {
 }
 const describeConnected = dynamoAvailable ? describe : describe.skip
 
-const harness = Clears.connectedHarness(ENDPOINT)
+// Each scenario on an empty table of its definition, one at a time: reused, emptied between them.
+const pool = makeTablePool(
+  new DynamoDBClient({
+    region: "us-east-1",
+    endpoint: ENDPOINT,
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  "clears",
+)
+afterAll(() => pool.drain())
+
+const harness = Clears.connectedHarness(ENDPOINT, pool)
 
 describeConnected("clearing a field, on DynamoDB", () => {
   for (const [group, scenarios] of Object.entries({

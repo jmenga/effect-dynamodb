@@ -7,6 +7,7 @@
  *   - Entity.make with refs config for ref hydration
  *   - Entity.Input accepts IDs, Entity.Record returns full objects
  *   - RefNotFound error handling
+ *   - .keepRefs() for reassigning one ref of an index key that holds two
  *   - Aggregate.make for sub-aggregates and top-level aggregates
  *   - Aggregate.one, Aggregate.many, Aggregate.ref edge types
  *   - Sub-aggregate discriminators via .with()
@@ -189,6 +190,11 @@ const SquadSelections = Entity.make({
       pk: { field: "gsi1pk", composite: ["playerId"] },
       sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
     },
+    byRole: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["squadRole"] },
+      sk: { field: "gsi2sk", composite: ["teamId", "playerId"] },
+    },
   },
   refs: {
     team: { entity: Teams },
@@ -334,6 +340,8 @@ const program = Effect.gen(function* () {
       { AttributeName: "sk", AttributeType: "S" },
       { AttributeName: "gsi1pk", AttributeType: "S" },
       { AttributeName: "gsi1sk", AttributeType: "S" },
+      { AttributeName: "gsi2pk", AttributeType: "S" },
+      { AttributeName: "gsi2sk", AttributeType: "S" },
     ],
     GlobalSecondaryIndexes: [
       {
@@ -341,6 +349,14 @@ const program = Effect.gen(function* () {
         KeySchema: [
           { AttributeName: "gsi1pk", KeyType: "HASH" },
           { AttributeName: "gsi1sk", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      },
+      {
+        IndexName: "gsi2",
+        KeySchema: [
+          { AttributeName: "gsi2pk", KeyType: "HASH" },
+          { AttributeName: "gsi2sk", KeyType: "RANGE" },
         ],
         Projection: { ProjectionType: "ALL" },
       },
@@ -373,6 +389,12 @@ const program = Effect.gen(function* () {
     firstName: "Virat",
     lastName: "Kohli",
     role: "batter",
+  })
+  yield* db.entities.Players.put({
+    id: "hazlewood-01",
+    firstName: "Josh",
+    lastName: "Hazlewood",
+    role: "bowler",
   })
   yield* db.entities.Coaches.put({ id: "mcdonald", name: "Andrew McDonald" })
   yield* db.entities.Coaches.put({ id: "gambhir", name: "Gautam Gambhir" })
@@ -436,6 +458,27 @@ const program = Effect.gen(function* () {
   }
   // #endregion
   yield* Console.log(`RefNotFound: ${refError._tag}`)
+
+  // #region keep-refs
+  // byRole's sort key holds both refs' IDs. Replace the player in selection 1,
+  // keeping its team: the new player is fetched and copied, while the team's ID
+  // only keys the index. The team isn't fetched again, its stored copy stays as
+  // it is, and the update fails with ConditionalCheckFailed if the row holds
+  // another team.
+  yield* db.entities.SquadSelections.update({
+    squadId: "aus#2024-25#BGT",
+    selectionNumber: 1,
+  })
+    .set({ playerId: "hazlewood-01", isCaptain: false })
+    .keepRefs({ teamId: "aus" })
+
+  const bowlers = yield* db.entities.SquadSelections.byRole({ squadRole: "bowler" }).collect()
+  // bowlers[0].player.lastName → "Hazlewood"
+  // #endregion
+  if (bowlers.length !== 1 || bowlers[0]!.player.lastName !== "Hazlewood") {
+    return yield* Effect.die(new Error("byRole: expected Hazlewood's selection"))
+  }
+  yield* Console.log(`Bowlers by role: ${bowlers.map((s) => s.player.lastName).join(", ")}`)
 
   // =========================================================================
   // Part 2: Aggregate CRUD
@@ -660,6 +703,17 @@ const program = Effect.gen(function* () {
   // #endregion
 
   yield* Console.log(`Latest completed: ${latest.data[0]?.matchId}`)
+
+  // A key value is matched whole: no match id is `bgt-2025-test-0`. With
+  // `prefix: true` the last value given is a prefix, in any casing.
+  // #region list-prefix
+  const testMatches = yield* TournamentMatchAggregate.list(
+    { tournament: "bgt-2025", matchId: "BGT-2025-TEST-0" },
+    { prefix: true },
+  )
+  // #endregion
+
+  yield* Console.log(`Test matches: ${testMatches.data.map((m) => m.matchId).join(", ")}`)
 
   for (const n of ["01", "02", "03", "04", "05"]) {
     yield* TournamentMatchAggregate.delete({ matchId: `bgt-2025-test-${n}` })

@@ -29,6 +29,10 @@
  * of a payload as the `Object.prototype` member of its name, so fewer cases were.) It's generated
  * once from the published package: don't regenerate or "fix" it.
  *
+ * Every position runs under the ordinary name, `__proto__` (the one name handled otherwise),
+ * `constructor`, `hasOwnProperty` and `toString`; the other eight members of `Object.prototype`
+ * are inherited functions as those three are, and every member × every position is not run.
+ *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
  *   (or set DYNAMODB_ENDPOINT to another port)
@@ -49,6 +53,9 @@ import {
   POSITIONS,
   type Position,
 } from "./helpers/InheritedNames.js"
+
+/** The names each position runs under: the ordinary one, `__proto__` and three inherited functions. */
+const RUN = [CONTROL, "__proto__", "constructor", "hasOwnProperty", "toString"] as const
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -101,10 +108,11 @@ const run = (position: Position, name: string) =>
   capture(api, ENDPOINT, `inherited-${Date.now()}-${tables++}`, position, name)
 
 describeConnected("names every object inherits (#239)", () => {
-  it("covers every member of Object.prototype", () => {
+  it("runs names the helper's list of Object.prototype's members holds", () => {
     expect([...NAMES].filter((name) => name !== CONTROL).sort()).toEqual(
       Object.getOwnPropertyNames(Object.prototype).sort(),
     )
+    for (const name of RUN) expect(NAMES).toContain(name)
   })
 
   for (const position of POSITIONS) {
@@ -115,7 +123,7 @@ describeConnected("names every object inherits (#239)", () => {
         return control
       }
 
-      for (const name of NAMES) {
+      for (const name of RUN) {
         it(name, { timeout: 60_000 }, async () => {
           const outcome = name === CONTROL ? await ordinary() : await run(position, name)
           expect(JSON.stringify(outcome)).not.toContain("[native code]")

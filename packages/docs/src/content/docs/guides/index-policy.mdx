@@ -286,6 +286,10 @@ yield* db.entities.Assets.update(key).remove(["site"])
 
 If you want to demote (truncate) hierarchically, you must `set` the surviving composites in the same call.
 
+### A half holding two refs' IDs
+
+A ref's ID (`teamId`, `playerId`) is a composite like any other, so an update reassigning one ref of a half that also holds another ref's ID follows the rules above: with the other ID left out, the half is left as stored or truncated before it. The remedy differs from an ordinary composite's, though. Giving the unchanged ID with `.set()` fetches that ref again and overwrites its stored copy. Give it with `.keepRefs({ playerId })` instead: the ID keys the half, nothing is fetched or rewritten, and the update is conditioned on the row holding that ref. See [Reassigning one ref of a key that holds two](/effect-dynamodb/guides/aggregates/#reassigning-one-ref-of-a-key-that-holds-two).
+
 ### Multi-writer leak (v1.7.0 footgun, fixed in v1.7.1)
 
 In v1.7.0, a stamp writer that touched only a non-composite attribute (e.g. `set({ published: "2026-04-30" })`) would still trigger sparse-policy evaluation on every GSI half declared sparse — and REMOVE the half's key even though the stamp writer wasn't claiming ownership of the half. This made the multi-writer pattern impractical.

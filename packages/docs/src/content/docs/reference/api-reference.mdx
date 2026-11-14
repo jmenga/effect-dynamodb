@@ -268,7 +268,7 @@ import { Entity } from "effect-dynamodb"
 | `timestamps` | `boolean \| { created?, updated? }` | No | Auto-managed `createdAt`/`updatedAt`. Each slot takes a field name, a `DynamoModel` date schema (storage only), or `{ field?, schema? }`. A `schema` without a `DynamoEncoding` annotation throws `EDD-9044` at make() time |
 | `versioned` | `boolean \| { retain?, field?, ttl? }` | No | Auto-increment version with optional snapshot retention |
 | `softDelete` | `boolean \| { ttl?, preserveUnique? }` | No | Soft delete with optional TTL |
-| `unique` | `Record<string, string[]>` | No | Unique constraint definitions |
+| `unique` | `Record<string, string[]>` | No | Unique constraint definitions: model fields, or a ref's id (`teamId` for `refs: { team }`); a ref itself is refused (**EDD-9172**) |
 | `refs` | `Record<string, Entity>` | No | Map ref field names to their source entities for ref hydration |
 
 ### Operations
@@ -1302,7 +1302,7 @@ const MatchAggregate = Aggregate.make(Match, {
 | `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated, sub-aggregate transactions). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
 | `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
 | `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove the rows of the aggregate's entity types from its partition |
-| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()` or an `or()` with no parts fails with a `ValidationError` before sending; an `isIn` with no values is sent, and DynamoDB's rejection named), `reverse`, `cursor` (one that can't be decoded fails with a `ValidationError`, `EDD-9094`, `operation: "list"`). Returns `{ data, cursor }`; `cursor` is an `Option<string>`, `None` only when exhausted, and always `None` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
+| `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()` or an `or()` with no parts fails with a `ValidationError` before sending; an `isIn` with no values is sent, and DynamoDB's rejection named), `reverse`, `cursor` (one that can't be decoded fails with a `ValidationError`, `EDD-9094`, `operation: "list"`), `prefix` (match the last list sort key value given as a prefix of its value, not the whole value; a numeric composite stays whole). Returns `{ data, cursor }`; `cursor` is an `Option<string>`, `None` only when exhausted, and always `None` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
 
 ### Edge Types
 

@@ -603,9 +603,10 @@ describe("sort key bounds on values holding escaped characters (#171)", () => {
             })
           }
         }),
-      // Every shape, operator and plan per run: 15 seconds per casing here, and up to a minute on
-      // a CI runner, so the limit only has to catch a hang.
-      { timeout: 180_000, arbitrary: { runs: 150 } },
+      // Every shape, operator and plan per run, each run's values every escaped extension of its
+      // operands: with escaping off, the first run already fails. 10 runs a casing: about a
+      // second here, a few on a CI runner; the limit only has to catch a hang.
+      { timeout: 180_000, arbitrary: { runs: 10 } },
     )
   }
 

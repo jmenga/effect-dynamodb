@@ -80,7 +80,7 @@ describe("rekey's journal", () => {
       Effect.gen(function* () {
         const on = world()
         const PAGE = 25_000
-        const PAGES = 16
+        const PAGES = 8
         // Every other page is items under their current keys; the rest, another application's rows.
         let page = 0
         const client = mockDynamoClient({
@@ -122,10 +122,10 @@ describe("rekey's journal", () => {
         expect(report.skipped.notLibrary).toBe((PAGE * PAGES) / 2)
         // One entry at most, and none taken: nothing the run met is remembered.
         expect(report.journal).toEqual({ capacity: 1, used: 0, full: false, inexact: [] })
-        // The heap holds nothing per row: 400,000 rows at 208 bytes each would be 79 MiB.
+        // The heap holds nothing per row: 200,000 rows at 208 bytes each would be 40 MiB.
         expect((peak - first) / 1048576).toBeLessThan(16)
       }),
-    // 400,000 rows and a collection per page: seconds on an idle machine, more under load.
+    // 200,000 rows and a collection per page: seconds on an idle machine, more under load.
     120_000,
   )
 

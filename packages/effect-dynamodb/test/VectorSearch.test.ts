@@ -35,6 +35,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
+import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
 import {
   DynamoError,
   DynamoValidationError,
@@ -51,6 +52,7 @@ import {
   mockDynamoClientLayer,
   mockOutput,
 } from "./helpers/MockDynamoClient.js"
+import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -1322,6 +1324,85 @@ describe("shared physical vector index", () => {
       expect(articles.map((h) => h.item.articleId)).toEqual(["art"])
     }).pipe(Effect.provide(layer))
   })
+
+  // One domain field, stored under its own name by one sharer and renamed by another: the union
+  // holds both stored attributes, each sharer's filter resolved with its own renames (#265). Up
+  // to the fix the first sharer's renames named every sharer's filters, so the index declared
+  // `cat` twice and a filter on the other sharer's `category` was refused.
+  for (const made of ["pure", "runtime"] as const) {
+    it.effect(
+      `a filter one sharer renames and another doesn't, entities made ${made} (#265)`,
+      () => {
+        const model = Schema.Struct({
+          id: Schema.String,
+          body: Schema.String,
+          category: Schema.String,
+        })
+        const shared = {
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          vectorIndexes: {
+            byBody: {
+              name: "vec1",
+              dimensions: 3,
+              distance: "cosine",
+              source: { fields: ["body"] },
+              filters: ["category"],
+            },
+          },
+        } as const
+        const articles = {
+          ...shared,
+          entityType: "Article",
+          model: DynamoModel.configure(model, { category: { field: "cat" } }),
+        } as const
+        const products = { ...shared, entityType: "Product", model } as const
+        const Articles = made === "pure" ? PureEntity.make(articles) : Entity.make(articles)
+        const Products = made === "pure" ? PureEntity.make(products) : Entity.make(products)
+        const MainTable = Table.make({
+          schema: AppSchema,
+          entities: { Articles: Articles as never, Products: Products as never },
+        })
+        const definition = Table.definition(MainTable)
+        expect(definition.VectorIndexes?.[0]?.SearchSchema).toEqual([
+          { AttributeName: "__edd_vp_vec1__", SearchSchemaElementType: "HASH" },
+          { AttributeName: "cat", SearchSchemaElementType: "INLINE_FILTER" },
+          { AttributeName: "category", SearchSchemaElementType: "INLINE_FILTER" },
+        ])
+        const table = makeRecordingTable()
+        return Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: { Articles: Articles as never, Products: Products as never },
+            tables: { MainTable },
+            embedder: { dimensions: 3, embed: () => Effect.succeed([1, 0, 0]) },
+          })
+          // The members' types differ by package, so the client is read untyped.
+          const put = (entity: any, item: object): Effect.Effect<unknown> =>
+            entity.put(item).asEffect()
+          const search = (entity: any): Effect.Effect<ReadonlyArray<{ item: { id: string } }>> =>
+            entity.byBody([1, 0, 0]).filter({ category: "footwear" }).collect()
+          yield* put(db.entities.Articles, { id: "a1", body: "trail guide", category: "footwear" })
+          yield* put(db.entities.Products, { id: "p1", body: "hiking boots", category: "footwear" })
+          const found = {
+            articles: (yield* search(db.entities.Articles)).map((hit) => hit.item.id),
+            products: (yield* search(db.entities.Products)).map((hit) => hit.item.id),
+          }
+          expect(found).toEqual({ articles: ["a1"], products: ["p1"] })
+        }).pipe(
+          Effect.provide(
+            Layer.merge(
+              VectorSearchEmulation.layer(Layer.succeed(DynamoClient, table.client), {
+                tables: { MainTable },
+              }),
+              MainTable.layer({ name: "t" }),
+            ),
+          ),
+        )
+      },
+    )
+  }
 })
 
 // ---------------------------------------------------------------------------

@@ -111,7 +111,7 @@ The first push to `main` that touches `packages/docs/**` (or any of the source p
 Repo → **Settings → Branches → Add rule** for `main`:
 
 - Require pull request reviews before merging
-- Require status checks to pass — select the **Typecheck, Lint, Test, Build** check
+- Require status checks to pass — select the **CI** check (it passes only when every other job in `ci.yml` has)
 - Require linear history (optional but tidy with version-bump commits)
 
 ### 6. Initial publish
