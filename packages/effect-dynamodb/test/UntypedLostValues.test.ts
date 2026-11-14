@@ -6,7 +6,9 @@
  * no check at all. What isn't refused (a list holding `undefined`, a function or a hole, and a
  * bigint) is pinned as 1.40.0 stores it, natively and packed, on Effect 4.1.2 and 4.1.3 alike; so are
  * sparse, frozen and exotic lists, alone and next to an empty set, against what published 1.40.0
- * stored (`fixtures/untyped-lists-1.40.0.json`).
+ * stored (`fixtures/untyped-lists-1.40.0.json`). A `Schema.ObjectKeyword` field holds any object as
+ * given, so it's checked as one too (1.42.2), and what it stores of a value holding no lost part is
+ * what 1.42.1 sent.
  */
 import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
@@ -93,6 +95,115 @@ describe("[EDD-9161] every write path refuses a Date in an untyped field", () =>
       }
     }),
   )
+})
+
+describe("[EDD-9161] a Schema.ObjectKeyword field, which holds any object as given", () => {
+  /** Refused up to 1.42.1 only packed: natively the `Date` was stored as an empty map. */
+  const SHARED = [
+    "put",
+    "update .set",
+    "update pathSet",
+    "a transaction's put",
+    "a batch's put",
+  ] as const
+  for (const name of SHARED) {
+    const path = PATHS.find((each) => each.name === name)!
+    it.effect(`${path.operation}: ${path.name}`, () =>
+      Effect.gen(function* () {
+        const { writes, layer } = recording()
+        const members = membersOf(Schema.ObjectKeyword)
+        const provided = Layer.merge(layer, members.Base.layer({ name: "untyped-table" }))
+        const exit = yield* Effect.gen(function* () {
+          const db = yield* clientOf(members)
+          return yield* path.run(db, members, { at: new Date(0) })
+        }).pipe(Effect.provide(provided as never), Effect.exit)
+        const error = failureOf(exit)
+        expect(error).toBeInstanceOf(ValidationError)
+        expect(String(error.cause)).toContain("the value at f.at is a Date, which DynamoDB doesn't")
+        expect(String(error.cause)).toContain("EDD-9161")
+        expect(writes).toEqual([])
+      }),
+    )
+  }
+
+  const Objects = Entity.make({
+    model: Schema.Struct({ id: Schema.String, o: Schema.optional(Schema.ObjectKeyword) }),
+    entityType: "O",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const ObjectsTable = Table.make({ schema, entities: { Objects } })
+  const provideObjects = (table: ReturnType<typeof makeRecordingTable>) =>
+    Effect.provide(Layer.merge(ObjectsTable.layer({ name: "objects" }), table.layer))
+
+  it.effect("a value holding only what DynamoDB stores is sent as 1.42.1 sent it", () => {
+    const table = makeRecordingTable()
+    const value = () => ({
+      name: "a",
+      n: 1.5,
+      tags: ["x", "y"],
+      nested: { list: [1, "z", { ok: true }] },
+    })
+    const stored = {
+      M: {
+        name: { S: "a" },
+        n: { N: "1.5" },
+        tags: { L: [{ S: "x" }, { S: "y" }] },
+        nested: { M: { list: { L: [{ N: "1" }, { S: "z" }, { M: { ok: { BOOL: true } } }] } } },
+      },
+    }
+    const key = { pk: { S: "$lost#v1#o#id_a" }, sk: { S: "$lost#v1#o" } }
+    // Recorded on 1.42.1, compared as text: the same attributes in the same order.
+    const sent = [
+      {
+        command: "PutItem",
+        input: {
+          TableName: "objects",
+          Item: { id: { S: "a" }, o: stored, __edd_e__: { S: "O" }, ...key },
+        },
+      },
+      {
+        command: "UpdateItem",
+        input: {
+          TableName: "objects",
+          Key: key,
+          UpdateExpression: "SET #u0 = :u0",
+          ExpressionAttributeNames: { "#u0": "o", "#exists": "pk" },
+          ExpressionAttributeValues: { ":u0": stored },
+          ConditionExpression: "attribute_exists(#exists)",
+          ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+          ReturnValues: "ALL_NEW",
+        },
+      },
+      {
+        command: "Scan",
+        input: {
+          TableName: "objects",
+          FilterExpression: "#eddE IN (:et0) AND (#e0 = :e1)",
+          ExpressionAttributeNames: { "#eddE": "__edd_e__", "#e0": "o" },
+          ExpressionAttributeValues: { ":et0": { S: "O" }, ":e1": stored },
+        },
+      },
+    ]
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Objects }, tables: { ObjectsTable } })
+      yield* db.entities.Objects.put({ id: "a", o: value() }).asEffect()
+      yield* db.entities.Objects.update({ id: "a" }).set({ o: value() }).asEffect()
+      yield* db.entities.Objects.scan().filter({ o: value() }).collect()
+      expect(JSON.stringify(table.take())).toBe(JSON.stringify(sent))
+    }).pipe(provideObjects(table))
+  })
+
+  it.effect("a row already holding an empty map reads as it did", () => {
+    const table = makeRecordingTable()
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({ entities: { Objects }, tables: { ObjectsTable } })
+      yield* db.entities.Objects.put({ id: "a" }).asEffect()
+      const key = [...table.items.keys()][0]!
+      table.items.set(key, { ...table.items.get(key)!, o: { M: { at: { M: {} } } } })
+      const row = yield* db.entities.Objects.get({ id: "a" })
+      expect(row.o).toEqual({ at: {} })
+    }).pipe(provideObjects(table))
+  })
 })
 
 describe("[EDD-9124] a Chunk, which holds itself, on every write path", () => {
@@ -340,6 +451,7 @@ describe("what a model with no untyped position pays", () => {
     expect(readBackOf(typed, () => typed)).toBeUndefined()
     expect(holdsUntyped(Schema.Struct({ x: Schema.Option(Schema.Unknown) }).ast)).toBe(true)
     expect(holdsUntyped(Schema.Record(Schema.String, Schema.Any).ast)).toBe(true)
+    expect(holdsUntyped(Schema.Struct({ o: Schema.optional(Schema.ObjectKeyword) }).ast)).toBe(true)
   })
 
   it("a value holding no lost part is looked through and passed", () => {
