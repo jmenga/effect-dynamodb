@@ -468,7 +468,8 @@ import {
 
 export { normalizeTtlSeconds }
 
-const composeUniqueSentinel = (
+/** The sentinel of `source`'s values; an entity composes each through its `composeUniqueSentinel`. */
+const composeSentinelFrom = (
   schema: DynamoSchema.DynamoSchema,
   entityType: string,
   constraintName: string,
@@ -2566,7 +2567,7 @@ export const make = <
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
-  const TUnique extends EntityUniqueConfig<TModel> | undefined = undefined,
+  const TUnique extends EntityUniqueConfig<TModel, RefsOrNone<TRefs>> | undefined = undefined,
   const TTimeSeries extends EntityTimeSeriesConfig<TModel> | undefined = undefined,
   const TGeneratedId extends EntityGeneratedIdConfig<TModel> | undefined = undefined,
   const TVectorIndexes extends EntityVectorIndexesConfig<TModel> | undefined = undefined,
@@ -5689,6 +5690,61 @@ const makeImpl = <
     }
   })()
 
+  /** The refs whose id a unique constraint names (`teamId` for `refs: { team }`, #266). */
+  const uniqueRefs = resolvedRefs.filter((ref) =>
+    Object.values((config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>).some(
+      (def) => resolveUniqueFields(def).includes(ref.idFieldName),
+    ),
+  )
+  const uniqueRefIds: ReadonlySet<string> = new Set(uniqueRefs.map((ref) => ref.idFieldName))
+
+  /**
+   * Every unique sentinel of this entity, composed from `source`'s values ({@link composeSentinelFrom}).
+   * A ref's id a constraint names (#266) is the referenced item's key as the ref holds it
+   * ({@link storedRefId}), in the key form an index composite of it takes. Every path composes it
+   * from there, a row read back and a write's item alike (a write hydrates the ref first), so a
+   * sentinel a write reserves is the one a later delete, restore or `rekey` composes. A source
+   * holding no ref (a put's input, checked before hydration) gives the id as given. An entity whose
+   * constraints name no ref's id composes exactly as it did.
+   */
+  const composeUniqueSentinel = (
+    under: DynamoSchema.DynamoSchema,
+    _entityType: string,
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    source: globalThis.Record<string, unknown>,
+    stored: (field: string, value: unknown) => unknown,
+  ): ReturnType<typeof composeSentinelFrom> => {
+    if (uniqueRefs.length === 0) {
+      return composeSentinelFrom(under, entityType, constraintName, constraintDef, source, stored)
+    }
+    const values = { ...source }
+    for (const ref of uniqueRefs) {
+      const held = ownValue(source, ref.fieldName) as
+        | globalThis.Record<string, unknown>
+        | null
+        | undefined
+      const id =
+        held === undefined || held === null
+          ? given(source, ref.idFieldName)
+          : (() => {
+              const key = ownValue(held, ref.keyField)
+              return key === undefined || key === null ? undefined : storedRefId(ref, key)
+            })()
+      values[ref.idFieldName] =
+        id === undefined || id === null ? id : compositeKeyForm(ref.idFieldName, id)
+    }
+    return composeSentinelFrom(
+      under,
+      entityType,
+      constraintName,
+      constraintDef,
+      values,
+      // The id is in its key form already, which no stored form of the field changes.
+      (field, value) => (uniqueRefIds.has(field) ? undefined : stored(field, value)),
+    )
+  }
+
   /**
    * `keyForm` of a caller's DOMAIN key record: each composite first put into
    * the form `put` stores it in, as `put`'s encode and `get`'s `encodeKey` do,
@@ -7342,7 +7398,7 @@ const makeImpl = <
       for (const key of Object.keys(names)) if (key.startsWith("#dg")) delete names[key]
       for (const key of Object.keys(values)) if (key.startsWith(":dg")) delete values[key]
       const uniqueAttrs = Object.values(config.unique ?? {}).flatMap((def) =>
-        resolveUniqueFields(def as UniqueConstraintDef).map(resolveDbName),
+        resolveUniqueFields(def as UniqueConstraintDef).map(compositeAttribute),
       )
       const modelAttrs = Object.keys(data.modelFields as object).map(resolveDbName)
       const ordered = [
@@ -8198,7 +8254,8 @@ const makeImpl = <
         ...new Set(
           Object.values((config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>)
             .flatMap((def) => [...resolveUniqueFields(def)])
-            .map(resolveDbName),
+            // A ref's id is held by the ref.
+            .map(compositeAttribute),
         ),
       ]
       const userCondition = args.userCondition
@@ -9816,6 +9873,10 @@ const makeImpl = <
       ...Object.keys(uState.append ?? {}),
       ...Object.keys(uState.deleteFromSet ?? {}),
     ])
+    // A ref's id is written as the ref (`team`, hydrated from `teamId`), and removed by its field.
+    for (const ref of uniqueRefs) {
+      if (allUpdatedFields.has(ref.fieldName)) allUpdatedFields.add(ref.idFieldName)
+    }
     return [...uniqueFieldSet].some((f) => allUpdatedFields.has(f))
   }
 
@@ -10535,7 +10596,13 @@ const makeImpl = <
             if (written.has(indexDef.sk.field)) add(asRead(indexDef.sk.composite))
           }
           for (const rotation of sentinelRotations) {
-            add(resolveUniqueFields(config.unique![rotation.constraintName]!), true)
+            // A ref's id is read from the ref, which is what's guarded.
+            add(
+              resolveUniqueFields(config.unique![rotation.constraintName]!).map(
+                (field) => uniqueRefs.find((ref) => ref.idFieldName === field)?.fieldName ?? field,
+              ),
+              true,
+            )
           }
           for (const [, definition] of vectorIndexEntries) {
             if (written.has(definition.vectorField)) add(definition.sourceFields)
@@ -12839,7 +12906,7 @@ const makeImpl = <
                     ? [
                         ...new Set(
                           Object.values(config.unique!).flatMap((def) =>
-                            resolveUniqueFields(def).map(resolveDbName),
+                            resolveUniqueFields(def).map(compositeAttribute),
                           ),
                         ),
                       ]
@@ -18637,7 +18704,7 @@ const makeImpl = <
   const sameOwnerValues = (now: StoredRow, read: StoredRow): boolean =>
     [
       "__edd_e__",
-      ...allUniqueFields().map((field) => resolveDbName(field)),
+      ...allUniqueFields().map((field) => compositeAttribute(field)),
       UNSENTINELED_DEFAULTS,
     ].every((attribute) => attributeValueEquals(now[attribute], read[attribute]))
 
@@ -18797,7 +18864,7 @@ const makeImpl = <
     const guards = ["#e = :e"]
     const attributes = [
       ...new Set([
-        ...resolveUniqueFields(constraintDef).map((field) => resolveDbName(field)),
+        ...resolveUniqueFields(constraintDef).map((field) => compositeAttribute(field)),
         UNSENTINELED_DEFAULTS,
       ]),
     ]
