@@ -377,6 +377,7 @@ import type {
 import {
   allCompositeAttributes,
   allKeyFieldNames,
+  configuredStorageOf,
   type DerivedSchemas,
   getSchemaFields,
   inferDefaultEncoding,
@@ -3022,6 +3023,15 @@ const makeImpl = <
       storedFormAt,
       storedBelow,
     )
+  /** Each ref's field and the model it is denormalised from (a `configure` wrapper as given). */
+  const refModels = (
+    data.resolvedRefs as ReadonlyArray<{
+      readonly fieldName: string
+      readonly refEntity?: { readonly model?: unknown }
+    }>
+  ).flatMap((ref) =>
+    ref.refEntity?.model === undefined ? [] : [[ref.fieldName, ref.refEntity.model] as const],
+  )
   // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
   // record-based `append`, which bypass the update schema (#133).
   const pathValues = makePathValueEncoder(
@@ -3034,25 +3044,22 @@ const makeImpl = <
     // A `DynamoModel.ref` field's own schema is opaque; paths under it follow
     // the model it is denormalised from.
     Object.fromEntries(
-      (
-        data.resolvedRefs as ReadonlyArray<{
-          readonly fieldName: string
-          readonly refEntity?: { readonly model?: unknown }
-        }>
-      )
-        .filter((ref) => ref.refEntity?.model !== undefined)
-        .map((ref) => {
-          const model = ref.refEntity!.model as Schema.Top
-          return [
-            ref.fieldName,
-            isConfiguredModel(model) ? (model.model as Schema.Top) : model,
-          ] as const
-        }),
+      refModels.map(([field, model]) => [
+        field,
+        (isConfiguredModel(model) ? model.model : model) as Schema.Top,
+      ]),
     ),
     // An operand DynamoDB can't store in its stored form is sent as given (`operand`).
     (encoded) => unstorableIn({ stored: encoded }) === undefined,
     (schemas.modelSchema as unknown as { readonly fields: globalThis.Record<string, Schema.Top> })
       .fields,
+    // ...in the storage the target's `configure` gives its fields, which the ref holds them in.
+    Object.fromEntries(
+      refModels.flatMap(([field, model]) => {
+        const storage = configuredStorageOf(model)
+        return storage === undefined ? [] : [[field, storage] as const]
+      }),
+    ),
   )
   /**
    * Encode a path-addressed update value and check it against the write schema
