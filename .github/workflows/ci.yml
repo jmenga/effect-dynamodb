@@ -25,6 +25,9 @@ jobs:
   static:
     name: Lint, build, type check, policy gates
     runs-on: ubuntu-latest
+    # Every job is cut off long before GitHub's 6-hour default, so a hung
+    # DynamoDB Local or a stuck test fails the run instead of holding a runner.
+    timeout-minutes: 20
     permissions:
       contents: read
       # The release-order gate lists other open PRs to check whether release work
@@ -217,6 +220,7 @@ jobs:
   unit:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -248,6 +252,7 @@ jobs:
   connected:
     name: ${{ matrix.pass.name }} (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Every job has a DynamoDB Local of its own. Run against an instance another
     # pass has filled, the escaped pass is several times slower and its larger
     # tests time out.
@@ -315,6 +320,7 @@ jobs:
     if: always()
     needs: [static, unit, connected]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Every job succeeded
         env:
