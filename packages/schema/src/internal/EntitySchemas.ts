@@ -1203,11 +1203,13 @@ export interface DeepSubstitutionOptions {
   readonly resolveRef?: ((name: string, field: Schema.Top) => Schema.Top | undefined) | undefined
   /**
    * The storage `DynamoModel.configure` gives immediate fields of the passed model (`storedAs` a
-   * date schema), by name (applied only at the top level), as the model's own entity applies it
-   * ({@link substituteSchemas}): a ref to that entity stores its item as the entity's read schema
-   * encodes it (`refDataOf`), so it holds such a field in that storage ({@link configuredStorageOf}).
+   * date schema), by name, as the model's own entity applies it ({@link substituteSchemas}), and
+   * what each ref field of it holds: a ref to that entity stores its item as the entity's read
+   * schema encodes it (`refDataOf`), so it holds such a field in that storage
+   * ({@link heldStorageOf}). Applied at the top level, through an optional wrapper or a union to
+   * the struct beneath.
    */
-  readonly configuredStorage?: Readonly<globalThis.Record<string, DynamoEncoding>> | undefined
+  readonly configuredStorage?: HeldStorage | undefined
   /**
    * Also substitute Pattern B transform date schemas (e.g.
    * `Schema.DateTimeUtcFromString`) with a TOLERANT date transform that accepts
@@ -1514,6 +1516,8 @@ const childOptions = (
     collidingKinds,
     ...(opts?.unionDateOverride ? { dateEncodingOverride: opts.unionDateOverride } : {}),
     ...(opts?.unionDateOverride && opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
+    // A nullable ref (`NullOr(Team)`): its struct member holds what the ref's entity holds.
+    ...(opts?.configuredStorage ? { configuredStorage: opts.configuredStorage } : {}),
   }
 }
 
@@ -1612,13 +1616,17 @@ const throughOptional = (
   opts: DeepSubstitutionOptions | undefined,
 ): DeepSubstitutionOptions | undefined => {
   const deeper = descend(opts)
-  return opts?.unionDateOverride || opts?.collidingKinds || opts?.dateEncodingOverride
+  return opts?.unionDateOverride ||
+    opts?.collidingKinds ||
+    opts?.dateEncodingOverride ||
+    opts?.configuredStorage
     ? {
         ...deeper,
         ...(opts.unionDateOverride ? { unionDateOverride: opts.unionDateOverride } : {}),
         ...(opts.collidingKinds ? { collidingKinds: opts.collidingKinds } : {}),
         ...(opts.dateEncodingOverride ? { dateEncodingOverride: opts.dateEncodingOverride } : {}),
         ...(opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
+        ...(opts.configuredStorage ? { configuredStorage: opts.configuredStorage } : {}),
       }
     : deeper
 }
@@ -2432,7 +2440,8 @@ export const substituteSchemaDeep = (
             atField(deeper, opts, name),
             name,
             field,
-            ownValue(opts?.configuredStorage, name),
+            ownValue(opts?.configuredStorage?.fields, name),
+            ownValue(opts?.configuredStorage?.refs, name),
           ),
         )
         setOwn(
@@ -2778,8 +2787,8 @@ export const substituteSchemas = (
     // 1. Self-date substitution. Pattern A: user declared `Schema.DateTimeUtc`
     //    and chose a wire format via annotation. We substitute with the
     //    tolerant date transform so the encode pipeline produces the right
-    //    wire primitive.
-    if (isSelfDateSchema(schema)) {
+    //    wire primitive. An optional one keeps its wrapper (step 3).
+    if (isSelfDateSchema(schema) && optionalField(schema) === undefined) {
       const enc = ownValue(fieldEncodings, name)
       if (enc) {
         setOwn(out, name, fieldNamed(name, buildDateTransform(enc), schema, storedAsProto))
@@ -2819,18 +2828,22 @@ export const substituteSchemas = (
     //    — `substituteSchemaDeep` substitutes those while preserving class
     //    identity, and returns the schema unchanged when nothing nested needs it.
     //    A configured storage override on a UNION field (`NullOr(DateTimeUtc)`)
-    //    is applied to the union's self-date member (#133).
-    const unionOverride = unionDateOverride(name, schema, ownValue(fieldEncodings, name))
+    //    is applied to the union's self-date member (#133), and on an optional
+    //    date to the date beneath the wrapper (`withConfiguredStorage`).
     setOwn(
       out,
       name,
       fieldNamed(
         name,
-        substituteSchemaDeep(schema, {
-          ...deep,
-          path: [name],
-          ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
-        }),
+        substituteSchemaDeep(
+          schema,
+          withConfiguredStorage(
+            { ...deep, path: [name] },
+            name,
+            schema,
+            ownValue(fieldEncodings, name),
+          ),
+        ),
         schema,
         storedAsProto,
       ),
@@ -2879,8 +2892,7 @@ const unionDateOverride = (
 
 /**
  * @internal The storage `DynamoModel.configure` gives a model's fields (`storedAs` a date schema),
- * by name, or `undefined` for a model with none. What a ref to the model's entity holds such a
- * field in (`DeepSubstitutionOptions.configuredStorage`).
+ * by name, or `undefined` for a model with none.
  */
 export const configuredStorageOf = (
   model: unknown,
@@ -2894,23 +2906,99 @@ export const configuredStorageOf = (
 }
 
 /**
+ * @internal What a ref to an entity holds the entity's fields in (`refDataOf` stores the item as
+ * the entity's read schema encodes it): the storage its `DynamoModel.configure` gives its fields
+ * (`fields`), and, by ref field, what each entity it refs holds (`refs`), so a ref two levels down
+ * is read in the storage it's held in. See `DeepSubstitutionOptions.configuredStorage`.
+ */
+export interface HeldStorage {
+  readonly fields: Readonly<globalThis.Record<string, DynamoEncoding>>
+  readonly refs: Readonly<globalThis.Record<string, HeldStorage>>
+}
+
+/** Each entity's {@link HeldStorage}, by its derived schemas (shared by its pure and runtime forms). */
+const heldStorages = new WeakMap<object, HeldStorage>()
+
+/**
+ * @internal Record what an entity holds (`fields`, the storage its schemas apply to its own fields;
+ * `refs`, by ref field, each entity it refs), when it's made. An entity can only ref one made
+ * before it, so the tree is finite.
+ */
+export const holdStorage = (
+  schemas: object,
+  fields: Readonly<globalThis.Record<string, DynamoEncoding>> | undefined,
+  refs: ReadonlyArray<{ readonly fieldName: string; readonly refEntity?: unknown }>,
+): void => {
+  const held: globalThis.Record<string, HeldStorage> = {}
+  for (const ref of refs) {
+    const storage = heldStorageOf(ref.refEntity)
+    if (storage !== undefined) setOwn(held, ref.fieldName, storage)
+  }
+  heldStorages.set(schemas, { fields: fields ?? {}, refs: held })
+}
+
+/**
+ * @internal The {@link HeldStorage} of a ref's entity, or `undefined` where it holds every field in
+ * the default storage. An entity this module didn't make is taken by its model's `configure`.
+ */
+export const heldStorageOf = (entity: unknown): HeldStorage | undefined => {
+  const { schemas, model } = (entity ?? {}) as {
+    readonly schemas?: unknown
+    readonly model?: unknown
+  }
+  const held =
+    typeof schemas === "object" && schemas !== null ? heldStorages.get(schemas) : undefined
+  if (held === undefined) {
+    const fields = configuredStorageOf(model)
+    return fields === undefined ? undefined : { fields, refs: {} }
+  }
+  return Object.keys(held.fields).length === 0 && Object.keys(held.refs).length === 0
+    ? undefined
+    : held
+}
+
+/**
+ * @internal Whether the storage `DynamoModel.configure` gives this field was left unapplied up to
+ * 1.41.0: a date beneath an optional wrapper that is a union (`Schema.optional(date)`,
+ * `Schema.optionalKey(Schema.NullOr(date))`), which those releases stored as ISO text.
+ */
+export const configuredStorageWasIgnored = (field: Schema.Top): boolean => {
+  const optional = optionalField(field)
+  return optional !== undefined && !isSelfDateSchema(field) && isSelfDateSchema(optional.inner)
+}
+
+/**
  * A field's substitution options with the storage `encoding` its model's `DynamoModel.configure`
- * gives it, where its entity applies that storage ({@link substituteSchemas} decides by the same
- * tests): a date (a `Schema.optionalKey` one too, or one beneath a decoding default), or a union's
- * date member. Elsewhere, and without one, `options` as given. A read (`legacyReads`) also takes
- * the form the date's own storage writes (`readsDeclaredStorage`).
+ * gives it: a date, the date beneath an optional wrapper (`Schema.optionalKey`, `Schema.optional`,
+ * the first member of an `optionalKey` union, as `optionalKey(NullOr(date))`), or beneath a
+ * decoding default, or a union's date member. The wrapper is kept as declared. A field holding a
+ * ref takes what that ref's entity holds (`refs`). Elsewhere, and without either, `options` as
+ * given. A read (`legacyReads`) also takes the form the date's own storage writes
+ * (`readsDeclaredStorage`). Up to 1.41.0 an entity's own `optional` date and the date of an
+ * `optionalKey(NullOr(…))` were stored as ISO text, and an `optionalKey` date became required.
  */
 const withConfiguredStorage = (
   options: DeepSubstitutionOptions,
   name: string,
   field: Schema.Top,
   encoding: DynamoEncoding | undefined,
+  refs?: HeldStorage,
 ): DeepSubstitutionOptions => {
+  if (refs !== undefined) return { ...options, configuredStorage: refs }
   if (encoding === undefined) return options
   const reads = options.legacyReads ? { readsDeclaredStorage: true } : {}
-  const defaulted = decodingDefaultField(field)
-  if (isSelfDateSchema(field) || (defaulted !== undefined && isSelfDateSchema(defaulted.inner))) {
-    return { ...options, dateEncodingOverride: encoding, ...reads }
+  const optional = optionalField(field)
+  const date = optional?.inner ?? decodingDefaultField(field)?.inner ?? field
+  if (isSelfDateSchema(date)) {
+    // A read takes the whole union beneath `optionalKey`, its date member in this storage too.
+    const union =
+      optional?.union === undefined ? undefined : unionDateOverride(name, optional.union, encoding)
+    return {
+      ...options,
+      dateEncodingOverride: encoding,
+      ...(union === undefined ? {} : { unionDateOverride: union }),
+      ...reads,
+    }
   }
   const union = unionDateOverride(name, field, encoding)
   return union === undefined ? options : { ...options, unionDateOverride: union, ...reads }
@@ -3155,9 +3243,9 @@ export const buildDerivedSchemas = (
     const asDeclared = (target: Schema.Top) =>
       optional === undefined ? target : optional.rewrap(target)
     // In the storage the target's `DynamoModel.configure` gives its fields, which the ref holds them
-    // in (`refDataOf`). Up to 1.41.0 the default: a date stored as epoch seconds read back as
-    // milliseconds, and a condition or `pathSet` on it sent ISO text.
-    const storage = configuredStorageOf(targetModel)
+    // in (`refDataOf`), and its refs' fields in theirs. Up to 1.41.0 the default: a date stored as
+    // epoch seconds read back as milliseconds, and a condition or `pathSet` on it sent ISO text.
+    const storage = heldStorageOf(ref.refEntity)
     const configured = storage === undefined ? {} : { configuredStorage: storage }
     // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
     setOwn(
@@ -3847,10 +3935,10 @@ export const makePathValueEncoder = (
   /** The entity's READ schemas of the model's fields, which a row is decoded by (`readsAsGiven`). */
   readFields: SchemaFields = {},
   /**
-   * The storage the `DynamoModel.configure` of each ref's target gives its fields
-   * (`configuredStorageOf`), keyed by ref field: the ref holds them in it, as its schemas do.
+   * What each ref's entity holds its fields in (`heldStorageOf`), its own refs' included, keyed by
+   * ref field: the ref holds them in it, as its schemas do.
    */
-  refStorage: globalThis.Record<string, Readonly<globalThis.Record<string, DynamoEncoding>>> = {},
+  refStorage: globalThis.Record<string, HeldStorage> = {},
 ): {
   /**
    * A condition's or filter's operand as the attribute at `segments` holds it (#242): the one
@@ -4075,17 +4163,25 @@ export const makePathValueEncoder = (
   /**
    * `original`, the model's schema at `segments` (below a field), as a write stores it: a field of a
    * ref's target in the storage its `DynamoModel.configure` gives it, which the ref holds it in
-   * (`refStorage`), as the ref's own schemas do.
+   * (`refStorage`), as the ref's own schemas do, and a field of a ref that target holds in turn in
+   * its entity's.
    */
   const storedSchema = (segments: ReadonlyArray<string | number>, original: Schema.Top) => {
-    const [head, name] = segments
-    const encoding =
-      segments.length === 2 && typeof head === "string" && typeof name === "string"
-        ? ownValue(ownValue(refStorage, head), name)
-        : undefined
+    const name = segments[segments.length - 1]
+    let held = typeof segments[0] === "string" ? ownValue(refStorage, segments[0]) : undefined
+    for (const segment of segments.slice(1, -1)) {
+      held = typeof segment === "string" ? ownValue(held?.refs, segment) : undefined
+    }
+    const named = typeof name === "string"
     return substituteSchemaDeep(
       original,
-      withConfiguredStorage({ enforceChecks: true }, name as string, original, encoding),
+      withConfiguredStorage(
+        { enforceChecks: true },
+        name as string,
+        original,
+        named ? ownValue(held?.fields, name) : undefined,
+        named ? ownValue(held?.refs, name) : undefined,
+      ),
     )
   }
   const schemaAt = (segments: ReadonlyArray<string | number>) => {
