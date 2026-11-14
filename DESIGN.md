@@ -4025,10 +4025,17 @@ the model declares (`Object.hasOwn`): the tables a definition looks fields up in
 1.40.0 an update of it beside a sparse map wrote `undefined#…` attributes and returned the old
 value). Path operations take segments, not a callback; segments a builder's `.entry()` built
 carry the mark that they name an entry (`entryOfPath`). A model field named like one of the
-builder's own members (`at`, `size`, `entry`, `segments`, `_tag`, `pipe`, `then`, `toJSON`) is
-the member in a callback, not the field, as through 1.40.0 (named, not changed): an equality
-shorthand (`{ eq: { at: 1 } }`, `.filter({ at: 1 })`), a record operation (`.set({ at })`) and a
-path operation's segments (`["at"]`) reach it (`test/PathBuilderMembers.test.ts`). A
+builder's accessors (`size`, `at`, `entry`) is the field in a callback, at the root and below a
+struct (`t.size`, `t.box.size`), and, called, the accessor on the path before it
+(`t.box.size()`, `t.roster.at(0)`, `t.zones.entry("k")`): that path is a function whose call
+performs the accessor, and `isPath` takes it. Through 1.41.0 it was only the accessor, so
+`eq(t.size, 5)` sent an operand with no value, which DynamoDB rejected. A field named `_tag` (a
+tagged struct's tag, `t.box._tag`) is the field too: a path is recognised by its `PathTag`, and
+through 1.41.0 `_tag` was the text `"Path"`, so a condition on it never held. A field named like
+one of the builder's other members (`segments`, `pipe`, `then`, `toJSON`) is still the member: an
+equality shorthand (`{ eq: { segments: 1 } }`, `.filter({ segments: 1 })`), a record operation
+(`.set({ segments })`) and a path operation's segments (`["segments"]`) reach it
+(`test/PathBuilderMembers.test.ts`). A
 filter on `t.g.entry("b")` names the attribute a condition names, and asks the
 row where it holds a map a `field:` rename stores whole (`entryForms`). In a
 collection each member names the entry by its own prefix, a member that holds
