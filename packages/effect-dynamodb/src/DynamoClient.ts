@@ -2558,6 +2558,28 @@ const makeFromConfig = (config: {
   readonly compressors?: ReadonlyArray<Compressor>
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
+    // A member may be a pure `@effect-dynamodb/schema` EntityDefinition (the headline output of the
+    // schema/runtime split) rather than a runtime Entity. Pure definitions carry no operations,
+    // `_decodeRecord`, bind-time checks or `rekey` handler, so each is promoted to a full runtime
+    // Entity (a thin op-attach over its retained `_data`), once: the entity checked at bind, the
+    // bound entity, the members `rekey` judges and the members the client checks are one object
+    // (#265: `rekey` looked at the definitions as given and counted their rows `unregistered`, and
+    // the bind-time checks passed them by). Runtime-authored entities pass through.
+    const promoted = new Map<unknown, unknown>()
+    const operational = (member: unknown): unknown => {
+      if (
+        (member as { readonly _tag?: unknown })._tag !== "Entity" ||
+        typeof (member as { readonly get?: unknown }).get === "function"
+      ) {
+        return member
+      }
+      const known = promoted.get(member)
+      if (known !== undefined) return known
+      const entity = entityFromDefinition(member as EntityDefinition)
+      promoted.set(member, entity)
+      return entity
+    }
+
     // 1. Resolve the provide function from context.
     //
     // Bundle a `SecureRandom` service into the captured context so that bound entity
@@ -2599,12 +2621,16 @@ const makeFromConfig = (config: {
     // A bound member whose packed config names a codec meets values
     // compressed with it on every read and write, so the codec must be
     // registered here — a configuration defect (`[EDD-9078]`) at bind, not a
-    // ValidationError on the first compressed value (#147).
+    // ValidationError on the first compressed value (#147). A pure definition is checked as the
+    // entity it is promoted to, which carries the codecs its packed fields name (#265).
     const codecError = unregisteredCodecError(
       "DynamoClient.make",
       [
         ...Object.entries(config.entities).flatMap(([key, entity]) =>
-          codecRequirements(`entity "${key}"`, packedFieldConfigs(entity as unknown as EntityLike)),
+          codecRequirements(
+            `entity "${key}"`,
+            packedFieldConfigs(operational(entity) as unknown as EntityLike),
+          ),
         ),
         ...Object.entries(config.aggregates ?? {}).flatMap(([key, aggregate]) =>
           [...(aggregate._packedByType ?? new Map())].flatMap(([edgeType, packed]) =>
@@ -2625,9 +2651,10 @@ const makeFromConfig = (config: {
 
     // A table's TTL attribute is named by its configuration, so an entity that sets it is checked
     // here, where the table is bound: a row's reader may not take it as a sparse map's entry
-    // (`[EDD-9140]`, as `Entity.make` checks every name the definition supplies).
+    // (`[EDD-9140]`, as `Entity.make` checks every name the definition supplies). A pure definition
+    // is checked as the entity it is promoted to (#265).
     for (const rawEntity of Object.values(config.entities)) {
-      const entityLike = rawEntity as unknown as EntityLike
+      const entityLike = operational(rawEntity) as unknown as EntityLike
       const tableConfig = Option.getOrUndefined(Context.getOption(baseCtx, entityLike._tableTag))
       if (tableConfig !== undefined) entityLike._refuseTableAttributes?.(tableConfig)
     }
@@ -3035,27 +3062,6 @@ const makeFromConfig = (config: {
             }),
         )
       }
-    }
-
-    // A member may be a pure `@effect-dynamodb/schema` EntityDefinition (the headline output of the
-    // schema/runtime split) rather than a runtime Entity. Pure definitions carry no operations,
-    // `_decodeRecord` or `rekey` handler, so each is promoted to a full runtime Entity (a thin
-    // op-attach over its retained `_data`), once: the bound entity, the members `rekey` judges and
-    // the members the client checks are one object (#265: `rekey` looked at the definitions as
-    // given and counted their rows `unregistered`). Runtime-authored entities pass through.
-    const promoted = new Map<unknown, unknown>()
-    const operational = (member: unknown): unknown => {
-      if (
-        (member as { readonly _tag?: unknown })._tag !== "Entity" ||
-        typeof (member as { readonly get?: unknown }).get === "function"
-      ) {
-        return member
-      }
-      const known = promoted.get(member)
-      if (known !== undefined) return known
-      const entity = entityFromDefinition(member as EntityDefinition)
-      promoted.set(member, entity)
-      return entity
     }
 
     // 2. Bind entities + build entity query accessors
