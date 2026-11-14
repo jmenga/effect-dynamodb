@@ -3445,7 +3445,10 @@ siblings. The rule covers the primary accessor, every GSI accessor (on an
 isolated or a clustered collection index too), `Entity.query.<index>` and the
 language service's params (a collection query pins no sort key composites); `Aggregate.list` applies the same rule to its list sort key
 (`=` when every list sk composite is given, else `begins_with` with a trailing
-`#`). A full pin on a time-series entity's primary accessor reads the current item
+`#`). Its `prefix: true` option (#264) sends 1.36's bare `begins_with(<key text>)`, so
+the last value given matches as a prefix, as `.where(beginsWith)` does on an entity; a
+numeric last value has no text prefix and keeps the rule above
+(`KeyComposer.matchesTextPrefix`). A full pin on a time-series entity's primary accessor reads the current item
 only, never its `#e#` rows. Z-order halves pin prefix segments only and are
 unaffected. An index whose sort key has no composites (an empty-composite half)
 pins nothing: its accessor sends the partition key alone, and on the primary key

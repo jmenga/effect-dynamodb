@@ -838,7 +838,7 @@ const TournamentMatchAggregate = Aggregate.make(TournamentMatch, {
 })
 ```
 
-The first argument selects the partition (and, with contiguous SK composites, a prefix within it). The second carries the paging options:
+The first argument selects the partition and, with leading list sort key composites, the aggregates holding those values, each matched whole. The second carries the paging options:
 
 | Option | Meaning |
 |--------|---------|
@@ -847,6 +847,7 @@ The first argument selects the partition (and, with contiguous SK composites, a 
 | `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()`, and the same empty-part rules: an empty filter is none, and an empty part under `or()` / `not()`, an `or()` with no parts, or an operand that is `t` itself fails with a `ValidationError` before sending. An `isIn` with no values is sent; DynamoDB rejects its `IN ()`, and `list` fails with a `ValidationError` (`operation: "list.filter"`) naming it. A path is named as a query's filter names it: below a struct that renames its keys as they're stored (`Schema.encodeKeys`), `t.meta.amount` names the stored `meta.am` |
 | `reverse` | Walk the list index descending |
 | `cursor` | Resume after the last aggregate the previous call returned |
+| `prefix` | Match the last list sort key value given as a prefix of its composite's value, not the whole value |
 
 ```typescript region="list-filtered" example="guide-aggregates.ts"
 const completed = yield* TournamentMatchAggregate.list(
@@ -878,6 +879,17 @@ const latest = yield* TournamentMatchAggregate.list(
   { filter: (t, { eq }) => eq(t.status, "completed"), limit: 1, reverse: true },
 )
 ```
+
+A list sort key value is matched whole: no match id is `bgt-2025-test-0`, so without the option the call below returns nothing. With `prefix: true` the last value given is matched as a prefix of its composite's value, and every value before it still whole. For a list keyed `sk: [league, name]`, `{ league: "Big Bash", name: "fin" }` finds the `Big Bash` aggregates whose name starts with `fin`, and `{ league: "big" }` finds the leagues `Big`, `Big Bash` and `Big Bash League`. Up to 1.36 every list key was matched this way.
+
+```typescript region="list-prefix" example="guide-aggregates.ts"
+const testMatches = yield* TournamentMatchAggregate.list(
+  { tournament: "bgt-2025", matchId: "BGT-2025-TEST-0" },
+  { prefix: true },
+)
+```
+
+The prefix is composed as the key is, so it follows the schema's casing (case-insensitive under the default lowercase) and `escapeKeys`, and the list pages with its own cursor. A number has no text prefix, so a numeric composite is still matched whole, and a date (or any composite whose schema transforms its value) is read as a whole value of its type, so `prefix` is for text composites. With `escapeKeys` off, a `#` in the prefix is the key delimiter and also matches the start of the next composite's value.
 
 :::caution[Sharded lists cannot be resumed]
 With `list.cardinality`, the list index is spread across _n_ partitions and `list` fans out across all of them. `limit` bounds the merged result, but there is no resumable position across shards — `cursor` is always `None`, and passing one fails with a `ValidationError` (`EDD-9051`) rather than being silently ignored.

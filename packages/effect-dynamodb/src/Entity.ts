@@ -20605,13 +20605,12 @@ export const bind = <
           if ("between" in cond)
             return { between: [rewrite(cond.between[0]), rewrite(cond.between[1])] }
           if ("beginsWith" in cond) {
-            // A number has no text prefix: its key text is not its digits
-            // (`-3` is `-9999999999999996:`), and an integer's text prefixes
-            // its fractions'. `beginsWith` on a numeric orderBy is `eq`.
+            // A number has no text prefix (`KeyComposer.matchesTextPrefix`):
+            // `beginsWith` on a numeric orderBy is `eq`.
             const operand = keyFormOf(cond.beginsWith)
-            return typeof operand === "number" || typeof operand === "bigint"
-              ? { eq: rewrite(cond.beginsWith) }
-              : { beginsWith: rewrite(cond.beginsWith) }
+            return KeyComposer.matchesTextPrefix(operand)
+              ? { beginsWith: rewrite(cond.beginsWith) }
+              : { eq: rewrite(cond.beginsWith) }
           }
           return cond
         }
