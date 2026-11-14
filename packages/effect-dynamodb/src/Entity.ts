@@ -377,9 +377,9 @@ import type {
 import {
   allCompositeAttributes,
   allKeyFieldNames,
-  configuredStorageOf,
   type DerivedSchemas,
   getSchemaFields,
+  heldStorageOf,
   inferDefaultEncoding,
   makePathValueEncoder,
   type PathSetValue,
@@ -3053,11 +3053,17 @@ const makeImpl = <
     (encoded) => unstorableIn({ stored: encoded }) === undefined,
     (schemas.modelSchema as unknown as { readonly fields: globalThis.Record<string, Schema.Top> })
       .fields,
-    // ...in the storage the target's `configure` gives its fields, which the ref holds them in.
+    // ...in the storage the target's `configure` gives its fields, which the ref holds them in, and
+    // its own refs' fields in theirs.
     Object.fromEntries(
-      refModels.flatMap(([field, model]) => {
-        const storage = configuredStorageOf(model)
-        return storage === undefined ? [] : [[field, storage] as const]
+      (
+        data.resolvedRefs as ReadonlyArray<{
+          readonly fieldName: string
+          readonly refEntity?: unknown
+        }>
+      ).flatMap((ref) => {
+        const storage = heldStorageOf(ref.refEntity)
+        return storage === undefined ? [] : [[ref.fieldName, storage] as const]
       }),
     ),
   )

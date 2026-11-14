@@ -3236,6 +3236,30 @@ user's transform. A `DynamoModel.configure(..., { f: { storedAs } })` override
 on a top-level union field applies to the union's single self-date member; with
 several date members it is rejected with **EDD-9057**.
 
+**An optional date keeps its wrapper.** A `configure` `storedAs` on a date beneath an
+optional wrapper (`Schema.optionalKey`, `Schema.optional`, the first member of an
+`optionalKey` union such as `optionalKey(NullOr(date))`) applies to the date, and the wrapper
+is kept as declared: `withConfiguredStorage`, the one rule an entity's own fields and a ref's
+`configuredStorage` both take. Up to 1.41.0 `substituteSchemas` replaced an `optionalKey` date
+whole, so the field became required (a `put` leaving it out failed with `Missing key`; a
+present value was stored in the configured form on every path, so no row holds another), and
+left the storage unapplied to `Schema.optional(date)` and `optionalKey(NullOr(date))`, which
+were stored, compared and path-written as ISO text: a TTL attribute so declared never expired,
+and a model-declared `optional` `createdAt` / `updatedAt`, which the stamp writes in the
+configured form, read back as epoch milliseconds (a 1970 date). A read takes either form by the
+kind of value stored (`readsDeclaredStorage`), so a row holding ISO text reads as the date it
+holds; a condition or filter on it sends the configured form and doesn't match until a write
+(`update().set()`, a `put`) stores it again. Where such a field is composed into a key (a
+primary or index composite, a Z-order prefix, a `unique` field, a vector partition,
+`timeSeries.orderBy`), storing it as configured would move the key text of every row holding
+it, so it is still stored, and keyed, as ISO text (`configuredStorageWasIgnored`,
+`keyedAsBefore` in `buildEntityDefinition`). A model that doesn't put the two together sends
+what 1.41.0 sent (`OptionalStoredAs.test.ts`, `helpers/OptionalStoredAs.ts`,
+`connected.optional-stored-as.test.ts`). Named: an index a collection adds after `make`
+(`Collections.make`) isn't counted among the keys; `optionalKey(Union([String, date]))`, whose
+date isn't the first member, is unchanged; `optionalKey(Union([date, Number]))` with an epoch
+storage is refused with **EDD-9058**, as `Union([date, Number])` is.
+
 **Legacy reads on entities.** Entity READ schemas (model, record, item,
 deleted, history) are built with `legacyReads`: a transform field also accepts
 the domain-form value older path updates wrote (a `number` on a
@@ -5713,12 +5737,19 @@ as 1.41.0 did (`RefConfiguredStorage.test.ts`). Writes and operands encode the c
 only. Where both storages are numbers (a field declared in epoch milliseconds that `configure`
 stores in seconds) the kind can't tell them apart, and the configured scale is read. A condition
 on a copy holding ISO text sends the configured form and doesn't match it; rewriting the ref
-(`.set({ playerId })`, or an update of the target with `.cascade()`) stores it again. Named, not
-changed: the storage is the target's own fields', not that of a ref the
-target holds in turn. With `Selection` → `Player` → `Team`, `Team` configuring `founded`,
-`Player` now stores and reads its copy of `team` right, so `Selection`'s copy of `player.team`
-holds `founded` in `Team`'s storage, which `Selection` reads with the default (a 1970 date, as
-1.41.0 read the ISO text it stored of the 1970 date `Player` read). A whole-ref
+(`.set({ playerId })`, or an update of the target with `.cascade()`) stores it again. A ref the
+target holds in turn is held in its own entity's storage, at any depth: each entity records at
+`make` what a ref to it holds (`HeldStorage`: its fields' storage and, by ref field, what its
+refs hold; `holdStorage`, read by `heldStorageOf`), and the ref schemas and the path encoder walk
+it. With `Selection` → `Player` → `Team`, `Team` configuring `founded`, `Selection`'s copy of
+`player.team` holds `founded` in `Team`'s storage, as hydration stores it, and is read, compared
+and path-written in it (`helpers/EntityRefStoredAs.ts`). An entity can only ref one made before
+it, so the tree is built from finished entities and can't loop. A copy 1.41.0 wrote holds the
+ISO text of the 1970 date `Player` read then, and reads as that date; setting the ref again
+stores it right. Named, not changed: a middle model declaring its ref opaque (`team:
+DynamoModel.ref(Team)` in `Player`'s class, not `team: Team` with `configure`'s `ref: true`)
+isn't looked into, and such a `Selection` fails its `put` and reads (`Expected DateTime.Utc at
+player.team.founded`) whatever the storage, as it did before. A whole-ref
 `pathSet(["player"], value)` the ref's schema refuses as a whole is encoded part by part over
 the raw model, without the storage. An aggregate's ref and `one` edge copies are encoded by the
 aggregate's own encoders over the raw model (`buildAttrEncoders`), so they hold the default
