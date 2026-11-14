@@ -173,7 +173,7 @@ export interface BoundVectorQueryConfig {
   readonly resolveDbName: (domainName: string) => string
   /**
    * How the entity stores a filter's value at a field (#242): an equality filter's value that is
-   * one of Effect's instances, a `Date` or a primitive the field doesn't hold as given is sent in
+   * one of Effect's instances, a `Date` or a primitive the field stores as another type is sent in
    * that form (`operandAsStored`).
    */
   readonly storedAt?: StoredFormAt | undefined

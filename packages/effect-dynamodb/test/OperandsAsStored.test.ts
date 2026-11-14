@@ -235,6 +235,8 @@ describe("a primitive is sent as the attribute holds it, where it doesn't hold i
     expect(at(["picks"], 3)).toBe("3")
     expect(at(["big"], 5n)).toBe("5")
     expect(at(["ranks"], 5, "contained")).toBe("5")
+    // A number where the date is stored as text: the text a write of that date stores.
+    expect(at(["listed"], 0)).toBe("1970-01-01T00:00:00.000Z")
   })
 
   it("as given where the attribute holds it so", () => {
@@ -246,10 +248,60 @@ describe("a primitive is sent as the attribute holds it, where it doesn't hold i
       [["n"], 1],
       [["picks"], "3"],
       [["listed"], "2026-01"],
-      [["listed"], 0],
     ]
     for (const [segments, value] of asGiven) expect(at(segments, value)).toBe(value)
     expect(at(["ranks"], "5", "contained")).toBe("5")
+  })
+
+  it.effect("text where text is stored, a transform's included, as 1.41.0 sent it", () =>
+    Effect.gen(function* () {
+      // `"hello"` is stored as `"aGVsbG8="`, the set's member too. A text operand could be that
+      // text, a substring of it or a prefix, so it's sent as given and matches as on 1.41.0.
+      const E = Entity.make({
+        model: Schema.Struct({
+          id: Schema.String,
+          body: Schema.StringFromBase64,
+          tags: Schema.ReadonlySet(Schema.StringFromBase64),
+        }),
+        entityType: "E",
+        primaryKey: byId,
+      } as never) as any
+      const table = makeRecordingTable()
+      yield* run({ E }, table, (db) =>
+        Effect.gen(function* () {
+          yield* db.entities.E.put({ id: "a", body: "hello", tags: new Set(["hello"]) }).asEffect()
+          const stored = table.items.get("$os#v1#e#id_a|$os#v1#e")!
+          expect([stored.body, stored.tags]).toEqual([{ S: "aGVsbG8=" }, { SS: ["aGVsbG8="] }])
+          table.take()
+          const sent: Array<unknown> = []
+          const found: Array<number> = []
+          for (const filter of [
+            (t: any, { contains }: any) => contains(t.tags, "aGVsbG8="),
+            (t: any, { contains }: any) => contains(t.body, "bG"),
+            (t: any, { beginsWith }: any) => beginsWith(t.body, "aGV"),
+          ]) {
+            found.push((yield* db.entities.E.scan().filter(filter).collect()).length)
+            sent.push(table.take()[0]?.input.ExpressionAttributeValues?.[":e1"])
+          }
+          expect(sent).toEqual([{ S: "aGVsbG8=" }, { S: "bG" }, { S: "aGV" }])
+          expect(found).toEqual([1, 1, 1])
+        }),
+      )
+    }),
+  )
+
+  it("on a field named like a member every object inherits", () => {
+    const E = Entity.make({
+      model: Schema.Struct({
+        id: Schema.String,
+        toString: Schema.String,
+        constructor: Schema.NumberFromString,
+      }),
+      entityType: "E",
+      primaryKey: byId,
+    } as never) as any
+    expect(operandAsStored(E._storedFormAt, ["toString"], "x", "value")).toBe("x")
+    expect(operandAsStored(E._storedFormAt, ["constructor"], 5, "value")).toBe("5")
   })
 })
 

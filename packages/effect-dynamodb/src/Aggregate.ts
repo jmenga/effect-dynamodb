@@ -2323,7 +2323,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
    */
   const rootStoredFormAt: StoredFormAt = (segments, value, kind) => {
     // A primitive is sent as given, as up to 1.41.0: the root's encoders don't tell a value the
-    // attribute holds as it's given from one it doesn't, as an entity's `operand` does.
+    // attribute stores as another type from one it doesn't, as an entity's `operand` does.
     if (isPrimitiveOperand(value)) return value
     const name = String(segments[0])
     const encode = segments.length === 1 ? attrEncoders[name] : undefined

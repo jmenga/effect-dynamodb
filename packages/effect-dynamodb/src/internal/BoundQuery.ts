@@ -872,7 +872,7 @@ const readsWholeRows = (
  * attribute of each renamed field. A select of no renamed field stays the
  * plain projection, so an entity without renames sends what it always sent.
  * With `storedAt`, a filter's operand that is one of Effect's instances, or a
- * primitive the attribute doesn't hold as given, is sent in the form the
+ * primitive the attribute stores as another type, is sent in the form the
  * attribute holds (`operandsAsStored`, #242), judged by
  * the domain path before it's renamed. A select naming a sparse map field
  * reads whole rows and trims each to what it selected, as the read rebuilds it
