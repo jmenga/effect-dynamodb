@@ -22,6 +22,7 @@ import {
   getEncoding,
   isConfiguredModel,
   isHidden,
+  isRef,
 } from "../DynamoModel.js"
 import type { IndexDefinition } from "../KeyComposer.js"
 import { reviveMarshalledDateTime } from "./EffectInstances.js"
@@ -1211,6 +1212,20 @@ export interface DeepSubstitutionOptions {
    */
   readonly configuredStorage?: HeldStorage | undefined
   /**
+   * The refs of the passed model's entity, by field ({@link HeldRef}): each such field holds its ref
+   * (`heldRef`). Applied at the top level, through an optional wrapper or a union to the struct
+   * beneath, as `configuredStorage` is.
+   */
+  readonly heldRefs?: HeldRefs | undefined
+  /**
+   * The ref this position holds, a ref of its model's entity ({@link HeldRef}): beneath whatever the
+   * model declares around it (an optional key, `NullOr`, a union with other members, a decoding
+   * default), kept as declared, its member is what a read of the ref's entity returns
+   * ({@link heldRefMember}), walked with that entity's refs. Applied here, and through an optional
+   * wrapper, a union or a decoding default to the member beneath, as `configuredStorage` is.
+   */
+  readonly heldRef?: HeldRef | undefined
+  /**
    * Also substitute Pattern B transform date schemas (e.g.
    * `Schema.DateTimeUtcFromString`) with a TOLERANT date transform that accepts
    * the domain value too on decode. Propagated through the whole recursion.
@@ -1518,6 +1533,8 @@ const childOptions = (
     ...(opts?.unionDateOverride && opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
     // A nullable ref (`NullOr(Team)`): its struct member holds what the ref's entity holds.
     ...(opts?.configuredStorage ? { configuredStorage: opts.configuredStorage } : {}),
+    ...(opts?.heldRefs ? { heldRefs: opts.heldRefs } : {}),
+    ...(opts?.heldRef ? { heldRef: opts.heldRef } : {}),
   }
 }
 
@@ -1619,7 +1636,9 @@ const throughOptional = (
   return opts?.unionDateOverride ||
     opts?.collidingKinds ||
     opts?.dateEncodingOverride ||
-    opts?.configuredStorage
+    opts?.configuredStorage ||
+    opts?.heldRefs ||
+    opts?.heldRef
     ? {
         ...deeper,
         ...(opts.unionDateOverride ? { unionDateOverride: opts.unionDateOverride } : {}),
@@ -1627,6 +1646,8 @@ const throughOptional = (
         ...(opts.dateEncodingOverride ? { dateEncodingOverride: opts.dateEncodingOverride } : {}),
         ...(opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
         ...(opts.configuredStorage ? { configuredStorage: opts.configuredStorage } : {}),
+        ...(opts.heldRefs ? { heldRefs: opts.heldRefs } : {}),
+        ...(opts.heldRef ? { heldRef: opts.heldRef } : {}),
       }
     : deeper
 }
@@ -2039,6 +2060,10 @@ const refusesUndefinedPositions = (
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
+  const held = heldMemberOf(schema, opts)
+  if (held !== undefined) {
+    return held.member !== schema || needsDeepSubstitution(held.member, held.options)
+  }
   // A ref held as less than its class (`refHeldTarget`) is another schema than the field it
   // re-points, whatever its leaves.
   if (heldStructs.has(schema)) return true
@@ -2100,7 +2125,12 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
       // Re-point ref edge fields at their target; optionality is handled when the
       // field itself is recursed into (optional unwrap at the entry above).
       const refTarget = opts?.resolveRef?.(name, field)
-      return needsDeepSubstitution(refTarget ?? field, deeper)
+      if (refTarget !== undefined) return needsDeepSubstitution(refTarget, deeper)
+      const held = ownValue(opts?.heldRefs, name)
+      return needsDeepSubstitution(
+        field,
+        held === undefined ? deeper : { ...deeper, heldRef: held },
+      )
     })
   }
   return liftsBigInts(opts) && holdsUnwalkedBigInt(schema)
@@ -2205,6 +2235,9 @@ export const substituteSchemaDeep = (
   schema: Schema.Top,
   opts?: DeepSubstitutionOptions,
 ): Schema.Top => {
+  // The member of a nested ref (`heldRef`), beneath the wrappers walked to reach it.
+  const held = heldMemberOf(schema, opts)
+  if (held !== undefined) return substituteSchemaDeep(held.member, held.options)
   if (!needsDeepSubstitution(schema, opts)) return schema
 
   // `tolerantTransforms`, `resolveRef`, `strictWireKind` and `legacyReads`
@@ -2434,15 +2467,19 @@ export const substituteSchemaDeep = (
         const sub = substituteSchemaDeep(refTarget, atField(deeper, opts, name))
         setOwn(subFields, name, fieldNamed(name, fieldOpt ? fieldOpt.rewrap(sub) : sub, field))
       } else {
+        // A ref of the model's entity (`heldRefs`): its member is what a read of the ref's entity
+        // returns, beneath the wrappers the model declares around it (`heldRef`).
+        const held = ownValue(opts?.heldRefs, name)
+        const options = withConfiguredStorage(
+          atField(deeper, opts, name),
+          name,
+          field,
+          ownValue(opts?.configuredStorage?.fields, name),
+          ownValue(opts?.configuredStorage?.refs, name),
+        )
         const sub = substituteSchemaDeep(
           field,
-          withConfiguredStorage(
-            atField(deeper, opts, name),
-            name,
-            field,
-            ownValue(opts?.configuredStorage?.fields, name),
-            ownValue(opts?.configuredStorage?.refs, name),
-          ),
+          held === undefined ? options : { ...options, heldRef: held },
         )
         setOwn(
           subFields,
@@ -2920,9 +2957,25 @@ export interface HeldStorage {
 const heldStorages = new WeakMap<object, HeldStorage>()
 
 /**
+ * @internal An entity's refs, by ref field: the model of the entity each names, without its
+ * `configure` (`model`), and that entity's own refs (`refs`). A ref holds its entity's refs as
+ * that entity's read returns them, so a ref nested in a ref's target is walked as its entity's
+ * model ({@link heldRefMember}), at any depth, whichever way its model declares it.
+ */
+export interface HeldRef {
+  readonly model: Schema.Top
+  readonly refs: HeldRefs
+}
+/** @internal See {@link HeldRef}. */
+export type HeldRefs = Readonly<globalThis.Record<string, HeldRef>>
+
+/** Each entity's {@link HeldRefs}, by its derived schemas, as {@link heldStorages}. */
+const heldRefsBySchemas = new WeakMap<object, HeldRefs>()
+
+/**
  * @internal Record what an entity holds (`fields`, the storage its schemas apply to its own fields;
- * `refs`, by ref field, each entity it refs), when it's made. An entity can only ref one made
- * before it, so the tree is finite.
+ * `refs`, by ref field, each entity it refs, and that entity's model and refs), when it's made. An
+ * entity can only ref one made before it, so each tree is finite, and is fixed when it's made.
  */
 export const holdStorage = (
   schemas: object,
@@ -2930,11 +2983,74 @@ export const holdStorage = (
   refs: ReadonlyArray<{ readonly fieldName: string; readonly refEntity?: unknown }>,
 ): void => {
   const held: globalThis.Record<string, HeldStorage> = {}
+  const models: globalThis.Record<string, HeldRef> = {}
   for (const ref of refs) {
     const storage = heldStorageOf(ref.refEntity)
     if (storage !== undefined) setOwn(held, ref.fieldName, storage)
+    const model = (ref.refEntity as { readonly model?: unknown } | undefined)?.model
+    if (model !== undefined) {
+      setOwn(models, ref.fieldName, {
+        model: (isConfiguredModel(model) ? model.model : model) as Schema.Top,
+        refs: entityRefsOf(ref.refEntity),
+      })
+    }
   }
   heldStorages.set(schemas, { fields: fields ?? {}, refs: held })
+  heldRefsBySchemas.set(schemas, models)
+}
+
+/** @internal The {@link HeldRefs} of a ref's entity: none for an entity this module didn't make. */
+export const entityRefsOf = (entity: unknown): HeldRefs => {
+  const { schemas } = (entity ?? {}) as { readonly schemas?: unknown }
+  return (
+    (typeof schemas === "object" && schemas !== null
+      ? heldRefsBySchemas.get(schemas)
+      : undefined) ?? {}
+  )
+}
+
+/** `options` with the refs of the model a field holds ({@link HeldRef}), where it has any. */
+const withHeldRefs = (
+  options: DeepSubstitutionOptions,
+  held: HeldRef | undefined,
+): DeepSubstitutionOptions =>
+  held === undefined || Object.keys(held.refs).length === 0
+    ? options
+    : { ...options, heldRefs: held.refs }
+
+/**
+ * @internal The member of a nested ref's declaration that holds the ref, as a walk below the ref
+ * takes it, or `undefined` for anything else: an optional wrapper, a union (`NullOr`, one with other
+ * members), a decoding default, which the walk goes through to the member beneath, kept as declared,
+ * and a member that isn't the ref (`null`, a string). The member is the model of the ref's entity, or
+ * a `DynamoModel.ref` of it. It is what a read of that entity returns (`refHeldTarget`) wherever its
+ * own schema can't be walked (`DynamoModel.ref` hides a class's fields) or holds more than that read;
+ * elsewhere the member as declared, as 1.42.1 walked it.
+ */
+export const heldRefMember = (member: Schema.Top, model: Schema.Top): Schema.Top | undefined => {
+  if (
+    optionalField(member) !== undefined ||
+    SchemaAST.isUnion(member.ast) ||
+    decodingDefaultField(member) !== undefined ||
+    (member !== model && !isRef(member))
+  ) {
+    return undefined
+  }
+  const held = refHeldTarget(model)
+  return schemaFieldsOf(member) !== undefined && held === model ? member : held
+}
+
+/** The walk's {@link heldRefMember} at `schema` (`heldRef`), with what it walks that member with. */
+const heldMemberOf = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): { readonly member: Schema.Top; readonly options: DeepSubstitutionOptions } | undefined => {
+  const held = opts?.heldRef
+  if (held === undefined) return undefined
+  const member = heldRefMember(schema, held.model)
+  return member === undefined
+    ? undefined
+    : { member, options: withHeldRefs({ ...opts, heldRef: undefined }, held) }
 }
 
 /**
@@ -3246,7 +3362,14 @@ export const buildDerivedSchemas = (
     // in (`refDataOf`), and its refs' fields in theirs. Up to 1.41.0 the default: a date stored as
     // epoch seconds read back as milliseconds, and a condition or `pathSet` on it sent ISO text.
     const storage = heldStorageOf(ref.refEntity)
-    const configured = storage === undefined ? {} : { configuredStorage: storage }
+    // ...and the target's own refs as what a read of each of their entities returns, however the
+    // target's model declares them. Up to 1.42.1 a `DynamoModel.ref` field of the target hid its
+    // model's fields, so its dates were read as the ref holds no row (`Expected DateTime.Utc`).
+    const nested = entityRefsOf(ref.refEntity)
+    const configured = {
+      ...(storage === undefined ? {} : { configuredStorage: storage }),
+      ...(Object.keys(nested).length === 0 ? {} : { heldRefs: nested }),
+    }
     // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
     setOwn(
       fields,
@@ -3564,10 +3687,17 @@ export const resolveUniqueFields = (def: UniqueConstraintDef): ReadonlyArray<str
 // Path-addressed values (#133)
 // ---------------------------------------------------------------------------
 
-/** The schema one path segment addresses inside `schema`, or `undefined`. */
-const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.Top | undefined => {
+/**
+ * The schema one path segment addresses inside `schema`, or `undefined`. `member`: what the walk
+ * takes each member beneath an optional wrapper or a union as (a nested ref's, {@link heldRefMember}).
+ */
+const childAtSegment = (
+  schema: Schema.Top,
+  segment: string | number,
+  member: (schema: Schema.Top) => Schema.Top = (schema) => schema,
+): Schema.Top | undefined => {
   const opt = optionalField(schema)
-  const inner = opt?.union ?? opt?.inner ?? schema
+  const inner = member(opt?.union ?? opt?.inner ?? schema)
   const s = inner as unknown as globalThis.Record<string, unknown>
   const fields = schemaFieldsOf(inner)
   if (fields !== undefined)
@@ -3583,8 +3713,8 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   if (SchemaAST.isUnion(inner.ast)) {
     // `NullOr(Stamp)` and friends: the first member the segment resolves in.
     const members = Array.isArray(s.members) ? (s.members as ReadonlyArray<Schema.Top>) : []
-    for (const member of members) {
-      const child = childAtSegment(member, segment)
+    for (const each of members) {
+      const child = childAtSegment(each, segment, member)
       if (child !== undefined) return child
     }
     return undefined
@@ -3819,6 +3949,8 @@ type UnionWayAt = {
   readonly original: Schema.Top
   readonly asDeclared: boolean
   readonly parent: UnionParent
+  /** The nested ref `original` holds, if it holds one (`DeepSubstitutionOptions.heldRef`). */
+  readonly heldRef?: HeldRef | undefined
 }
 
 /**
@@ -3941,6 +4073,11 @@ export const makePathValueEncoder = (
    * ref field: the ref holds them in it, as its schemas do.
    */
   refStorage: globalThis.Record<string, HeldStorage> = {},
+  /**
+   * The entity's refs ({@link HeldRefs}): a path below a ref follows a ref of its target's entity,
+   * at any depth, as what the ref holds there ({@link heldRefMember}), as the ref's schemas do.
+   */
+  heldRefs: HeldRefs = {},
 ): {
   /**
    * A condition's or filter's operand as the attribute at `segments` holds it (#242): the one
@@ -4144,6 +4281,36 @@ export const makePathValueEncoder = (
     return out
   }
   /**
+   * The ref a path ends at below a ref (`path` naming a ref of each ref's target in turn), or
+   * `undefined`: a ref nested in a ref's target, at any depth ({@link HeldRefs}).
+   */
+  const nestedRefAt = (path: ReadonlyArray<string | number>): HeldRef | undefined => {
+    let held: HeldRef | undefined
+    for (const [index, segment] of path.entries()) {
+      if (typeof segment !== "string") return undefined
+      held = ownValue(index === 0 ? heldRefs : held?.refs, segment)
+      if (held === undefined) return undefined
+    }
+    return path.length < 2 ? undefined : held
+  }
+  /**
+   * What a walk takes a member of the schema at `path` as: where a ref nested in a ref's target is,
+   * its member is what the ref holds there ({@link heldRefMember}), beneath the wrappers the model
+   * declares around it; anything else as it is.
+   */
+  const memberAt = (path: ReadonlyArray<string | number>) => {
+    const held = nestedRefAt(path)
+    return held === undefined
+      ? (member: Schema.Top) => member
+      : (member: Schema.Top) => heldRefMember(member, held.model) ?? member
+  }
+  /** {@link childAtSegment}, at `path` (the segments up to and including `segment`). */
+  const childAt = (
+    schema: Schema.Top,
+    segment: string | number,
+    path: ReadonlyArray<string | number>,
+  ): Schema.Top | undefined => childAtSegment(schema, segment, memberAt(path.slice(0, -1)))
+  /**
    * The model's own schema at a path, before any substitution, and whether the path goes through a
    * later member of an optional union, which is written as declared ({@link writesFirstMemberOnly}).
    */
@@ -4152,13 +4319,16 @@ export const makePathValueEncoder = (
     if (typeof head !== "string") return undefined
     let current: Schema.Top | undefined = ownValue(refTargets, head) ?? ownValue(modelFields, head)
     let asDeclared = false
-    for (const segment of rest) {
+    for (const [index, segment] of rest.entries()) {
       if (current === undefined) return undefined
       const opt = optionalField(current)
-      if (opt?.union !== undefined && childAtSegment(opt.inner, segment) === undefined) {
+      if (
+        opt?.union !== undefined &&
+        childAtSegment(opt.inner, segment, memberAt(segments.slice(0, index + 1))) === undefined
+      ) {
         asDeclared = true
       }
-      current = childAtSegment(current, segment)
+      current = childAt(current, segment, segments.slice(0, index + 2))
     }
     return current === undefined ? undefined : { schema: current, asDeclared }
   }
@@ -4166,7 +4336,7 @@ export const makePathValueEncoder = (
    * `original`, the model's schema at `segments` (below a field), as a write stores it: a field of a
    * ref's target in the storage its `DynamoModel.configure` gives it, which the ref holds it in
    * (`refStorage`), as the ref's own schemas do, and a field of a ref that target holds in turn in
-   * its entity's.
+   * its entity's, that ref held as its entity's read returns it (`heldRef`).
    */
   const storedSchema = (segments: ReadonlyArray<string | number>, original: Schema.Top) => {
     const name = segments[segments.length - 1]
@@ -4175,16 +4345,15 @@ export const makePathValueEncoder = (
       held = typeof segment === "string" ? ownValue(held?.refs, segment) : undefined
     }
     const named = typeof name === "string"
-    return substituteSchemaDeep(
+    const options = withConfiguredStorage(
+      { enforceChecks: true },
+      name as string,
       original,
-      withConfiguredStorage(
-        { enforceChecks: true },
-        name as string,
-        original,
-        named ? ownValue(held?.fields, name) : undefined,
-        named ? ownValue(held?.refs, name) : undefined,
-      ),
+      named ? ownValue(held?.fields, name) : undefined,
+      named ? ownValue(held?.refs, name) : undefined,
     )
+    const heldRef = nestedRefAt(segments)
+    return substituteSchemaDeep(original, heldRef === undefined ? options : { ...options, heldRef })
   }
   const schemaAt = (segments: ReadonlyArray<string | number>) => {
     const at = originalAt(segments)
@@ -4264,28 +4433,31 @@ export const makePathValueEncoder = (
       members: ReadonlyArray<Schema.Top>,
       segment: string | number,
       asDeclared: (index: number) => boolean,
+      path: ReadonlyArray<string | number>,
     ): ReadonlyArray<Position> | undefined => {
       const out: Array<Position> = []
       for (const [index, member] of members.entries()) {
-        const reached = reach(member, segment, asDeclared(index))
+        const reached = reach(member, segment, asDeclared(index), path)
         if (reached === undefined) return undefined
         out.push(...reached)
       }
       return out
     }
+    /** The positions below `schema` at `segment`, `path` the segments up to and including it. */
     const reach = (
       schema: Schema.Top,
       segment: string | number,
       asDeclared: boolean,
+      path: ReadonlyArray<string | number>,
     ): ReadonlyArray<Position> | undefined => {
       const opt = optionalField(schema)
       if (opt?.union !== undefined) {
         // An optional union writes its first member substituted and the later ones as declared.
         const members = membersOf(opt.union)?.filter((m) => m.ast._tag !== "Undefined")
         if (members === undefined) return undefined
-        return through(members, segment, (index) => asDeclared || index > 0)
+        return through(members, segment, (index) => asDeclared || index > 0, path)
       }
-      const inner = opt?.inner ?? schema
+      const inner = memberAt(path.slice(0, -1))(opt?.inner ?? schema)
       const fields = schemaFieldsOf(inner)
       if (fields !== undefined) {
         const child = typeof segment === "string" ? fields[segment] : undefined
@@ -4295,7 +4467,7 @@ export const makePathValueEncoder = (
       if (holdsNoPath.has(ast._tag)) return []
       if (SchemaAST.isUnion(ast)) {
         const members = membersOf(inner)
-        return members === undefined ? undefined : through(members, segment, () => asDeclared)
+        return members === undefined ? undefined : through(members, segment, () => asDeclared, path)
       }
       if (SchemaAST.isArrays(ast)) {
         if (typeof segment !== "number") return []
@@ -4313,10 +4485,11 @@ export const makePathValueEncoder = (
       return undefined
     }
     let positions: ReadonlyArray<Position> = [{ schema: top, asDeclared: false }]
-    for (const segment of rest) {
+    for (const [index, segment] of rest.entries()) {
       const next: Array<Position> = []
+      const path = segments.slice(0, index + 2)
       for (const position of positions) {
-        const reached = reach(position.schema, segment, position.asDeclared)
+        const reached = reach(position.schema, segment, position.asDeclared, path)
         if (reached === undefined) return undefined
         for (const p of reached) {
           if (!next.some((q) => q.schema === p.schema && q.asDeclared === p.asDeclared))
@@ -4416,7 +4589,8 @@ export const makePathValueEncoder = (
       parent: UnionParent,
     ): void => {
       if (depth === rest.length) {
-        ways.push({ choices, end: { _tag: "At", original: schema, asDeclared, parent } })
+        const heldRef = nestedRefAt(segments)
+        ways.push({ choices, end: { _tag: "At", original: schema, asDeclared, parent, heldRef } })
         return
       }
       const segment = rest[depth]!
@@ -4426,24 +4600,30 @@ export const makePathValueEncoder = (
       // `originalAt` writes it ({@link writesFirstMemberOnly}).
       const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
       const at = JSON.stringify(segments.slice(0, depth + 1))
+      const held = memberAt(segments.slice(0, depth + 1))
       for (const member of members) {
         const chosen = members.length > 1 ? new Map(choices).set(at, member) : choices
         const declared = asDeclared || (first !== undefined && !first.has(member))
-        const child = childAtSegment(member, segment)
-        if (child !== undefined) walk(child, depth + 1, chosen, declared, parentOf(member))
-        else ways.push({ choices: chosen, end: missingAt(member, segment) })
+        const child = childAt(member, segment, segments.slice(0, depth + 2))
+        if (child !== undefined) walk(child, depth + 1, chosen, declared, parentOf(held(member)))
+        else ways.push({ choices: chosen, end: missingAt(held(member), segment) })
       }
     }
     walk(start, 0, new Map(), false, "other")
     return ways
   }
-  const wayStored = new Map<Schema.Top, Schema.Top>()
+  const wayStored = new Map<Schema.Top, Map<HeldRef | undefined, Schema.Top>>()
   const wayDeclared = (way: UnionWayAt): Schema.Top => {
     if (way.asDeclared) return way.original
-    const found = wayStored.get(way.original)
+    const byRef = wayStored.get(way.original) ?? new Map<HeldRef | undefined, Schema.Top>()
+    wayStored.set(way.original, byRef)
+    const found = byRef.get(way.heldRef)
     if (found !== undefined) return found
-    const stored = substituteSchemaDeep(way.original, { enforceChecks: true })
-    wayStored.set(way.original, stored)
+    const stored = substituteSchemaDeep(way.original, {
+      enforceChecks: true,
+      ...(way.heldRef === undefined ? {} : { heldRef: way.heldRef }),
+    })
+    byRef.set(way.heldRef, stored)
     return stored
   }
   const wayValidators = new Map<Schema.Top, (encoded: unknown) => unknown>()
@@ -4522,10 +4702,17 @@ export const makePathValueEncoder = (
     asDeclared: boolean,
     parent: UnionParent,
     strict: boolean,
+    path: ReadonlyArray<string | number>,
   ): boolean => {
     const ending = below.filter(({ rest }) => rest.length === 0)
     const further = bySegment(below)
-    const at: UnionWayAt = { _tag: "At", original: schema, asDeclared, parent }
+    const at: UnionWayAt = {
+      _tag: "At",
+      original: schema,
+      asDeclared,
+      parent,
+      heldRef: nestedRefAt(path),
+    }
     if (strict && ending.length > 0 && (ending.length > 1 || further.length > 0)) return false
     for (const { clause } of ending) {
       const verdict = endVerdict(clause, at)
@@ -4540,7 +4727,8 @@ export const makePathValueEncoder = (
     const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
     const declaredFor = (member: Schema.Top) =>
       asDeclared || (first !== undefined && !first.has(member))
-    const reads = (member: Schema.Top) => memberReads(member, further, declaredFor(member), strict)
+    const reads = (member: Schema.Top) =>
+      memberReads(member, further, declaredFor(member), strict, path)
     if (members.length === 1) return reads(members[0]!)
     // Members that don't name every segment alike are written as 1.40.0 wrote them, by the names
     // given ({@link membersNamedExactly}): what they leave isn't judged.
@@ -4548,20 +4736,25 @@ export const makePathValueEncoder = (
     if (!strict) return members.some(reads)
     return (
       members.every(reads) ||
-      members.some((member) => fixes(member, further, declaredFor(member)) && reads(member))
+      members.some((member) => fixes(member, further, declaredFor(member), path) && reads(member))
     )
   }
-  /** {@link judge} under one member, for the clauses going further, by segment. */
+  /**
+   * {@link judge} under one member, for the clauses going further, by segment. `path`: the segments
+   * up to the member.
+   */
   const memberReads = (
     member: Schema.Top,
     further: ReadonlyArray<readonly [string | number, Below]>,
     asDeclared: boolean,
     strict: boolean,
+    path: ReadonlyArray<string | number>,
   ): boolean =>
     further.every(([segment, below]) => {
-      const read = readAs(member)
-      const child = childAtSegment(read, segment)
-      if (child !== undefined) return judge(child, below, asDeclared, parentOf(read), strict)
+      const read = readAs(memberAt(path)(member))
+      const at = [...path, segment]
+      const child = childAt(read, segment, at)
+      if (child !== undefined) return judge(child, below, asDeclared, parentOf(read), strict, at)
       const end = missingAt(read, segment)
       if (strict) return end._tag !== "Unknown"
       // A clause the schema can't judge is taken as read, wherever the member leaves it.
@@ -4579,18 +4772,25 @@ export const makePathValueEncoder = (
     member: Schema.Top,
     further: ReadonlyArray<readonly [string | number, Below]>,
     asDeclared: boolean,
+    path: ReadonlyArray<string | number>,
   ): boolean => {
-    const read = readAs(member)
+    const read = readAs(memberAt(path)(member))
     if (parentOf(read) !== "struct") return false
     return (read.ast as SchemaAST.Objects).propertySignatures.every((property) => {
       const group = further.find(([segment]) => segment === property.name)
       if (group === undefined) return false
-      const child = childAtSegment(read, property.name as string)
-      return child !== undefined && fixedBy(child, group[1], asDeclared)
+      const at = [...path, property.name as string]
+      const child = childAt(read, property.name as string, at)
+      return child !== undefined && fixedBy(child, group[1], asDeclared, at)
     })
   }
   /** Whether the clauses below a node set all of it ({@link fixes}). */
-  const fixedBy = (schema: Schema.Top, below: Below, asDeclared: boolean): boolean => {
+  const fixedBy = (
+    schema: Schema.Top,
+    below: Below,
+    asDeclared: boolean,
+    path: ReadonlyArray<string | number>,
+  ): boolean => {
     const ending = below.filter(({ rest }) => rest.length === 0)
     if (ending.length > 0) {
       return ending.length === 1 && below.length === 1 && ending[0]!.clause._tag !== "Other"
@@ -4603,8 +4803,8 @@ export const makePathValueEncoder = (
     return members.some((member) => {
       const declared = asDeclared || (first !== undefined && !first.has(member))
       return (
-        fixes(member, further, declared) &&
-        (members.length === 1 || memberReads(member, further, declared, true))
+        fixes(member, further, declared, path) &&
+        (members.length === 1 || memberReads(member, further, declared, true, path))
       )
     })
   }
@@ -4619,7 +4819,7 @@ export const makePathValueEncoder = (
       return !strict
     }
     const below = clauses.map((clause) => ({ rest: clause.segments.slice(1), clause }))
-    return judge(start, below, false, "other", strict)
+    return judge(start, below, false, "other", strict, [head as string])
   }
   const readDecoders = new WeakMap<Schema.Top, (value: unknown) => boolean>()
   const readDecoder = (schema: Schema.Top): ((value: unknown) => boolean) => {

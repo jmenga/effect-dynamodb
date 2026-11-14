@@ -378,6 +378,7 @@ import {
   allCompositeAttributes,
   allKeyFieldNames,
   type DerivedSchemas,
+  entityRefsOf,
   getSchemaFields,
   heldStorageOf,
   inferDefaultEncoding,
@@ -385,6 +386,7 @@ import {
   type PathSetValue,
   primaryKeyComposites,
   type ResolvedSystemFields,
+  refHeldTarget,
   resolveUniqueFields,
   type UnionClause,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
@@ -2888,6 +2890,18 @@ const makeImpl = <
     isSchemaClass,
     hasHiddenFields,
   } = data
+  /**
+   * Whether a ref of the model holds less than its target's class (`refHeldTarget`: a required
+   * hidden field left out), a plain object the model's own constructor refuses. Up to 1.42.1 a read
+   * of such a class model in "model" mode, which a ref to this entity hydrates through, died.
+   */
+  const refsHoldLess = (
+    data.resolvedRefs as ReadonlyArray<{ readonly refEntity?: { readonly model?: unknown } }>
+  ).some((ref) => {
+    const model = ref.refEntity?.model
+    const target = (isConfiguredModel(model) ? model.model : model) as Schema.Top | undefined
+    return target !== undefined && refHeldTarget(target) !== target
+  })
   /** Which stored attributes are this entity's sparse map entries, as a row's reader takes them. */
   const sparseEntries = sparseReader(sparseFields)
   /** The attributes `field:` renames store sparse maps under whole, by attribute. */
@@ -3064,6 +3078,20 @@ const makeImpl = <
       ).flatMap((ref) => {
         const storage = heldStorageOf(ref.refEntity)
         return storage === undefined ? [] : [[ref.fieldName, storage] as const]
+      }),
+    ),
+    // ...and its target's own refs as what a read of each of their entities returns, at any depth.
+    Object.fromEntries(
+      (
+        data.resolvedRefs as ReadonlyArray<{
+          readonly fieldName: string
+          readonly refEntity?: { readonly model?: unknown }
+        }>
+      ).flatMap((ref) => {
+        const model = ref.refEntity?.model
+        if (model === undefined) return []
+        const target = (isConfiguredModel(model) ? model.model : model) as Schema.Top
+        return [[ref.fieldName, { model: target, refs: entityRefsOf(ref.refEntity) }] as const]
       }),
     ),
   )
@@ -6432,7 +6460,7 @@ const makeImpl = <
             : schemas.itemSchema
       return Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
         Effect.map((decoded) =>
-          mode === "model" && isSchemaClass && !hasHiddenFields
+          mode === "model" && isSchemaClass && !hasHiddenFields && !refsHoldLess
             ? new (rawModel as any)(decoded)
             : mode !== "item"
               ? attachPrototype(decoded)

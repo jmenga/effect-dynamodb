@@ -4197,10 +4197,13 @@ wire AND validates as the domain type (`StringFromBase64` given `"aGk="`,
 `"hi"` on `StringFromBase64` is not valid wire and is encoded. Paths into and
 under a TOP-LEVEL `DynamoModel.ref` field follow the ref target's model
 (`refTargets`), whose read schema is substituted, so they are encoded like any
-other path. An opaque class (built with `.check()` or `.annotate()`, or a
-`DynamoModel.ref` nested inside a ref target) is deliberately not followed by
-`childAtSegment`: its `.fields` are gone, so the read schema keeps it
-unsubstituted and decodes its leaves exactly as `put` stores them, and a path
+other path, and so are paths under a ref nested in a ref target, at any depth,
+through the model of the entity the target's entity names for it (`heldRefs`,
+`heldRef`, `heldRefMember`), however the target's model declares it, within the
+wrappers it declares around it (up to 1.42.1 a nested `DynamoModel.ref` was
+opaque here). An opaque class (built with `.check()` or
+`.annotate()`) is deliberately not followed by `childAtSegment`: its `.fields`
+are gone, so the read schema keeps it unsubstituted and decodes its leaves exactly as `put` stores them, and a path
 value under it is passed through as given so the item stays readable. Known
 limitation: plain dates inside such a class are still stored as maps (also by
 `put` / `.set()`), as on 1.22.0. Only those and paths no schema describes (under
@@ -5733,11 +5736,13 @@ the hidden set `hiddenFieldNamesOf` that the entity's own read uses too): where 
 hidden field is required, the ref is the target's other fields, a plain object.
 Up to 1.40.0 the ref was read as the whole target, so a `put` naming one wrote its
 row without the field and failed (`Missing key`), as did every read of it
-(`fixtures/entity-ref-hidden-1.40.0.json`, `EntityRefHidden.test.ts`). Named, not
-changed: two levels deep (`League` refs `Club`, which refs `Team`, whose hidden
-field is required), `League`'s write still fails, as on 1.40.0, since its ref's
-read builds a `Club` by the class's constructor, which checks `team` as a whole
-`Team` (`RefHiddenPositions.test.ts`). For an
+(`fixtures/entity-ref-hidden-1.40.0.json`, `EntityRefHidden.test.ts`). Two levels
+deep (`League` refs `Club`, which refs `Team`, whose hidden field is required),
+`League`'s write failed through 1.42.1, since its ref's read built a `Club` by the
+class's constructor, which checks `team` as a whole `Team`. An entity one of whose
+refs holds less than its target's class (`refHeldTarget`) is now read in "model"
+mode by prototype, as its other reads are (`refsHoldLess`), whichever way the refs
+are declared (`RefHiddenPositions.test.ts`). For an
 entity whose identifier is its key, nothing a `put` sends or stores changes
 (`fixtures/entity-ref-keys-1.39.0.json`, `EntityRefKeys.test.ts`,
 `connected.entity-ref-keys.test.ts`). An entity keyed by more than one composite
@@ -5784,10 +5789,24 @@ it. With `Selection` → `Player` → `Team`, `Team` configuring `founded`, `Sel
 and path-written in it (`helpers/EntityRefStoredAs.ts`). An entity can only ref one made before
 it, so the tree is built from finished entities and can't loop. A copy 1.41.0 wrote holds the
 ISO text of the 1970 date `Player` read then, and reads as that date; setting the ref again
-stores it right. Named, not changed: a middle model declaring its ref opaque (`team:
-DynamoModel.ref(Team)` in `Player`'s class, not `team: Team` with `configure`'s `ref: true`)
-isn't looked into, and such a `Selection` fails its `put` and reads (`Expected DateTime.Utc at
-player.team.founded`) whatever the storage, as it did before. A whole-ref
+stores it right. A middle model may declare its ref either way (`team: DynamoModel.ref(Team)` in
+`Player`'s class, or `team: Team` with `configure`'s `ref: true`): each entity also records at
+`make`, by ref field, the model of the entity it refs and that entity's own refs (`HeldRefs`,
+read by `entityRefsOf`), and the ref schemas (`DeepSubstitutionOptions.heldRefs`) and the path
+encoder (`makePathValueEncoder`'s `heldRefs`) walk a ref of a ref's target as what a read of its
+entity returns (`heldRefMember`), at any depth. The walk keeps the wrapper the model declares
+around such a ref exactly (`NullOr`, `UndefinedOr`, `optional`, `optionalKey`, `optionalKey`
+of a `NullOr`, a `Union` with other members), as it keeps the one around a date: the field
+carries the ref down (`DeepSubstitutionOptions.heldRef`) through the wrappers the walker already
+passes through, and only the ref member inside is replaced, so a player without a team (`team:
+Schema.NullOr(Team)`) reads, and is path-written `null`, as 1.42.1 did. `DynamoModel.ref` hides a class's fields, so up to
+1.42.1 the annotated form wasn't looked into: such a `Selection`'s `put` stored its row and then
+failed, as did its reads (`Expected DateTime.Utc at player.team.founded`), and a condition,
+filter or `pathSet` on `player.team.founded` sent the date as a map. Both forms now send what the
+configure form sent in 1.42.1, byte for byte; the row such a `put` left behind holds those bytes
+and reads, and a copy a 1.42.1 `pathSet` left as a map reads as the date it holds
+(`helpers/EntityRefNested.ts`). A ref back to a model on the way (a model that refs itself,
+through `Schema.suspend`) is held to the depth its entities give it, as the tree is. A whole-ref
 `pathSet(["player"], value)` the ref's schema refuses as a whole is encoded part by part over
 the raw model, without the storage. An aggregate's ref and `one` edge copies are encoded by the
 aggregate's own encoders over the raw model (`buildAttrEncoders`), so they hold the default
@@ -6058,7 +6077,14 @@ inside sub-aggregate edges and `many` elements (found by
 `deriveEntityFieldName`), a `many` field whose element *is* an opaque ref
 (`Schema.Array(X.pipe(DynamoModel.ref))`, re-pointed as a whole at
 `Schema.Array(<entity model>)` because the walker re-points fields, not
-elements), and refs nested in an edge entity's own model (#116). A
+elements), and refs nested in an edge entity's own model (#116) and in their
+entities' models in turn (`entityRefsOf`; up to 1.42.1 only a pure definition's,
+one level down, whatever its wrapper), each only where the field is the ref or an
+optional key or property of it (`keepsWrapper`), since the resolver re-applies only
+optionality: a nested ref beneath a `NullOr` or a `Union` is walked as declared, as
+1.42.1 walked a runtime entity's. A ref back to a model already on the way (a model that refs
+itself through `Schema.suspend`) is not registered, so the walk ends; its dates
+are encoded as 1.42.1 encoded them. A
 plain-class element field is walked directly and needs no registration. Targets
 are keyed by **field schema identity**, not field name: the resolver is
 consulted at every depth, and a name-keyed table re-pointed any same-named field
