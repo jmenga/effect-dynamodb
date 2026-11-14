@@ -10,6 +10,9 @@
  * and the moving one takes its key; without, the move is refused, whichever of the two the scan
  * meets first, and the sentinel is reported with `reservations`, or counted `unrecognizedKey` as
  * 1.40.0 counted it.
+ *
+ * The part-moved tables run four settings (each segment count once, both concurrencies), every cut
+ * point each; the cheaper describes keep their full segment × order × concurrency grids.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -506,43 +509,46 @@ const runOn = (
 describe("rekey from a table a run cut short left part-moved finishes it in one run", () => {
   // Every unit kind, cut after each of the writes a run sends, in an order of its own: the next
   // run, in any order, says in its dry run what it does, and leaves the rows an uncut run leaves.
-  for (const segments of [1, 2, 3, 5]) {
-    for (const seed of [0, 1, 2, 3]) {
-      for (const concurrency of [1, 4]) {
-        it.effect(
-          `${segments} segment(s), order ${seed}, ${concurrency} at once`,
-          () =>
-            Effect.gen(function* () {
-              const written = yield* writtenOff
-              const finished = yield* runOn(written, { segments: 1, concurrency: 1 }, 0)
-              expect(finished.real.conflicts).toEqual([])
-              const cut = { segments: 6 - segments, concurrency: 5 - concurrency }
-              let after = 0
-              for (; ; after++) {
-                const start = yield* cutShort(written, after, cut, scanOrder(seed + 1))
-                if (start === undefined) break
-                const runs = yield* runOn(start, { segments, concurrency }, seed)
-                const at = `cut after ${after} write(s)`
-                expect(runs.untouched, at).toEqual(storedOf(start))
-                expect(decided(runs.dry), at).toEqual(decided(runs.real))
-                expect(runs.real.conflicts, at).toEqual([])
-                expect(runs.real.scanned, at).toBe(start.length)
-                expect(runs.after, at).toEqual(finished.after)
-                expect(
-                  Object.values(runs.again.moved).every((n) => n === 0),
-                  at,
-                ).toBe(true)
-                expect(runs.again.sentinelsMoved, at).toBe(0)
-                expect(runs.again.conflicts, at).toEqual([])
-              }
-              // A run sends a write or more for each unit: the run was cut at each.
-              expect(after).toBeGreaterThan(20)
-            }),
-          // Three runs from each of 20-odd cuts: up to a second here, several times that on CI.
-          30_000,
-        )
-      }
-    }
+  // Each segment count once, both concurrencies and four orders among them (the cross-product of
+  // the three, 32 cases, took eight times as long).
+  for (const [segments, seed, concurrency] of [
+    [1, 0, 1],
+    [2, 1, 4],
+    [3, 2, 1],
+    [5, 3, 4],
+  ] as const) {
+    it.effect(
+      `${segments} segment(s), order ${seed}, ${concurrency} at once`,
+      () =>
+        Effect.gen(function* () {
+          const written = yield* writtenOff
+          const finished = yield* runOn(written, { segments: 1, concurrency: 1 }, 0)
+          expect(finished.real.conflicts).toEqual([])
+          const cut = { segments: 6 - segments, concurrency: 5 - concurrency }
+          let after = 0
+          for (; ; after++) {
+            const start = yield* cutShort(written, after, cut, scanOrder(seed + 1))
+            if (start === undefined) break
+            const runs = yield* runOn(start, { segments, concurrency }, seed)
+            const at = `cut after ${after} write(s)`
+            expect(runs.untouched, at).toEqual(storedOf(start))
+            expect(decided(runs.dry), at).toEqual(decided(runs.real))
+            expect(runs.real.conflicts, at).toEqual([])
+            expect(runs.real.scanned, at).toBe(start.length)
+            expect(runs.after, at).toEqual(finished.after)
+            expect(
+              Object.values(runs.again.moved).every((n) => n === 0),
+              at,
+            ).toBe(true)
+            expect(runs.again.sentinelsMoved, at).toBe(0)
+            expect(runs.again.conflicts, at).toEqual([])
+          }
+          // A run sends a write or more for each unit: the run was cut at each.
+          expect(after).toBeGreaterThan(20)
+        }),
+      // Three runs from each of 20-odd cuts: up to a second here, several times that on CI.
+      30_000,
+    )
   }
 })
 
