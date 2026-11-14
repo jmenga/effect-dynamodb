@@ -1265,6 +1265,12 @@ export interface DeepSubstitutionOptions {
   readonly unionDateOverride?: DynamoEncoding | undefined
   /** Set internally from `unionDateOverride` on the union's members. */
   readonly dateEncodingOverride?: DynamoEncoding | undefined
+  /**
+   * Set internally, beside a ref's `configuredStorage` on a READ schema: the date also reads the
+   * form its own storage writes, which a ref copy holds where a path write put it there up to
+   * 1.41.0 ({@link declaredStoragePlan}). Goes where the override goes.
+   */
+  readonly readsDeclaredStorage?: boolean | undefined
   /** The field path being substituted, for error messages. */
   readonly path?: ReadonlyArray<string> | undefined
   /**
@@ -1507,6 +1513,7 @@ const childOptions = (
     strictWireKind: true,
     collidingKinds,
     ...(opts?.unionDateOverride ? { dateEncodingOverride: opts.unionDateOverride } : {}),
+    ...(opts?.unionDateOverride && opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
   }
 }
 
@@ -1611,6 +1618,7 @@ const throughOptional = (
         ...(opts.unionDateOverride ? { unionDateOverride: opts.unionDateOverride } : {}),
         ...(opts.collidingKinds ? { collidingKinds: opts.collidingKinds } : {}),
         ...(opts.dateEncodingOverride ? { dateEncodingOverride: opts.dateEncodingOverride } : {}),
+        ...(opts.readsDeclaredStorage ? { readsDeclaredStorage: true } : {}),
       }
     : deeper
 }
@@ -1654,16 +1662,50 @@ const selfDatePlan = (
   return { encoding, canonicalOnly }
 }
 
+/**
+ * Under `readsDeclaredStorage`, in a union: the plan of the storage the date declares, where the
+ * override reads another kind of value (see `readsDeclaredStorage`). Out of a union the override's
+ * transform reads a value by its kind already, text as ISO text and a number in its own scale.
+ */
+const declaredStoragePlan = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): ReturnType<typeof selfDatePlan> => {
+  if (!opts?.readsDeclaredStorage || !opts.strictWireKind || !opts.dateEncodingOverride) {
+    return undefined
+  }
+  const own = getEncoding(schema) ?? inferDefaultEncoding(schema)
+  const text = (encoding: DynamoEncoding) => encoding.storage === "string"
+  if (own === undefined || text(own) === text(opts.dateEncodingOverride)) return undefined
+  try {
+    return selfDatePlan(schema, { ...opts, dateEncodingOverride: undefined })
+  } catch {
+    // An epoch beside a number member (EDD-9058) is refused where it's the storage, not here.
+    return undefined
+  }
+}
+
 const selfDateSubstitute = (
   schema: Schema.Top,
   opts: DeepSubstitutionOptions | undefined,
 ): Schema.Top => {
   const plan = selfDatePlan(schema, opts)
   if (plan === undefined) return schema
-  return buildDateTransform(plan.encoding, {
+  const substitute = buildDateTransform(plan.encoding, {
     strictWireKind: opts?.strictWireKind,
     canonicalOnly: plan.canonicalOnly,
   })
+  // Encodes as the override, and reads either form, as an aggregate's union member does.
+  const declared = declaredStoragePlan(schema, opts)
+  return declared === undefined
+    ? substitute
+    : (Schema.Union([
+        substitute as Schema.Codec<any>,
+        buildDateTransform(declared.encoding, {
+          strictWireKind: true,
+          canonicalOnly: declared.canonicalOnly,
+        }) as Schema.Codec<any>,
+      ]) as unknown as Schema.Top)
 }
 
 /**
@@ -1679,7 +1721,12 @@ const isCanonicalDateMember = (
   opts: DeepSubstitutionOptions | undefined,
 ): boolean => {
   const inner = optionalField(member)?.inner ?? member
-  if (isSelfDateSchema(inner)) return selfDatePlan(inner, opts)?.canonicalOnly === true
+  if (isSelfDateSchema(inner)) {
+    return (
+      selfDatePlan(inner, opts)?.canonicalOnly === true ||
+      declaredStoragePlan(inner, opts)?.canonicalOnly === true
+    )
+  }
   // A nested union holding such a member (`NullOr(DateTimeUtc)` next to a
   // `String`) is decoded first for the same reason.
   const container = walkedContainer(inner)
@@ -2850,7 +2897,8 @@ export const configuredStorageOf = (
  * A field's substitution options with the storage `encoding` its model's `DynamoModel.configure`
  * gives it, where its entity applies that storage ({@link substituteSchemas} decides by the same
  * tests): a date (a `Schema.optionalKey` one too, or one beneath a decoding default), or a union's
- * date member. Elsewhere, and without one, `options` as given.
+ * date member. Elsewhere, and without one, `options` as given. A read (`legacyReads`) also takes
+ * the form the date's own storage writes (`readsDeclaredStorage`).
  */
 const withConfiguredStorage = (
   options: DeepSubstitutionOptions,
@@ -2859,12 +2907,13 @@ const withConfiguredStorage = (
   encoding: DynamoEncoding | undefined,
 ): DeepSubstitutionOptions => {
   if (encoding === undefined) return options
+  const reads = options.legacyReads ? { readsDeclaredStorage: true } : {}
   const defaulted = decodingDefaultField(field)
   if (isSelfDateSchema(field) || (defaulted !== undefined && isSelfDateSchema(defaulted.inner))) {
-    return { ...options, dateEncodingOverride: encoding }
+    return { ...options, dateEncodingOverride: encoding, ...reads }
   }
   const union = unionDateOverride(name, field, encoding)
-  return union === undefined ? options : { ...options, unionDateOverride: union }
+  return union === undefined ? options : { ...options, unionDateOverride: union, ...reads }
 }
 
 /**

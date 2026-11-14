@@ -104,6 +104,8 @@ const onTable = (
     readonly step: (op: any) => Effect.Effect<{ exit: Exit.Exit<any, any>; sent: Array<Sent> }>
     /** The selection's stored row. */
     readonly row: (id: string) => Effect.Effect<Row>
+    /** Store `item` as it is, outside the library. */
+    readonly seed: (item: Row) => Effect.Effect<void, unknown>
   }) => Effect.Effect<void, unknown>,
 ) =>
   harness.onTable((tableName) =>
@@ -138,7 +140,14 @@ const onTable = (
           harness.rows(tableName),
           (rows) => rows.find((r) => r.pk?.S === `${prefix}#id_${id}` && r.sk?.S === prefix)!,
         )
-      yield* body({ db, put: put.sent, step, row })
+      const seed = (item: Row) =>
+        exec(
+          Effect.gen(function* () {
+            const client = yield* DynamoClient
+            yield* client.putItem({ TableName: tableName, Item: item })
+          }),
+        )
+      yield* body({ db, put: put.sent, step, row, seed })
     }),
   )
 
@@ -234,6 +243,39 @@ export const suite = (
             const after = yield* step(S.get({ id: "a" }))
             if (Exit.isFailure(after.exit)) throw after.exit
             same(after.exit.value.player.born, moved)
+          }),
+        ),
+      ))
+
+    it("reads a copy a path write left as ISO text, as 1.41.0 read it", () =>
+      Effect.runPromise(
+        onTable(harness, ({ db, step, row, seed }) =>
+          Effect.gen(function* () {
+            const S = db.entities.Selections
+            // What 1.41.0's `pathSet` stored in the copy, for the plain date and the `NullOr` one.
+            const born = at("2001-02-03T04:05:06.000Z")
+            const stored = yield* row("a")
+            const player = stored.player!.M!
+            yield* seed({
+              ...stored,
+              player: {
+                M: {
+                  ...player,
+                  born: { S: "2001-02-03T04:05:06.000Z" },
+                  retired: { S: "2024-01-02T03:04:05.000Z" },
+                },
+              },
+            })
+            const read = yield* step(S.get({ id: "a" }))
+            if (Exit.isFailure(read.exit)) throw read.exit
+            same(read.exit.value.player.born, born)
+            same(read.exit.value.player.retired, RETIRED_6)
+            // Naming the player again stores the copy in the player's storage.
+            const named = yield* step(S.update({ id: "a" }).set({ playerId: "p5" }))
+            expect(Exit.isSuccess(named.exit)).toBe(true)
+            expect((yield* row("a")).player).toEqual({
+              M: { ...player, born: seconds(BORN_5), retired: { NULL: true } },
+            })
           }),
         ),
       ))

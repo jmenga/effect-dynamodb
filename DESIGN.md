@@ -5695,10 +5695,19 @@ date), a `NullOr` date so stored failed the `put` that wrote it and every read o
 condition or filter on it sent ISO text and matched no row, and `pathSet` wrote ISO text into
 the copy. What hydration stores is unchanged, and a ref whose entity configures no storage
 sends what 1.41.0 sent (`helpers/EntityRefStoredAs.ts`, `EntityRefKeys.test.ts`,
-`connected.entity-ref-keys.test.ts`). A copy `pathSet` wrote as ISO text still reads (the
-tolerant read takes a string), but a condition on it now sends the stored form and doesn't
-match it; rewriting the ref (`.set({ playerId })`, or an update of the target with `.cascade()`)
-stores it again. Named, not changed: the storage is the target's own fields', not that of a ref the
+`connected.entity-ref-keys.test.ts`). A copy holding ISO text, as `pathSet` wrote it up to
+1.41.0, reads as the date it holds, as it did on 1.41.0: a read takes the field's own storage
+beside the configured one, by the kind of value stored (`readsDeclaredStorage`, set on read
+schemas only). Out of a union the date's transform reads text as ISO text already; in one, the
+member is a union of the configured transform and the declared one, each strict, the way an
+aggregate's member reads two storages, and a member either one takes canonically is decoded
+first (`declaredStoragePlan`), so a `Union([String, DateTimeUtc])` reads ISO text as the date,
+as 1.41.0 did (`RefConfiguredStorage.test.ts`). Writes and operands encode the configured form
+only. Where both storages are numbers (a field declared in epoch milliseconds that `configure`
+stores in seconds) the kind can't tell them apart, and the configured scale is read. A condition
+on a copy holding ISO text sends the configured form and doesn't match it; rewriting the ref
+(`.set({ playerId })`, or an update of the target with `.cascade()`) stores it again. Named, not
+changed: the storage is the target's own fields', not that of a ref the
 target holds in turn. With `Selection` → `Player` → `Team`, `Team` configuring `founded`,
 `Player` now stores and reads its copy of `team` right, so `Selection`'s copy of `player.team`
 holds `founded` in `Team`'s storage, which `Selection` reads with the default (a 1970 date, as
