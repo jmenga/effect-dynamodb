@@ -290,15 +290,17 @@ describe("a ref to an entity with a DynamoModel.Hidden field, at every position 
 })
 
 /**
- * Named, not changed (#241): a ref two levels deep whose innermost target holds a required hidden
- * field. `Team` (hidden `secret`, required) is held by `Club` as what a read of it returns, but
- * `League`'s ref to `Club` decodes the club it reads through `Club`'s class, whose constructor checks
- * `team` as a `Team`, so every `League` write fails, as on 1.40.0. One level deep it works (above).
+ * A ref two levels deep whose innermost target holds a required hidden field. `Team` (hidden
+ * `secret`, required) is held by `Club` as what a read of it returns, and so by `League`'s copy of
+ * the club, whichever way the models declare their refs. Up to 1.42.1 every `League` write failed
+ * and stored nothing: the club it read was
+ * rebuilt through `Club`'s class, whose constructor checks `team` as a `Team`, and `League`'s read of
+ * the copy demanded `secret` too.
  */
 describe("a two-level ref chain whose innermost target holds a required hidden field", () => {
-  it.effect(
-    "the outer entity's write fails, as on 1.40.0, and stores nothing",
-    () =>
+  it.effect.each(["model", "configure"] as const)(
+    "the outer entity's write stores the club as a read of it returns, and reads it back (refs declared by %s)",
+    (form) =>
       Effect.gen(function* () {
         const key = {
           pk: { field: "pk", composite: ["id"] },
@@ -314,22 +316,29 @@ describe("a two-level ref chain whose innermost target holds a required hidden f
           entityType: "Team",
           primaryKey: key,
         } as never) as any
+        // On the model (`DynamoModel.ref`), or a plain class configured `{ ref: true }`.
+        const refTo = <S extends Schema.Top>(target: S): S =>
+          form === "model" ? target.pipe(DynamoModel.ref) : target
+        const configured = <M extends Schema.Top>(model: M, field: string) =>
+          form === "model"
+            ? model
+            : DynamoModel.configure(model as never, { [field]: { ref: true } })
         class Club extends Schema.Class<Club>("ChainClub")({
           id: Schema.String.pipe(DynamoModel.identifier),
-          team: Team.pipe(DynamoModel.ref),
+          team: refTo(Team),
         }) {}
         const Clubs = Entity.make({
-          model: Club,
+          model: configured(Club, "team"),
           entityType: "Club",
           primaryKey: key,
           refs: { team: { entity: Teams } },
         } as never) as any
         class League extends Schema.Class<League>("ChainLeague")({
           id: Schema.String.pipe(DynamoModel.identifier),
-          club: Club.pipe(DynamoModel.ref),
+          club: refTo(Club),
         }) {}
         const Leagues = Entity.make({
-          model: League,
+          model: configured(League, "club"),
           entityType: "League",
           primaryKey: key,
           refs: { club: { entity: Clubs } },
@@ -345,12 +354,13 @@ describe("a two-level ref chain whose innermost target holds a required hidden f
         ) as Effect.Effect<any, unknown, never>
         yield* db.entities.Teams.put({ id: "t", name: "team", secret: "s" })
         yield* db.entities.Clubs.put({ id: "c", teamId: "t" })
-        const league = yield* Effect.exit(
-          db.entities.Leagues.put({ id: "l", clubId: "c" }).asEffect(),
-        )
-        expect(Exit.isFailure(league)).toBe(true)
-        const types = [...table.items.values()].map((row: any) => row.__edd_e__?.S).sort()
-        expect(types).toEqual(["Club", "Team"])
+        const league = yield* db.entities.Leagues.put({ id: "l", clubId: "c" }).asEffect()
+        expect(league).toEqual({ id: "l", club: { id: "c", team: { id: "t", name: "team" } } })
+        const row = [...table.items.values()].find((r: any) => r.__edd_e__?.S === "League") as Row
+        expect(row.club).toEqual({
+          M: { id: { S: "c" }, team: { M: { id: { S: "t" }, name: { S: "team" } } } },
+        })
+        expect(yield* db.entities.Leagues.get({ id: "l" })).toEqual(league)
       }) as Effect.Effect<void, unknown, never>,
   )
 })

@@ -15,6 +15,7 @@ import { connectedHarness, dynamoAvailable } from "./helpers/ConnectedHarness.js
 import { suite as cascadeSuite } from "./helpers/EntityRefCascade.js"
 import { suite as keepSuite } from "./helpers/EntityRefKeep.js"
 import { suite } from "./helpers/EntityRefKeys.js"
+import { suite as nestedSuite } from "./helpers/EntityRefNested.js"
 import { suite as operandsSuite } from "./helpers/EntityRefOperands.js"
 import { suite as storedAsSuite } from "./helpers/EntityRefStoredAs.js"
 import { suite as writesSuite } from "./helpers/EntityRefWrites.js"
@@ -28,3 +29,4 @@ writesSuite(harness, describeConnected)
 keepSuite(harness, describeConnected)
 operandsSuite(harness, describeConnected)
 storedAsSuite(harness, describeConnected)
+nestedSuite(harness, describeConnected)

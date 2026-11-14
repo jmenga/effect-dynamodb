@@ -55,6 +55,8 @@ import {
   containedOperand,
   containsWireTransform,
   type DeepSubstitutionOptions,
+  entityRefsOf,
+  type HeldRefs,
   keepsAsGiven,
   matchDateRepresentation,
   optionalField,
@@ -1915,12 +1917,6 @@ const validateNestedDiscriminators = (
 /** The structural slice of an edge's target entity that ref resolution reads. */
 interface RefTargetEntity {
   readonly model?: Schema.Top
-  readonly _data?: {
-    readonly resolvedRefs?: ReadonlyArray<{
-      readonly fieldName: string
-      readonly refEntity?: { readonly model?: Schema.Top }
-    }>
-  }
 }
 
 const unwrapEntityModel = (model: Schema.Top): Schema.Top =>
@@ -1949,7 +1945,7 @@ const unwrapEntityModel = (model: Schema.Top): Schema.Top =>
  *   re-pointed at `Schema.Array(<entity model>)`, since the walker can only
  *   re-point fields, not array elements;
  * - **refs nested inside an edge entity's own model** (`maker` on a `supplier`
- *   edge entity, #116).
+ *   edge entity, #116), and in their entities' models in turn.
  *
  * Keyed by schema IDENTITY. The resolver is consulted at every depth of the
  * walk, so the former name-keyed table re-pointed every same-named field
@@ -1988,12 +1984,26 @@ const collectRefTargets = (
     const held = refHeldTarget(inner)
     if (held !== inner) targets.set(field, held)
   }
+  // The refs of an edge entity's model, and of their entities' models in turn (`entityRefsOf`): a
+  // read of the edge entity holds each as a read of its own entity returns it. An opaque one is
+  // registered, a class only where its read holds less (`registerHeld`), as for an edge. Up to
+  // 1.42.1 only a pure definition's refs were, one level down: an entity made with this package's
+  // `Entity.make` had none, so a `DynamoModel.ref` in its model stored a date as a marshalled map.
+  // A ref back to a model on the way (A → B → A) isn't followed.
   const registerNested = (entity: RefTargetEntity | undefined) => {
     if (entity?.model === undefined) return
-    const entityFields = getSchemaFields(unwrapEntityModel(entity.model))
-    for (const nested of entity._data?.resolvedRefs ?? []) {
-      register(ownValue(entityFields, nested.fieldName), nested.refEntity?.model, false)
+    const nested = (model: Schema.Top, refs: HeldRefs, on: ReadonlySet<Schema.Top>) => {
+      const fields = getSchemaFields(model)
+      for (const [name, held] of Object.entries(refs)) {
+        if (on.has(held.model)) continue
+        const field = ownValue(fields, name)
+        if (field !== undefined && isOpaqueRefField(field)) register(field, held.model, false)
+        else registerHeld(field)
+        nested(held.model, held.refs, new Set([...on, held.model]))
+      }
     }
+    const model = unwrapEntityModel(entity.model)
+    nested(model, entityRefsOf(entity), new Set([model]))
   }
   const walk = (
     fields: Record<string, Schema.Top> | undefined,
