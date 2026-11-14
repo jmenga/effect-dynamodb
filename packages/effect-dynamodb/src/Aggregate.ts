@@ -2658,37 +2658,50 @@ const makeAggregate = <TSchema extends Schema.Top>(
     )
   }
   const decodeRootKey = decodeAsRead(config.pk.composite)
-  const decodeListSortKey = decodeAsRead(config.list?.sk.composite ?? [])
+  // A list sort key composite's value as a read takes it, one composite at a time (built when
+  // first asked): `list` reads only the composites a key gives after a gap, so a row from an index
+  // that doesn't project the others is still matched.
+  const listCompositeReads = new Map<string, ReturnType<typeof decodeAsRead>>()
+  const readListComposite = (row: Record<string, unknown>, attr: string): unknown => {
+    const stored = ownValue(row, attr)
+    if (stored == null) return undefined
+    let read = listCompositeReads.get(attr)
+    if (read === undefined) {
+      read = decodeAsRead([attr])
+      listCompositeReads.set(attr, read)
+    }
+    const given: Record<string, unknown> = {}
+    setOwn(given, attr, stored)
+    const value = read(given)
+    return Option.isSome(value) ? ownValue(value.value, attr) : undefined
+  }
 
   /**
    * Does a root row `list` read hold, for each composite named, the key text given? Its text is the
-   * one `create` composed into its list sort key: its values as a read takes them, through the key
-   * encoders and the key form. A row whose values a read can't take has no such text, so it's
-   * neither kept nor dropped: the call is refused (`EDD-9168`).
+   * one `create` composed into its list sort key: its value as a read takes it, through the key
+   * encoder and the key form. Only the composites named are read. A row without a readable value
+   * for one (the index doesn't project it, or a read can't take what it holds) has no such text,
+   * so it's neither kept nor dropped: the call is refused (`EDD-9168`).
    */
   const listGapMatch =
     (texts: ReadonlyArray<readonly [attr: string, text: string]>) =>
     (row: Record<string, unknown>): boolean => {
-      const stored: Record<string, unknown> = {}
-      for (const attr of config.list?.sk.composite ?? []) {
-        if (hasOwnName(row, attr)) setOwn(stored, attr, row[attr])
-      }
-      const read = decodeListSortKey(stored)
-      if (Option.isNone(read)) {
-        throw new KeyValueError({
-          value: stored,
-          reason: "a read of the root row can't take its list sort key values",
-          message:
-            `[EDD-9168] Aggregate "${aggregateName}" list: a root row's list sort key values ` +
-            `(${Object.keys(stored).join(", ")}) are not ones its fields read, so they have no ` +
-            "key text to match a value given after a gap against. Nothing was returned.",
-        })
-      }
       const keyed: Record<string, unknown> = {}
       for (const [attr] of texts) {
-        const value = ownValue(read.value, attr)
+        const value = readListComposite(row, attr)
+        if (value == null) {
+          throw new KeyValueError({
+            value: ownValue(row, attr),
+            reason: `the list index row holds no readable value for "${attr}"`,
+            message:
+              `[EDD-9168] Aggregate "${aggregateName}" list: the list index row of a root item ` +
+              `holds no readable value for "${attr}", a list sort key composite given after a ` +
+              `gap, so it has no key text to match against. Project "${attr}" onto the list ` +
+              "index, or give the key without the gap. Nothing was returned.",
+          })
+        }
         const encode = ownValue(keyAttrEncoders, attr)
-        setOwn(keyed, attr, encode !== undefined && value != null ? encode(value) : value)
+        setOwn(keyed, attr, encode !== undefined ? encode(value) : value)
       }
       const composites = keyRecord(keyed)
       return texts.every(

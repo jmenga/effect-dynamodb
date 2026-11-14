@@ -52,6 +52,8 @@ const setup = (
     readonly cardinality?: number
     readonly casing?: DynamoSchema.Casing
     readonly sk?: ReadonlyArray<"league" | "season" | "name" | "startDate">
+    /** The list index's projection: every attribute (the default), or the keys and these. */
+    readonly projection?: ReadonlyArray<string>
   } = {},
 ) => {
   const schema = DynamoSchema.make({
@@ -80,7 +82,15 @@ const setup = (
     root: { entityType: "PlayerItem" },
     edges: {},
   })
-  const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+  const table = makeRecordingTable({
+    indexes: {
+      gsi1: {
+        pk: "gsi1pk",
+        sk: "gsi1sk",
+        ...(options.projection === undefined ? {} : { projection: options.projection }),
+      },
+    },
+  })
   const layer = Layer.merge(table.layer, MainTable.layer({ name: "players" }))
   const db = DynamoClient.make({
     entities: { Tags },
@@ -278,19 +288,45 @@ describe("Aggregate.list with a gap in its key", () => {
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("a root row whose value a read can't take is refused (EDD-9168)", () => {
-    const { players, layer, table } = setup()
+  it.effect("only the composites given after the gap are read off the index row", () => {
+    // An index projecting `id`, `league` and `name`, not `season`: `season` isn't asked for.
+    const { players, layer } = setup({ projection: ["id", "league", "name"] })
     return Effect.gen(function* () {
       const Players = yield* players
-      for (const [text, item] of [...table.items.entries()]) {
-        if (item.id?.S === "p5" && item.gsi1sk !== undefined) {
-          table.items.set(text, { ...item, name: { N: "5" } })
-        }
-      }
-      const error = yield* Effect.flip(Players.list({ league: "bbl", name: "smith" }))
-      expect(error._tag).toBe("ValidationError")
-      expect(String((error as { cause?: unknown }).cause)).toContain("EDD-9168")
+      expect(sorted(yield* Players.list({ league: "bbl", name: "Smith" }))).toEqual(["p1", "p3"])
+      expect(sorted(yield* Players.list({ name: "SMITH" }))).toEqual(["p1", "p3", "p4"])
     }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("a composite matched that the index row holds no readable value for (EDD-9168)", () => {
+    return Effect.gen(function* () {
+      // The index doesn't project `name`.
+      const unprojected = setup({ projection: ["id", "league"] })
+      const absent = yield* Effect.flip(
+        Effect.flatMap(unprojected.players, (Players) =>
+          Players.list({ league: "bbl", name: "smith" }),
+        ).pipe(Effect.provide(unprojected.layer)),
+      )
+      // The row holds `name` as a number, which the field can't read.
+      const unreadable = setup()
+      const stored = yield* Effect.flip(
+        Effect.gen(function* () {
+          const Players = yield* unreadable.players
+          for (const [text, item] of [...unreadable.table.items.entries()]) {
+            if (item.id?.S === "p5" && item.gsi1sk !== undefined) {
+              unreadable.table.items.set(text, { ...item, name: { N: "5" } })
+            }
+          }
+          return yield* Players.list({ league: "bbl", name: "smith" })
+        }).pipe(Effect.provide(unreadable.layer)),
+      )
+      for (const error of [absent, stored]) {
+        expect(error._tag).toBe("ValidationError")
+        const cause = String((error as { cause?: unknown }).cause)
+        expect(cause).toContain("EDD-9168")
+        expect(cause).toContain('no readable value for "name"')
+      }
+    })
   })
 
   it.effect("a sharded list matches every shard's rows", () => {
