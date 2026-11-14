@@ -5854,10 +5854,16 @@ ref and its id in `removedSet`, so the halves holding the id are REMOVEd under b
 and a changed unique field releases its sentinel), storing `null`; `.keepRefs()` takes no
 `null` (`KeptRefIds`). A `transactWrite` update plans the entity's own update and agrees; a
 `transactWrite` put of a ref entity is refused as before. Up to 1.42.1 the target replaced the
-whole field, so the id took no `null` and a row holding `null` failed every read (`Expected
-object`), which also failed an aggregate edge copying such a row. A nullable ref's id composes
-no primary key: every item has one, and `null` has no id to compose it from (`EDD-9169`, at
-`Entity.make`; an `UndefinedOr` ref's id isn't refused, as a required key it is always given)
+whole field: a non-null id wrote and read as it does now (the requests are unchanged), but the id
+took no `null` and a row holding `null` failed every read (`Expected object`), which also failed
+an aggregate edge copying such a row. A primary key composed from a ref's id takes a non-null id
+as before; a write of a whole item (`put` / `create` / `upsert`) giving `null`, or leaving out an
+optional ref's id, is refused before anything is sent, another ref's read included
+(`refuseUnkeyedRefs`, from `composeAllKeys` and the plain upsert before its hydration;
+`EDD-9169`): every item has a primary key, and a ref without an id has none to compose it from.
+Up to 1.42.1 the `null` failed decoding and a left-out optional id died in key composition
+(`Missing composite attribute`). A key-taking op is refused by its key schema, which takes no
+`null`, and an update can't set a primary key composite, as before
 (`helpers/EntityRefNullable.ts`, `EntityNullableRefs.types.test.ts`).
 
 **Reassigning one ref of a half that holds two (#263).** An update composes a half from its
@@ -9105,7 +9111,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9166` | `Entity.ts` (`keptRefsOf`), at `update` / `patch` and a planned `transactWrite` update (`ValidationError`, `operation: "update.keepRefs"`, nothing sent) | `.keepRefs()` naming something that is no ref id an update can give: a model field, a typo, or a ref's id that is a primary key composite (no update changes the key). Typed callers can't write one (`KeptRefIds`). The message lists the ids it takes (#263). |
 | `EDD-9167` | `Entity.ts` (`keptRefsOf`), as `EDD-9166` | `.keepRefs()` keeping a ref the same update reassigns (`.set({ playerId })`) or removes (`.remove(["player"])`): keep it or change it, not both (#263). |
 | `EDD-9168` | `Aggregate.ts` (`listGapMatch`), at `list` (`ValidationError`, through `Capacity.refusalsFail`; nothing returned) | An aggregate `list` key giving a value after a list sort key composite left out, matched on the root items read (text under a folding casing), meets a list index row with no readable value for that composite: the index doesn't project it, or the row holds something its field can't read (`readListComposite`). Such a row has no key text to compare, so the call is refused rather than the row kept or dropped. The message names the composite, to project onto the list index. Only the composites matched are read: one the key doesn't give after the gap is never asked for. |
-| `EDD-9169` | `Entity.make` (schema `Entity.ts`, thrown at definition time) | A primary key composite that is the id (`${field}Id`) of a ref the model declares nullable (`Schema.NullOr`, under `Schema.optionalKey` too, read by `refNullish`). Every item has a primary key, and a ref holding `null` has no id to compose it from. Declare the ref without `null`, or compose the primary key from other attributes. |
+| `EDD-9169` | `Entity.ts` (`refuseUnkeyedRefs`, from `composeAllKeys` and the plain `upsert` before its ref reads), at `put` / `create` / `upsert` (`ValidationError`; nothing sent) | A write of a whole item giving no id for a ref whose id (`${field}Id`) is a primary key composite: `null` for a ref the model declares nullable, or none for one it declares optional. Every item has a primary key, and a ref without an id has none to compose it from. Up to 1.42.1 the `null` failed decoding (`Expected string`) and a left-out id died in key composition (`Missing composite attribute`). A non-null id is written as before. |
 | `EDD-9172` | `Entity.ts` (schema, the `unique` check in `make`), pure and operational | A `unique` constraint naming a ref (`"team"` for `refs: { team }`, or a field the model marks `ref: true`). The ref's value is the referenced item's data, which composed the key text `[object object]` for every item, so the first item written took the value for all of them (#266). Refused at load, naming the constraint and the ref and saying to write its id (`teamId`), which a constraint takes as an index composite does. The `unique` type leaves refs out, so it is a compile error too. |
 
 Next free code: `9111`, else none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9114`–`9120` are taken on branches in flight, and `9107` and `9113` are retired, don't reuse them); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.

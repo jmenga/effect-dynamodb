@@ -1,8 +1,9 @@
 /**
  * A ref the model declares nullable (`team: Schema.NullOr(Team)` configured `{ ref: true }`, or
  * `DynamoModel.ref(Schema.NullOr(Team))`) behaves as an optional ref does, with `null` stored and
- * read where the optional form stores nothing. Up to 1.42.1 its id took no `null` (`put` failed
- * `Expected string at ["teamId"]`), and a row holding `null` failed every read (`Expected object`).
+ * read where the optional form stores nothing. Up to 1.42.1 such a ref wrote and read a non-null id
+ * only: its id took no `null` (`put` failed `Expected string at ["teamId"]`), and a row holding
+ * `null` failed every read (`Expected object`).
  *
  * - `put` / `create` / `upsert` take `teamId: null`: nothing is fetched, the row stores `team` as
  *   `NULL`, and an index half or unique constraint over `teamId` takes it as an optional ref's
@@ -11,7 +12,8 @@
  *   it as `.remove(["team"])` detaches an optional one (the index key composed from the id goes,
  *   the sentinel is released), storing `NULL`.
  * - A `Schema.UndefinedOr` ref's id is a required key that takes `undefined`, which stores none.
- * - A nullable ref's id composes no primary key (`EDD-9169`).
+ * - A primary key composed from a nullable ref's id writes and reads a non-null id as 1.42.1 did;
+ *   a write giving `null` or no id is refused before anything is sent (`EDD-9169`).
  *
  * Also: a whole ref written below refs declared nullable, three levels down, is stored in its
  * entity's storage. Up to 1.42.1 such a write was refused in epoch storage.
@@ -141,6 +143,7 @@ const onTable = <A>(
 const PLAYER = "$nullref#v1#player"
 const key = (id: string) => ({ pk: { S: `${PLAYER}#id_${id}` }, sk: { S: PLAYER } })
 const lions = { M: { id: { S: "t2" }, name: { S: "Lions" } } }
+const lionsT1 = { M: { id: { S: "t1" }, name: { S: "Lions" } } }
 
 /**
  * Teams t1 and t2, player p1 on t1; then p2 is put without a team (left out, or `null`), read,
@@ -458,23 +461,98 @@ export const suite = (
         }),
       ))
 
-    it("its id composes no primary key (EDD-9169)", () => {
-      class Player extends Schema.Class<Player>("NullRefKeyedPlayer")({
-        id: Schema.String,
-        team: Schema.NullOr(Team),
-      }) {}
-      expect(() =>
-        Entity.make({
-          model: DynamoModel.configure(Player, { team: { ref: true } }),
-          entityType: "Player",
-          primaryKey: {
+    it("a primary key composed from its id writes and reads a non-null id as 1.42.1 did; null or none is refused at the write (EDD-9169)", () =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const keyed = {
             pk: { field: "pk", composite: ["teamId"] },
             sk: { field: "sk", composite: ["id"] },
-          },
-          refs: { team: { entity: makeTeams() } },
-        } as never),
-      ).toThrow(/\[EDD-9169\].*"teamId".*nullable/)
-    })
+          }
+          // The model as 1.42.1 took it: an attached team wrote and read. Only `null` failed.
+          const Teams = makeTeams()
+          class Player extends Schema.Class<Player>("NullRefKeyedPlayer")({
+            id: Schema.String,
+            nick: Schema.String,
+            team: Schema.NullOr(Team).pipe(DynamoModel.ref),
+          }) {}
+          const Players = Entity.make({
+            model: Player,
+            entityType: "Player",
+            primaryKey: keyed,
+            refs: { team: { entity: Teams } },
+          } as never) as any
+          // An optional ref left out: up to 1.42.1 its write died in key composition.
+          class Member extends Schema.Class<Member>("NullRefKeyedMember")({
+            id: Schema.String,
+            team: Schema.optionalKey(Team),
+          }) {}
+          const Members = Entity.make({
+            model: DynamoModel.configure(Member, { team: { ref: true } }),
+            entityType: "Member",
+            primaryKey: keyed,
+            refs: { team: { entity: Teams } },
+          } as never) as any
+          yield* onTable(harness, { Teams, Players, Members }, ({ db, step }) =>
+            Effect.gen(function* () {
+              const P = db.entities.Players
+              const team = yield* step(db.entities.Teams.put({ id: "t1", name: "Lions" }))
+              const put = yield* step(P.put({ id: "p1", nick: "a", teamId: "t1" }))
+              const get = yield* step(P.get({ id: "p1", teamId: "t1" }))
+              const playerKey = {
+                pk: { S: "$nullref#v1#player#teamid_t1" },
+                sk: { S: "$nullref#v1#player#id_p1" },
+              }
+              const teamKey = { pk: { S: "$nullref#v1#team#id_t1" }, sk: { S: "$nullref#v1#team" } }
+              expect([...team.sent, ...put.sent, ...get.sent]).toEqual([
+                {
+                  command: "PutItem",
+                  input: {
+                    TableName: "<table>",
+                    Item: {
+                      id: { S: "t1" },
+                      name: { S: "Lions" },
+                      __edd_e__: { S: "Team" },
+                      ...teamKey,
+                    },
+                  },
+                },
+                { command: "GetItem", input: { TableName: "<table>", Key: teamKey } },
+                {
+                  command: "PutItem",
+                  input: {
+                    TableName: "<table>",
+                    Item: {
+                      id: { S: "p1" },
+                      nick: { S: "a" },
+                      team: lionsT1,
+                      __edd_e__: { S: "Player" },
+                      ...playerKey,
+                    },
+                  },
+                },
+                { command: "GetItem", input: { TableName: "<table>", Key: playerKey } },
+              ])
+              expect(outcome(get.exit)).toEqual({
+                ok: { id: "p1", nick: "a", team: { id: "t1", name: "Lions" } },
+              })
+              const refusals = [
+                yield* step(P.put({ id: "p2", nick: "b", teamId: null })),
+                yield* step(P.create({ id: "p2", nick: "b", teamId: null })),
+                yield* step(P.upsert({ id: "p2", nick: "b", teamId: null })),
+                yield* step(db.entities.Members.put({ id: "m1" })),
+                yield* step(db.entities.Members.upsert({ id: "m1" })),
+              ]
+              for (const refused of refusals) {
+                expect(failure(refused.exit)?._tag).toBe("ValidationError")
+                expect(String(failure(refused.exit)?.cause)).toMatch(
+                  /^\[EDD-9169\] the primary key is composed from "teamId", the id of ref "team", and the write (gives null|leaves it out)/,
+                )
+                expect(refused.sent).toEqual([])
+              }
+            }),
+          )
+        }),
+      ))
 
     it("a whole ref written three levels down, below refs declared nullable, is stored as its entity stores it", () =>
       Effect.runPromise(

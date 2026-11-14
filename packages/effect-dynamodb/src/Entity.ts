@@ -6009,11 +6009,48 @@ const makeImpl = <
    * on the guarded path after the item is marshalled, and the marshaller
    * would refuse a `NaN` as a defect.
    */
+  /**
+   * A write of a whole item giving no id (`null`, or left out) for a ref whose id is a primary key
+   * composite: every item has a primary key, and a ref without an id has none to compose it from.
+   * Refused before anything is sent (`EDD-9169`). Up to 1.42.1 a left-out id died in key
+   * composition (`Missing composite attribute`), and a nullable ref's `null` failed decoding.
+   */
+  const refuseUnkeyedRefs = (
+    record: globalThis.Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    const ref = resolvedRefs.find(
+      (r) => primaryKeyComposites.includes(r.idFieldName) && given(record, r.idFieldName) == null,
+    )
+    return ref === undefined
+      ? Effect.void
+      : Effect.fail(
+          new ValidationError({
+            entityType,
+            operation,
+            cause:
+              `[EDD-9169] the primary key is composed from "${ref.idFieldName}", the id of ref ` +
+              `"${ref.fieldName}", and the write ${given(record, ref.idFieldName) === null ? "gives null" : "leaves it out"}: ` +
+              "every item has a primary key, and a ref without an id has none to compose it from. " +
+              `Give "${ref.idFieldName}". Nothing was sent.`,
+          }),
+        )
+  }
+
   const composeAllKeys = (
     record: globalThis.Record<string, unknown>,
     operation: string,
     /** {@link ownSchema} for a write of the item's own values; a restore composes what's stored. */
     under: DynamoSchema.DynamoSchema = schema,
+  ) =>
+    Effect.andThen(refuseUnkeyedRefs(record, operation), () =>
+      composeAllKeysOf(record, operation, under),
+    )
+
+  const composeAllKeysOf = (
+    record: globalThis.Record<string, unknown>,
+    operation: string,
+    under: DynamoSchema.DynamoSchema,
   ) =>
     composeKeysOrFail(entityType, operation, () => {
       const keys = KeyComposer.composeAllKeys(
@@ -13618,6 +13655,11 @@ const makeImpl = <
             )
           ) {
             return yield* guardedUpsert(input, mode, opts)
+          }
+
+          // Before another ref is read: a primary key composed from a ref's id needs it.
+          if (hasRefs) {
+            yield* refuseUnkeyedRefs(encodedInput as globalThis.Record<string, unknown>, "upsert")
           }
 
           // Hydrate refs: replace ID fields with full entity domain data

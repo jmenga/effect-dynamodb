@@ -63,7 +63,6 @@ import {
   holdStorage,
   optionalField,
   type ResolvedSystemFields,
-  refNullish,
   resolveFieldEncoding,
   resolveSystemFields,
   resolveUniqueFields,
@@ -1058,25 +1057,6 @@ export const buildEntityDefinition = (config: {
     ...config.indexes.primary.sk.composite,
   ]) {
     checkCompositeForNull("primaryKey", attr)
-  }
-  // EDD-9169: no primary key composite is the id of a ref the model declares nullable. Every item
-  // has a primary key, and a ref holding `null` has no id to compose it from. A secondary index or a
-  // unique constraint over such an id takes `null` as an optional ref's absent id.
-  for (const refFieldName of Object.keys(config.refs ?? {})) {
-    const id = `${refFieldName}Id`
-    if (
-      [...config.indexes.primary.pk.composite, ...config.indexes.primary.sk.composite].includes(
-        id,
-      ) &&
-      refNullish(ownValue(modelFields, refFieldName) as Schema.Top | undefined).nullable
-    ) {
-      throw new Error(
-        `[EDD-9169] Entity "${config.entityType}": the primary key is composed from "${id}", the ` +
-          `id of ref "${refFieldName}", which the model declares nullable. Every item has a ` +
-          "primary key, and a ref holding null has no id to compose it from. Declare the ref " +
-          "without null, or compose the primary key from other attributes.",
-      )
-    }
   }
   for (const [indexName, indexDef] of Object.entries(config.indexes)) {
     if (indexName === "primary") continue
