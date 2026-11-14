@@ -121,7 +121,7 @@ A key composite holding one of Effect's look-alikes (a `Duration`, `BigDecimal`,
 
 A key can hold composites earlier releases each composed their own way: 1.39.0 on `effect` 4.1.3 restored an item keyed by a `Duration` and a date zoned in `Etc/UTC` under `…#d_[object object]#at_…[etc/utc]`, the `Duration` as its map and the zone [as given](#rows-keyed-by-a-zones-given-name-effect-413). `rekey` reads each composite every way an earlier release read it (in 1.39.0's form, a zone as given, a map as `restore` read it), in every combination, fewest composites read another way first, up to 64 readings of one row. Past that, a row stored under a combination it didn't try is left where it is and counted in `skipped.unrecognizedKey`; each earlier release's reading by itself is always tried. 64 covers every combination of six composites read two ways, or three read four ways.
 
-The unique-constraint sentinel that `restore` wrote under `[object object]` names the key the item left, so `rekey` leaves it and counts it as `skipped.unrecognizedKey`, on every run. The value stays reserved: 1.39.0's soft delete didn't release the sentinel `put` wrote, which names the item's key as `put` wrote it. With `escapeKeys` off that's where the item moves, and with it turned on, that sentinel moves with the item. No write composes `[object object]` since 1.41.0 (`EDD-9162`), so the leftover sentinel holds nothing back.
+The unique-constraint sentinel that `restore` wrote under `[object object]` names the key the item left, so `rekey` leaves it and counts it as `skipped.unrecognizedKey`, on every run. The value stays reserved: 1.39.0's soft delete didn't release the sentinel `put` wrote, which names the item's key as `put` wrote it. With `escapeKeys` off that's where the item moves, and with it turned on, that sentinel moves with the item. No write composes `[object object]` for such a value since 1.41.0 (`EDD-9162`), so the leftover sentinel holds nothing back.
 
 ## Turning `escapeKeys` on over existing data
 
@@ -466,6 +466,11 @@ To keep every count exact on a large table, raise `journalCapacity`, or bound ea
 An inverted index over strings is broken in 1.37.0 and 1.38.0: a value with a space, `%` or another character a sort key escapes overwrites a table key, with each attribute holding the text of the half that wrote it last. **1.39.0 fixes it:** both roles build one text under either setting. `rekey` recognises the row those releases left and moves it, an escape in each half included.
 
 Index keys belong in [dedicated attributes](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute): an inverted index is supported, not encouraged.
+
+## Unique constraints over a ref in 1.42
+
+- **`EDD-9172`**: a `unique` constraint naming a ref (`"team"` for `refs: { team }`) now throws at `Entity.make`, and is a compile error. Up to 1.41.0 every record composed the same sentinel from it (`…#[object object]#…`), so the first record took the value for all of them. Name the ref's id instead (`"teamId"`), which 1.41.0 refused (`EDD-9002`) and 1.42 takes, as an index composite does.
+- **The sentinels those releases wrote stay in the table.** Nothing reads them, and the records written then hold no reservation under the id until a write changes the constraint's value. [Constraints Over a Ref](/effect-dynamodb/guides/data-integrity/#constraints-over-a-ref) says how to find them, and how `rekey` reports and releases them.
 
 ## Changes to `rekey` in 1.41
 
