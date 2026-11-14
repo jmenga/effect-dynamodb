@@ -1024,10 +1024,11 @@ export const holdsCustomDeclaration = (
 }
 
 /**
- * Whether a stored side holds a position no schema types (`Schema.Unknown`, `Schema.Any`), at any
- * depth: what's written there is the caller's value as given, so only a value can say whether
- * DynamoDB stores it (`internal/LostValues.ts`, `EDD-9161`). A declaration's type parameters count,
- * as `Schema.Option(Schema.Unknown)` holds its value as given.
+ * Whether a stored side holds a position no schema types (`Schema.Unknown`, `Schema.Any`,
+ * `Schema.ObjectKeyword`, the last any object), at any depth: what's written there is the caller's
+ * value as given, so only a value can say whether DynamoDB stores it (`internal/LostValues.ts`,
+ * `EDD-9161`), as packed storage takes the same three as opaque (`PackedCodec.packedShape`). A
+ * declaration's type parameters count, as `Schema.Option(Schema.Unknown)` holds its value as given.
  */
 export const holdsUntyped = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
   const encoding = ast.encoding
@@ -1037,6 +1038,7 @@ export const holdsUntyped = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new 
   switch (ast._tag) {
     case "Unknown":
     case "Any":
+    case "ObjectKeyword":
       return true
     case "Declaration":
       return within(ast.typeParameters)
