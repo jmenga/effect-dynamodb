@@ -3723,9 +3723,11 @@ const dynamoTypeOf = (value: unknown): "S" | "N" | "BOOL" =>
  * the operand as (`5` where a `NumberFromString` stores `"5"`). Text where text is stored could be
  * the stored text itself, a substring for `contains` or a prefix, which the library can't tell
  * apart, so it is sent as 1.41.0 sent it; so is a number where a number is stored, and a primitive
- * where what's stored is no primitive.
+ * where what's stored is no primitive. An aggregate's root reads it too.
+ *
+ * @internal
  */
-const keepsAsGiven = (operand: unknown, stored: unknown): boolean =>
+export const keepsAsGiven = (operand: unknown, stored: unknown): boolean =>
   isPrimitive(operand) && (!isPrimitive(stored) || dynamoTypeOf(stored) === dynamoTypeOf(operand))
 
 /** A plain object or class instance whose fields a path value can be walked by. */

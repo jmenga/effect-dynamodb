@@ -3472,7 +3472,20 @@ language service's params (a collection query pins no sort key composites); `Agg
 `#`). Its `prefix: true` option (#264) sends 1.36's bare `begins_with(<key text>)`, so
 the last value given matches as a prefix, as `.where(beginsWith)` does on an entity; a
 numeric last value has no text prefix and keeps the rule above
-(`KeyComposer.matchesTextPrefix`). A full pin on a time-series entity's primary accessor reads the current item
+(`KeyComposer.matchesTextPrefix`). The list key's sort key condition holds the
+leading values only, up to the first composite not given; a value given after
+that gap is matched whole against the value the root row stores, as an equality
+ANDed into the root-item `FilterExpression` ahead of the list's own `filter`.
+It is sent as `create` stores it (the root's attribute encoder,
+`rootStoredValue`: `2025` on a `Schema.NumberFromString` as `"2025"`, a
+`DateTime` as its ISO text; a whole value, so transformed text is encoded too,
+unlike a filter operand), and in the case given: the schema's casing is the
+key's, not the attribute's. A value no condition can compare (`NaN`) is a
+`ValidationError` (`EDD-9124`), nothing sent. `prefix` then changes nothing. `limit` and the cursor follow the filtered-list rules.
+Up to 1.42.1 such a value was dropped, so `list({ league, name })` on
+`sk: [league, season, name]` returned every aggregate of the league. A key
+without a gap sends what it sent (`AggregateListGap.test.ts`,
+`connected.aggregate-list-gap.test.ts`). A full pin on a time-series entity's primary accessor reads the current item
 only, never its `#e#` rows. Z-order halves pin prefix segments only and are
 unaffected. An index whose sort key has no composites (an empty-composite half)
 pins nothing: its accessor sends the partition key alone, and on the primary key
@@ -3935,10 +3948,15 @@ entity's model, which the stored ref holds in its stored form, so
 `eq(t.player.id, 5)` on a player keyed by a `NumberFromString` compares the
 `"5"` the ref holds. Up to 1.41.0 every primitive was sent as given, so such a
 comparison never held (a number against text; `ne` always held). An aggregate's
-`list` filter still sends a primitive as given: the root's attribute encoders
-are left as they were. Pinned by `OperandsAsStored.test.ts`,
-`TransactionCheckOperands.test.ts` and `helpers/EntityRefOperands.ts`
-(recording table and DynamoDB Local).
+`list` filter follows the same rule against its root's attribute encoders, the
+encoders its writes store the root row with (`buildAttrEncoders`, a `storedAs`
+date included): `eq(t.caps, 7)` on a root
+`Schema.NumberFromString` sends `"7"` (#124). Through 1.42.1 every primitive
+there was sent as given, and such a comparison never held; an instance (the
+issue's `DateTime.Utc` against a `Schema.DateTimeUtcFromString`) has been sent
+in the stored form since 1.41.0. Pinned by `OperandsAsStored.test.ts`,
+`TransactionCheckOperands.test.ts`, `AggregateListGap.test.ts` and
+`helpers/EntityRefOperands.ts` (recording table and DynamoDB Local).
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first
