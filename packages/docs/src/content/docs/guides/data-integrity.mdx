@@ -114,6 +114,22 @@ unique: {
 
 This allows `alice@example.com` to exist in different tenants but not twice within the same tenant.
 
+### Constraints Over a Ref
+
+A constraint over a [ref](/effect-dynamodb/guides/aggregates/#entity-references) names the ref's id, as an index composite does. The sentinel key holds the id of the item each record references:
+
+```typescript
+refs: { team: { entity: Teams }, player: { entity: Players } },
+unique: {
+  identity: ["season", "teamId", "playerId"],
+}
+// Sentinel PK: $myapp#v1#selection.identity#2025#t-1#p-7
+```
+
+An update that sets `teamId` to another team moves the reservation, and a delete releases it, as with any other unique field. Naming the ref itself (`"team"`) fails at `Entity.make` with `EDD-9172` and a compile error: the ref's value is the referenced item, not a key.
+
+Up to 1.41.0 a constraint that named the ref was accepted, and every record composed the same sentinel, `…#[object object]#…`, so the first record took the value for all of them. Those sentinels stay in the table after you rename the field to the id; nothing reads them. To find them, look for items whose `__edd_e__` is `<EntityType>._unique.<constraint>` and whose partition key contains `[object object]`. `rekey({ reservations: true })` reports each one as `orphaned`, and `rekey({ releaseOrphanedReservations: true, writesStopped: true })` deletes them while writes to the table are stopped. Neither creates the sentinels the records written then are missing: like a constraint added after records were written, those records hold no reservation until a write changes the constraint's value (a write of the same value, a `put` included, reserves nothing).
+
 ### Sparse Constraints
 
 A unique constraint is **sparse** with respect to its composing fields: a sentinel is only written when every field is present on the record. If any composite is `undefined` or `null`, the constraint is silently skipped — the record is excluded from that constraint, just as a [sparse GSI](/effect-dynamodb/guides/indexes/) excludes records with missing key composites.

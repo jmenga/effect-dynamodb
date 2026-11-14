@@ -284,8 +284,14 @@ export type EntityIndexesConfig<TModel extends Schema.Top, TRefs> = globalThis.R
   GsiConfig<KeyFields<TModel, TRefs>>
 >
 
-/** @internal See {@link EntityPrimaryKeyConfig}: unique constraints over model fields. */
-export type EntityUniqueConfig<TModel extends Schema.Top> = UniqueConfig<ModelFieldName<TModel>>
+/**
+ * @internal See {@link EntityPrimaryKeyConfig}: unique constraints over model fields and ref ids
+ * (`teamId` for `refs: { team }`), as a key composite names them. The ref itself is the
+ * referenced item's data, which composes no value of its own (`EDD-9172`).
+ */
+export type EntityUniqueConfig<TModel extends Schema.Top, TRefs> = UniqueConfig<
+  Exclude<keyof KeyFields<TModel, TRefs> & string, keyof TRefs>
+>
 
 /**
  * @internal See {@link EntityPrimaryKeyConfig}: refs keyed by the model's
@@ -1238,15 +1244,31 @@ export const buildEntityDefinition = (config: {
   }
 
   // ---------------------------------------------------------------------------
-  // Validate unique constraint fields (EDD-9002)
+  // Validate unique constraint fields (EDD-9002, EDD-9172)
   // ---------------------------------------------------------------------------
   if (config.unique) {
+    // A ref's id (`teamId` for `refs: { team }`) names the referenced item, as an index composite
+    // of it does (#266). The ref itself is the referenced item's data, an object.
+    const refIds = new Set(Object.keys(config.refs ?? {}).map((field) => `${field}Id`))
     for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
       for (const field of resolveUniqueFields(constraintDef)) {
-        if (!hasOwnName(modelFields, field)) {
+        const fieldSchema = ownValue(modelFields, field)
+        if (
+          fieldSchema !== undefined &&
+          (isRef(fieldSchema) || isRefField(field, config.model as Schema.Top))
+        ) {
+          throw new Error(
+            `[EDD-9172] Entity "${config.entityType}": unique constraint "${constraintName}" names ` +
+              `ref "${field}", whose value is the referenced item's data, so every item would ` +
+              `compose the same sentinel and the first item written would take the value for all ` +
+              `of them. Name the ref's id instead: "${field}Id"` +
+              (refIds.has(`${field}Id`) ? "." : `, with "${field}" declared in \`refs\`.`),
+          )
+        }
+        if (fieldSchema === undefined && !refIds.has(field)) {
           throw new Error(
             `[EDD-9002] Entity "${config.entityType}": unique constraint "${constraintName}" references ` +
-              `unknown attribute "${field}". Valid attributes: ${Object.keys(modelFields).sort().join(", ")}`,
+              `unknown attribute "${field}". Valid attributes: ${[...Object.keys(modelFields), ...refIds].sort().join(", ")}`,
           )
         }
       }
@@ -1884,7 +1906,7 @@ export const make = <
   const TTimestamps extends TimestampsConfig | undefined = undefined,
   const TVersioned extends VersionedConfig | undefined = undefined,
   const TSoftDelete extends SoftDeleteConfig | undefined = undefined,
-  const TUnique extends EntityUniqueConfig<TModel> | undefined = undefined,
+  const TUnique extends EntityUniqueConfig<TModel, RefsOrNone<TRefs>> | undefined = undefined,
   const TTimeSeries extends EntityTimeSeriesConfig<TModel> | undefined = undefined,
   const TGeneratedId extends EntityGeneratedIdConfig<TModel> | undefined = undefined,
   const TVectorIndexes extends EntityVectorIndexesConfig<TModel> | undefined = undefined,
