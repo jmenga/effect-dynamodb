@@ -193,9 +193,12 @@ export type PathBuilder<Root, Model, Keys extends ReadonlyArray<string | number>
 // Runtime: createPathBuilder — single recursive Proxy handler
 // ---------------------------------------------------------------------------
 
-/** Check if a value is a Path */
+/**
+ * Check if a value is a Path. A path ending in `size`, `at` or `entry` is a function (it is also
+ * that accessor, called), so a function is checked too.
+ */
 export const isPath = (value: unknown): value is Path =>
-  typeof value === "object" && value !== null && PathTag in value
+  ((typeof value === "object" && value !== null) || typeof value === "function") && PathTag in value
 
 /** @internal A sparse map's entry, as `.entry(key)` named it: the map's field and the entry's key. */
 export interface PathEntry {
@@ -244,14 +247,32 @@ export const withEntry = (
  * builder for callbacks — `BoundQueryConfig` / `BoundCrudConfig` — declare it
  * as `never` so any concrete path is assignable at the call site, so they
  * instantiate this as `createPathBuilder<Model, never>()`.
+ *
+ * `size`, `at` and `entry` are each two things, as the types say: the model's
+ * field of that name, below this path (`t.size`, `t.box.size`), and, called,
+ * the accessor on this path (`t.tags.size()`, `t.roster.at(0)`,
+ * `t.zones.entry("k")`). The path below is a function, and calling it performs
+ * the accessor. Through 1.41.0 each was only the accessor, so a field of that
+ * name compiled to an operand with no value behind it.
  */
 export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | number> = []>(
   segments: ReadonlyArray<string | number> = [],
   resolveDbName?: (name: string) => string,
   sparseFields?: globalThis.Record<string, { readonly prefix: string }>,
-): PathBuilder<Model, Model, Keys> => {
+): PathBuilder<Model, Model, Keys> =>
+  pathProxy(segments, resolveDbName, sparseFields) as PathBuilder<Model, Model, Keys>
+
+/** The path at `segments`; with `call`, also a function performing an accessor on its parent. */
+const pathProxy = (
+  segments: ReadonlyArray<string | number>,
+  resolveDbName: ((name: string) => string) | undefined,
+  sparseFields: globalThis.Record<string, { readonly prefix: string }> | undefined,
+  call?: (arg: never) => unknown,
+): object => {
   // Every path below an entry carries it (`.entry("k").x`, `.entry("k").at(0)`).
   const entry = entryOfPath(segments)
+  const below = (segment: string | number, accessor?: (arg: never) => unknown) =>
+    pathProxy(withEntry([...segments, segment], entry), resolveDbName, sparseFields, accessor)
   const handler: ProxyHandler<object> = {
     get(_target, prop) {
       if (prop === PathTag) return PathTag
@@ -259,37 +280,31 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
       if (prop === "segments") return segments
       if (prop === "_Root" || prop === "_Value") return undefined
       if (prop === "size") {
-        return () => ({
+        return below("size", () => ({
           _tag: "size" as const,
           _Root: undefined,
           segments,
-        })
+        }))
       }
       if (prop === "at") {
-        return (index: number) =>
-          createPathBuilder(withEntry([...segments, index], entry), resolveDbName, sparseFields)
+        return below("at", (index: number) => below(index))
       }
       if (prop === "entry") {
-        // The path must be a top-level field marked sparse: a sparse map is a top-level field, so a
-        // nested field of the same name (`t.inner.zones`) is not it. We look up its prefix and bake
-        // the segment as `<prefix>#<key>`.
-        const last = segments[segments.length - 1]
-        if (
-          segments.length !== 1 ||
-          typeof last !== "string" ||
-          !sparseFields ||
-          !Object.hasOwn(sparseFields, last)
-        ) {
-          // No-op for non-sparse fields — return a function that throws so
-          // misuse is loud and clear.
-          return (_key: string) => {
+        return below("entry", (key: string) => {
+          // The path must be a top-level field marked sparse: a sparse map is a top-level field, so
+          // a nested field of the same name (`t.inner.zones`) is not it. We look up its prefix and
+          // bake the segment as `<prefix>#<key>`.
+          const last = segments[segments.length - 1]
+          if (
+            segments.length !== 1 ||
+            typeof last !== "string" ||
+            !sparseFields ||
+            !Object.hasOwn(sparseFields, last)
+          ) {
             throw new Error(
               `PathBuilder.entry: field "${segments.join(".")}" is not configured as a sparse map`,
             )
           }
-        }
-        const prefix = sparseFields[last]!.prefix
-        return (key: string) => {
           if (typeof key !== "string" || key.length === 0) {
             throw new Error(`PathBuilder.entry: key must be a non-empty string`)
           }
@@ -300,28 +315,29 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
           // `<prefix>#<key>` literal segment. Subsequent property accesses
           // (e.g. `.views` on a struct bucket) chain normally and compile to
           // dotted nested-Map paths.
-          const newSegments = [...segments.slice(0, -1), `${prefix}#${key}`]
+          const newSegments = [...segments.slice(0, -1), `${sparseFields[last]!.prefix}#${key}`]
           // A map is a top-level field, so its entry is the path's first segment: marked as one.
-          return createPathBuilder(
+          return pathProxy(
             withEntry(newSegments, newSegments.length === 1 ? { field: last, key } : undefined),
             resolveDbName,
             sparseFields,
           )
-        }
+        })
       }
       // Pipe/iterator/Symbol access — return undefined to avoid interference
       if (typeof prop === "symbol") return undefined
       if (prop === "pipe" || prop === "toJSON" || prop === "then") return undefined
-      if (typeof prop === "string") {
-        return createPathBuilder(withEntry([...segments, prop], entry), resolveDbName, sparseFields)
-      }
-      return undefined
+      return below(prop)
     },
     has(_target, prop) {
       return prop === PathTag || prop === "_tag" || prop === "segments"
     },
+    apply(_target, _this, args) {
+      return call?.(args[0] as never)
+    },
   }
-  return new Proxy({} as any, handler) as PathBuilder<Model, Model, Keys>
+  // A function target only where the path is also an accessor: every other path stays an object.
+  return new Proxy(call === undefined ? {} : () => undefined, handler)
 }
 
 /**

@@ -10,9 +10,9 @@ import type { ConditionInput } from "../Expression.js"
 import { isEmptySet, toAttributeValue, type UnstorableValue, unstorableIn } from "../Marshaller.js"
 import {
   compilePath,
+  isPath,
   type PackedPath,
   type Path,
-  PathTag,
   type SizeOperand,
   type StoredBelow,
 } from "./PathBuilder.js"
@@ -49,10 +49,9 @@ export type Operand =
 
 /** Convert a Path, SizeOperand, or raw value to an Operand */
 const toOperand = (v: unknown): Operand => {
+  // A path ending in `size`, `at` or `entry` is a function (`isPath`).
+  if (isPath(v)) return { _tag: "path", segments: v.segments }
   if (typeof v === "object" && v !== null) {
-    if (PathTag in v) {
-      return { _tag: "path", segments: (v as Path).segments }
-    }
     if ("_tag" in v && (v as { _tag: string })._tag === "size") {
       return { _tag: "size", segments: (v as SizeOperand).segments }
     }
