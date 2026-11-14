@@ -663,6 +663,13 @@ export interface EntityDefinition<
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
 
   /**
+   * @internal Domain field name → the attribute it is stored under (a `field:` rename), as the
+   * runtime entity resolves it. A table's definition reads it to name a vector index's filter
+   * attributes.
+   */
+  readonly _resolveDbName: (domainName: string) => string
+
+  /**
    * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`).
    * Carries the `TPackedFields` type, which narrows expression path builders:
    * a packed field can be tested only with `exists` / `notExists` as a whole.
@@ -1964,6 +1971,7 @@ const makeDefinitionImpl = (config: {
     generatedId: config.generatedId,
     vectorIndexes: config.vectorIndexes,
     _vectorIndexes: data.vectorIndexes,
+    _resolveDbName: data.resolveDbName,
     _packedFields: Object.keys(data.packedFields),
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,

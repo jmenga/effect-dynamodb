@@ -11,6 +11,7 @@ import { beforeEach, vi } from "vitest"
 
 import * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
+import * as RuntimeEntity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
@@ -231,6 +232,41 @@ describe("pure @effect-dynamodb/schema authoring bound via DynamoClient.make (#6
       yield* db.tables.MainTable.create()
     }).pipe(Effect.provide(layers)),
   )
+
+  it("a vector index filtering a renamed field is declared under its stored name (#265)", () => {
+    class Doc extends Schema.Class<Doc>("Doc")({
+      id: Schema.String,
+      body: Schema.String,
+      category: Schema.String,
+    }) {}
+    const docs = {
+      model: DynamoModel.configure(Doc, { category: { field: "cat" } }),
+      entityType: "Doc",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      vectorIndexes: {
+        byBody: {
+          name: "vec1",
+          dimensions: 3,
+          distance: "cosine",
+          source: { fields: ["body"] },
+          filters: ["category"],
+        },
+      },
+    } as const
+    const pure = Table.definition(
+      Table.make({ schema: AppSchema, entities: { Docs: PureEntity.make(docs) } }),
+    )
+    const runtime = Table.definition(
+      Table.make({ schema: AppSchema, entities: { Docs: RuntimeEntity.make(docs) } }),
+    )
+    // The attribute a write stores the field under, as for an entity made with `effect-dynamodb`.
+    expect(pure).toEqual(runtime)
+    expect(pure.AttributeDefinitions).toContainEqual({ AttributeName: "cat", AttributeType: "S" })
+    expect(pure.VectorIndexes?.[0]?.SearchSchema).toContainEqual({
+      AttributeName: "cat",
+      SearchSchemaElementType: "INLINE_FILTER",
+    })
+  })
 
   it.effect("update + delete work on a pure-authored entity", () =>
     Effect.gen(function* () {

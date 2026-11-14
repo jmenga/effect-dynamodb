@@ -3037,6 +3037,27 @@ const makeFromConfig = (config: {
       }
     }
 
+    // A member may be a pure `@effect-dynamodb/schema` EntityDefinition (the headline output of the
+    // schema/runtime split) rather than a runtime Entity. Pure definitions carry no operations,
+    // `_decodeRecord` or `rekey` handler, so each is promoted to a full runtime Entity (a thin
+    // op-attach over its retained `_data`), once: the bound entity, the members `rekey` judges and
+    // the members the client checks are one object (#265: `rekey` looked at the definitions as
+    // given and counted their rows `unregistered`). Runtime-authored entities pass through.
+    const promoted = new Map<unknown, unknown>()
+    const operational = (member: unknown): unknown => {
+      if (
+        (member as { readonly _tag?: unknown })._tag !== "Entity" ||
+        typeof (member as { readonly get?: unknown }).get === "function"
+      ) {
+        return member
+      }
+      const known = promoted.get(member)
+      if (known !== undefined) return known
+      const entity = entityFromDefinition(member as EntityDefinition)
+      promoted.set(member, entity)
+      return entity
+    }
+
     // 2. Bind entities + build entity query accessors
     const boundEntities: Record<string, unknown> = {}
     // Track collection memberships for auto-discovery
@@ -3047,17 +3068,9 @@ const makeFromConfig = (config: {
     >()
 
     for (const [key, rawEntity] of Object.entries(config.entities)) {
-      // A member may be a pure `@effect-dynamodb/schema` EntityDefinition (the
-      // headline output of the schema/runtime split) rather than a runtime
-      // Entity. Pure definitions carry no operations or `_decodeRecord`, so
-      // binding one directly would crash at call time. Promote it to a full
-      // runtime Entity (a thin op-attach over its retained `_data`) so the bound
-      // CRUD, query accessors, and collection decode all work. Runtime-authored
-      // entities already carry `.get` and pass through untouched.
-      const entity =
-        typeof (rawEntity as { get?: unknown }).get === "function"
-          ? rawEntity
-          : entityFromDefinition(rawEntity as unknown as EntityDefinition)
+      // A pure definition, promoted (`operational`), so the bound CRUD, query accessors and
+      // collection decode all work.
+      const entity = operational(rawEntity)
       // Provide the resolved services (SecureRandom, Embedder, Compression) into the
       // bind: `bind` captures its context at bind time, so the bound CRUD
       // methods resolve the explicit `crypto`, `embedder` and `compressors`
@@ -3346,12 +3359,15 @@ const makeFromConfig = (config: {
       )?.name
     }
     // Every entity the client sees: those it binds, then those of every table it binds, named as a
-    // refusal names them. A member may reach the client only as another bound table's.
+    // refusal names them, a pure definition promoted. A member may reach the client only as
+    // another bound table's.
     const visible: ReadonlyArray<readonly [name: string, entity: unknown]> = [
-      ...Object.entries(config.entities),
+      ...Object.entries(config.entities).map(
+        ([key, entity]) => [key, operational(entity)] as const,
+      ),
       ...Object.entries(config.tables ?? {}).flatMap(([tableKey, table]) =>
         Object.entries(table.entities).map(
-          ([key, entity]) => [`${tableKey}.${key}`, entity] as const,
+          ([key, entity]) => [`${tableKey}.${key}`, operational(entity)] as const,
         ),
       ),
     ]
@@ -3415,9 +3431,10 @@ const makeFromConfig = (config: {
 
     // `rekey` (#171) hands each row to the member owning it: the table's
     // entities and aggregates, those the client binds on the same table, and
-    // the streams the caller passes (`DynamoClient.make` binds no streams).
+    // the streams the caller passes (`DynamoClient.make` binds no streams). A
+    // pure definition is judged as the entity the client promoted it to (#265).
     const rekeyFor =
-      (tableName: string, tagKey: string, registered: ReadonlyArray<unknown>) =>
+      (tableName: string, tagKey: string, given: ReadonlyArray<unknown>) =>
       (options?: RekeyOptions): Effect.Effect<RekeyReport, DynamoClientError | ValidationError> =>
         provide(
           Effect.gen(function* () {
@@ -3425,9 +3442,10 @@ const makeFromConfig = (config: {
               (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key ===
               tagKey
             const handlers = new Set<Rekey.RekeyMember>()
+            const registered = given.map(operational)
             const tableMembers = [
               ...registered,
-              ...Object.values(config.entities).filter(onTable),
+              ...Object.values(config.entities).map(operational).filter(onTable),
               ...Object.values(config.aggregates ?? {}).filter(onTable),
             ]
             for (const member of [...tableMembers, ...(options?.streams ?? [])]) {
