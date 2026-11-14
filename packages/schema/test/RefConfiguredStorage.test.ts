@@ -27,7 +27,7 @@ const FIELDS = {
 const derived = (field: Schema.Top, options: object) =>
   substituteSchemaDeep(Schema.Struct({ f: field }), {
     ...options,
-    configuredStorage: { f: epochSeconds },
+    configuredStorage: { fields: { f: epochSeconds }, refs: {} },
   }) as unknown as Schema.Codec<{ readonly f?: unknown }, unknown>
 const read = (field: Schema.Top) => derived(field, { legacyReads: true, absentReads: true })
 const write = (field: Schema.Top) => derived(field, { enforceChecks: true })
