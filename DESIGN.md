@@ -3884,7 +3884,7 @@ and an aggregate's `list` filter (the root's attribute encoder for a top-level
 field, `contains` included; anywhere deeper, as given). An instance whose map is
 the stored form (a zone, a `Duration`, a `BigDecimal`, an `Option` of a number,
 any value of an untyped field) is the bytes 1.40.0 sent, and an operand that
-isn't an instance or a `Date` (a primitive, a plain map or list, even one holding
+isn't an instance, a `Date` or a primitive (a plain map or list, even one holding
 instances, a path) and a `begins_with` prefix are sent as given: reading inside
 a plain container would read the caller's values a second time. Finding an
 instance reads the operand's prototype once. A `.where()` bound composes key text
@@ -3894,6 +3894,22 @@ through the key form, as it did. `Transaction.check` takes a condition
 has no stored form to give: their operands are sent as given. Pinned by
 `OperandsAsStored.test.ts`, `OperandStoredForm.test.ts` and
 `connected.operands-as-stored.test.ts`.
+
+*A primitive* (text, a number, a `bigint`, a boolean) goes to `operand` too
+(`isPrimitiveOperand`), which sends it as given at a position that decodes it as
+given (the stored schema there takes it: `"t1"` on a string, `"5"` on a
+`Schema.NumberFromString`, a partial ISO `"2026-01"` on a date stored as text, a
+number on a date stored as one), so those requests are 1.41.0's bytes, and in
+its stored form where the position doesn't (`5` on a `NumberFromString` is
+`"5"`, `5n` on a `BigIntFromString` likewise). A path into a ref follows the
+referenced entity's model, which the stored ref holds in its stored form, so
+`eq(t.player.id, 5)` on a player keyed by a `NumberFromString` compares the
+`"5"` the ref holds. Up to 1.41.0 every primitive was sent as given, so such a
+comparison never held (a number against text; `ne` always held). An aggregate's
+`list` filter still sends a primitive as given: the root's attribute encoders
+don't tell a value held as given from one that isn't. Pinned by
+`OperandsAsStored.test.ts`, `TransactionCheckOperands.test.ts` and
+`helpers/EntityRefOperands.ts` (recording table and DynamoDB Local).
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first

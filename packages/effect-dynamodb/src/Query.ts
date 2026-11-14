@@ -275,9 +275,10 @@ interface QueryState {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
   /**
    * How the entity whose query this is stores a filter's operand at a path (#242): a filter added
-   * with {@link filterExpr} sends each operand that is one of Effect's instances or a `Date` in
-   * that form (`operandsAsStored`). `undefined` on a query no one entity's schema types (an event
-   * stream's, a collection's, one made by hand): operands are sent as given.
+   * with {@link filterExpr} sends each operand that is one of Effect's instances, a `Date` or a
+   * primitive the attribute doesn't hold as given in that form (`operandsAsStored`). `undefined` on
+   * a query no one entity's schema types (an event stream's, a collection's, one made by hand):
+   * operands are sent as given.
    */
   readonly storedAt: StoredFormAt | undefined
   /** Optional effect to resolve table name at execution time (for deferred resolution) */

@@ -330,9 +330,9 @@ export const not = (expr: Expr): Expr => ({
  * A condition's or filter's operand as the attribute at the path `segments` (domain names) holds
  * it: the value there (`"value"`), or what `contains` compares, an element of what's stored there
  * (`"contained"`: an element of a list, a member of a set, a substring of text). `value` itself
- * where the schema alone doesn't determine the stored form, or the path's schema doesn't take it.
- * Each entity supplies its own (`Entity._storedFormAt`, the path encoder's `operand`); an
- * aggregate its root's.
+ * where the schema alone doesn't determine the stored form, or the path's schema doesn't take it,
+ * and a primitive the attribute holds as it's given. Each entity supplies its own
+ * (`Entity._storedFormAt`, the path encoder's `operand`); an aggregate its root's.
  */
 export type StoredFormAt = (
   segments: ReadonlyArray<string | number>,
@@ -361,17 +361,29 @@ const isInstanceOperand = (value: unknown): boolean => {
 }
 
 /**
+ * Text, a number, a `bigint` or a boolean: an operand `storedAt` puts in the attribute's form only
+ * where the attribute doesn't hold it as given (`5` compared with a `Schema.NumberFromString`,
+ * which holds `"5"`). Up to 1.41.0 every one was sent as given, so `eq(t.player.id, 5)` on a ref
+ * whose id is a `NumberFromString` compared a number with the text the row holds, and never held.
+ */
+export const isPrimitiveOperand = (value: unknown): boolean => {
+  const type = typeof value
+  return type === "string" || type === "number" || type === "bigint" || type === "boolean"
+}
+
+/**
  * One operand compared with the attribute at `segments`, in the form it holds there (#242): an
- * instance ({@link isInstanceOperand}) as `storedAt` gives it, and any other value as given. Every
- * operand position goes through it: {@link operandsAsStored} for an expression, a vector search's
- * equality filters for theirs.
+ * instance ({@link isInstanceOperand}) or a primitive ({@link isPrimitiveOperand}) as `storedAt`
+ * gives it, and any other value as given. Every operand position goes through it:
+ * {@link operandsAsStored} for an expression, a vector search's equality filters for theirs.
  */
 export const operandAsStored = (
   storedAt: StoredFormAt,
   segments: ReadonlyArray<string | number>,
   value: unknown,
   kind: "value" | "contained",
-): unknown => (isInstanceOperand(value) ? storedAt(segments, value, kind) : value)
+): unknown =>
+  isInstanceOperand(value) || isPrimitiveOperand(value) ? storedAt(segments, value, kind) : value
 
 /**
  * A condition's or filter's operands in the form the attribute each is compared with holds
@@ -381,9 +393,11 @@ export const operandAsStored = (
  * `Schema.DateTimeZoned` compared that map with the ISO text the row holds, and never matched.
  * A comparison, `between` and `in` compare the path's value; `contains` an element of it. Where
  * the schema alone doesn't determine the stored form, `storedAt` hands the operand back and it is
- * sent as 1.40.0 sent it. Every other operand (a primitive, a plain object or list, even one
- * holding instances, one compared with no path, a `begins_with` prefix) is sent as given, and an
- * expression holding none is returned as it is.
+ * sent as 1.40.0 sent it. A primitive is too, unless the attribute doesn't hold it as given: `5`
+ * compared with a `Schema.NumberFromString`, a ref's id among them, is sent as the `"5"` it holds.
+ * Every other operand (a plain object or list, even one holding instances, one compared with no
+ * path, a `begins_with` prefix) is sent as given, and an expression holding none is returned as it
+ * is.
  */
 export const operandsAsStored = (expr: Expr, storedAt: StoredFormAt): Expr => {
   const asStored = (

@@ -3508,6 +3508,12 @@ const asStored = (value: unknown): unknown => {
   return out
 }
 
+/** Text, a number, a `bigint` or a boolean. */
+const isPrimitive = (value: unknown): boolean => {
+  const type = typeof value
+  return type === "string" || type === "number" || type === "bigint" || type === "boolean"
+}
+
 /** A plain object or class instance whose fields a path value can be walked by. */
 const isWalkableObject = (value: unknown): value is object =>
   value !== null &&
@@ -3719,7 +3725,8 @@ export const makePathValueEncoder = (
    * alone determines it — every position a row can hold the path under that takes the value stores
    * it in the same form (`declaredAt`). Anywhere else (union members that store it differently, an
    * `Unknown` or `Any`, a suspended schema or a declaration the walk doesn't follow, a value no
-   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it.
+   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it. A primitive a
+   * position holds as it's given is the value itself there.
    */
   readonly operand: (
     segments: ReadonlyArray<string | number>,
@@ -4106,6 +4113,14 @@ export const makePathValueEncoder = (
               const encode = leafAwareEncoder(from, to)
               const decode = Schema.decodeUnknownExit(to as Schema.Codec<any>)
               return (value: unknown): { readonly stored: unknown } | undefined => {
+                // A primitive the position holds as it's given (text where text is stored, a
+                // partial ISO date included) is sent as given, as up to 1.41.0, and so is one a
+                // schema that can't run synchronously can't judge; one it doesn't hold so (`5`
+                // where a `NumberFromString` stores `"5"`) is put in its stored form.
+                if (isPrimitive(value)) {
+                  const issue = issueOf(() => decode(value))
+                  if (issue === undefined || issue === CANT_SAY) return { stored: value }
+                }
                 const encoded = encode(value)
                 if (decode(asStored(encoded))._tag !== "Success") return undefined
                 if (storable !== undefined && !storable(encoded)) return undefined

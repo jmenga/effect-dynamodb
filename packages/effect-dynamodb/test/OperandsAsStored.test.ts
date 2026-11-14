@@ -8,7 +8,10 @@
  * (callback and shorthand), a transaction op's condition, a collection's filter and an aggregate
  * `list` filter. Where 1.40.0 sent the stored form already (a zone, a `Duration`, an `Option`, …),
  * the operand is the same bytes, and a filter on a plain value is the same request. DynamoDB's
- * own verdicts, `between` and `contains` included: `connected.operands-as-stored.test.ts`.
+ * own verdicts, `between` and `contains` included: `connected.operands-as-stored.test.ts`. A
+ * primitive the attribute doesn't hold as given (`5` on a `Schema.NumberFromString`, a ref's id
+ * among them) is sent in its stored form too; requests and DynamoDB's verdicts for it:
+ * `helpers/EntityRefOperands.ts`.
  */
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -17,6 +20,7 @@ import { DateTime, Duration, Effect, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import { operandAsStored } from "../src/internal/Expr.js"
 import { toAttributeValue } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -177,7 +181,79 @@ describe("an operand that is one of Effect's instances is sent as the attribute 
   }
 })
 
-describe("what isn't one of Effect's instances is sent as given", () => {
+describe("a primitive is sent as the attribute holds it, where it doesn't hold it as given", () => {
+  class Team extends Schema.Class<Team>("OsTeam")({ id: Schema.String, name: Schema.String }) {}
+  class Player extends Schema.Class<Player>("OsPlayer")({
+    id: Schema.NumberFromString,
+    name: Schema.String,
+    shirt: Schema.NumberFromString,
+  }) {}
+  class Selection extends Schema.Class<Selection>("OsSelection")({
+    id: Schema.String,
+    season: Schema.String,
+    n: Schema.Number,
+    picks: Schema.NumberFromString,
+    big: Schema.BigIntFromString,
+    ranks: Schema.Array(Schema.NumberFromString),
+    listed: Schema.DateTimeUtc,
+    team: Team,
+    player: Player,
+  }) {}
+  const byId = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const Teams = Entity.make({
+    model: DynamoModel.configure(Team, { id: { identifier: true } }),
+    entityType: "Team",
+    primaryKey: byId,
+  })
+  const Players = Entity.make({
+    model: DynamoModel.configure(Player, { id: { identifier: true } }),
+    entityType: "Player",
+    primaryKey: byId,
+  })
+  const Selections = Entity.make({
+    model: DynamoModel.configure(Selection, {
+      id: { identifier: true },
+      team: { ref: true },
+      player: { ref: true },
+    }),
+    entityType: "Selection",
+    primaryKey: byId,
+    refs: { team: { entity: Teams }, player: { entity: Players } },
+  } as never) as any
+  const at = (
+    segments: ReadonlyArray<string>,
+    value: unknown,
+    kind: "value" | "contained" = "value",
+  ) => operandAsStored(Selections._storedFormAt, segments, value, kind)
+
+  it("into a ref, through the referenced entity's fields, and on the entity's own", () => {
+    expect(at(["player", "id"], 5)).toBe("5")
+    expect(at(["player", "shirt"], 9)).toBe("9")
+    expect(at(["picks"], 3)).toBe("3")
+    expect(at(["big"], 5n)).toBe("5")
+    expect(at(["ranks"], 5, "contained")).toBe("5")
+  })
+
+  it("as given where the attribute holds it so", () => {
+    const asGiven: ReadonlyArray<readonly [ReadonlyArray<string>, unknown]> = [
+      [["player", "id"], "5"],
+      [["player", "name"], "P5"],
+      [["team", "id"], "t1"],
+      [["season"], "2025"],
+      [["n"], 1],
+      [["picks"], "3"],
+      [["listed"], "2026-01"],
+      [["listed"], 0],
+    ]
+    for (const [segments, value] of asGiven) expect(at(segments, value)).toBe(value)
+    expect(at(["ranks"], "5", "contained")).toBe("5")
+  })
+})
+
+describe("what isn't one of Effect's instances is sent as given where the field holds it so", () => {
   it.effect("a string, a number, a Date, a plain map and a path are the same request", () =>
     Effect.gen(function* () {
       const E = entityOf(Schema.Unknown)
