@@ -3508,6 +3508,27 @@ const asStored = (value: unknown): unknown => {
   return out
 }
 
+/** Text, a number, a `bigint` or a boolean. */
+const isPrimitive = (value: unknown): boolean => {
+  const type = typeof value
+  return type === "string" || type === "number" || type === "bigint" || type === "boolean"
+}
+
+/** The type DynamoDB holds a primitive as: text, a number (a `bigint` too), or a boolean. */
+const dynamoTypeOf = (value: unknown): "S" | "N" | "BOOL" =>
+  typeof value === "string" ? "S" : typeof value === "boolean" ? "BOOL" : "N"
+
+/**
+ * Whether a condition's or filter's `operand` is sent as given where a write of it stores `stored`
+ * (#242): a primitive is, unless what's stored is a primitive of another type, which no row holds
+ * the operand as (`5` where a `NumberFromString` stores `"5"`). Text where text is stored could be
+ * the stored text itself, a substring for `contains` or a prefix, which the library can't tell
+ * apart, so it is sent as 1.41.0 sent it; so is a number where a number is stored, and a primitive
+ * where what's stored is no primitive.
+ */
+const keepsAsGiven = (operand: unknown, stored: unknown): boolean =>
+  isPrimitive(operand) && (!isPrimitive(stored) || dynamoTypeOf(stored) === dynamoTypeOf(operand))
+
 /** A plain object or class instance whose fields a path value can be walked by. */
 const isWalkableObject = (value: unknown): value is object =>
   value !== null &&
@@ -3532,8 +3553,10 @@ export const containedKindOf = (field: Schema.Top): "list" | "set" | "text" => {
 /**
  * A `contains` operand in the form the field stores what it compares (#242), from what a write of
  * a whole value there stores (`value`) and of one list element (`element`): the element as a list
- * stores it; the single member of a write of a set holding it; the text a write of it stores, when
- * that's text. `undefined` when the field doesn't take it so, and the operand is sent as given.
+ * stores it; the single member of a write of a set holding it (a primitive member as given, unless
+ * the set stores it as a primitive of another type: {@link keepsAsGiven}); the text a write of it
+ * stores, when that's text. `undefined` when the field doesn't take it so, and the operand is sent
+ * as given.
  *
  * @internal
  */
@@ -3547,7 +3570,9 @@ export const containedOperand =
     if (kind === "list") return element(operand)
     if (kind === "set") {
       const set = value(new Set([operand]))?.stored
-      return set instanceof Set && set.size === 1 ? { stored: [...set][0] } : undefined
+      if (!(set instanceof Set) || set.size !== 1) return undefined
+      const member = [...set][0]
+      return { stored: keepsAsGiven(operand, member) ? operand : member }
     }
     const text = value(operand)
     return typeof text?.stored === "string" ? text : undefined
@@ -3719,7 +3744,8 @@ export const makePathValueEncoder = (
    * alone determines it — every position a row can hold the path under that takes the value stores
    * it in the same form (`declaredAt`). Anywhere else (union members that store it differently, an
    * `Unknown` or `Any`, a suspended schema or a declaration the walk doesn't follow, a value no
-   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it.
+   * position takes, or one DynamoDB can't store) the value itself, as 1.40.0 sent it. A primitive is
+   * the value itself unless a write of it stores a primitive of another type ({@link keepsAsGiven}).
    */
   readonly operand: (
     segments: ReadonlyArray<string | number>,
@@ -3982,7 +4008,7 @@ export const makePathValueEncoder = (
   ): ReadonlyArray<{ readonly schema: Schema.Top; readonly asDeclared: boolean }> | undefined => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return undefined
-    const top = refTargets[head] ?? modelFields[head]
+    const top = ownValue(refTargets, head) ?? ownValue(modelFields, head)
     if (top === undefined) return undefined
     type Position = { readonly schema: Schema.Top; readonly asDeclared: boolean }
     const holdsNoPath = new Set([
@@ -4097,7 +4123,7 @@ export const makePathValueEncoder = (
             const original = position.schema
             const stored =
               segments.length === 1
-                ? recordFields[head]
+                ? ownValue(recordFields, head)
                 : position.asDeclared
                   ? original
                   : substituteSchemaDeep(original, { enforceChecks: true })
@@ -4106,6 +4132,19 @@ export const makePathValueEncoder = (
               const encode = leafAwareEncoder(from, to)
               const decode = Schema.decodeUnknownExit(to as Schema.Codec<any>)
               return (value: unknown): { readonly stored: unknown } | undefined => {
+                if (isPrimitive(value)) {
+                  // A primitive is put in its stored form only where that is a primitive of
+                  // another type (`5` where a `NumberFromString` stores `"5"`), and is sent as
+                  // given anywhere else, as up to 1.41.0 ({@link keepsAsGiven}).
+                  const encoded = encode(value)
+                  const issue = issueOf(() => decode(asStored(encoded)))
+                  if (issue === CANT_SAY) return { stored: value }
+                  if (issue !== undefined) return undefined
+                  if (keepsAsGiven(value, encoded)) return { stored: value }
+                  return storable === undefined || storable(encoded)
+                    ? { stored: encoded }
+                    : undefined
+                }
                 const encoded = encode(value)
                 if (decode(asStored(encoded))._tag !== "Success") return undefined
                 if (storable !== undefined && !storable(encoded)) return undefined
@@ -4136,7 +4175,7 @@ export const makePathValueEncoder = (
   const waysTo = (segments: ReadonlyArray<string | number>): ReadonlyArray<UnionWay> => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return []
-    const start: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    const start: Schema.Top | undefined = ownValue(refTargets, head) ?? ownValue(modelFields, head)
     if (start === undefined) return []
     const ways: Array<UnionWay> = []
     const walk = (
@@ -4341,7 +4380,10 @@ export const makePathValueEncoder = (
   }
   const reads = (clauses: ReadonlyArray<UnionClause>, strict: boolean): boolean => {
     const head = clauses[0]?.segments[0]
-    const start = typeof head === "string" ? (refTargets[head] ?? modelFields[head]) : undefined
+    const start =
+      typeof head === "string"
+        ? (ownValue(refTargets, head) ?? ownValue(modelFields, head))
+        : undefined
     // A field the walk can't follow is one the schema can't judge.
     if (start === undefined || clauses.some((clause) => clause.segments[0] !== head)) {
       return !strict

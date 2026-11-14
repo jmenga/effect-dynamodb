@@ -125,6 +125,7 @@ import {
   type Expr,
   emptyPartProblem,
   isEmptyExpr,
+  isPrimitiveOperand,
   parseSimpleShorthand,
   type StoredFormAt,
 } from "./internal/Expr.js"
@@ -2321,6 +2322,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * (`operandsAsStored`).
    */
   const rootStoredFormAt: StoredFormAt = (segments, value, kind) => {
+    // A primitive is sent as given, as up to 1.41.0: the root's encoders don't tell a value the
+    // attribute stores as another type from one it doesn't, as an entity's `operand` does.
+    if (isPrimitiveOperand(value)) return value
     const name = String(segments[0])
     const encode = segments.length === 1 ? attrEncoders[name] : undefined
     const field = schemaFields?.[name]

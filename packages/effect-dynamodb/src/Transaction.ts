@@ -161,9 +161,10 @@ const storedNames = (
 
 /**
  * A compiled condition with each operand that is one of Effect's instances (a `DateTime`, a
- * `BigDecimal`, a `Duration`, an `Option`, a `Redacted`, …) or a `Date` in the form its field
- * stores it (#236), as a condition on the entity sends it (`operandAsStored`, #242). The builder
- * has no entity, so it marshalled the instance as its own map, which no row holds. Only a
+ * `BigDecimal`, a `Duration`, an `Option`, a `Redacted`, …), a `Date` or a primitive its field
+ * stores as another type (`3` on a `NumberFromString`) in the form its field stores it (#236), as a
+ * condition on the entity sends it (`operandAsStored`, #242). The builder has no entity, so it
+ * marshalled the instance as its own map, which no row holds. Only a
  * condition `Expression.condition` built carries its operands (`comparedOperandsOf`); every other
  * operand, every other condition, and one whose field's stored form the schema doesn't determine
  * are sent as given.
