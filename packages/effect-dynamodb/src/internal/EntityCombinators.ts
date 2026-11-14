@@ -674,6 +674,38 @@ export const cascade: {
   },
 )
 
+/**
+ * Name refs an update keeps, by their ids (`{ playerId }`): each id keys the indexes it is a
+ * composite of, as `.set({ playerId })` would, but the referenced item is not fetched and the stored
+ * ref is not rewritten. The update is conditioned on the row holding that ref, so it fails with
+ * {@link ConditionalCheckFailed} where the row holds another (in `Transaction.transactWrite`, the
+ * transaction is cancelled). For reassigning one ref of an index half that holds two refs' ids
+ * (#263): `.set({ season, series, teamId }).keepRefs({ playerId })`.
+ */
+export const keepRefs: {
+  (
+    ids: globalThis.Record<string, unknown>,
+  ): <A, Rec, U, E, R>(
+    self: EntityUpdate<A, Rec, U, E, R>,
+  ) => EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R>
+  <A, Rec, U, E, R>(
+    self: EntityUpdate<A, Rec, U, E, R>,
+    ids: globalThis.Record<string, unknown>,
+  ): EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R>
+} = Fn.dual(
+  2,
+  <A, Rec, U, E, R>(
+    self: EntityUpdate<A, Rec, U, E, R>,
+    ids: globalThis.Record<string, unknown>,
+  ): EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R> =>
+    new EntityUpdateImpl<A, Rec, U, E | ConditionalCheckFailed, R>(
+      self._builder as any,
+      { ...self._updateState, keepRefs: { ...self._updateState.keepRefs, ...ids } },
+      self._entity,
+      self._key,
+    ) as any,
+)
+
 // ---------------------------------------------------------------------------
 // Path-based update combinators (internal — used by entity-level typed combinators)
 // ---------------------------------------------------------------------------

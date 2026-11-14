@@ -159,6 +159,7 @@ import {
   compileExpr,
   createConditionOps,
   type Expr,
+  ExprTag,
   emptyPartProblem,
   isExpr,
   nonEmptyCondition,
@@ -347,6 +348,7 @@ export {
   consistentRead,
   deleteFromSet,
   expectedVersion,
+  keepRefs,
   pathAdd,
   pathAppend,
   pathDelete,
@@ -1927,6 +1929,15 @@ export type VectorIndexNames<TVectorIndexes> =
     ? keyof TVectorIndexes & string
     : never
 
+/**
+ * What `.keepRefs()` takes (#263): the ids of the refs an update can keep, each typed as `.set()`
+ * takes it (`{ playerId?: string }`). `never` for an entity without refs, which makes `.keepRefs()`
+ * uncallable on it.
+ */
+export type KeptRefIds<TRefs, TUpdate> = [TRefs] extends [undefined]
+  ? never
+  : Pick<TUpdate, `${keyof TRefs & string}Id` & keyof TUpdate>
+
 export interface BoundEntity<
   TModel extends Schema.Top,
   TIndexes extends globalThis.Record<string, IndexDefinition>,
@@ -2071,7 +2082,8 @@ export interface BoundEntity<
     | VectorErrors<TVectorIndexes>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields,
-    RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>
+    RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>,
+    KeptRefIds<TRefs, EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>>
   >
 
   /**
@@ -2154,7 +2166,8 @@ export interface BoundEntity<
     | VectorErrors<TVectorIndexes>,
     VectorIndexNames<TVectorIndexes>,
     TPackedFields,
-    RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>
+    RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable>,
+    KeptRefIds<TRefs, EntityRefUpdateType<TModel, TIndexes, TRefs, TTimestamps, TVersioned>>
   >
 
   /** Delete an existing item, fails if not found. Returns a fluent {@link BoundDelete}. */
@@ -2656,6 +2669,24 @@ export const storedRefIdOf = (
 /** @internal {@link storedRefIdOf}, or the value as it's stored when it's no value of the key. */
 const storedRefId = (ref: Parameters<typeof storedRefIdOf>[0], stored: unknown): unknown =>
   Option.getOrElse(storedRefIdOf(ref, stored), () => stored)
+
+/**
+ * @internal {@link storedRefIdOf}'s inverse (#263): a ref's id as the stored ref holds it, encoded
+ * through the referenced entity's own field, as {@link refDataOf} encodes the item a ref stores
+ * (`5` of a `NumberFromString` is `"5"`). The id as given where that field is unknown or doesn't
+ * take it.
+ */
+const storedRefKeyOf = (
+  ref: Parameters<typeof storedRefIdOf>[0],
+  id: unknown,
+): Effect.Effect<unknown> => {
+  const field = getSchemaFields(ref.refEntity.schemas.modelSchema)?.[ref.keyField]
+  return field === undefined
+    ? Effect.succeed(id)
+    : Schema.encodeUnknownEffect(field as Schema.Codec<any>)(id).pipe(
+        Effect.orElseSucceed(() => id),
+      )
+}
 
 /**
  * @internal What a ref stores of the item it names: the referenced entity's domain item encoded
@@ -8578,6 +8609,158 @@ const makeImpl = <
   }
 
   /**
+   * The refs an update holding the whole row keys its indexes from as the row holds them (#263):
+   * each whose id an index half holds that also holds a composite the update gives or removes, so
+   * the half composes from the ref the row holds, as a `put` of the row would, rather than
+   * stopping before the id. Not a ref whose id the update has otherwise (given, kept, or a
+   * primary key composite), nor one only a half the update doesn't touch holds: the id the row
+   * holds may be spelled other than the one that half was composed from (a ref read through a key
+   * that folds case). An id read here is guarded as read (`heldRefGuard`).
+   */
+  const heldRefsOf = (
+    row: globalThis.Record<string, unknown>,
+    payload: globalThis.Record<string, unknown>,
+    removed: ReadonlySet<string> | undefined,
+    kept: { readonly ids: globalThis.Record<string, unknown> } | undefined,
+  ): ReadonlyArray<{ readonly ref: ResolvedRef; readonly id: unknown }> => {
+    if (!hasRefs) return []
+    const touched = (attr: string) =>
+      (Object.hasOwn(payload, attr) && payload[attr] !== undefined) || removed?.has(attr) === true
+    const beside = new Set<string>()
+    for (const [name, index] of Object.entries(allIndexes)) {
+      if (name === "primary") continue
+      for (const [, composites] of halvesOf(index)) {
+        if (composites.some(touched)) for (const attr of composites) beside.add(attr)
+      }
+    }
+    return resolvedRefs.flatMap((ref) => {
+      const name = ref.idFieldName
+      if (!beside.has(name) || touched(name) || isPrimaryComposite(name)) return []
+      if (kept !== undefined && Object.hasOwn(kept.ids, name)) return []
+      const held = ownValue(row, ref.fieldName)
+      if (held === null || typeof held !== "object") return []
+      const id = ownValue(held as globalThis.Record<string, unknown>, ref.keyField)
+      return id === undefined ? [] : [{ ref, id: storedRefId(ref, id) }]
+    })
+  }
+
+  /** A row's index key record with the ids `heldRefsOf` read beside their refs. A copy. */
+  const withHeldRefIds = (
+    row: globalThis.Record<string, unknown>,
+    held: ReadonlyArray<{ readonly ref: ResolvedRef; readonly id: unknown }>,
+  ): globalThis.Record<string, unknown> =>
+    held.length === 0
+      ? row
+      : { ...row, ...Object.fromEntries(held.map(({ ref, id }) => [ref.idFieldName, id])) }
+
+  /**
+   * The guard that a ref `heldRefsOf` read is still the one read (#263): its id inside the stored
+   * ref (`#team.#id = :id`), as read. An unversioned update guards each composite it read as read;
+   * a ref's id isn't an attribute of the row, so a guard on it would hold whatever the ref is.
+   * `undefined` where the stored ref has no id to compare (the update then guards as before).
+   */
+  const heldRefGuard = (
+    ref: ResolvedRef,
+    read: globalThis.Record<string, AttributeValue>,
+  ):
+    | { readonly attribute: string; readonly key: string; readonly id: AttributeValue }
+    | undefined => {
+    const attribute = compositeAttribute(ref.idFieldName)
+    const stored = ownValue(read, attribute) as AttributeValue | undefined
+    const id = stored?.M === undefined ? undefined : ownValue(stored.M, ref.keyField)
+    return id === undefined ? undefined : { attribute, key: ref.keyField, id: id as AttributeValue }
+  }
+
+  /**
+   * What `.keepRefs()` keeps (#263): the ids it names, encoded as `.set()` encodes them (`ids`, which
+   * key the indexes each is a composite of), and the condition that the row holds each of those refs
+   * (`guard`: the stored ref's key is the id). `undefined` without `.keepRefs()`. A name that is no
+   * ref id an update can give ([EDD-9166]), or the id of a ref the same update sets or removes
+   * ([EDD-9167]), is refused before anything is read or sent.
+   */
+  const keptRefsOf = (uState: UpdateState) =>
+    Effect.gen(function* () {
+      const given = uState.keepRefs
+      if (given === undefined) return undefined
+      const named = Object.keys(given).filter((name) => given[name] !== undefined)
+      if (named.length === 0) return undefined
+      const primaryComposites = new Set([
+        ...config.indexes.primary.pk.composite,
+        ...config.indexes.primary.sk.composite,
+      ])
+      const updates = (uState.updates ?? {}) as globalThis.Record<string, unknown>
+      const removed = new Set(uState.remove ?? [])
+      const kept: Array<ResolvedRef> = []
+      for (const name of named) {
+        const ref = resolvedRefs.find((candidate) => candidate.idFieldName === name)
+        if (ref === undefined || primaryComposites.has(name)) {
+          const ids = resolvedRefs
+            .map((candidate) => candidate.idFieldName)
+            .filter((id) => !primaryComposites.has(id))
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.keepRefs",
+            cause:
+              `[EDD-9166] .keepRefs() names "${name}", which is no ref id this update can keep. ` +
+              (ids.length === 0
+                ? `Entity "${entityType}" has no ref an update can reassign.`
+                : `It takes ${ids.map((id) => `"${id}"`).join(", ")}.`) +
+              " Nothing was sent.",
+          })
+        }
+        if (
+          (hasOwnName(updates, name) && updates[name] !== undefined) ||
+          removed.has(ref.fieldName)
+        ) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.keepRefs",
+            cause:
+              `[EDD-9167] .keepRefs() keeps "${ref.fieldName}", which the same update ` +
+              `${removed.has(ref.fieldName) ? "removes" : `reassigns with .set({ ${name} })`}. ` +
+              "Keep it or change it, not both. Nothing was sent.",
+          })
+        }
+        kept.push(ref)
+      }
+      const ids = (yield* encodeForWrite(
+        schemas.updateSchema as Schema.Codec<any>,
+        Object.fromEntries(named.map((name) => [name, given[name]])),
+        "update.keepRefs",
+      )) as globalThis.Record<string, unknown>
+      // The row holds the ref when its stored key is the id: the id in the form the stored ref
+      // holds it (`"5"` of a `NumberFromString`), not the key form the index keys take.
+      const holds = yield* Effect.forEach(kept, (ref) =>
+        Effect.map(
+          storedRefKeyOf(
+            ref,
+            Option.getOrElse(
+              keyValueOf(ref.keySchema, ids[ref.idFieldName]),
+              () => ids[ref.idFieldName],
+            ),
+          ),
+          (value) =>
+            ({
+              [ExprTag]: ExprTag,
+              _tag: "eq",
+              left: { _tag: "path", segments: [ref.fieldName, ref.keyField] },
+              right: { _tag: "value", value },
+            }) as Expr,
+        ),
+      )
+      const guard: Expr =
+        holds.length === 1 ? holds[0]! : ({ [ExprTag]: ExprTag, _tag: "and", exprs: holds } as Expr)
+      return { ids, guard }
+    })
+
+  /** An update's index key record, with the ids of the refs it keeps (`.keepRefs()`, #263). */
+  const withKeptRefIds = (
+    record: globalThis.Record<string, unknown>,
+    kept: { readonly ids: globalThis.Record<string, unknown> } | undefined,
+  ): globalThis.Record<string, unknown> =>
+    kept === undefined ? record : { ...record, ...kept.ids }
+
+  /**
    * What an update's `.remove()` removes, as the index key composer is told (`removedSet`): the
    * fields named, and the id of each ref removed, which is the composite a cascade index is keyed
    * by (#241), so the row leaves that index as it leaves the ref.
@@ -9662,10 +9845,15 @@ const makeImpl = <
             "is no version to check. Add `versioned: true`, or use a `.condition()`. Nothing was sent.",
         })
       }
+      // `.keepRefs()` (#263): the refs this update keeps, and the guard that the row holds them.
+      const kept = yield* keptRefsOf(uState)
       // The caller's condition, ANDed onto `patch`'s exists guard — a guard
-      // no `.condition()` can replace (#133).
+      // no `.condition()` can replace (#133) — and onto `.keepRefs()`'s.
       const userCond = withGuard(
-        uState.patch ? { attributeExists: [config.indexes.primary.pk.field] } : undefined,
+        withGuard(
+          uState.patch ? { attributeExists: [config.indexes.primary.pk.field] } : undefined,
+          kept?.guard,
+        ),
         uState.condition,
       )
       yield* checkWithVectorNames(uState.withVectors, "update")
@@ -9732,6 +9920,7 @@ const makeImpl = <
               encodedKey,
               encodedUpdates,
               encodedUpdates as globalThis.Record<string, unknown>,
+              kept,
             )
           : undefined
       // The operands written as values of a field, in the form they're written: refused here if
@@ -9763,6 +9952,7 @@ const makeImpl = <
         encodedUpdates,
         refsToHydrate,
         checked,
+        kept,
       }
     })
 
@@ -9891,6 +10081,8 @@ const makeImpl = <
     encodedKey: globalThis.Record<string, unknown>,
     encodedUpdates: unknown,
     hydratedUpdates: globalThis.Record<string, unknown>,
+    /** The refs the update keeps (`.keepRefs()`, #263): their ids key the indexes too. */
+    kept: { readonly ids: globalThis.Record<string, unknown> } | undefined,
   ) =>
     Effect.gen(function* () {
       // The index keys the payload feeds, composed once before anything is
@@ -9905,7 +10097,7 @@ const makeImpl = <
           entityVersion,
           allIndexes,
           keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
-          keyForm(encodedKey as globalThis.Record<string, unknown>),
+          keyForm(withKeptRefIds(encodedKey as globalThis.Record<string, unknown>, kept)),
           // The branches below know more: the retain path reads the whole item
           // first, so a shard it can compute is not refused here (#183).
           {
@@ -10041,6 +10233,7 @@ const makeImpl = <
           encodedKey,
           encodedUpdates,
           hydratedUpdates,
+          prepared.kept,
         ))
       if (
         rewritesWholeItem(uState, needsBothImages, {
@@ -10320,8 +10513,21 @@ const makeImpl = <
         // here. Recompose all keys with the updated attributes.
         //
         // Primary key always recomposes from `newItem` (Put-style), a ref's id in it the caller's:
-        // a row stores the ref, not the id.
-        const keyedItem = withRefIds(newItem, encodedKey)
+        // a row stores the ref, not the id. In an index half the update touches, a ref's id the
+        // update doesn't give is the one the row holds (`heldRefsOf`, #263), so the half composes
+        // as a `put` of the row would, guarded as read below. Up to 1.41.0 those ids were missing
+        // here, so such a half was truncated before the first.
+        const retainRemovedSet = removedSetOf(uState.remove)
+        const heldRefs = heldRefsOf(
+          newItem,
+          withRefIds(hydratedUpdates, encodedUpdates),
+          retainRemovedSet,
+          prepared.kept,
+        )
+        const keyedItem = withKeptRefIds(
+          withRefIds(withHeldRefIds(newItem, heldRefs), encodedKey),
+          prepared.kept,
+        )
         const primaryKeyMap = composePrimaryKey(keyedItem)
         Object.assign(newItem, primaryKeyMap)
 
@@ -10338,7 +10544,6 @@ const makeImpl = <
         // EDD-9024 was deprecated in v1.7.1 — hole patterns don't throw. A
         // Z-order value the composer can't place (EDD-9092, #171) fails the
         // update with a `ValidationError`.
-        const retainRemovedSet = removedSetOf(uState.remove)
         // The payload's values are the write's own; the rest of `newItem` is the row as stored.
         const ownUpdate = ownPayload(hydratedUpdates as globalThis.Record<string, unknown>)
         const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
@@ -10556,6 +10761,8 @@ const makeImpl = <
         // and a concurrent change to an input is refused.
         const condParts: Array<string> = []
         const inputs: Array<string> = []
+        // The refs whose ids a key was composed from as read, guarded by the id in the ref.
+        const heldGuards: Array<NonNullable<ReturnType<typeof heldRefGuard>>> = []
         if (systemFields.version) {
           condParts.push(versionIs(currentVersion, writeNames, writeValues, "#ver", ":expectedVer"))
           const incarnation = incarnationGuard(currentItem, writeNames, writeValues)
@@ -10609,6 +10816,16 @@ const makeImpl = <
             if (written.has(definition.partitionField)) add(definition.partition)
           }
           for (const [i, field] of inputs.entries()) {
+            const held = heldRefs.find(({ ref }) => ref.idFieldName === field)
+            const asRead = held === undefined ? undefined : heldRefGuard(held.ref, currentItem)
+            if (asRead !== undefined) {
+              writeNames[`#g${i}`] = asRead.attribute
+              writeNames[`#g${i}k`] = asRead.key
+              writeValues[`:g${i}`] = asRead.id
+              condParts.push(`#g${i}.#g${i}k = :g${i}`)
+              heldGuards.push(asRead)
+              continue
+            }
             const attr = resolveDbName(field)
             writeNames[`#g${i}`] = attr
             const read = ownValue(currentItem, attr)
@@ -10718,20 +10935,30 @@ const makeImpl = <
             )
           }
           if (stored === undefined) return missingItem()
-          const changed = guardedAttrs.filter(
-            (attr) =>
-              !attributeValueEquals(
-                ownValue(stored, attr) as AttributeValue | undefined,
-                ownValue(currentItem, attr),
-              ),
-          )
-          if (changed.length === 0 && userCond) {
+          const changed = new Set([
+            ...guardedAttrs.filter(
+              (attr) =>
+                !attributeValueEquals(
+                  ownValue(stored, attr) as AttributeValue | undefined,
+                  ownValue(currentItem, attr),
+                ),
+            ),
+            // A ref is guarded by its id: another ref is a change, a refreshed copy isn't.
+            ...heldGuards
+              .filter((guard) => {
+                const ref = ownValue(stored, guard.attribute) as AttributeValue | undefined
+                const id = ref?.M === undefined ? undefined : ownValue(ref.M, guard.key)
+                return !attributeValueEquals(id as AttributeValue | undefined, guard.id)
+              })
+              .map((guard) => guard.attribute),
+          ])
+          if (changed.size === 0 && userCond) {
             return new ConditionalCheckFailed({ entityType, key: encodedKey })
           }
           return new ConcurrentModification({
             entityType,
             key: encodedKey,
-            attributes: changed.map(domainNameOf),
+            attributes: [...changed].map(domainNameOf),
             current: Option.none(),
           })
         }
@@ -11434,7 +11661,7 @@ const makeImpl = <
           entityVersion,
           allIndexes,
           keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
-          keyForm(encodedKey as globalThis.Record<string, unknown>),
+          keyForm(withKeptRefIds(encodedKey as globalThis.Record<string, unknown>, prepared.kept)),
           {
             ...(removedSet === undefined ? {} : { removedSet }),
             stamped: keyForm(
@@ -11790,8 +12017,8 @@ const makeImpl = <
         condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
       }
       // A plain write already requires the item (`attribute_exists(#exists)`
-      // below), so `patch`'s own exists guard would only repeat it.
-      const sentCond = plainWrite ? uState.condition : userCond
+      // below), so `patch`'s own exists guard would only repeat it; `.keepRefs()`'s is sent.
+      const sentCond = plainWrite ? withGuard(prepared.kept?.guard, uState.condition) : userCond
       const uc = sentCond ? compileOwnCondition(sentCond) : undefined
       if (uc) {
         condParts.push(`(${uc.expression})`)
@@ -12480,7 +12707,8 @@ const makeImpl = <
             Object.entries(uState.subtract ?? {}).map(([field, by]) => [field, -by]),
           ),
         },
-        callerCondition: uState.condition !== undefined,
+        // `.keepRefs()`'s guard is the caller's: a row holding another ref fails it, unchanged.
+        callerCondition: uState.condition !== undefined || prepared.kept !== undefined,
         expectedVersion: uState.expectedVersion,
         refuse: (row) => fallbackRefusal(prepared.operands.fallbacks, row),
       },

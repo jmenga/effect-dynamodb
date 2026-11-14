@@ -14,6 +14,7 @@ import { Config, Effect, Layer } from "effect"
 import { describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import { suite as cascadeSuite } from "./helpers/EntityRefCascade.js"
+import { suite as keepSuite } from "./helpers/EntityRefKeep.js"
 import { type Harness, INDEXES, suite } from "./helpers/EntityRefKeys.js"
 import { suite as writesSuite } from "./helpers/EntityRefWrites.js"
 
@@ -131,3 +132,4 @@ const harness: Harness = {
 suite(harness, dynamoAvailable ? describe : describe.skip)
 cascadeSuite(harness, dynamoAvailable ? describe : describe.skip)
 writesSuite(harness, dynamoAvailable ? describe : describe.skip)
+keepSuite(harness, dynamoAvailable ? describe : describe.skip)
