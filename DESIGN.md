@@ -5687,6 +5687,43 @@ default fills one in), and fails as on 1.40.0 where they don't (`get.decode`,
 (`fixtures/entity-ref-keys-encoding-default-1.40.0.json`). The identifier is
 still required at `Entity.make`, as before.
 
+**A ref holds a field in the storage its entity's `configure` gives it.** `refDataOf`
+encodes the referenced item through the target's `modelSchema`, which applies the
+target's `DynamoModel.configure` overrides, so a ref copy holds a field `storedAs` a date
+schema (`DateEpochSeconds`, say) in that storage, as the target's own row does. The
+referencing entity builds its ref schemas from the target's raw model, so they apply the
+same storage: the write and read fields (`refHeldSchema` with
+`DeepSubstitutionOptions.configuredStorage`, from `configuredStorageOf`) and the path
+encoder behind conditions, filters and `pathSet` (`makePathValueEncoder`'s `refStorage`),
+by the tests `substituteSchemas` applies the entity's own storage by (a date, an
+`optionalKey` one, one beneath a decoding default, a union's date member). Up to 1.41.0 they
+applied the default: a date stored as epoch seconds read back as milliseconds (a 1970
+date), a `NullOr` date so stored failed the `put` that wrote it and every read of its row, a
+condition or filter on it sent ISO text and matched no row, and `pathSet` wrote ISO text into
+the copy. What hydration stores is unchanged, and a ref whose entity configures no storage
+sends what 1.41.0 sent (`helpers/EntityRefStoredAs.ts`, `EntityRefKeys.test.ts`,
+`connected.entity-ref-keys.test.ts`). A copy holding ISO text, as `pathSet` wrote it up to
+1.41.0, reads as the date it holds, as it did on 1.41.0: a read takes the field's own storage
+beside the configured one, by the kind of value stored (`readsDeclaredStorage`, set on read
+schemas only). Out of a union the date's transform reads text as ISO text already; in one, the
+member is a union of the configured transform and the declared one, each strict, the way an
+aggregate's member reads two storages, and a member either one takes canonically is decoded
+first (`declaredStoragePlan`), so a `Union([String, DateTimeUtc])` reads ISO text as the date,
+as 1.41.0 did (`RefConfiguredStorage.test.ts`). Writes and operands encode the configured form
+only. Where both storages are numbers (a field declared in epoch milliseconds that `configure`
+stores in seconds) the kind can't tell them apart, and the configured scale is read. A condition
+on a copy holding ISO text sends the configured form and doesn't match it; rewriting the ref
+(`.set({ playerId })`, or an update of the target with `.cascade()`) stores it again. Named, not
+changed: the storage is the target's own fields', not that of a ref the
+target holds in turn. With `Selection` → `Player` → `Team`, `Team` configuring `founded`,
+`Player` now stores and reads its copy of `team` right, so `Selection`'s copy of `player.team`
+holds `founded` in `Team`'s storage, which `Selection` reads with the default (a 1970 date, as
+1.41.0 read the ISO text it stored of the 1970 date `Player` read). A whole-ref
+`pathSet(["player"], value)` the ref's schema refuses as a whole is encoded part by part over
+the raw model, without the storage. An aggregate's ref and `one` edge copies are encoded by the
+aggregate's own encoders over the raw model (`buildAttrEncoders`), so they hold the default
+form and read it back with the same: consistent, and unchanged.
+
 **Every write keys a ref's indexes from the id given (#241).** `put` composes an
 index keyed by `${field}Id` from the id in its input; `upsert` and `update` /
 `patch` / a planned `transactWrite` update compose from the hydrated payload,
