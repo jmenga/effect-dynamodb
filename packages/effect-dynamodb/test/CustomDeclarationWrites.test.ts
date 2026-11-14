@@ -478,8 +478,8 @@ describe("a new write path can't go unnoticed", () => {
     // `encodeForWrite`'s one encode, and `_unstorableKey`'s encode of a key record as `put` would
     // encode it, which writes nothing.
     expect(count(entity, /\bencodeOrDecodeEncode\(/g)).toBe(2)
-    // Put, update, upsert twice, and a time series' append.
-    expect(count(entity, /\bencodeForWrite\(/g)).toBe(5)
+    // Put, update, upsert twice, a time series' append, and the ids `.keepRefs()` keeps.
+    expect(count(entity, /\bencodeForWrite\(/g)).toBe(6)
     // A key value that reads back as the other numeric kind is refused in `encodeForWrite`, and in
     // the check a transaction's or a batch's put goes through (`_refuseNotReadBack`).
     expect(count(entity, /\brefuseOtherKindRead\(/g)).toBe(2)
