@@ -235,6 +235,65 @@ const oneLevel = (form: Form) => {
   return { Teams, Squads }
 }
 
+/**
+ * Team (`founded` stored as epoch seconds) → player → selection, with `Player.team` and
+ * `Selection.player` declared as given, and configured `{ ref: true }` where `configured` says.
+ */
+const declared = (
+  name: string,
+  declare: {
+    readonly team: (target: typeof Team) => Schema.Top
+    readonly player: (target: Schema.Top) => Schema.Top
+    readonly configured: ReadonlyArray<"team" | "player">
+  },
+) => {
+  const ref = (field: "team" | "player") =>
+    declare.configured.includes(field) ? { [field]: { ref: true } } : {}
+  const Teams = Entity.make({
+    model: DynamoModel.configure(Team, {
+      id: { identifier: true },
+      founded: { storedAs: DynamoModel.DateEpochSeconds },
+    }),
+    entityType: "Team",
+    primaryKey: byId,
+  } as never) as any
+  class Player extends Schema.Class<Player>(`NestedRef${name}Player`)({
+    id: Schema.String,
+    team: declare.team(Team) as typeof Team,
+  }) {}
+  const Players = Entity.make({
+    model: DynamoModel.configure(Player, { id: { identifier: true }, ...ref("team") } as never),
+    entityType: "Player",
+    primaryKey: byId,
+    refs: { team: { entity: Teams } },
+  } as never) as any
+  class Selection extends Schema.Class<Selection>(`NestedRef${name}Selection`)({
+    id: Schema.String,
+    note: Schema.String,
+    player: declare.player(Player) as typeof Player,
+  }) {}
+  const Selections = Entity.make({
+    model: DynamoModel.configure(Selection, {
+      id: { identifier: true },
+      ...ref("player"),
+    } as never),
+    entityType: "Selection",
+    primaryKey: byId,
+    refs: { player: { entity: Players } },
+  } as never) as any
+  return { Teams, Players, Selections }
+}
+
+/** A selection row of {@link declared}'s selection entity, holding `player`. */
+const selectionRow = (id: string, player: AttributeValue): Row => ({
+  id: { S: id },
+  note: { S: "-" },
+  player,
+  __edd_e__: { S: "Selection" },
+  pk: { S: `${prefix}#id_${id}` },
+  sk: { S: prefix },
+})
+
 export const suite = (
   harness: Harness,
   describeIt: (name: string, body: () => void) => void = describe,
@@ -405,6 +464,116 @@ export const suite = (
             if (Exit.isFailure(read.exit)) throw read.exit
             same(read.exit.value.player.team.founded, at(MOVED))
           }),
+        ),
+      ))
+
+    // The wrapper a model declares around a nested ref is kept: only the ref inside it is held as
+    // its entity's read holds it. 1.42.1 read and path-wrote these copies as declared.
+    for (const form of ["configure", "model"] as const) {
+      it(`a nullable nested ref reads and path-writes null, declared ${form === "model" ? "on the model" : "by configure"}`, () =>
+        Effect.runPromise(
+          onTable(
+            harness,
+            declared(`Nullable${form}`, {
+              team: (target) =>
+                form === "model" ? DynamoModel.ref(Schema.NullOr(target)) : Schema.NullOr(target),
+              player: (target) => (form === "model" ? DynamoModel.ref(target) : target),
+              configured: form === "model" ? [] : ["team", "player"],
+            }),
+            ({ db, step, rows, seed }) =>
+              Effect.gen(function* () {
+                // A selection of a player without a team, as 1.42.1 stored it.
+                yield* seed(selectionRow("s0", { M: { id: { S: "p0" }, team: { NULL: true } } }))
+                const read = yield* step(db.entities.Selections.get({ id: "s0" }))
+                expect(outcome(read.exit)).toEqual({
+                  ok: { id: "s0", note: "-", player: { id: "p0", team: null } },
+                })
+                const set = yield* step(
+                  db.entities.Selections.update({ id: "s0" }).pathSet({
+                    segments: ["player", "team"],
+                    value: null,
+                  }),
+                )
+                if (Exit.isFailure(set.exit)) throw set.exit
+                expect(set.sent.at(-1)!.input.UpdateExpression).toBe("SET #ps0.#ps1 = :ps2")
+                expect(valuesOf(set)).toEqual([{ NULL: true }])
+                const row = (yield* rows).find((r) => r.pk?.S === `${prefix}#id_s0`)!
+                expect(row.player).toEqual({ M: { id: { S: "p0" }, team: { NULL: true } } })
+                const again = yield* step(db.entities.Selections.get({ id: "s0" }))
+                expect(outcome(again.exit)).toEqual(outcome(read.exit))
+              }),
+          ),
+        ))
+    }
+
+    it("an optional nested ref the copy leaves out reads without it", () =>
+      Effect.runPromise(
+        onTable(
+          harness,
+          declared("Optional", {
+            team: (target) => Schema.optionalKey(target),
+            player: (target) => target,
+            configured: ["team", "player"],
+          }),
+          ({ db, step, seed }) =>
+            Effect.gen(function* () {
+              yield* seed(selectionRow("s0", { M: { id: { S: "p0" } } }))
+              const read = yield* step(db.entities.Selections.get({ id: "s0" }))
+              expect(outcome(read.exit)).toEqual({
+                ok: { id: "s0", note: "-", player: { id: "p0" } },
+              })
+            }),
+        ),
+      ))
+
+    it("a nested ref beneath a nullable ref is held as its entity's read holds it", () =>
+      Effect.runPromise(
+        onTable(
+          harness,
+          declared("BeneathNullable", {
+            team: (target) => DynamoModel.ref(target),
+            player: (target) => DynamoModel.ref(Schema.NullOr(target)),
+            configured: [],
+          }),
+          ({ db, exec, step, rows }) =>
+            Effect.gen(function* () {
+              // Up to 1.42.1 the put stored the row and failed `Expected DateTime.Utc at
+              // player.team.founded`, and so did every read of it.
+              const S = db.entities.Selections
+              yield* exec(db.entities.Teams.put({ id: "t1", founded: at(FOUNDED) }))
+              yield* exec(db.entities.Players.put({ id: "p1", teamId: "t1" }))
+              const put = yield* step(S.put({ id: "s1", note: "-", playerId: "p1" }))
+              if (Exit.isFailure(put.exit)) throw put.exit
+              same(put.exit.value.player.team.founded, at(FOUNDED))
+              const row = () =>
+                Effect.map(rows, (all) => all.find((r) => r.pk?.S === `${prefix}#id_s1`)!.player)
+              const team = (iso: string) => ({
+                M: { id: { S: "t1" }, founded: stored("seconds", iso) },
+              })
+              expect(yield* row()).toEqual({ M: { id: { S: "p1" }, team: team(FOUNDED) } })
+              const read = yield* step(S.get({ id: "s1" }))
+              if (Exit.isFailure(read.exit)) throw read.exit
+              same(read.exit.value.player.team.founded, at(FOUNDED))
+              const held = yield* step(
+                S.update({ id: "s1" })
+                  .set({ note: "held" })
+                  .condition((t: any, { eq }: any) => eq(t.player.team.founded, at(FOUNDED))),
+              )
+              if (Exit.isFailure(held.exit)) throw held.exit
+              expect(valuesOf(held)).toContainEqual(stored("seconds", FOUNDED))
+              const set = yield* step(
+                S.update({ id: "s1" }).pathSet({
+                  segments: ["player", "team", "founded"],
+                  value: at(MOVED),
+                }),
+              )
+              if (Exit.isFailure(set.exit)) throw set.exit
+              expect(valuesOf(set)).toEqual([stored("seconds", MOVED)])
+              expect(yield* row()).toEqual({ M: { id: { S: "p1" }, team: team(MOVED) } })
+              const after = yield* step(S.get({ id: "s1" }))
+              if (Exit.isFailure(after.exit)) throw after.exit
+              same(after.exit.value.player.team.founded, at(MOVED))
+            }),
         ),
       ))
 

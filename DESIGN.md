@@ -4199,8 +4199,9 @@ under a TOP-LEVEL `DynamoModel.ref` field follow the ref target's model
 (`refTargets`), whose read schema is substituted, so they are encoded like any
 other path, and so are paths under a ref nested in a ref target, at any depth,
 through the model of the entity the target's entity names for it (`heldRefs`,
-`heldRefField`), however the target's model declares it (up to 1.42.1 a nested
-`DynamoModel.ref` was opaque here). An opaque class (built with `.check()` or
+`heldRef`, `heldRefMember`), however the target's model declares it, within the
+wrappers it declares around it (up to 1.42.1 a nested `DynamoModel.ref` was
+opaque here). An opaque class (built with `.check()` or
 `.annotate()`) is deliberately not followed by `childAtSegment`: its `.fields`
 are gone, so the read schema keeps it unsubstituted and decodes its leaves exactly as `put` stores them, and a path
 value under it is passed through as given so the item stays readable. Known
@@ -5793,7 +5794,12 @@ stores it right. A middle model may declare its ref either way (`team: DynamoMod
 `make`, by ref field, the model of the entity it refs and that entity's own refs (`HeldRefs`,
 read by `entityRefsOf`), and the ref schemas (`DeepSubstitutionOptions.heldRefs`) and the path
 encoder (`makePathValueEncoder`'s `heldRefs`) walk a ref of a ref's target as what a read of its
-entity returns (`heldRefField`), at any depth. `DynamoModel.ref` hides a class's fields, so up to
+entity returns (`heldRefMember`), at any depth. The walk keeps the wrapper the model declares
+around such a ref exactly (`NullOr`, `UndefinedOr`, `optional`, `optionalKey`, `optionalKey`
+of a `NullOr`, a `Union` with other members), as it keeps the one around a date: the field
+carries the ref down (`DeepSubstitutionOptions.heldRef`) through the wrappers the walker already
+passes through, and only the ref member inside is replaced, so a player without a team (`team:
+Schema.NullOr(Team)`) reads, and is path-written `null`, as 1.42.1 did. `DynamoModel.ref` hides a class's fields, so up to
 1.42.1 the annotated form wasn't looked into: such a `Selection`'s `put` stored its row and then
 failed, as did its reads (`Expected DateTime.Utc at player.team.founded`), and a condition,
 filter or `pathSet` on `player.team.founded` sent the date as a map. Both forms now send what the
@@ -6073,7 +6079,10 @@ inside sub-aggregate edges and `many` elements (found by
 `Schema.Array(<entity model>)` because the walker re-points fields, not
 elements), and refs nested in an edge entity's own model (#116) and in their
 entities' models in turn (`entityRefsOf`; up to 1.42.1 only a pure definition's,
-one level down). A ref back to a model already on the way (a model that refs
+one level down, whatever its wrapper), each only where the field is the ref or an
+optional key or property of it (`keepsWrapper`), since the resolver re-applies only
+optionality: a nested ref beneath a `NullOr` or a `Union` is walked as declared, as
+1.42.1 walked a runtime entity's. A ref back to a model already on the way (a model that refs
 itself through `Schema.suspend`) is not registered, so the walk ends; its dates
 are encoded as 1.42.1 encoded them. A
 plain-class element field is walked directly and needs no registration. Targets

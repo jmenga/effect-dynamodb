@@ -1914,6 +1914,18 @@ const validateNestedDiscriminators = (
   }
 }
 
+/**
+ * Whether the walker re-points a ref field within the wrapper its model declares: the ref itself, or
+ * `Schema.optional` / `Schema.optionalKey` directly around it, which it re-applies. Not a union
+ * (`NullOr`, one with other members, `optionalKey` over one), which it would replace whole.
+ */
+const keepsWrapper = (field: Schema.Top): boolean => {
+  const optional = optionalField(field)
+  return optional === undefined
+    ? !SchemaAST.isUnion(field.ast)
+    : optional.union === undefined && !SchemaAST.isUnion(optional.inner.ast)
+}
+
 /** The structural slice of an edge's target entity that ref resolution reads. */
 interface RefTargetEntity {
   readonly model?: Schema.Top
@@ -1986,10 +1998,11 @@ const collectRefTargets = (
   }
   // The refs of an edge entity's model, and of their entities' models in turn (`entityRefsOf`): a
   // read of the edge entity holds each as a read of its own entity returns it. An opaque one is
-  // registered, a class only where its read holds less (`registerHeld`), as for an edge. Up to
-  // 1.42.1 only a pure definition's refs were, one level down: an entity made with this package's
-  // `Entity.make` had none, so a `DynamoModel.ref` in its model stored a date as a marshalled map.
-  // A ref back to a model on the way (A → B → A) isn't followed.
+  // registered, a class only where its read holds less (`registerHeld`), as for an edge, each only
+  // where the walker re-points it within the wrapper its model declares (`keepsWrapper`). Up to
+  // 1.42.1 only a pure definition's refs were, one level down, whatever their wrapper: an entity
+  // made with this package's `Entity.make` had none, so a `DynamoModel.ref` in its model stored a
+  // date as a marshalled map. A ref back to a model on the way (A → B → A) isn't followed.
   const registerNested = (entity: RefTargetEntity | undefined) => {
     if (entity?.model === undefined) return
     const nested = (model: Schema.Top, refs: HeldRefs, on: ReadonlySet<Schema.Top>) => {
@@ -1997,8 +2010,10 @@ const collectRefTargets = (
       for (const [name, held] of Object.entries(refs)) {
         if (on.has(held.model)) continue
         const field = ownValue(fields, name)
-        if (field !== undefined && isOpaqueRefField(field)) register(field, held.model, false)
-        else registerHeld(field)
+        if (field !== undefined && keepsWrapper(field)) {
+          if (isOpaqueRefField(field)) register(field, held.model, false)
+          else registerHeld(field)
+        }
         nested(held.model, held.refs, new Set([...on, held.model]))
       }
     }
