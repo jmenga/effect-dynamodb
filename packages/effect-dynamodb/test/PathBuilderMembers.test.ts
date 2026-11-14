@@ -7,10 +7,14 @@
  * with a `TypeError` before sending. Expressions over a model with no such field send what 1.41.0
  * sent (the pins below were recorded on 1.41.0).
  *
- * The builder's other members (`segments`, `_tag`, `pipe`, `then`, `toJSON`) are still the member,
- * as through 1.41.0: an equality shorthand (`{ eq: { segments: 1 } }`, `.filter({ segments: 1 })`),
- * a record operation (`.set({ segments })`) and a path operation's segments (`["segments"]`) reach
- * a field of that name.
+ * A field named `_tag` (a tagged struct's tag, `t.box._tag`) is the field too. Through 1.41.0 it
+ * was the builder's own tag, the text `"Path"`, so `eq(t.box._tag, "Box")` compared `"Path"` with
+ * `"Box"` and never held.
+ *
+ * The builder's other members (`segments`, `pipe`, `then`, `toJSON`) are still the member, as
+ * through 1.41.0: an equality shorthand (`{ eq: { segments: 1 } }`, `.filter({ segments: 1 })`), a
+ * record operation (`.set({ segments })`) and a path operation's segments (`["segments"]`) reach a
+ * field of that name.
  */
 
 import { it } from "@effect/vitest"
@@ -183,6 +187,61 @@ describe("a model field named size, at or entry", () => {
     expect(Object.values(names).sort()).toEqual(["at", "size"])
     expect(expression).toContain("=")
   })
+})
+
+describe("a model field named _tag", () => {
+  const Tagged = Schema.Struct({
+    id: Schema.String,
+    box: Schema.TaggedStruct("Box", { side: Schema.Number }),
+  })
+
+  it("is the field's path, at the root and below a struct", () => {
+    const t = createPathBuilder<{ readonly _tag: "Doc"; readonly box: typeof Tagged.Type.box }>()
+    const { and, eq } = createConditionOps<any>()
+    expect(compileExpr(and(eq(t._tag, "Doc"), eq(t.box._tag, "Box")))).toEqual({
+      expression: "(#e0 = :e1) AND (#e2.#e3 = :e4)",
+      names: { "#e0": "_tag", "#e2": "box", "#e3": "_tag" },
+      values: { ":e1": { S: "Doc" }, ":e4": { S: "Box" } },
+    })
+  })
+
+  it.effect("is reached by a condition and a filter", () =>
+    onTable(
+      Lib.Entity.make({
+        model: Tagged,
+        entityType: "Doc",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      }),
+      { id: "a", box: { _tag: "Box", side: 2 } },
+      (db, take) =>
+        Effect.gen(function* () {
+          yield* db.entities.Docs.update({ id: "a" })
+            .set({ box: { _tag: "Box", side: 3 } })
+            .condition((t: any, { eq }: any) => eq(t.box._tag, "Box"))
+            .asEffect()
+          const [update] = take()
+          expect(update?.input.ConditionExpression).toBe(
+            "(#e0.#e1 = :e2) AND attribute_exists(#exists)",
+          )
+          expect(update?.input.ExpressionAttributeNames).toMatchObject({
+            "#e0": "box",
+            "#e1": "_tag",
+          })
+          const refused = yield* db.entities.Docs.update({ id: "a" })
+            .set({ box: { _tag: "Box", side: 4 } })
+            .condition((t: any, { eq }: any) => eq(t.box._tag, "Crate"))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(refused._tag).toBe("ConditionalCheckFailed")
+          take()
+          const found = yield* db.entities.Docs.scan()
+            .filter((t: any, { eq }: any) => eq(t.box._tag, "Box"))
+            .collect()
+          expect(found.map((doc: any) => doc.box)).toEqual([{ _tag: "Box", side: 3 }])
+          expect(take()[0]?.input.FilterExpression).toBe("#eddE IN (:et0) AND (#e0.#e1 = :e2)")
+        }),
+    ),
+  )
 })
 
 describe("the builder's other members", () => {

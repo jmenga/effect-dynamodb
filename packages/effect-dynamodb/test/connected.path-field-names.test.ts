@@ -1,7 +1,7 @@
 /**
  * A model field named like a path builder accessor (`size`), at the root and below a struct,
  * against DynamoDB Local: a condition on `t.size` holds or fails as the stored value says, a filter
- * on it finds the row, and a select of it returns it. Through 1.41.0 `eq(t.size, 5)` sent
+ * on it (and on a tagged struct's `_tag`) finds the row, and a select of it returns it. Through 1.41.0 `eq(t.size, 5)` sent
  * `:e0 = :e1` with nothing behind `:e0`, which DynamoDB rejects, and a select of `t.size` died
  * before sending. `test/PathBuilderMembers.test.ts` checks the names each request sends.
  *
@@ -38,6 +38,7 @@ const Listings = Lib.Entity.make({
     id: Schema.String,
     size: Schema.Number,
     box: Schema.Struct({ size: Schema.Number, label: Schema.String }),
+    crate: Schema.TaggedStruct("Crate", { side: Schema.Number }),
   }),
   entityType: "Listing",
   primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
@@ -58,7 +59,12 @@ describeConnected("a field named size, on DynamoDB Local", () => {
       }),
       (db) =>
         Effect.gen(function* () {
-          yield* db.entities.Listings.put({ id: "a", size: 5, box: { size: 5, label: "l" } })
+          yield* db.entities.Listings.put({
+            id: "a",
+            size: 5,
+            box: { size: 5, label: "l" },
+            crate: { _tag: "Crate", side: 1 },
+          })
           yield* db.entities.Listings.update({ id: "a" })
             .set({ box: { size: 6, label: "l" } })
             .condition((t, { and, eq }) => and(eq(t.size, 5), eq(t.box.size, 5)))
@@ -69,7 +75,9 @@ describeConnected("a field named size, on DynamoDB Local", () => {
             .pipe(Effect.flip)
           expect(refused._tag).toBe("ConditionalCheckFailed")
           const found = yield* db.entities.Listings.scan()
-            .filter((t, { and, eq }) => and(eq(t.size, 5), eq(t.box.size, 6)))
+            .filter((t, { and, eq }) =>
+              and(eq(t.size, 5), eq(t.box.size, 6), eq(t.crate._tag, "Crate")),
+            )
             .collect()
           expect(found.map((listing) => listing.id)).toEqual(["a"])
           const selected = yield* db.entities.Listings.scan()

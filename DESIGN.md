@@ -4008,8 +4008,10 @@ builder's accessors (`size`, `at`, `entry`) is the field in a callback, at the r
 struct (`t.size`, `t.box.size`), and, called, the accessor on the path before it
 (`t.box.size()`, `t.roster.at(0)`, `t.zones.entry("k")`): that path is a function whose call
 performs the accessor, and `isPath` takes it. Through 1.41.0 it was only the accessor, so
-`eq(t.size, 5)` sent an operand with no value, which DynamoDB rejected. A field named like one of
-the builder's other members (`segments`, `_tag`, `pipe`, `then`, `toJSON`) is still the member: an
+`eq(t.size, 5)` sent an operand with no value, which DynamoDB rejected. A field named `_tag` (a
+tagged struct's tag, `t.box._tag`) is the field too: a path is recognised by its `PathTag`, and
+through 1.41.0 `_tag` was the text `"Path"`, so a condition on it never held. A field named like
+one of the builder's other members (`segments`, `pipe`, `then`, `toJSON`) is still the member: an
 equality shorthand (`{ eq: { segments: 1 } }`, `.filter({ segments: 1 })`), a record operation
 (`.set({ segments })`) and a path operation's segments (`["segments"]`) reach it
 (`test/PathBuilderMembers.test.ts`). A

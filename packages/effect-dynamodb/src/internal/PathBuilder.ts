@@ -254,6 +254,10 @@ export const withEntry = (
  * `t.zones.entry("k")`). The path below is a function, and calling it performs
  * the accessor. Through 1.41.0 each was only the accessor, so a field of that
  * name compiled to an operand with no value behind it.
+ *
+ * `_tag` is the model's field too (`t.box._tag`, a tagged struct's tag): a path
+ * is recognised by {@link PathTag}, never by a tag. Through 1.41.0 it was the
+ * text `"Path"`, so a condition on it never held.
  */
 export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | number> = []>(
   segments: ReadonlyArray<string | number> = [],
@@ -276,7 +280,6 @@ const pathProxy = (
   const handler: ProxyHandler<object> = {
     get(_target, prop) {
       if (prop === PathTag) return PathTag
-      if (prop === "_tag") return "Path"
       if (prop === "segments") return segments
       if (prop === "_Root" || prop === "_Value") return undefined
       if (prop === "size") {
@@ -330,7 +333,7 @@ const pathProxy = (
       return below(prop)
     },
     has(_target, prop) {
-      return prop === PathTag || prop === "_tag" || prop === "segments"
+      return prop === PathTag || prop === "segments"
     },
     apply(_target, _this, args) {
       return call?.(args[0] as never)
