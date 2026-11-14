@@ -21,7 +21,11 @@ import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 import { storedRows } from "./helpers/StoredRows.js"
 
 const SEEDS = [4, 6, 12, 13, 20, 22, 30, 38]
-const JITTERS = 20
+/**
+ * Jitters 1–7 a seed: on the code before the fix, every seed failed under at least one of them in
+ * each direction (to on, seed 6 first at jitter 7; to off, seed 4 at 6). The sweep once ran 20.
+ */
+const JITTERS = 7
 const OPTIONS = { segments: 2, concurrency: 4, pageSize: 3 }
 
 describe.each([
@@ -72,6 +76,10 @@ describe.each([
  */
 describe("the chain scenarios, their requests interleaving at random", () => {
   const STEMS = ["foo", "alpha", "kappa"]
+  // Jitters 1–5 a stem: on the code before the fix, "a sentinel's key held by one that can move"
+  // failed at foo's 1 and 2 in one segment and at alpha's and kappa's 5 in three, in both
+  // directions. The sweep once ran 12.
+  const JITTERS = 5
   for (const scenario of RekeyChains.chainScenarios) {
     for (const segments of [1, 3]) {
       it.effect(
@@ -79,7 +87,7 @@ describe("the chain scenarios, their requests interleaving at random", () => {
         () =>
           Effect.gen(function* () {
             for (const stem of STEMS) {
-              for (let jitter = 1; jitter <= 12; jitter++) {
+              for (let jitter = 1; jitter <= JITTERS; jitter++) {
                 const table = makeRecordingTable()
                 const client = gatedLayer(
                   table.client as DynamoClientService,

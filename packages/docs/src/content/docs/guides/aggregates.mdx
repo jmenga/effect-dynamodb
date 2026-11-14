@@ -71,6 +71,11 @@ const SquadSelections = Entity.make({
       pk: { field: "gsi1pk", composite: ["playerId"] },
       sk: { field: "gsi1sk", composite: ["squadId", "selectionNumber"] },
     },
+    byRole: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["squadRole"] },
+      sk: { field: "gsi2sk", composite: ["teamId", "playerId"] },
+    },
   },
   refs: {
     team: { entity: Teams },
@@ -120,6 +125,31 @@ An ID is a value of the referenced entity's key composite, the one attribute its
 The ID is a value of the key's own type: `5` for a `Schema.NumberFromString` key, `5n` for a `Schema.BigIntFromString` one, a date for a `DynamoModel.DateEpochSeconds` one. Before 1.41.0 a write naming an entity keyed by such a field failed with a `ValidationError` (`get.decode`).
 
 An index keyed by a ref's ID (a cascade index, or one of your own such as `byPlayer` above) is keyed from the ID given, by every write: `put`, `upsert`, and an `update`, `patch` or `Transaction.transactWrite` update that reassigns the ref with `.set({ playerId })`, through the index's [policy](/effect-dynamodb/guides/index-policy/) like any other composite. Before 1.41.0 an `upsert` wrote no key for such an index, and an update reassigning the ref kept the old key, so a cascade from the newly named entity missed the row. To key the rows earlier versions wrote that way, run `db.tables.<Table>.rekey({ repairIndexKeys: true })`, which rewrites each index key that isn't what a `put` of the row's values writes (with `dryRun: true` it counts them).
+
+#### Reassigning one ref of a key that holds two
+
+`byRole`'s sort key holds both refs' IDs. An update that reassigns one of them keys that half under the [index policy](/effect-dynamodb/guides/index-policy/), like any update that gives some of a half's composites: `.set({ playerId })` alone leaves the stored key naming the old player, because `teamId` comes first in the key and the update doesn't give it. For an ordinary composite you would give the unchanged value as well. For a ref, giving the unchanged `teamId` fetches the team again and overwrites the stored copy with its current state. Name the ref you keep with `.keepRefs()` instead:
+
+```typescript region="keep-refs" example="guide-aggregates.ts"
+// byRole's sort key holds both refs' IDs. Replace the player in selection 1,
+// keeping its team: the new player is fetched and copied, while the team's ID
+// only keys the index. The team isn't fetched again, its stored copy stays as
+// it is, and the update fails with ConditionalCheckFailed if the row holds
+// another team.
+yield* db.entities.SquadSelections.update({
+  squadId: "aus#2024-25#BGT",
+  selectionNumber: 1,
+})
+  .set({ playerId: "hazlewood-01", isCaptain: false })
+  .keepRefs({ teamId: "aus" })
+
+const bowlers = yield* db.entities.SquadSelections.byRole({ squadRole: "bowler" }).collect()
+// bowlers[0].player.lastName → "Hazlewood"
+```
+
+`.keepRefs({ teamId })` gives the ID for key composition only. It keys every index the ID is a composite of, as `.set({ teamId })` would, but the team isn't fetched and its stored copy isn't rewritten. The update is conditioned on the row holding that team (`team.id = :id`), so it fails with `ConditionalCheckFailed` where the row holds another; in `Transaction.transactWrite` the transaction is cancelled. It adds no read. `.keepRefs()` takes only the entity's ref IDs (any other name is refused with `EDD-9166`, and it doesn't compile on an entity without refs), and not the ID of a ref the same update reassigns or removes (`EDD-9167`). Unbound updates take it as `Entity.keepRefs()`.
+
+An update that reads the row anyway holds every ref the row stores. That is an update of a `versioned: { retain: true }` entity, or one that changes a unique field. Since 1.42.0 such an update composes each index key it touches (one holding a field it sets or removes) from those refs, so `.set({ playerId })` alone keys `byRole` as a `put` of the row would. A key it doesn't touch stays as stored. Before 1.42.0 it took each ref's ID as missing and truncated a key holding one: on a `[season, series, teamId, playerId]` key, `.set({ season })` dropped both IDs. `db.tables.<Table>.rekey({ repairIndexKeys: true })` rewrites keys left that way.
 
 A ref the model declares optional (`Schema.optionalKey(Team.pipe(DynamoModel.ref))`, or `Schema.optional(Team).pipe(DynamoModel.ref)`) can be left out: its ID is optional in `put`, `create` and `upsert`, nothing is fetched, and the row stores no ref and no key of an index keyed by its ID, so a cascade skips it. `.remove(["team"])` removes it, and the row leaves that index. `.remove(["teamId"])`, `.set({ teamId: undefined })` and `pathRemove(["team"])` are refused, naming `.remove(["team"])`: the row stores the ref, not its ID, and a path removal doesn't take the row out of that index. A required ref can't be left out or removed: a row without it couldn't be read. Before 1.41.0 every ref's ID was required, and removing a ref was refused.
 
@@ -838,7 +868,7 @@ const TournamentMatchAggregate = Aggregate.make(TournamentMatch, {
 })
 ```
 
-The first argument selects the partition (and, with contiguous SK composites, a prefix within it). The second carries the paging options:
+The first argument selects the partition and, with leading list sort key composites, the aggregates holding those values, each matched whole. The second carries the paging options:
 
 | Option | Meaning |
 |--------|---------|
@@ -847,6 +877,7 @@ The first argument selects the partition (and, with contiguous SK composites, a 
 | `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()`, and the same empty-part rules: an empty filter is none, and an empty part under `or()` / `not()`, an `or()` with no parts, or an operand that is `t` itself fails with a `ValidationError` before sending. An `isIn` with no values is sent; DynamoDB rejects its `IN ()`, and `list` fails with a `ValidationError` (`operation: "list.filter"`) naming it. A path is named as a query's filter names it: below a struct that renames its keys as they're stored (`Schema.encodeKeys`), `t.meta.amount` names the stored `meta.am` |
 | `reverse` | Walk the list index descending |
 | `cursor` | Resume after the last aggregate the previous call returned |
+| `prefix` | Match the last list sort key value given as a prefix of its composite's value, not the whole value |
 
 ```typescript region="list-filtered" example="guide-aggregates.ts"
 const completed = yield* TournamentMatchAggregate.list(
@@ -878,6 +909,17 @@ const latest = yield* TournamentMatchAggregate.list(
   { filter: (t, { eq }) => eq(t.status, "completed"), limit: 1, reverse: true },
 )
 ```
+
+A list sort key value is matched whole: no match id is `bgt-2025-test-0`, so without the option the call below returns nothing. With `prefix: true` the last value given is matched as a prefix of its composite's value, and every value before it still whole. For a list keyed `sk: [league, name]`, `{ league: "Big Bash", name: "fin" }` finds the `Big Bash` aggregates whose name starts with `fin`, and `{ league: "big" }` finds the leagues `Big`, `Big Bash` and `Big Bash League`. Up to 1.36 every list key was matched this way.
+
+```typescript region="list-prefix" example="guide-aggregates.ts"
+const testMatches = yield* TournamentMatchAggregate.list(
+  { tournament: "bgt-2025", matchId: "BGT-2025-TEST-0" },
+  { prefix: true },
+)
+```
+
+The prefix is composed as the key is, so it follows the schema's casing (case-insensitive under the default lowercase) and `escapeKeys`, and the list pages with its own cursor. A number has no text prefix, so a numeric composite is still matched whole, and a date (or any composite whose schema transforms its value) is read as a whole value of its type, so `prefix` is for text composites. With `escapeKeys` off, a `#` in the prefix is the key delimiter and also matches the start of the next composite's value.
 
 :::caution[Sharded lists cannot be resumed]
 With `list.cardinality`, the list index is spread across _n_ partitions and `list` fans out across all of them. `limit` bounds the merged result, but there is no resumable position across shards — `cursor` is always `None`, and passing one fails with a `ValidationError` (`EDD-9051`) rather than being silently ignored.

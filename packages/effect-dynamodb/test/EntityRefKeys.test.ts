@@ -7,7 +7,10 @@
 
 import { Effect, Layer } from "effect"
 import { suite as cascadeSuite } from "./helpers/EntityRefCascade.js"
+import { suite as keepSuite } from "./helpers/EntityRefKeep.js"
 import { type Harness, INDEXES, suite } from "./helpers/EntityRefKeys.js"
+import { suite as operandsSuite } from "./helpers/EntityRefOperands.js"
+import { suite as storedAsSuite } from "./helpers/EntityRefStoredAs.js"
 import { suite as writesSuite } from "./helpers/EntityRefWrites.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
@@ -40,3 +43,6 @@ const harness: Harness = {
 suite(harness)
 cascadeSuite(harness)
 writesSuite(harness)
+keepSuite(harness)
+operandsSuite(harness)
+storedAsSuite(harness)

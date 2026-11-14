@@ -8,11 +8,13 @@
  *   (or set DYNAMODB_ENDPOINT to another port)
  */
 
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb"
 import { Config, Effect } from "effect"
-import { describe } from "vitest"
+import { afterAll, describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import { INDEX, type Request, type Row } from "./helpers/AggregateUpgradeSweep.js"
 import { sweepSuite } from "./helpers/AggregateUpgradeSweepSuite.js"
+import { makeTablePool, type TableShape } from "./helpers/TablePool.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -34,14 +36,46 @@ const ClientLayer = DynamoClient.layer({
   credentials: { accessKeyId: "local", secretAccessKey: "local" },
 })
 
-let made = 0
+// Each case on an empty table of its key attribute, one at a time: reused, emptied between cases.
+const pool = makeTablePool(
+  new DynamoDBClient({
+    region: "us-east-1",
+    endpoint: ENDPOINT,
+    credentials: { accessKeyId: "local", secretAccessKey: "local" },
+  }),
+  "aggregate-upgrade-sweep",
+)
+afterAll(() => pool.drain())
+
+const shapeOf = (pk: string): TableShape => ({
+  KeySchema: [
+    { AttributeName: pk, KeyType: "HASH" },
+    { AttributeName: "sk", KeyType: "RANGE" },
+  ],
+  AttributeDefinitions: [
+    { AttributeName: pk, AttributeType: "S" },
+    { AttributeName: "sk", AttributeType: "S" },
+    { AttributeName: INDEX.sk, AttributeType: "S" },
+  ],
+  LocalSecondaryIndexes: [
+    {
+      IndexName: INDEX.name,
+      KeySchema: [
+        { AttributeName: pk, KeyType: "HASH" },
+        { AttributeName: INDEX.sk, KeyType: "RANGE" },
+      ],
+      Projection: { ProjectionType: "ALL" },
+    },
+  ],
+})
 
 sweepSuite(
   {
     onTable: (pk, body) =>
       Effect.gen(function* () {
         const raw = yield* DynamoClient
-        const tableName = `aggregate-upgrade-sweep-${Date.now()}-${made++}`
+        const shape = shapeOf(pk)
+        const tableName = yield* pool.take(shape)
         const sent: Array<Request> = []
         // Every request the library sends, under its command's name.
         const recording = new Proxy(raw, {
@@ -83,32 +117,8 @@ sweepSuite(
           Effect.gen(function* () {
             for (const row of rows) yield* raw.putItem({ TableName: tableName, Item: row })
           })
-        return yield* Effect.acquireUseRelease(
-          raw.createTable({
-            TableName: tableName,
-            BillingMode: "PAY_PER_REQUEST",
-            KeySchema: [
-              { AttributeName: pk, KeyType: "HASH" },
-              { AttributeName: "sk", KeyType: "RANGE" },
-            ],
-            AttributeDefinitions: [
-              { AttributeName: pk, AttributeType: "S" },
-              { AttributeName: "sk", AttributeType: "S" },
-              { AttributeName: INDEX.sk, AttributeType: "S" },
-            ],
-            LocalSecondaryIndexes: [
-              {
-                IndexName: INDEX.name,
-                KeySchema: [
-                  { AttributeName: pk, KeyType: "HASH" },
-                  { AttributeName: INDEX.sk, KeyType: "RANGE" },
-                ],
-                Projection: { ProjectionType: "ALL" },
-              },
-            ],
-          }),
-          () => body({ tableName, client: recording, take, scan }, seed),
-          () => raw.deleteTable({ TableName: tableName }).pipe(Effect.ignore),
+        return yield* body({ tableName, client: recording, take, scan }, seed).pipe(
+          Effect.ensuring(pool.give(tableName, shape)),
         )
       }).pipe(Effect.provide(ClientLayer)) as Effect.Effect<any, unknown>,
   },

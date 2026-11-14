@@ -287,6 +287,8 @@ export const mergeVectorIndexes = (
     const declared = entity._vectorIndexes
     if (!declared) continue
     const owner = entity.entityType ?? entityKey
+    // Each sharer's filters are named by the attributes IT stores them under, before the union: one
+    // domain name can be stored under different attributes by different sharers (#265).
     const resolveDbName = entity._resolveDbName ?? ((domainName: string) => domainName)
     for (const definition of Object.values(declared)) {
       const existing = merged.get(definition.index)
@@ -295,8 +297,8 @@ export const mergeVectorIndexes = (
           definition,
           owner,
           sharers: [owner],
-          filters: [...definition.filters],
-          resolveDbName,
+          filters: definition.filters.map((f) => resolveDbName(f)),
+          resolveDbName: (stored: string) => stored,
           filterStoredTypes: Object.fromEntries(
             definition.filters.map((f) => [resolveDbName(f), definition.filterTypes[f] ?? "S"]),
           ),
@@ -334,8 +336,8 @@ export const mergeVectorIndexes = (
           )
         }
         setOwn(existing.filterStoredTypes, stored, storedType)
-        if (existing.filters.some((f) => existing.resolveDbName(f) === stored)) continue
-        existing.filters.push(filter)
+        if (existing.filters.includes(stored)) continue
+        existing.filters.push(stored)
       }
     }
   }
@@ -355,9 +357,12 @@ export interface MergedVectorIndex {
   readonly owner: string
   /** Entity type of every entity declaring the index, in registration order. */
   readonly sharers: ReadonlyArray<string>
-  /** Union of every sharer's declared `filters` (domain names). */
+  /**
+   * Union of every sharer's declared `filters`, each by the attribute that sharer stores it under
+   * (its own `field:` renames applied before the union).
+   */
   readonly filters: ReadonlyArray<string>
-  /** Stored-name resolver for the first declarer's `storedAs` renames. */
+  /** The identity: `filters` already holds stored attribute names. */
   readonly resolveDbName: (domainName: string) => string
   /**
    * `AttributeDefinitions` scalar type per STORED filter attribute name,
