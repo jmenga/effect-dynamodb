@@ -661,6 +661,17 @@ const program = Effect.gen(function* () {
 
   yield* Console.log(`Latest completed: ${latest.data[0]?.matchId}`)
 
+  // A key value is matched whole: no match id is `bgt-2025-test-0`. With
+  // `prefix: true` the last value given is a prefix, in any casing.
+  // #region list-prefix
+  const testMatches = yield* TournamentMatchAggregate.list(
+    { tournament: "bgt-2025", matchId: "BGT-2025-TEST-0" },
+    { prefix: true },
+  )
+  // #endregion
+
+  yield* Console.log(`Test matches: ${testMatches.data.map((m) => m.matchId).join(", ")}`)
+
   for (const n of ["01", "02", "03", "04", "05"]) {
     yield* TournamentMatchAggregate.delete({ matchId: `bgt-2025-test-${n}` })
   }

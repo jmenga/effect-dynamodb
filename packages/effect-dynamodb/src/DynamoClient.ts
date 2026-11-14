@@ -308,9 +308,9 @@ const boundHolds = (
   if ("between" in bound) return against(bound.between[0]) >= 0 && against(bound.between[1]) <= 0
   // A number has no text prefix: `beginsWith` on a numeric composite is `eq`.
   const operand = bound.beginsWith
-  return typeof operand === "number" || typeof operand === "bigint"
-    ? against(operand) === 0
-    : text.startsWith(valueText(schema, casing, operand))
+  return KeyComposer.matchesTextPrefix(operand)
+    ? text.startsWith(valueText(schema, casing, operand))
+    : against(operand) === 0
 }
 
 /**
@@ -387,13 +387,11 @@ export const composeRangeUnder = (
   // `beginsWith` / `between` / `eq` carry the prefix in BOTH operands, so they
   // never escape it.
   if ("beginsWith" in bound) {
-    // A number has no text prefix: its key text is not its digits (`-3` is
-    // `-9999999999999996:`), and an integer's text prefixes its fractions'
-    // (3 of 3.14). `beginsWith` on a numeric composite is `eq` — what it
-    // amounted to up to 1.36 for non-negative integers, whose key text was
-    // fixed-width.
+    // A number has no text prefix (`KeyComposer.matchesTextPrefix`):
+    // `beginsWith` on a numeric composite is `eq` — what it amounted to up to
+    // 1.36 for non-negative integers, whose key text was fixed-width.
     const operand = bound.beginsWith
-    if (typeof operand === "number" || typeof operand === "bigint") {
+    if (!KeyComposer.matchesTextPrefix(operand)) {
       return composeRangeUnder(index, prefixText, field, { eq: operand }, options)
     }
     return { beginsWith: compose(operand) }

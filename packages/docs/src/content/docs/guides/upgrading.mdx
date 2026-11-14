@@ -34,6 +34,8 @@ A new table has no rows under other text, so setting `escapeKeys: true` on one n
 
 Nothing to do, unless an entity is [keyed by a codec](#entities-keyed-by-a-codec-1400): the default composes the key text 1.36 composed, for strings and numbers, so every row is where the library looks for it. Upgrade and deploy.
 
+One read changed in 1.37.0: `Aggregate.list` matches each list sort key value it's given whole, so `{ league: "big" }` no longer finds `Big Bash`. To match the last value given as a prefix, as 1.36 did, pass [`prefix: true`](/effect-dynamodb/guides/aggregates/#list--page-through-aggregates) in its options.
+
 ## From 1.37.0 or 1.38.0
 
 1.37.0 changed key text: it escaped sort keys, gave numbers their numeric text, and put the `orderBy`'s key text in time-series event keys. 1.38.0 kept it. **From 1.39.0 the default reverses that.** So these rows, as 1.37.0 or 1.38.0 wrote them, aren't where the default looks:
