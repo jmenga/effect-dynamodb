@@ -4,7 +4,8 @@
  * the configured model), `BoundEntity` and `TypedClient` pass it on, every
  * write adds `WriteBlobErrors<TOffload>` — `BlobStoreError` for a member that
  * offloads anything, nothing for one that does not — and an External field's
- * paths are `PackedPath`s, as a packed field's are.
+ * paths are `PackedPath`s, as a packed field's are. An aggregate carries the
+ * blob errors of its edge entities (`AggregateBlobErrors`, §9.3).
  *
  * Compile-time only; checked by `tsc -p tsconfig.test.json` (`pnpm check`).
  */
@@ -12,12 +13,18 @@
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as SchemaEntity from "@effect-dynamodb/schema/Entity.js"
-import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
+import type {
+  AggregateAssemblyError,
+  BlobStoreError,
+  ValidationError,
+} from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Schema, Stream } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
+import type { AggregateCreateError, AggregateWriteError } from "../src/Aggregate.js"
+import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
-import { DynamoClient } from "../src/DynamoClient.js"
+import { DynamoClient, type DynamoClientError } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import type * as EventStore from "../src/EventStore.js"
 import type { WithBinaryInput } from "../src/internal/OffloadTypes.js"
@@ -747,6 +754,123 @@ describe("binary write inputs (#179, design §3.8, §9.4)", () => {
       // @ts-expect-error a member that does not offload takes bytes only
       Plain.put({ ...doc, scan: stream })
     })
+    expect(true).toBe(true)
+  })
+})
+
+describe("the aggregate error parameter (#179, design §9.3)", () => {
+  /** A subset of a doc without its offloaded fields: what a ref may copy (`EDD-9143`). */
+  class DocRef extends Schema.Class<DocRef>("DocRef")({
+    docId: Schema.String,
+    title: Schema.String,
+  }) {}
+  class DocPage extends Schema.Class<DocPage>("DocPage")({
+    label: Schema.String,
+    docs: Schema.Array(Doc),
+  }) {}
+  class Binder extends Schema.Class<Binder>("Binder")({
+    binderId: Schema.String,
+    cover: Doc,
+    page: DocPage,
+    pinned: DocRef,
+  }) {}
+
+  const binder = <
+    const C extends typeof Docs | typeof Plain,
+    const P extends typeof Docs | typeof Plain,
+  >(
+    cover: C,
+    page: P,
+  ) =>
+    ({
+      table: MainTable,
+      schema: DynamoSchema.make({ name: "types", version: 1, escapeKeys: true }),
+      pk: { field: "pk", composite: ["binderId"] },
+      collection: { name: "binder" },
+      root: { entityType: "BinderItem" },
+      edges: {
+        cover: Aggregate.one("cover", { entityType: "BinderCover", entity: cover }),
+        page: Aggregate.make(DocPage, {
+          root: { entityType: "BinderPage" },
+          edges: {
+            docs: Aggregate.many("docs", {
+              entityType: "BinderDoc",
+              entity: page,
+              sk: { composite: ["docId"] },
+            }),
+          },
+        }).with({ discriminator: { pageNo: 1 } }),
+        // A ref copy never holds an offloaded field: it adds nothing.
+        pinned: Aggregate.ref(Docs),
+      },
+    }) as const
+
+  const Offloading = Aggregate.make(Binder, binder(Docs, Plain))
+  /** The offloading entity only inside the sub-aggregate. */
+  const Nested = Aggregate.make(Binder, binder(Plain, Docs))
+  const Plain_ = Aggregate.make(Binder, binder(Plain, Plain))
+
+  type ReadErrors = AggregateAssemblyError | DynamoClientError | ValidationError
+
+  it("adds BlobStoreError to get, list, create and update — not delete", () => {
+    type A = typeof Offloading
+    expectTypeOf<Effect.Error<ReturnType<A["get"]>>>().toEqualTypeOf<ReadErrors | BlobStoreError>()
+    expectTypeOf<Effect.Error<ReturnType<A["list"]>>>().toEqualTypeOf<ReadErrors | BlobStoreError>()
+    expectTypeOf<Effect.Error<ReturnType<A["create"]>>>().toEqualTypeOf<
+      AggregateCreateError | BlobStoreError
+    >()
+    expectTypeOf<Effect.Error<ReturnType<A["update"]>>>().toEqualTypeOf<
+      AggregateWriteError | BlobStoreError
+    >()
+    expectTypeOf<Effect.Error<ReturnType<A["delete"]>>>().toEqualTypeOf<
+      AggregateAssemblyError | DynamoClientError
+    >()
+    expect(true).toBe(true)
+  })
+
+  it("adds it through a sub-aggregate's edges", () => {
+    type N = typeof Nested
+    expectTypeOf<Effect.Error<ReturnType<N["get"]>>>().toEqualTypeOf<ReadErrors | BlobStoreError>()
+    expectTypeOf<Effect.Error<ReturnType<N["create"]>>>().toEqualTypeOf<
+      AggregateCreateError | BlobStoreError
+    >()
+    expect(true).toBe(true)
+  })
+
+  it("adds nothing when no one or many edge entity offloads (a ref edge's included)", () => {
+    type P = typeof Plain_
+    expectTypeOf<Effect.Error<ReturnType<P["get"]>>>().toEqualTypeOf<ReadErrors>()
+    expectTypeOf<Effect.Error<ReturnType<P["list"]>>>().toEqualTypeOf<ReadErrors>()
+    expectTypeOf<Effect.Error<ReturnType<P["create"]>>>().toEqualTypeOf<AggregateCreateError>()
+    expectTypeOf<Effect.Error<ReturnType<P["update"]>>>().toEqualTypeOf<AggregateWriteError>()
+    // Type-erased edges add nothing; the parameter defaults to `never`.
+    expectTypeOf<Aggregate.AggregateBlobErrors<any>>().toBeNever()
+    expectTypeOf<
+      Effect.Error<ReturnType<Aggregate.Aggregate<any, any>["get"]>>
+    >().toEqualTypeOf<ReadErrors>()
+    expect(true).toBe(true)
+  })
+
+  it("reaches the bound aggregate", () => {
+    typeOnly(() =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { Docs, Plain },
+          aggregates: { Offloading, Plain_ },
+          tables: { MainTable },
+        })
+        const created = db.aggregates.Offloading.create({} as Record<string, unknown>)
+        expectTypeOf<Effect.Error<typeof created>>().toEqualTypeOf<
+          AggregateCreateError | BlobStoreError
+        >()
+        const read = db.aggregates.Plain_.get({ binderId: "b" })
+        expectTypeOf<Effect.Error<typeof read>>().toEqualTypeOf<ReadErrors>()
+        const bound = yield* Aggregate.bind(Offloading)
+        expectTypeOf<Effect.Error<ReturnType<typeof bound.update>>>().toEqualTypeOf<
+          AggregateWriteError | BlobStoreError
+        >()
+      }),
+    )
     expect(true).toBe(true)
   })
 })

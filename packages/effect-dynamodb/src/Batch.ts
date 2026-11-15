@@ -11,7 +11,7 @@
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import {
-  BlobStoreError,
+  type BlobStoreError,
   DynamoError,
   isAwsTransactionCancelled,
   ValidationError,
@@ -20,6 +20,7 @@ import { Effect } from "effect"
 import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
+import { expiredWithCommitted } from "./internal/BlobCalls.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
 import type {
   AnyGet,
@@ -333,25 +334,6 @@ export const write = <const T extends ReadonlyArray<BatchWriteOp>>(
     DynamoClient | TableConfig
   >
 
-/**
- * A `BlobStoreError` that refused one of the batch's requests (an upload over
- * the store's `maxUploadAge`, design §6.1), saying what the batch had already
- * written, as every other mid-batch failure does. Any other error unchanged.
- */
-const withCommitted = <E>(error: E, committed: string): E =>
-  error instanceof BlobStoreError && error.reason === "Expired"
-    ? (new BlobStoreError({
-        entityType: error.entityType,
-        attribute: error.attribute,
-        operation: error.operation,
-        action: error.action,
-        reason: error.reason,
-        ref: error.ref,
-        committed: error.committed,
-        cause: `${String(error.cause)} by that request; ${committed}`,
-      }) as E)
-    : error
-
 /** One op of a batch, built: its item (a put) or key (a delete), and what names it. */
 type BuiltWrite = {
   readonly tableName: string
@@ -610,7 +592,7 @@ const writeCore = (
       let retries = 0
       while (true) {
         const cancelled = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
-          Effect.mapError((error) => withCommitted(error, committed)),
+          Effect.mapError((error) => expiredWithCommitted(error, committed)),
           Effect.as(undefined),
           // A limit DynamoDB enforced (#144) — an oversized item, the 4 MB
           // payload, an over-long sort key — named. Such a rejection carries no
@@ -734,7 +716,7 @@ const writeCore = (
           writeRequests.length - chunkStart - chunk.length,
         )
         const response = yield* client.batchWriteItem({ RequestItems: sentItems }).pipe(
-          Effect.mapError((error) => withCommitted(error, committed)),
+          Effect.mapError((error) => expiredWithCommitted(error, committed)),
           // An oversized item or over-long sort key (#144), named, with what
           // the batch had already written: Batch.write was never atomic.
           diagnoseFailure({

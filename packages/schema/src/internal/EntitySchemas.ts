@@ -3346,6 +3346,8 @@ export const hiddenFieldNamesOf = (fields: SchemaFields): ReadonlySet<string> =>
 
 /** The targets {@link refHeldTarget} decided, each once. */
 const refHeldTargets = new WeakMap<Schema.Top, Schema.Top>()
+/** {@link refHeldTarget}'s decisions for an aggregate edge, which keeps the offloaded fields. */
+const edgeHeldTargets = new WeakMap<Schema.Top, Schema.Top>()
 /** The fields an entity of each model offloads to the blob store (#179), by its unconfigured model. */
 const offloadedByModel = new WeakMap<Schema.Top, ReadonlySet<string>>()
 
@@ -3361,6 +3363,7 @@ export const registerOffloadedFields = (model: Schema.Top, fields: Iterable<stri
   if (next.size === prior.size) return
   offloadedByModel.set(model, next)
   refHeldTargets.delete(model)
+  edgeHeldTargets.delete(model)
 }
 /** The schemas {@link refHeldTarget} built: a target's fields without its hidden ones. */
 const heldStructs = new WeakSet<Schema.Top>()
@@ -3372,24 +3375,30 @@ const heldStructs = new WeakSet<Schema.Top>()
  * `refDataOf` (the entity's own read schema encoding the item it read). A read leaves out the
  * target's `DynamoModel.Hidden` fields ({@link hiddenFieldNamesOf}), so the stored ref holds none
  * of them, and a ref never stores a field the entity offloads ({@link registerOffloadedFields}), so
- * those are left out the same way. Where a hidden field read absent fails, as a read decodes it (`Missing key`), the ref is
+ * those are left out the same way — except at an aggregate's edge (`edge`), whose row stores them as
+ * its own uploads (#179). Where a hidden field read absent fails, as a read decodes it (`Missing key`), the ref is
  * the target's other fields, a plain object as the entity's own read decodes it: up to 1.40.0 it
  * was the whole target, so the referencing row failed every read, after its write. Every other
  * target is held as declared, a class read back as its instance, as up to 1.40.0: one whose hidden
  * fields are optional, or read absent as a value (`Schema.Unknown`, `Schema.Any`,
  * `Schema.UndefinedOr`, a decoding default).
  */
-export const refHeldTarget = (target: Schema.Top): Schema.Top => {
-  const decided = refHeldTargets.get(target)
+export const refHeldTarget = (target: Schema.Top, edge = false): Schema.Top => {
+  const cache = edge ? edgeHeldTargets : refHeldTargets
+  const decided = cache.get(target)
   if (decided !== undefined) return decided
   const fields = getSchemaFields(target)
-  // Its hidden fields, and the fields it offloads (#179), which a ref never stores either.
+  // Its hidden fields, and the fields it offloads (#179), which a ref never stores either. An
+  // aggregate's edge (`edge`) keeps the offloaded ones: its own row stores them, uploaded afresh
+  // under its own key (design §6.9), never a pointer copied from the entity's row.
   const hidden =
     fields === undefined
       ? new Set<string>()
       : new Set([
           ...hiddenFieldNamesOf(fields),
-          ...[...(offloadedByModel.get(target) ?? [])].filter((name) => hasOwnName(fields, name)),
+          ...(edge
+            ? []
+            : [...(offloadedByModel.get(target) ?? [])].filter((name) => hasOwnName(fields, name))),
         ])
   // A hidden field read absent, as a read of the referencing row decodes it.
   const failsAbsent = (name: string) =>
@@ -3408,7 +3417,7 @@ export const refHeldTarget = (target: Schema.Top): Schema.Top => {
         ) as unknown as Schema.Top)
       : target
   if (held !== target) heldStructs.add(held)
-  refHeldTargets.set(target, held)
+  cache.set(target, held)
   return held
 }
 

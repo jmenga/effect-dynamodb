@@ -1496,6 +1496,7 @@ I/O.
 | EventStore reads (`read`, `readFrom`, `readLatest`, `readSnapshot`, `readIndex`, `fold`, `query.*`) | eager (event `data` and snapshot `state` are overflow values, eager by default per decision 5) | `ReadOptions.offloaded: "lazy"` / `Query.offloaded("lazy")` → `LazyStreamEvent` (§10.2) |
 | `GeoSearch.nearby` (geo package) | **both eager** | it decodes through the entity's own two-phase row decoder (unpack + resolve) instead of running `recordSchema` over the raw row (`GeoSearch.ts:107-116`), which also fixes #147's gap: geo reads do not unpack packed fields today. `GeoIndex<A, P>` uses one `A` for its input and its results, so a lazy handle cannot be typed there without splitting it; `GeoIndex.put` takes `Uint8Array` for binary fields, as aggregates do |
 | ref hydration (`hydrateRefs`) | lazy internally | the ref copy takes only the ref schema's fields (§15), so offloaded fields of the target are never fetched |
+| aggregate ref hydration | per copy, internally | an edge item copy (a `one` edge's entity, a `many` element given as an id) fetches only the target's offloaded fields its item holds — eagerly for a kind it holds whole, from lazy values otherwise — which the edge item re-uploads; the rest, and every offloaded field of a ref copy, are dropped unfetched |
 | projection engine `readRow` | eager internally | it folds over the row |
 
 ### 8.5 Filters and conditions
@@ -2590,7 +2591,7 @@ kept. Every use (code, tests, docs, examples, this document) carries the new num
 | `EDD-9117` | `internal/BoundQuery.ts`, `Query.ts`, `Entity.ts`, `EventStore.ts` | An offload mode the library cannot honour (reachable from untyped code): an unknown mode string or key, or `.offloaded()` after `.filterBy()` |
 | `EDD-9118` | `BlobGc.ts` | `BlobGc.make` options invalid: a reaper grace that is not a non-negative duration; a sweep grace under 1 hour or under the store's `maxUploadAge` + 15 minutes; an unknown `reaper.confirm` value; a member without offloaded fields; or a sweep (per-item or store-wide) on a store without the capabilities it needs (`list` and `marks`; `sweepStore` also `head`) |
 | `EDD-9119` | `BlobGc.ts`, `Entity.ts` (`decodeStreamRecord`) | A stream record lacks the images reaping or change detection needs: its `StreamViewType` is not `NEW_AND_OLD_IMAGES`, or (no view type on the record) a `MODIFY` / `REMOVE` without `OldImage` or a `MODIFY` / `INSERT` without `NewImage`. A defect from `reap` (every record checked before any is acted on), a `ValidationError` from `decodeStreamRecord` |
-| `EDD-9120` | `internal/OffloadInput.ts`, `internal/BlobLedger.ts`, `Entity.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle, source or `OffloadedValue` for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; `Offload.source` options that are invalid (a body that is neither bytes nor a stream; a `contentType` that is not a non-empty printable US-ASCII string of at most 255 bytes; a `contentLength` that is not a non-negative safe integer, or differs from its bytes' length); an immutable binary field restated by a `Stream` (§6.5); a `Stream` or source for an aggregate edge; or a `Stream` given to a second target (another field, item or op), to a later operation after its first use, or again after its upload failed — a `Stream` is single-use (§3.8) |
+| `EDD-9120` | `internal/OffloadInput.ts`, `internal/BlobLedger.ts`, `Entity.ts`, `Aggregate.ts`, `EventStore.ts` | An offloaded field's write input is unusable (`ValidationError` at execution): a `Stream`, handle, source or `OffloadedValue` for an overflow field; a value that is not `Uint8Array` / `Stream` / `BlobHandle` / `Offload.source` for a binary field; `Offload.source` options that are invalid (a body that is neither bytes nor a stream; a `contentType` that is not a non-empty printable US-ASCII string of at most 255 bytes; a `contentLength` that is not a non-negative safe integer, or differs from its bytes' length); an immutable binary field restated by a `Stream` (§6.5); a `Stream`, handle or source for an aggregate edge (or an `OffloadedValue` for its overflow field); or a `Stream` given to a second target (another field, item or op), to a later operation after its first use, or again after its upload failed — a `Stream` is single-use (§3.8) |
 | `EDD-9141` | `DynamoModel.ts` | `DynamoModel.Packed({ external })` or `DynamoModel.External(...)` options invalid: not an object, an unknown key, a `threshold` that is not a non-negative safe integer, a `contentType` that is not a non-empty printable US-ASCII string ≤ 255 bytes |
 | `EDD-9142` | `Entity.ts` (schema), `Aggregate.ts` | An `External` field is a key or index attribute source (primary-key / GSI / LSI composite, a GSI's `shards.by` source, `timeSeries.orderBy`), a unique-constraint field, a ref field, the entity's identifier, a vector index source, partition or filter field, or an aggregate discriminator / `many` sort-key composite. (An aggregate's list and collection composites are root fields, and a root model takes no `configure`, so none can be `External`: there is nothing to check there.) |
 | `EDD-9143` | `Entity.ts` (schema), `Aggregate.ts` | A ref (entity ref, aggregate ref edge, or the ref a `many` edge's element wraps — `PlayerSheet { player }`, which hydration fills by name — at any depth) whose schema includes a field the referenced entity offloads — the denormalised copy would inline it (400 KB risk), need to marshal a lazy handle, or copy a pointer across item families (§11.2). Reference a subset model without the field |
@@ -3702,6 +3703,103 @@ a write path, deletes the gate.
 11. **Aggregates** — diff first, route + upload after `buildDynamoItems` on stored attributes,
     no read-pointer reuse, per-group settlement, eager assembly, `AggregateType` error
     parameter. (The aggregate-edge interleaving of §19 is item 16's: it needs the reaper.)
+    *Implementation notes (commit 11):*
+    - `buildDynamoItems` returns the built items unmarshalled; `routeAggregateItems` routes and
+      uploads them with `OffloadWrite.route`, then `marshalGroups` marshals them. Each edge item
+      type has an `OffloadInfo` (`collectOffloadInfoByType`): the edge entity's overflow and
+      binary fields among the node's item attributes (domain names — aggregates apply no
+      `field` renames), its `itemBudget` and `prefix`, `copiesPointers: false`. The row is the
+      built item's (`pk.field`, `sk`), so the object key's family and row are the edge item's SK
+      (§4.5) and `edd-entity` is the item's `__edd_e__` (the edge's entity type). Two nodes of
+      one item type merge their fields; the smaller budget holds for both.
+    - Every upload of a write runs before its first transaction, as `Batch.write`'s do: an
+      upload failure writes nothing. Each group's uploads settle by the transaction that
+      carries them at the choke point; a group never sent leaves its uploads `pending`, deleted
+      at exit. An `Expired` refusal of a later group names the sub-aggregates already committed
+      (`expiredWithCommitted`, moved from `Batch.ts` to `internal/BlobCalls.ts` and shared).
+    - `update` decides the rewritten groups on the decomposed values first, packs only those,
+      builds every new item (their SKs decide the orphans to delete) and routes only the
+      rewritten groups'. Within one, every offloaded value is uploaded afresh.
+    - Reads: `collectReadPlans` gives each edge item type a `ReadPlan` — its stored-form
+      dispatch attributes, its bytes-shaped non-sparse item fields (§4.7) and its offloaded
+      kinds — loaded with `OffloadRead.loadRows` in `EAGER_MODES` (operation
+      `aggregate.decode`, entity type `<aggregate>.<item type>`, as the unpacking named them).
+      It replaces `unpackAggregateItems`: a pointer on an attribute the edge entity no longer
+      offloads now resolves through the ambient store (§4.7) instead of being refused.
+    - Ref hydration makes one `Batch.get` per target entity type and *kept set*: the target's
+      offloaded fields a copy keeps. An *item* copy (a `one` edge's entity, a `many` element
+      given as the entity's id) keeps those among its node's item attributes
+      (`ResolvedNode.offloaded`), which the edge item re-uploads; a *ref* copy
+      (`Aggregate.ref`, a wrapped `many` element) keeps none. A kind the copy keeps whole is
+      read eagerly; a kind it keeps none or only some of is read lazily, and its kept fields
+      are then read from their lazy values at the store's `readConcurrency`. The fields a copy
+      does not keep are dropped and the rest encoded through the record schema without them —
+      as `Entity.hydrateRefs` does — so nothing is fetched for them, and a copy that keeps
+      none (a subset element without the target's offloaded fields) needs no store, as the
+      bind-time check (`_offloadByType`) already said.
+    - `[EDD-9120]`: `refuseEdgeInputs` walks the hydrated `create` input and the mutation's
+      result along the resolved graph (`one` edges, `many` elements, sub-aggregates) before the
+      schema decode, whose own refusal would not say why. Hydration's input copy
+      (`cloneInput`) keeps a `Stream`, an `Offload.source(...)` and an `OffloadedValue` by
+      reference (a `BlobHandle` is an `Equal` value, kept already), so the refusal sees them
+      whether or not the input has a ref id or a renamed `inputField`.
+    - Not here: the aggregate-edge interleaving scenario of §19.2 needs the reaper, so it stays
+      item 16's (`test/Offload.interleaving.test.ts`), carried as that commit's follow-up.
+    - Types: `AggregateBlobErrors<TEdges>` is `BlobStoreError` when the entity of a `one` or
+      `many` edge — at any depth, through sub-aggregates — offloads a field, `never` otherwise
+      (ref edges and type-erased edges add nothing). `Aggregate` and `BoundAggregate` gain a
+      trailing `TBlobErrors = never` (with a type-only `_blobErrors` member on `Aggregate`),
+      `DynamoClient.make`'s `TypedClient` passes it on, and `Aggregate.bind` keeps it.
+    *Deviations (commit 11):*
+    - `delete` does not carry the error parameter (§9.3 said every aggregate operation): it
+      reads only the partition's keys and never reaches the store, so the error could not
+      occur. `get`, `list`, `create` and `update` carry it.
+    - The parameter is computed per `one` / `many` edge entity, so a `many` edge whose element
+      wraps the ref (rather than being the entity) counts when its entity offloads, though its
+      items hold none of those fields: conservative, and the bind-time store check
+      (`_offloadByType`) still requires a store only for item attributes that offload.
+    - `[EDD-9120]` refuses a `BlobHandle` and an `OffloadedValue` on an aggregate edge field as
+      well as a `Stream` and a source (§6.9 says "no `Stream`, handle or source"; §14.3's row
+      named the stream and the source only): the row now says so.
+    *Debt fixed (commit 11):* `deepEqual` (the update diff) compared byte arrays through
+    `Object.keys`, one string key per byte; it compares them bytewise. `hydrateAggregateRefs`
+    returned an input that needed no fetch without renaming a `many` edge's `inputField` to
+    its model field (an empty or id-less list), so the decode silently dropped the list; it is
+    renamed on a copy now. `update` marshalled the whole old item set only to read its keys;
+    only the delete keys are marshalled.
+    *Review fixes (commit 11):* ref hydration chose its read per copy kind, so a `many` element
+    given as an id whose element is a subset of an offloading entity fetched every offloaded
+    object of the target only for the decode to drop them, and failed `NotProvided` without a
+    store although the aggregate needs none; it reads per kept set now (above), and fetches
+    only the fields the element holds. `cloneInput` copied a `Stream`, a source and an
+    `OffloadedValue` to bare objects, so an input with a ref id or a renamed `inputField`
+    reached the schema decode or the packer with a misleading refusal instead of
+    `[EDD-9120]`; they are kept by reference. Unit tests now pin an `update` whose rewritten
+    group is cancelled (its fresh versions deleted, the live versions under the same keys
+    kept and read back) and one whose later group finds its uploads `Expired` (the committed
+    group keeps its versions), a subset element (no GET, no store) and partial overlaps
+    (across kinds and within one). `DESIGN.md`'s errors paragraph names the `delete`
+    exception.
+    *Port onto 1.42.2 (commit 11):* main's `buildDynamoItems` returns marshalled items and
+    its write paths judge them before sending (`refuseGivenOverRows`, `refuseNotReadBack`, the
+    read-back checks of 1.40–1.42), so the port does not unmarshal them for routing:
+    `routeBuiltGroups` takes the built groups after those checks, unmarshals only the items of
+    an offloading type for `OffloadWrite.route` (under `forEachSettled`) and writes back only
+    the attributes it uploaded; the checks still judge the values as given, never a pointer.
+    `update` routes only its changed groups and assembles its result from the rows as built
+    (the offloaded values inline), so the result needs no store read. The 1.36 key fallback
+    is gone (owner decision): every offloading fixture sets `escapeKeys: true`, an aggregate
+    whose edge entity offloads is refused at bind and at its first unbound write
+    (`[EDD-9146]`), and `rekey` refuses to move an aggregate row holding a pointer, including
+    a row it would only copy (`Rekey.refusePointerRow`, `[EDD-9146]`, nothing written, dry run
+    alike); the rows `rekey` and the ref-holder pass read are loaded eagerly too. Main's
+    #241 decides what a ref position holds in one place (`refHeldTarget`), which leaves out
+    the fields the referenced entity offloads; an aggregate's own `one` edge and `many`
+    element keep them (`refHeldTarget(target, true)`), since their rows store them as their
+    own uploads, while a ref edge and a wrapped element still hold none. Ref hydration
+    computes each target type's kept set as the union over main's deduplicated requests.
+    Unit tests pin that every pointer an edge row holds names the row's own object (never a
+    target's), and that a ref copy holds none.
 12. **Geo** — `GeoSearch.nearby` decoding through the entity's two-phase decoder (fixing the
     #147 packed gap), eager resolution, `GeoIndex.put` binary input, `GeoIndex.bind` check,
     error unions.

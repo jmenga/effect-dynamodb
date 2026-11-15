@@ -12,7 +12,11 @@
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { TypeId as SchemaAggregateTypeId } from "@effect-dynamodb/schema/Aggregate.js"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
-import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
+import type {
+  DynamoEncoding,
+  NoOffload,
+  OffloadFields,
+} from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchemaModule from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
@@ -26,6 +30,7 @@ import {
   AggregateAssemblyError,
   AggregateDecompositionError,
   AggregateTransactionOverflow,
+  type BlobStoreError,
   ConditionalCheckFailed,
   DynamoError,
   DynamoValidationError,
@@ -69,6 +74,7 @@ import {
   unionHoldsRef,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import type { WriteBlobErrors } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import { readingInstances } from "@effect-dynamodb/schema/internal/InstanceReads.js"
 import { keyReadings } from "@effect-dynamodb/schema/internal/KeyReadings.js"
@@ -118,16 +124,19 @@ import {
   Result,
   Schema,
   SchemaAST,
+  Stream,
 } from "effect"
 import * as Batch from "./Batch.js"
 import { BlobStore } from "./BlobStore.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
+import { expiredWithCommitted } from "./internal/BlobCalls.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
 import { entityNaming } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import { decodeKeyCursor, encodeKeyCursor } from "./internal/Cursor.js"
 import { digest } from "./internal/Digest.js"
+import { offloaded as offloadedCombinator } from "./internal/EntityCombinators.js"
 import {
   and as andExpr,
   type CompileResult,
@@ -148,11 +157,10 @@ import {
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
-import {
-  aggregateStoreRequirements,
-  missingStoreError,
-  unescapedKeysError,
-} from "./internal/OffloadWrite.js"
+import { isBlobSource } from "./internal/OffloadInput.js"
+import * as OffloadRead from "./internal/OffloadRead.js"
+import { isBlobHandle, isOffloadedValue } from "./internal/OffloadValues.js"
+import * as OffloadWrite from "./internal/OffloadWrite.js"
 import {
   codecRequirements,
   hasStoredForm,
@@ -308,6 +316,18 @@ export type TypeId = typeof SchemaAggregateTypeId
 // Internal: Resolved graph node
 // ---------------------------------------------------------------------------
 
+/** How a node's items offload (#179): its edge entity's config, on item attributes. */
+interface NodeOffload {
+  /** Item attribute → overflow config (`Packed({ external })`). */
+  readonly overflow: Readonly<Record<string, DynamoModel.ExternalPackedConfig>>
+  /** Item attribute → binary config (`External`). */
+  readonly binary: Readonly<Record<string, DynamoModel.ExternalConfig>>
+  /** The edge entity's `offload.itemBudget`. */
+  readonly itemBudget: number | undefined
+  /** The edge entity's `offload.prefix`. */
+  readonly prefix: string | undefined
+}
+
 interface ResolvedNode {
   readonly fieldName: string | null // null for root
   readonly entityType: string
@@ -344,6 +364,18 @@ interface ResolvedNode {
    * store for them (`[EDD-9115]`).
    */
   readonly offloaded?: ReadonlyArray<string> | undefined
+  /**
+   * How this node's items offload (#179): the edge entity's overflow and binary fields among
+   * them, and its `offload` settings. Absent when the edge entity offloads none of the node's
+   * item attributes.
+   */
+  readonly offload?: NodeOffload | undefined
+  /**
+   * The node's item attributes whose encoded side is bytes (#179, design §4.7), `External` or
+   * not: a `~edbp:` text there is a bytes pointer, read through the ambient store when the edge
+   * entity no longer offloads it.
+   */
+  readonly bytes?: ReadonlyArray<string> | undefined
   readonly cardinality: "root" | "one" | "many"
   readonly discriminator?: Record<string, unknown>
   readonly ownDiscriminator?: Record<string, unknown>
@@ -565,6 +597,45 @@ export type AggregateWriteError =
 export type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
 
 /**
+ * The fields an edge entity offloads (#179) — {@link NoOffload} when none,
+ * for an edge without an entity, and for type-erased ones (`any`).
+ */
+type EdgeOffload<E> = 0 extends 1 & E
+  ? NoOffload
+  : E extends { readonly _offloadFields?: infer T }
+    ? Exclude<T, undefined> extends infer F extends OffloadFields
+      ? 0 extends 1 & F
+        ? NoOffload
+        : F
+      : NoOffload
+    : NoOffload
+
+/**
+ * The blob store errors an aggregate's operations add (#179, design §9.3):
+ * `BlobStoreError` when the entity of any `one` or `many` edge — at any depth,
+ * through sub-aggregates — offloads a field, `never` otherwise. A ref edge
+ * adds nothing: its copy never holds an offloaded field (`[EDD-9143]`) and
+ * its target is read without fetching one. Reads are eager for both kinds
+ * (§8.4), so `get` and `list` carry it as the writes do; `delete` never
+ * reaches the store and carries nothing.
+ */
+export type AggregateBlobErrors<TEdges> = 0 extends 1 & TEdges
+  ? never
+  : {
+      readonly [K in keyof TEdges]: TEdges[K] extends {
+        readonly _tag: "OneEdge" | "ManyEdge"
+        readonly entity?: unknown
+      }
+        ? WriteBlobErrors<EdgeOffload<NonNullable<TEdges[K]["entity"]>>>
+        : TEdges[K] extends {
+              readonly _tag: "BoundSubAggregate"
+              readonly aggregate: { readonly edges: infer Sub }
+            }
+          ? AggregateBlobErrors<Sub>
+          : never
+    }[keyof TEdges]
+
+/**
  * What `create` takes for an input of type `I`. An input typed with a string index signature
  * (`Record<string, unknown>`, parsed JSON, a value built at run time) is taken as it is and judged
  * at run time, as 1.39.0's `create` took every input. Any other input (an object literal, a value
@@ -589,10 +660,18 @@ export interface Aggregate<
   // `any` by default, so a type written with three arguments names every aggregate, whatever
   // its `create` takes, and code calling `create` through it compiles as before.
   TCreate = any,
+  /**
+   * The blob store errors its operations add — {@link AggregateBlobErrors} of its edges (#179,
+   * design §9.3), `never` when no edge entity offloads a field.
+   */
+  TBlobErrors = never,
 > {
   readonly [TypeId]: TypeId
   readonly _tag: "Aggregate"
   readonly schema: TSchema
+
+  /** @internal Type-only (never set at runtime): the blob store errors its operations add. */
+  readonly _blobErrors?: TBlobErrors | undefined
 
   /**
    * @internal Tag of the table this aggregate is bound to. Used by
@@ -663,12 +742,16 @@ export interface Aggregate<
       }
     | undefined
 
-  /** Fetch and assemble the aggregate by its partition key composites */
+  /**
+   * Fetch and assemble the aggregate by its partition key composites. An edge
+   * entity's offloaded fields (#179) are read eagerly, both kinds (design
+   * §8.4): the assembled value holds their values, never a handle.
+   */
   readonly get: (
     key: TKey,
   ) => Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | TBlobErrors,
     DynamoClient | TableConfig
   >
 
@@ -680,10 +763,18 @@ export interface Aggregate<
    *
    * An input typed with a string index signature (`Record<string, unknown>`, parsed JSON) is taken
    * as it is and judged at run time ({@link CreateArgument}).
+   *
+   * An edge entity's offloaded fields (#179) are routed and uploaded per its own config on the
+   * built edge items, before the first transaction; a binary one takes a `Uint8Array` only
+   * (`[EDD-9120]`, design §6.9).
    */
   readonly create: <const I = TCreate>(
     input: CreateArgument<I, TCreate>,
-  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, DynamoClient | TableConfig>
+  ) => Effect.Effect<
+    Schema.Schema.Type<TSchema>,
+    AggregateCreateError | TBlobErrors,
+    DynamoClient | TableConfig
+  >
 
   /**
    * Update an aggregate: fetch current state, apply mutation, diff, write changes.
@@ -697,13 +788,20 @@ export interface Aggregate<
    * - `current` — the Schema.Class instance (rarely needed)
    *
    * Return either a class instance or a plain object — the schema decode handles both.
+   *
+   * A rewritten group re-uploads its edge items' offloaded fields (#179): no pointer read from the
+   * current state is written back (design §6.9). An unchanged group uploads nothing.
    */
   readonly update: (
     key: TKey,
     mutationFn: (
       context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
-  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError, DynamoClient | TableConfig>
+  ) => Effect.Effect<
+    Schema.Schema.Type<TSchema>,
+    AggregateWriteError | TBlobErrors,
+    DynamoClient | TableConfig
+  >
 
   /**
    * Delete an aggregate: every row in its partition whose entity type is one of the aggregate's
@@ -747,7 +845,7 @@ export interface Aggregate<
     options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | TBlobErrors,
     DynamoClient | TableConfig
   >
 
@@ -793,6 +891,8 @@ export interface BoundAggregate<
   // `any` by default, so a type written with three arguments names every aggregate, whatever
   // its `create` takes, and code calling `create` through it compiles as before.
   TCreate = any,
+  /** {@link Aggregate}'s blob store errors (#179, design §9.3). */
+  TBlobErrors = never,
 > {
   readonly schema: TSchema
 
@@ -800,21 +900,21 @@ export interface BoundAggregate<
     key: TKey,
   ) => Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | TBlobErrors,
     never
   >
 
   /** {@link Aggregate.create}, with its services resolved. */
   readonly create: <const I = TCreate>(
     input: CreateArgument<I, TCreate>,
-  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, never>
+  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError | TBlobErrors, never>
 
   readonly update: (
     key: TKey,
     mutationFn: (
       context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
-  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError, never>
+  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError | TBlobErrors, never>
 
   readonly delete: (
     key: TKey,
@@ -825,7 +925,7 @@ export interface BoundAggregate<
     options?: ListOptions<Schema.Schema.Type<TSchema>>,
   ) => Effect.Effect<
     ListResult<Schema.Schema.Type<TSchema>>,
-    AggregateAssemblyError | DynamoClientError | ValidationError,
+    AggregateAssemblyError | DynamoClientError | ValidationError | TBlobErrors,
     never
   >
 
@@ -1018,7 +1118,8 @@ export function make<
     TPK,
     AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
     SchemaFieldsOf<TSchema>
-  >
+  >,
+  AggregateBlobErrors<TEdges>
 >
 export function make<
   TSchema extends Schema.Top,
@@ -1038,7 +1139,7 @@ export function make<
 export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
-): SubAggregate<TSchema> | Aggregate<TSchema, Record<string, unknown>, unknown, any> {
+): SubAggregate<TSchema> | RuntimeAggregate<TSchema> {
   refuseUnreadable(`Aggregate "${config.root.entityType}"`, "aggregate", unwrapModel(schema), {
     manyEdges: manyEdgePaths(config.edges),
   })
@@ -2074,14 +2175,18 @@ const collectRefTargets = (
   //
   // `heldOnly`: registered only where the read holds less than the target (`refHeldTarget` decides
   // another schema), so a declaration 1.40.0 left unregistered decodes as it did everywhere else.
+  //
+  // `edge`: the position is the aggregate's own edge, whose row keeps the fields its entity offloads
+  // and uploads them afresh (#179, design §6.9); a ref nested in an edge entity holds none of them.
   const register = (
     field: Schema.Top | undefined,
     model: Schema.Top | undefined,
     heldOnly: boolean,
+    edge = false,
   ) => {
     if (field !== undefined && model !== undefined && !targets.has(field)) {
       const target = unwrapEntityModel(model)
-      const held = refHeldTarget(target)
+      const held = refHeldTarget(target, edge)
       if (!heldOnly || held !== target) targets.set(field, held)
     }
   }
@@ -2089,11 +2194,11 @@ const collectRefTargets = (
   // read can't do without: the walker would demand it of a hydrated value that has none (1.40.0
   // refused every such create), so the field is re-pointed at what a read of it holds. Anywhere
   // else `refHeldTarget` returns the class itself and nothing is registered.
-  const registerHeld = (field: Schema.Top | undefined) => {
+  const registerHeld = (field: Schema.Top | undefined, edge = false) => {
     if (field === undefined || targets.has(field)) return
     const inner = unwrapOptionalField(field)
     if (getSchemaFields(inner) === undefined) return
-    const held = refHeldTarget(inner)
+    const held = refHeldTarget(inner, edge)
     if (held !== inner) targets.set(field, held)
   }
   // Edge entities, in the walk's order, whose models' refs `registerHeldRefs` takes after the walk.
@@ -2153,8 +2258,9 @@ const collectRefTargets = (
         const entity = (edge as { readonly entity?: RefTargetEntity }).entity
         const field = ownValue(fields, edgeName)
         if (field !== undefined && (isRoot || isOpaqueRefField(field))) {
-          register(field, entity?.model, heldOnly)
-        } else if (entity !== undefined) registerHeld(field)
+          // A `one` edge is its own row; a ref edge's copy holds no offloaded field (#179).
+          register(field, entity?.model, heldOnly, edge._tag === "OneEdge")
+        } else if (entity !== undefined) registerHeld(field, edge._tag === "OneEdge")
         registerNested(entity)
       } else if (edge._tag === "ManyEdge") {
         const entity = edge.entity as RefTargetEntity | undefined
@@ -2167,7 +2273,7 @@ const collectRefTargets = (
           const model = entity?.model
           if (model !== undefined && !targets.has(arrayField)) {
             const target = unwrapEntityModel(model)
-            const held = refHeldTarget(target)
+            const held = refHeldTarget(target, true)
             if (!heldOnly || held !== target) {
               targets.set(
                 arrayField,
@@ -2182,7 +2288,7 @@ const collectRefTargets = (
         ) {
           // The element IS the entity's class, which the walker sees into (`Array<Umpire>`): as
           // `registerHeld`, re-pointed only where its read holds less than the class.
-          const held = refHeldTarget(element!)
+          const held = refHeldTarget(element!, true)
           if (held !== element && !targets.has(arrayField)) {
             targets.set(
               arrayField,
@@ -2248,10 +2354,22 @@ const applyNodeAttrEncoders = (
 // Top-level aggregate construction
 // ---------------------------------------------------------------------------
 
+/**
+ * The operational aggregate, typed with any blob store error (#179): `make`'s overload narrows it
+ * to its edges' ({@link AggregateBlobErrors}, `never` when no edge entity offloads a field).
+ */
+type RuntimeAggregate<TSchema extends Schema.Top> = Aggregate<
+  TSchema,
+  Record<string, unknown>,
+  unknown,
+  any,
+  BlobStoreError
+>
+
 const makeAggregate = <TSchema extends Schema.Top>(
   schema: TSchema,
   config: AggregateConfig<TSchema>,
-): Aggregate<TSchema, Record<string, unknown>> => {
+): RuntimeAggregate<TSchema> => {
   const aggregateName = config.root.entityType
   const groupKeys: GroupKeys = {
     pkField: config.pk.field,
@@ -2460,6 +2578,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const packedByType = collectPackedByType(rootNode)
   const offloadByType = collectOffloadByType(rootNode)
   const dispatchByType = collectDispatchByType(rootNode)
+  // How each item type's offloaded attributes are uploaded and read (#179).
+  const offloadInfoByType = collectOffloadInfoByType(rootNode)
+  const readPlans = collectReadPlans(rootNode, aggregateName)
 
   // Attribute ENCODERS for the root item: decompose works from the
   // schema-decoded domain object, so every root attribute holding a wire
@@ -2781,8 +2902,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
     rekeyRead?: RekeyRead,
   ) =>
     Effect.flatMap(readPartitionRaw(key, rejected, rekeyRead), (read) =>
-      // Packed edge attributes, read by their stored form (#147).
-      Effect.as(unpackAggregateItems(read.allItems, dispatchByType, aggregateName), read),
+      // Packed edge attributes, read by their stored form (#147); offloaded ones resolved
+      // eagerly, both kinds (#179, design §8.4).
+      Effect.as(loadAggregateItems(read.allItems, readPlans), read),
     )
 
   // A root row's partition key composites as a read takes them: decoded through their fields, as
@@ -2887,7 +3009,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       KeyComposer.extractKeyComposites(under, {}, config.pk.composite, keyRecord(record)),
     )
 
-  /** {@link readPartition} without unpacking — `delete` needs only the keys. */
+  /** {@link readPartition} without loading — `delete` needs only the keys. */
   const readPartitionRaw = <E>(
     key: Record<string, unknown>,
     rejected: (diagnosis: Diagnosis, original: unknown) => E,
@@ -4173,7 +4295,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
     mutationFn: (
       context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
-  ): Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError, DynamoClient | TableConfig> =>
+  ): Effect.Effect<
+    Schema.Schema.Type<TSchema>,
+    AggregateWriteError | BlobStoreError,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
       const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "update")
 
@@ -4206,6 +4332,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
         optic: opticRoot,
         current: current as Schema.Schema.Type<TSchema>,
       })
+      // An offloaded edge field takes its value, never a stream, handle, source or lazy value
+      // (`[EDD-9120]`, #179).
+      yield* refuseEdgeInputs(updated, rootNode, aggregateName, "aggregate.update")
 
       // 3. Validate the mutated state — its tolerant transforms take the domain
       //    values the mutation yields as what they are, for every field (root +
@@ -4411,7 +4540,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const readAt = rowsReadAt(rootNode, allItems, systemAttrs)
       yield* refuseOtherSettingRows(oldGroups, groupChanged, readAt, previousRows)
 
-      const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
+      // Route and upload the offloaded attributes of the groups the write sends, every one afresh
+      // (#179, design §6.9), before the first transaction: decided on the decomposed values above,
+      // so an unchanged group uploads nothing, and no pointer read from the partition is written
+      // back (each changed group's values were read eagerly, and are uploaded again).
+      const sentDynamo = yield* routeBuiltGroups(
+        newDynamo.filter((g) => groupChanged(g.group)),
+        offloadInfoByType,
+        {
+          table: tableConfig.name,
+          pkAttribute: config.pk.field,
+          operation: "Aggregate.update",
+          escapeKeys: config.schema.escapeKeys === true,
+        },
+      )
+      const newItemsByGroup = new Map(sentDynamo.map((g) => [g.group, g.items]))
+      // The rows as built, values inline: what the result is assembled from (no store I/O).
+      const builtByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
       const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
       // Every sk that survives anywhere in the new decomposition — an old item is
       // an orphan to DELETE only if its key appears in no new group at all.
@@ -4510,9 +4655,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
       // 1.40.0 assembled it.
       const stored = new Map(allItems.map((item) => [String(item.sk), item]))
       for (const { sk } of cleanup) stored.delete(sk)
-      for (const { deletes, puts } of groupWrites) {
+      for (const { group, deletes, puts } of groupWrites) {
         for (const item of deletes) stored.delete(String((item.sk as { S?: string }).S))
-        const written = puts.map((item) => fromAttributeMap(item) as Record<string, unknown>)
+        // The rows as built, not as sent: an offloaded value is inline there (#179).
+        const written = (puts.length === 0 ? [] : (builtByGroup.get(group) ?? puts)).map(
+          (item) => fromAttributeMap(item) as Record<string, unknown>,
+        )
         yield* unpackAggregateItems(written, dispatchByType, aggregateName)
         for (const item of written) stored.set(String(item.sk), item)
       }
@@ -4605,7 +4753,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
     ctx: Rekey.RekeyRowContext,
     /** The old partition the aggregate's root was found in, when it isn't the current one. */
     from: string | undefined,
-  ): Effect.Effect<Rekey.RekeyTally, AggregateWriteError, DynamoClient | TableConfig> =>
+  ): Effect.Effect<
+    Rekey.RekeyTally,
+    AggregateWriteError | BlobStoreError,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
       /** What a row too wide to guard whole, with no `updatedAt` to stand in, gets. */
       const unprovable = Rekey.unprovableRow(ctx)
@@ -4913,6 +5065,24 @@ const makeAggregate = <TSchema extends Schema.Top>(
             item,
           ]),
         )
+        // Rekey's backstop (#179, design §11.10): a row holding a blob pointer never moves, nor is
+        // it deleted as a copy of a row at its current key. Its objects are named from its key
+        // text, so moved it would name objects no write of its new key made. Offloading requires
+        // `escapeKeys: true`, under which such a row is only ever written at its final key text:
+        // judged on the row as read, dry run or not, before anything is written. Any well-formed
+        // pointer, at any depth, whatever the edge entities now declare.
+        for (const [r, row] of rows.entries()) {
+          if (row.placement !== "old" && !copies.has(r)) continue
+          const read = storedAt.get(positionOf(row.old.pk, row.old.sk))
+          const attribute = BlobLedger.pointerAttributeOf(read)
+          if (attribute !== undefined) {
+            return yield* Rekey.refusePointerRow(
+              `Aggregate "${aggregateName}"`,
+              { [config.pk.field]: row.old.pk, sk: row.old.sk },
+              attribute,
+            )
+          }
+        }
         // An aggregate is left as it is, reported, only while nothing of it has moved. One already
         // part-moved, in this run or a run cut short, is finished under the strongest guard that
         // fits, as 1.39.0 finished it: left across two keys, a read under either misses rows.
@@ -5419,7 +5589,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       }
       return yield* rekeyCore(key, ctx, from).pipe(
         Effect.catch(
-          (error: AggregateWriteError): Effect.Effect<Rekey.RekeyTally, DynamoClientError> => {
+          (
+            error: AggregateWriteError | BlobStoreError,
+          ): Effect.Effect<Rekey.RekeyTally, DynamoClientError> => {
             if (Rekey.isDynamoClientError(error)) return Effect.fail(error)
             const assembly = error._tag === "AggregateAssemblyError" ? error.reason : undefined
             // Gone since the scan read it: deleted by a write.
@@ -5504,7 +5676,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         const items = rows
           .filter((item) => item[config.pk.field]?.S === pk)
           .map((item) => fromAttributeMap(item) as Record<string, unknown>)
-        yield* unpackAggregateItems(items, dispatchByType, aggregateName)
+        yield* loadAggregateItems(items, readPlans)
         const assembled = yield* assembleAggregate(
           assembly,
           rootNode,
@@ -5549,7 +5721,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   return Rekey.carry(
     rekeyHandler,
-    withOperations<Aggregate<TSchema, Record<string, unknown>>>(aggregateName, {
+    withOperations<RuntimeAggregate<TSchema>>(aggregateName, {
       [TypeId]: TypeId,
       _tag: "Aggregate",
       _tableTag: config.table.Tag,
@@ -5613,8 +5785,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
             input as Record<string, unknown>,
             config.edges,
             schemaFields,
+            rootNode,
             aggregateName,
           )
+          // An offloaded edge field takes its value, never a stream, handle, source or lazy value
+          // (`[EDD-9120]`, #179).
+          yield* refuseEdgeInputs(hydrated, rootNode, aggregateName, "aggregate.create")
 
           // 2. Validate via schema decode (decodeSchema substitutes nested edge
           //    self-date/Redacted leaves — Option A — and is identical to `schema`
@@ -5685,6 +5861,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
             "aggregate.create",
             storedAsGivenIn(groups),
           )
+          // 5b. Route and upload the edge entities' offloaded attributes on the built items — their
+          //     keys composed, their values judged — before the first transaction (#179, §6.9).
+          const sentGroups = yield* routeBuiltGroups(dynamoGroups, offloadInfoByType, {
+            table: tableConfig.name,
+            pkAttribute: config.pk.field,
+            operation: "Aggregate.create",
+            escapeKeys: config.schema.escapeKeys === true,
+          })
 
           // 6. Write via sub-aggregate transactions. The root item goes first in
           //    the first transaction, guarded by `attribute_not_exists` (#134):
@@ -5693,7 +5877,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           //    they are only ever written after the root's transaction commits.
           const rootSk = composeKey(config.schema, config.root.entityType, [])
           const isRoot = (item: Record<string, AttributeValue>) => item.sk?.S === rootSk
-          const ordered = [...dynamoGroups]
+          const ordered = [...sentGroups]
             .sort((a, b) => Number(b.items.some(isRoot)) - Number(a.items.some(isRoot)))
             .map((g) => ({
               group: g.group,
@@ -6024,7 +6208,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
  * Each aggregate operation as a named operation for consumed-capacity
  * reports (#174); the entity ops and batches it composes nest under it.
  */
-const withOperations = <A extends Aggregate<any, any, any, any>>(
+const withOperations = <A extends Aggregate<any, any, any, any, any>>(
   aggregateName: string,
   ops: A,
 ): A => {
@@ -6060,10 +6244,11 @@ export const bind = <
   TKey extends Record<string, unknown>,
   TInput,
   TCreate,
+  TBlobErrors = never,
 >(
-  aggregate: Aggregate<TSchema, TKey, TInput, TCreate>,
+  aggregate: Aggregate<TSchema, TKey, TInput, TCreate, TBlobErrors>,
 ): Effect.Effect<
-  BoundAggregate<TSchema, TKey, TInput, TCreate>,
+  BoundAggregate<TSchema, TKey, TInput, TCreate, TBlobErrors>,
   never,
   DynamoClient | TableConfig
 > =>
@@ -6075,9 +6260,9 @@ export const bind = <
     // their offloaded fields need a blob store (`[EDD-9115]`) in the context
     // it is bound with — `DynamoClient.make` binds under the one it bundled.
     const owner = `aggregate "${aggregate._name ?? "?"}"`
-    const requirements = aggregateStoreRequirements(owner, aggregate)
+    const requirements = OffloadWrite.aggregateStoreRequirements(owner, aggregate)
     // Offloading requires escaped key text (`[EDD-9146]`), before the store.
-    const keysError = unescapedKeysError("Aggregate.bind", requirements)
+    const keysError = OffloadWrite.unescapedKeysError("Aggregate.bind", requirements)
     if (keysError !== undefined) throw keysError
     const codecError = unregisteredCodecError(
       "Aggregate.bind",
@@ -6087,7 +6272,7 @@ export const bind = <
       Context.getOrUndefined(ctx, Compression),
     )
     if (codecError !== undefined) throw codecError
-    const storeError = missingStoreError(
+    const storeError = OffloadWrite.missingStoreError(
       "Aggregate.bind",
       requirements,
       Context.getOrUndefined(ctx, BlobStore),
@@ -6116,7 +6301,7 @@ export const bind = <
       createSchema: aggregate.createSchema,
       updateSchema: aggregate.updateSchema,
       provide,
-    } as BoundAggregate<TSchema, TKey, TInput, TCreate>
+    } as BoundAggregate<TSchema, TKey, TInput, TCreate, TBlobErrors>
   })
 
 // ---------------------------------------------------------------------------
@@ -6128,6 +6313,15 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
   if (a == null || b == null) return false
   if (typeof a !== typeof b) return false
   if (typeof a !== "object") return false
+
+  // Bytes compare by content (#179): a binary edge field of megabytes was
+  // compared through `Object.keys`, one string key per byte.
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    if (!(a instanceof Uint8Array && b instanceof Uint8Array)) return false
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+    return true
+  }
 
   if (Array.isArray(a) && Array.isArray(b)) {
     if (a.length !== b.length) return false
@@ -6251,6 +6445,8 @@ interface ResolveNodeArgs {
   /** The schema's `escapeKeys`: an `entity:` edge's sort key composition follows it. */
   readonly escapeKeys?: boolean | undefined
   readonly offloaded?: ReadonlyArray<string> | undefined
+  readonly offload?: NodeOffload | undefined
+  readonly bytes?: ReadonlyArray<string> | undefined
 }
 
 /**
@@ -6433,17 +6629,80 @@ const edgeOffloadedFields = (
   return offloaded.length > 0 ? offloaded : undefined
 }
 
+/**
+ * How the node's items offload (#179): the edge entity's overflow fields among its packed ones, its
+ * binary fields among the item attributes, and its `offload` settings — `undefined` when it
+ * offloads none of them.
+ */
+const edgeOffload = (
+  packed:
+    | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
+    | undefined,
+  entity: EdgeEntity | undefined,
+  itemFields: Record<string, Schema.Top> | undefined,
+): NodeOffload | undefined => {
+  if (entity === undefined) return undefined
+  const overflow: Record<string, DynamoModel.ExternalPackedConfig> = {}
+  for (const [field, storedAs] of Object.entries(packed ?? {})) {
+    if (storedAs.external !== undefined) {
+      setOwn(overflow, field, storedAs as DynamoModel.ExternalPackedConfig)
+    }
+  }
+  const binary: Record<string, DynamoModel.ExternalConfig> = {}
+  for (const [field, storedAs] of Object.entries(DynamoModel.getExternalFields(entity.model))) {
+    if (itemFields === undefined || Object.hasOwn(itemFields, field)) {
+      setOwn(binary, field, storedAs)
+    }
+  }
+  if (Object.keys(overflow).length === 0 && Object.keys(binary).length === 0) return undefined
+  return {
+    overflow,
+    binary,
+    itemBudget: entity.offload?.itemBudget,
+    prefix: entity.offload?.prefix,
+  }
+}
+
+/**
+ * The node's item attributes whose encoded side is bytes (design §4.7): every non-sparse field of
+ * the item a bytes pointer may be stored on.
+ */
+const edgeBytesFields = (
+  entity: EdgeEntity | undefined,
+  itemFields: Record<string, Schema.Top> | undefined,
+): ReadonlyArray<string> | undefined => {
+  if (entity === undefined) return undefined
+  const sparse = DynamoModel.getSparseFields(entity.model)
+  const bytes = Object.entries(itemFields ?? {})
+    .filter(
+      ([field, schema]) =>
+        !Object.hasOwn(sparse, field) && binaryShapeRefusal(schema) === undefined,
+    )
+    .map(([field]) => field)
+  return bytes.length > 0 ? bytes : undefined
+}
+
+/** The parts of an edge entity a node's storage is derived from. */
+type EdgeEntity = {
+  readonly model: Schema.Top
+  readonly offload?:
+    | { readonly itemBudget: number | undefined; readonly prefix: string | undefined }
+    | undefined
+}
+
 /** A node's packed, stored-form-dispatch and offloaded attributes, as `resolveNode` args. */
 const edgeStorage = (
   packed:
     | Readonly<Record<string, DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig>>
     | undefined,
-  entity: { readonly model: Schema.Top } | undefined,
+  entity: EdgeEntity | undefined,
   itemFields: Record<string, Schema.Top> | undefined,
-): Pick<ResolveNodeArgs, "packed" | "dispatch" | "offloaded"> => ({
+): Pick<ResolveNodeArgs, "packed" | "dispatch" | "offloaded" | "offload" | "bytes"> => ({
   packed,
   dispatch: edgeDispatchFields(entity, itemFields, packed),
   offloaded: edgeOffloadedFields(packed, entity, itemFields),
+  offload: edgeOffload(packed, entity, itemFields),
+  bytes: edgeBytesFields(entity, itemFields),
 })
 
 const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
@@ -6517,7 +6776,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
                 edge.discriminator,
                 undefined,
               ),
-              edge.entity as { readonly model: Schema.Top } | undefined,
+              edge.entity as EdgeEntity | undefined,
               valueFields,
             ),
           }),
@@ -6610,7 +6869,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
                 discriminator,
                 edge.sk?.composite,
               ),
-              edge.entity as { readonly model: Schema.Top } | undefined,
+              edge.entity as EdgeEntity | undefined,
               elementFields,
             ),
           }),
@@ -6690,6 +6949,8 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(args.packed !== undefined && { packed: args.packed }),
     ...(args.dispatch !== undefined && { dispatch: args.dispatch }),
     ...(args.offloaded !== undefined && { offloaded: args.offloaded }),
+    ...(args.offload !== undefined && { offload: args.offload }),
+    ...(args.bytes !== undefined && { bytes: args.bytes }),
     attrEncoders,
     ...(args.elementEncoder !== undefined && { elementEncoder: args.elementEncoder }),
     ...(keyAttrEncoders !== undefined && { keyAttrEncoders }),
@@ -6815,6 +7076,300 @@ const unpackAggregateItems = (
         }
         return undefined
       })
+
+// ---------------------------------------------------------------------------
+// Internal: offloaded edge attributes (#179)
+// ---------------------------------------------------------------------------
+
+/**
+ * How each edge entity type's items offload, keyed by the entity type the items carry
+ * (`__edd_e__`): routed and uploaded on the built items (`OffloadWrite.route`, design §6.9). Edge
+ * rows never copy pointers — aggregate writes create no snapshots, tombstones or events.
+ */
+const collectOffloadInfoByType = (
+  root: ResolvedNode,
+): ReadonlyMap<string, OffloadWrite.OffloadInfo> => {
+  const out = new Map<string, OffloadWrite.OffloadInfo>()
+  const walk = (node: ResolvedNode): void => {
+    const offload = node.offload
+    if (offload !== undefined) {
+      const known = out.get(node.entityType)
+      const overflow = { ...(known?.overflow ?? {}), ...offload.overflow }
+      const binary = { ...(known?.binary ?? {}), ...offload.binary }
+      const budgets = [known?.itemBudget, offload.itemBudget].filter(
+        (budget): budget is number => budget !== undefined,
+      )
+      out.set(node.entityType, {
+        entityType: node.entityType,
+        overflow,
+        binary,
+        // Aggregates store domain names: every attribute is its field.
+        fieldOf: Object.fromEntries(
+          [...Object.keys(overflow), ...Object.keys(binary)].map((field) => [field, field]),
+        ),
+        // Two nodes of one item type (rare): the tighter budget holds for both.
+        itemBudget: budgets.length === 0 ? undefined : Math.min(...budgets),
+        prefix: known?.prefix ?? offload.prefix,
+        copiesPointers: false,
+      })
+    }
+    for (const child of node.children) walk(child)
+  }
+  walk(root)
+  return out
+}
+
+/** A read plan's lazy-value decoder; aggregates read eagerly, so it is never called. */
+const decodeWire = (_field: string, wire: unknown): Effect.Effect<unknown, ValidationError> =>
+  Effect.succeed(wire)
+
+/**
+ * How each edge entity type's stored rows are read (design §8.4): its stored-form-dispatch
+ * attributes, its bytes attributes (a `~edbp:` text is a bytes pointer, §4.7) and its offloaded
+ * ones. Types with nothing to read by stored form have no plan: their rows are final as stored.
+ */
+const collectReadPlans = (
+  root: ResolvedNode,
+  aggregateName: string,
+): ReadonlyMap<string, OffloadRead.ReadPlan> => {
+  const dispatch = new Map<string, Set<string>>()
+  const bytes = new Map<string, Set<string>>()
+  const offloaded = new Map<string, Record<string, "overflow" | "binary">>()
+  const contentTypes = new Map<string, Record<string, string>>()
+  const add = (into: Map<string, Set<string>>, type: string, attrs: ReadonlyArray<string>) => {
+    const set = into.get(type) ?? new Set<string>()
+    for (const attr of attrs) set.add(attr)
+    into.set(type, set)
+  }
+  const walk = (node: ResolvedNode): void => {
+    if (node.dispatch !== undefined) add(dispatch, node.entityType, node.dispatch)
+    if (node.bytes !== undefined) add(bytes, node.entityType, node.bytes)
+    if (node.offload !== undefined) {
+      const kinds = offloaded.get(node.entityType) ?? {}
+      const types = contentTypes.get(node.entityType) ?? {}
+      for (const field of Object.keys(node.offload.overflow)) setOwn(kinds, field, "overflow")
+      for (const [field, storedAs] of Object.entries(node.offload.binary)) {
+        setOwn(kinds, field, "binary")
+        setOwn(types, field, storedAs.contentType)
+      }
+      offloaded.set(node.entityType, kinds)
+      contentTypes.set(node.entityType, types)
+    }
+    for (const child of node.children) walk(child)
+  }
+  walk(root)
+  const plans = new Map<string, OffloadRead.ReadPlan>()
+  for (const type of new Set([...dispatch.keys(), ...bytes.keys()])) {
+    plans.set(type, {
+      entityType: `${aggregateName}.${type}`,
+      dispatch: [...(dispatch.get(type) ?? [])],
+      binary: [...(bytes.get(type) ?? [])],
+      offloaded: offloaded.get(type) ?? {},
+      // Aggregates store domain names: every attribute is its field.
+      fieldOf: {},
+      contentTypeOf: contentTypes.get(type) ?? {},
+      decodeField: decodeWire,
+    })
+  }
+  return plans
+}
+
+/**
+ * Read, in place, each item of a partition by its type's plan (design §8.4): packed and
+ * dispatch-eligible attributes by their stored form — whatever the edge entity configures now —
+ * and every offloaded value resolved eagerly, both kinds, so assembly decodes values, never
+ * handles. A pointer on an attribute the edge entity no longer offloads resolves through the
+ * ambient store (§4.7). A row with no string or binary value on any attribute of its plan costs
+ * one `typeof` per attribute.
+ */
+const loadAggregateItems = (
+  items: ReadonlyArray<Record<string, unknown>>,
+  plans: ReadonlyMap<string, OffloadRead.ReadPlan>,
+): Effect.Effect<void, ValidationError | BlobStoreError> => {
+  if (plans.size === 0 || items.length === 0) return Effect.void
+  const rowsByType = new Map<string, Array<Record<string, unknown>>>()
+  for (const item of items) {
+    const type = ownValue(item, "__edd_e__")
+    if (typeof type !== "string" || !plans.has(type)) continue
+    const rows = rowsByType.get(type) ?? []
+    rows.push(item)
+    rowsByType.set(type, rows)
+  }
+  return Effect.forEach(
+    rowsByType,
+    ([type, rows]) =>
+      OffloadRead.loadRows(plans.get(type)!, rows, {
+        operation: "aggregate.decode",
+        modes: OffloadRead.EAGER_MODES,
+      }),
+    { discard: true },
+  )
+}
+
+/** The table and key attributes a group write's uploads name their objects from. */
+interface RouteKeys {
+  readonly table: string
+  readonly pkAttribute: string
+  readonly operation: string
+  /** The aggregate's schema sets `escapeKeys: true`, which offloading requires (design §11.10). */
+  readonly escapeKeys: boolean
+}
+
+/**
+ * Route and upload the offloaded attributes of built edge items (design §6.9): after
+ * `buildDynamoItems` composed each item's keys, which the object key (§4.5) and the whole-item
+ * budget need, and after the write's read-back checks, which judge the values as given. Every item
+ * of the groups the write sends is uploaded afresh — no pointer read from the partition is written
+ * back (group `Put`s carry no condition, §6.4) — and all of them before the first transaction, so
+ * an upload failure writes nothing. Each group's uploads settle by the transaction that carries
+ * them (the ledger, §6.2). Returns the groups with each uploaded attribute holding its pointer; an
+ * item with nothing uploaded is the item built.
+ */
+const routeBuiltGroups = <G extends BuiltGroup>(
+  groups: ReadonlyArray<G>,
+  infos: ReadonlyMap<string, OffloadWrite.OffloadInfo>,
+  keys: RouteKeys,
+): Effect.Effect<ReadonlyArray<G>, BlobStoreError | ValidationError> => {
+  if (infos.size === 0) return Effect.succeed(groups)
+  type Target = {
+    readonly g: number
+    readonly i: number
+    readonly info: OffloadWrite.OffloadInfo
+    readonly item: Record<string, unknown>
+    uploaded: ReadonlySet<string>
+  }
+  const targets: Array<Target> = []
+  groups.forEach((group, g) => {
+    group.items.forEach((built, i) => {
+      const info = infos.get(built.__edd_e__?.S ?? "")
+      if (info === undefined) return
+      // The values as they will be stored: the router measures and uploads them in place.
+      const item = fromAttributeMap(built) as Record<string, unknown>
+      targets.push({ g, i, info, item, uploaded: new Set() })
+    })
+  })
+  if (targets.length === 0) return Effect.succeed(groups)
+  return Effect.map(
+    OffloadWrite.forEachSettled(targets, (target) =>
+      Effect.map(
+        OffloadWrite.route(
+          target.info,
+          target.item,
+          OffloadWrite.rowOf(target.item, {
+            table: keys.table,
+            pkAttribute: keys.pkAttribute,
+            skAttribute: "sk",
+            operation: keys.operation,
+            escapeKeys: keys.escapeKeys,
+          }),
+        ),
+        (routed) => {
+          target.uploaded = routed.uploaded
+        },
+      ),
+    ),
+    () => {
+      const routed = groups.map((group) => ({ ...group, items: [...group.items] }))
+      for (const { g, i, item, uploaded } of targets) {
+        if (uploaded.size === 0) continue
+        const built = { ...routed[g]!.items[i]! }
+        for (const attribute of uploaded) {
+          setOwn(built, attribute, toAttributeValue(ownValue(item, attribute)))
+        }
+        routed[g]!.items[i] = built
+      }
+      return routed as ReadonlyArray<G>
+    },
+  )
+}
+
+/** Why `value` cannot be an offloaded edge field's aggregate input, or `undefined`. */
+const edgeInputRefusal = (kind: "overflow" | "binary", value: unknown): string | undefined => {
+  const what = Stream.isStream(value)
+    ? "a Stream"
+    : isBlobHandle(value)
+      ? "a BlobHandle"
+      : isBlobSource(value)
+        ? "an Offload.source(...)"
+        : isOffloadedValue(value)
+          ? "an OffloadedValue (a lazy read)"
+          : undefined
+  if (what === undefined) return undefined
+  return kind === "binary"
+    ? `takes a Uint8Array, got ${what}: an aggregate's binary edge fields take their bytes ` +
+        "(design §6.9)"
+    : `takes its domain value, got ${what}`
+}
+
+/**
+ * Refuse an offloaded edge field holding a stream, handle, source or lazy value in an aggregate's
+ * write input (`[EDD-9120]`, design §6.9): the aggregate's input is its own schema, which takes a
+ * binary edge field's bytes only. Walks the input along the resolved graph — `one` edges, `many`
+ * edge elements and sub-aggregates — before the schema decode, whose refusal would not say why.
+ */
+const refuseEdgeInputs = (
+  input: unknown,
+  root: ResolvedNode,
+  aggregateName: string,
+  operation: string,
+): Effect.Effect<void, ValidationError> => {
+  // Only the subtrees holding an offloading node are read: an aggregate whose edges offload
+  // nothing reads none of the caller's object here, which reads it as 1.40.0 did (#239).
+  const offloads = new Map<ResolvedNode, boolean>()
+  const holdsOffload = (node: ResolvedNode): boolean => {
+    const known = offloads.get(node)
+    if (known !== undefined) return known
+    const holds = node.offload !== undefined || node.children.some(holdsOffload)
+    offloads.set(node, holds)
+    return holds
+  }
+  if (!holdsOffload(root)) return Effect.void
+  const visit = (value: unknown, node: ResolvedNode, path: string): string | undefined => {
+    if (value === null || typeof value !== "object") return undefined
+    const offload = node.offload
+    if (offload !== undefined) {
+      for (const [kind, fields] of [
+        ["overflow", offload.overflow],
+        ["binary", offload.binary],
+      ] as const) {
+        for (const field of Object.keys(fields)) {
+          const why = edgeInputRefusal(kind, givenValue(value, field))
+          if (why !== undefined) {
+            return (
+              `${kind} field "${field}" of edge "${path}" (entity type ` +
+              `"${node.entityType}") ${why}`
+            )
+          }
+        }
+      }
+    }
+    for (const child of node.children) {
+      if (child.fieldName === null || !holdsOffload(child)) continue
+      const childPath = path === "" ? child.fieldName : `${path}.${child.fieldName}`
+      const childValue = givenValue(value, child.fieldName)
+      if (child.cardinality === "many" && Array.isArray(childValue)) {
+        for (const [index, element] of childValue.entries()) {
+          const refused = visit(element, child, `${childPath}[${index}]`)
+          if (refused !== undefined) return refused
+        }
+      } else {
+        const refused = visit(childValue, child, childPath)
+        if (refused !== undefined) return refused
+      }
+    }
+    return undefined
+  }
+  const refused = visit(input, root, "")
+  return refused === undefined
+    ? Effect.void
+    : Effect.fail(
+        new ValidationError({
+          entityType: aggregateName,
+          operation,
+          cause: new Error(`[EDD-9120] Aggregate "${aggregateName}": ${refused}`),
+        }),
+      )
+}
 
 // ---------------------------------------------------------------------------
 // Internal: Query all items in the aggregate partition
@@ -7228,7 +7783,28 @@ interface RefRequest {
   readonly idFieldName: string
   /** Where the id was given, to name it in an error: `lineId`, `lines[0].lineId`. */
   readonly at: string
+  /**
+   * The fields the hydrated copy keeps among those the target may offload (#179, design §8.4):
+   * an edge item of its own — a `one` edge's flattened entity, a `many` element given as the
+   * entity's id — keeps the offloaded fields among its node's item attributes
+   * (`ResolvedNode.offloaded`), which the edge entity routes and uploads again under the edge
+   * item's key; a ref copy inside another item (`Aggregate.ref`, a wrapped `many` element) keeps
+   * none (`[EDD-9143]`).
+   */
+  readonly keeps: ReadonlyArray<string>
 }
+
+/** `node`'s child for edge `edgeName`. */
+const childNode = (node: ResolvedNode | undefined, edgeName: string): ResolvedNode | undefined =>
+  node?.children.find((child) => child.fieldName === edgeName)
+
+/** What an item copy for edge `edgeName` of `node` keeps (see {@link RefRequest.keeps}). */
+const keptByChild = (node: ResolvedNode | undefined, edgeName: string): ReadonlyArray<string> =>
+  childNode(node, edgeName)?.offloaded ?? []
+
+/** A lazily read value's own value (an eager one is returned as it is). */
+const readLazyValue = (value: unknown): Effect.Effect<unknown, BlobStoreError | ValidationError> =>
+  isOffloadedValue(value) || isBlobHandle(value) ? value.read() : Effect.succeed(value)
 
 /** An object as given, to name it in an error, whatever its `toString` (a JSON body's may be text). */
 const describeObject = (value: object): string => {
@@ -7272,16 +7848,18 @@ const hydrateAggregateRefs = (
   input: Record<string, unknown>,
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
   fields: Record<string, Schema.Top> | undefined,
+  /** The resolved graph of `edges`, which says what each copy keeps ({@link RefRequest.keeps}). */
+  root: ResolvedNode,
   aggregateName: string,
 ): Effect.Effect<
   Record<string, unknown>,
-  RefNotFound | DynamoClientError | ValidationError,
+  RefNotFound | DynamoClientError | ValidationError | BlobStoreError,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
     // Collect all ref IDs from the entire input hierarchy
     const refRequests: RefRequest[] = []
-    collectRefIdsFromEdges(refRequests, input, edges, fields, [], "")
+    collectRefIdsFromEdges(refRequests, input, edges, fields, root, [], "")
 
     // A `many` edge's value given under its `inputField` is decoded under its field's name, ids
     // or not (#241): up to 1.40.0 it was renamed only where an id was fetched.
@@ -7449,21 +8027,68 @@ const hydrateAggregateRefs = (
 
     // Batch-fetch all refs — one Batch.get call per entity type
     const hydratedLookup = new Map<string, Record<string, unknown>>()
+    // What each copy drops: the target's offloaded fields it doesn't keep (#179).
+    const droppedOf = new Map<RefRequest, ReadonlyArray<string>>()
+    const readConcurrency = Option.match(yield* Effect.serviceOption(BlobStore), {
+      onNone: () => 1,
+      onSome: (store) => store.readConcurrency,
+    })
     for (const { entityType, runtimeEntity, ops } of fetches) {
       const composite = refKeyComposite(runtimeEntity)!
+      // A target that offloads fields (#179, design §8.4) is read for what its copies keep: an
+      // edge item keeps the offloaded fields its node's items hold (and uploads them again under
+      // its own key), a ref copy keeps none, and nothing else is fetched. A kind kept whole is
+      // read eagerly; one kept in part, or not at all, lazily, and the fields kept are then read
+      // from their lazy values. Never a pointer: a copy holds values, which the edge entity routes.
+      const offloaded =
+        (runtimeEntity as { readonly _offloadedFields?: ReadonlyArray<string> | undefined })
+          ._offloadedFields ?? []
+      const binary = new Set(Object.keys(DynamoModel.getExternalFields(runtimeEntity.model)))
+      const reqsOfType = refRequests.filter(
+        (req) => req.entity.entityType === entityType && lookupKeys.has(req),
+      )
+      const kept = offloaded.filter((field) => reqsOfType.some((req) => req.keeps.includes(field)))
+      for (const req of reqsOfType) {
+        const dropped = offloaded.filter((field) => !req.keeps.includes(field))
+        if (dropped.length > 0) droppedOf.set(req, dropped)
+      }
+      const keepsWhole = (isBinary: boolean) =>
+        offloaded.every((field) => binary.has(field) !== isBinary || kept.includes(field))
+      const modes = {
+        overflow: keepsWhole(false) ? "eager" : "lazy",
+        binary: keepsWhole(true) ? "eager" : "lazy",
+      } as const
+      const readAfter = kept.filter(
+        (field) => modes[binary.has(field) ? "binary" : "overflow"] === "lazy",
+      )
       // Build EntityGet intermediates for batch fetching: `Batch.get` composes each key as the
       // entity's own `get` does, the key `Entity.put` wrote.
-      const getOps = ops.map(
-        ({ req }) =>
-          runtimeEntity.get({ [composite]: Option.getOrThrow(req.id) }) as EntityGet<
-            any,
-            any,
-            any,
-            any
-          >,
-      )
+      const getOps = ops.map(({ req }) => {
+        const get = runtimeEntity.get({ [composite]: Option.getOrThrow(req.id) }) as EntityGet<
+          any,
+          any,
+          any,
+          any
+        >
+        return offloaded.length === 0 ? get : (offloadedCombinator(get, modes) as typeof get)
+      })
 
       const results = yield* Batch.get(getOps)
+      // The kept fields of a kind read lazily, at the store's read concurrency.
+      if (readAfter.length > 0) {
+        yield* Effect.forEach(
+          results.flatMap((result) =>
+            result == null
+              ? []
+              : readAfter.map((field) => [result as Record<string, unknown>, field] as const),
+          ),
+          ([record, field]) =>
+            Effect.map(readLazyValue(ownValue(record, field)), (value) => {
+              setOwn(record, field, value)
+            }),
+          { concurrency: readConcurrency, discard: true },
+        )
+      }
 
       // Map results back to lookup, failing on missing refs.
       for (let i = 0; i < ops.length; i++) {
@@ -7484,10 +8109,18 @@ const hydrateAggregateRefs = (
       }
     }
 
-    // Walk the input again and replace IDs with hydrated data
+    // Walk the input again and replace IDs with hydrated data: each copy without the target's
+    // offloaded fields it doesn't keep (#179).
     const result = replaceRefIds(input, refRequests, (req) => {
       const lookupKey = lookupKeys.get(req)
-      return lookupKey === undefined ? undefined : hydratedLookup.get(lookupKey)
+      const data = lookupKey === undefined ? undefined : hydratedLookup.get(lookupKey)
+      const dropped = droppedOf.get(req)
+      if (data === undefined || dropped === undefined) return data
+      const copy: Record<string, unknown> = {}
+      for (const [field, value] of Object.entries(data)) {
+        if (!dropped.includes(field)) setOwn(copy, field, value)
+      }
+      return copy
     })
     return renameInputFields(result, edges)
   })
@@ -7576,6 +8209,11 @@ const collectRefIdsFromEdges = (
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
   /** The fields of the schema `input` is a value of: a `many` element's schema is read off it. */
   fields: Record<string, Schema.Top> | undefined,
+  /**
+   * The resolved node of `edges` (the root, or a sub-aggregate's), whose children say what each
+   * item copy keeps ({@link RefRequest.keeps}).
+   */
+  node: ResolvedNode | undefined,
   path: ReadonlyArray<string>,
   /** Where `input` is, to name an id in an error: `""` at the root, `"sub."` under `sub`. */
   at: string,
@@ -7598,6 +8236,8 @@ const collectRefIdsFromEdges = (
           fieldName: edgeName,
           idFieldName,
           at: `${at}${idFieldName}`,
+          // A `one` edge's entity is an edge item of its own; a ref edge's a copy inside the row.
+          keeps: edge._tag === "OneEdge" ? keptByChild(node, edgeName) : [],
         })
       }
     } else if (edge._tag === "BoundSubAggregate") {
@@ -7609,6 +8249,7 @@ const collectRefIdsFromEdges = (
           subInput as Record<string, unknown>,
           bound.aggregate.edges,
           fieldsOf(bound.aggregate.schema),
+          childNode(node, edgeName),
           [...path, edgeName],
           `${at}${edgeName}.`,
         )
@@ -7641,6 +8282,7 @@ const collectRefIdsFromEdges = (
               fieldName: edgeName,
               idFieldName: String(i),
               at: `${at}${inputKey}[${i}]`,
+              keeps: keptByChild(node, edgeName),
             })
           } else if (
             typeof elem === "object" &&
@@ -7661,6 +8303,8 @@ const collectRefIdsFromEdges = (
                 fieldName: entityFieldName,
                 idFieldName,
                 at: `${at}${inputKey}[${i}].${idFieldName}`,
+                // The entity is a copy inside the element's row.
+                keeps: [],
               })
             }
           }
@@ -7681,7 +8325,12 @@ const collectRefIdsFromEdges = (
  * such a value in its create input (#133).
  *
  * - Values implementing `Equal` — `DateTime`, `Redacted`, `Option`, `Duration`,
- *   `Chunk`, `HashMap`, … — are immutable, so they are kept by reference.
+ *   `Chunk`, `HashMap`, a `BlobHandle`, … — are immutable, so they are kept by
+ *   reference.
+ * - A `Stream`, an `Offload.source(...)` and an `OffloadedValue` are kept by
+ *   reference too (#179): a copy is a bare object without their type ids, so
+ *   the `[EDD-9120]` refusal of them on an edge field would not see them, and
+ *   the schema decode or the packer would refuse the husk without saying why.
  * - Built-ins `structuredClone` knows (`Date`, `Map`, `Set`, `RegExp`, binary
  *   data) still go through it.
  * - Plain objects, arrays and other class instances (a `Schema.Class` value
@@ -7692,6 +8341,7 @@ const collectRefIdsFromEdges = (
 const cloneInput = (value: unknown, seen: WeakMap<object, unknown> = new WeakMap()): unknown => {
   if (value === null || typeof value !== "object") return value
   if (Equal.isEqual(value)) return value
+  if (Stream.isStream(value) || isBlobSource(value) || isOffloadedValue(value)) return value
   const prior = seen.get(value)
   if (prior !== undefined) return prior
   if (Array.isArray(value)) {
@@ -9664,6 +10314,7 @@ type WriteGroupsError =
   | DynamoClientError
   | TransactionCancelled
   | ValidationError
+  | BlobStoreError
 
 /** The aggregate's item keys, to name an item in a diagnosed rejection (#144). */
 interface GroupKeys {
@@ -9783,6 +10434,17 @@ function writeTransactionGroups(
             })
 
       yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+        // An upload over its store's `maxUploadAge` (#179, design §6.1) refuses the group before
+        // it is sent: say what earlier groups committed.
+        Effect.mapError((error) =>
+          already.length === 0
+            ? error
+            : expiredWithCommitted(
+                error,
+                "earlier transactions of this write already committed sub-aggregates " +
+                  already.map((name) => `"${name}"`).join(", "),
+              ),
+        ),
         // One operation per item (#144): diagnosed BEFORE the root guard's
         // mapping, which would read a repeat's conditional failure as an
         // existing root.

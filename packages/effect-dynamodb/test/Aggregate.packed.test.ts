@@ -19,7 +19,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { expectUnresolvedPointer, jsonPointerBytes } from "./helpers/BlobPointers.js"
+import { expectPointerStoreFailure, jsonPointerBytes } from "./helpers/BlobPointers.js"
 import { unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
@@ -173,15 +173,22 @@ describe("Aggregate — packed edge fields", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("an edge item holding a blob pointer (#179) is refused, never assembled", () =>
-    Effect.gen(function* () {
-      yield* seedVenue
-      yield* Matches.create({ matchId: "m-3", name: "Qualifier", venueId: "v-1" } as never)
-      const [edge] = venueItems()
-      store.set(keyOf(edge!), { ...edge!, layout: { B: jsonPointerBytes() } })
-      const error = yield* Matches.get({ matchId: "m-3" }).pipe(Effect.flip)
-      expectUnresolvedPointer(error, "layout", { operation: "aggregate.decode" })
-    }).pipe(Effect.provide(TestLayer)),
+  it.effect(
+    "an edge item holding a blob pointer (#179) resolves it through the ambient store, never assembles it",
+    () =>
+      Effect.gen(function* () {
+        yield* seedVenue
+        yield* Matches.create({ matchId: "m-3", name: "Qualifier", venueId: "v-1" } as never)
+        const [edge] = venueItems()
+        store.set(keyOf(edge!), { ...edge!, layout: { B: jsonPointerBytes() } })
+        // The edge entity does not offload `layout` (design §4.7): the pointer is
+        // read through the ambient store — none here, so the read fails naming it.
+        const error = yield* Matches.get({ matchId: "m-3" }).pipe(Effect.flip)
+        expectPointerStoreFailure(error, "layout", {
+          entityType: "MatchItem.MatchVenue",
+          operation: "aggregate.decode",
+        })
+      }).pipe(Effect.provide(TestLayer)),
   )
 
   it.effect("update re-packs the edge it rewrites", () =>

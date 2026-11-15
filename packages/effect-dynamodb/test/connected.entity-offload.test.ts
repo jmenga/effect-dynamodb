@@ -9,17 +9,22 @@
  * to the in-memory blob store, whose call counts say what each read fetched
  * (the S3 store and MinIO are later commits'). Binary inputs (§3.8, §7):
  * streams through the store's multipart simulation, single use, handle
- * copies and source failures.
+ * copies and source failures. Aggregates (§6.9, §8.4): offloading edges
+ * hydrated eagerly and re-uploaded per edge item (only the offloaded fields
+ * an element holds; none, and no store, for one that holds none), a changed
+ * group's re-upload, a refused create's rollback, eager assembly.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { composeCollectionKey } from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
 import { Cause, Config, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { afterAll, beforeAll, beforeEach, describe, expect } from "vitest"
+import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -150,9 +155,61 @@ const Readings = withOffloadGate(() =>
   }),
 )
 
+/** Docs an aggregate hydrates its edges from: hydration keys them by their identifier. */
+const AlbumDocs = withOffloadGate(() =>
+  Entity.make({
+    model: DynamoModel.configure(Doc, {
+      docId: { identifier: true },
+      body: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 1_024 } }) },
+      scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
+    }),
+    entityType: "AlbumSource",
+    primaryKey: docKey,
+  }),
+)
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { Docs, Budgeted, Kept, Shelved, Readings },
+  entities: { Docs, Budgeted, Kept, Shelved, Readings, AlbumDocs },
+})
+
+/** An aggregate whose edges are offloading docs: a one edge, and a many edge in a sub-aggregate. */
+class AlbumPage extends Schema.Class<AlbumPage>("AlbumPage")({
+  label: Schema.String,
+  docs: Schema.Array(Doc),
+}) {}
+class Album extends Schema.Class<Album>("Album")({
+  albumId: Schema.String,
+  owner: Schema.String,
+  title: Schema.String,
+  cover: Doc,
+  page: AlbumPage,
+}) {}
+const Albums = Aggregate.make(Album, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["albumId"] },
+  collection: { name: "album" },
+  list: {
+    index: "gsi1",
+    name: "albums",
+    pk: { field: "gsi1pk", composite: ["owner"] },
+    sk: { field: "gsi1sk", composite: ["albumId"] },
+  },
+  root: { entityType: "AlbumItem" },
+  edges: {
+    cover: Aggregate.one("cover", { entityType: "AlbumCover", entity: AlbumDocs }),
+    page: Aggregate.make(AlbumPage, {
+      root: { entityType: "AlbumPageItem" },
+      edges: {
+        docs: Aggregate.many("docs", {
+          entityType: "AlbumDoc",
+          entity: AlbumDocs,
+          sk: { composite: ["docId"] },
+        }),
+      },
+    }).with({ discriminator: { pageNo: 1 } }),
+  },
 })
 
 const credentials = { accessKeyId: "local", secretAccessKey: "local" }
@@ -173,7 +230,8 @@ const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   )
 
 const client = DynamoClient.make({
-  entities: { Docs, Budgeted, Kept, Shelved, Readings },
+  entities: { Docs, Budgeted, Kept, Shelved, Readings, AlbumDocs },
+  aggregates: { Albums },
   tables: { MainTable },
 })
 
@@ -632,6 +690,200 @@ describeConnected("Entity offloaded fields (#179)", () => {
         }),
       ),
   )
+
+  describe("aggregates (§6.9, §8.4)", () => {
+    const albumPartition = (albumId: string) =>
+      partition(composeCollectionKey(AppSchema, "album", [albumId]))
+    const edgeRows = (albumId: string, type: string) =>
+      Effect.map(albumPartition(albumId), (items) =>
+        items.filter((item) => item.__edd_e__?.S === type),
+      )
+    const seed = (ids: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        const db = yield* client
+        for (const [i, docId] of ids.entries()) {
+          yield* db.entities.AlbumDocs.put({
+            docId,
+            title: `doc ${docId}`,
+            body: text(2_000 + i),
+            scan: bytes(3, i + 1),
+          })
+        }
+      })
+
+    it.effect(
+      "create hydrates offloading edges eagerly and re-uploads them under each edge item",
+      () =>
+        provide(
+          Effect.gen(function* () {
+            const db = yield* client
+            yield* seed(["ag-1", "ag-2", "ag-3"])
+            const entityKeys = new Set(blobs.inspect().versions.map((v) => v.ref.key))
+            const before = blobs.inspect().calls
+            yield* db.aggregates.Albums.create({
+              albumId: "al-1",
+              owner: "o-1",
+              title: "Holiday",
+              coverId: "ag-1",
+              page: { label: "Beach", docs: ["ag-2", "ag-3"] },
+            } as never)
+            // Each doc's two values read once (eager), uploaded again for its edge item.
+            expect(blobs.inspect().calls.get - before.get).toBe(6)
+            expect(blobs.inspect().calls.put - before.put).toBe(6)
+            const edges = [
+              ...(yield* edgeRows("al-1", "AlbumCover")),
+              ...(yield* edgeRows("al-1", "AlbumDoc")),
+            ]
+            expect(edges).toHaveLength(3)
+            for (const row of edges) {
+              expect(isOverflowPointer(row.body)).toBe(true)
+              expect(isBinaryPointer(row.scan)).toBe(true)
+              const pointer = BlobPointer.decodeText(row.scan!.S!)
+              expect(typeof pointer === "object" && !entityKeys.has(pointer!.ref.key)).toBe(true)
+            }
+
+            // Reads resolve both kinds eagerly: one GET per pointer.
+            const reads = blobs.inspect().calls.get
+            const album = yield* db.aggregates.Albums.get({ albumId: "al-1" })
+            expect(blobs.inspect().calls.get - reads).toBe(6)
+            expect(album.cover).toMatchObject({ body: text(2_000), scan: bytes(3, 1) })
+            expect(album.page.docs.map((d) => d.scan)).toEqual([bytes(3, 2), bytes(3, 3)])
+            const listed = yield* db.aggregates.Albums.list({ owner: "o-1" })
+            expect(listed.data.map((a) => a.page.docs[1]!.body)).toEqual([text(2_002)])
+          }),
+        ),
+    )
+
+    it.effect("update rewrites, and re-uploads, only the changed group", () =>
+      provide(
+        Effect.gen(function* () {
+          const db = yield* client
+          yield* seed(["au-1", "au-2"])
+          yield* db.aggregates.Albums.create({
+            albumId: "al-2",
+            owner: "o-2",
+            title: "Trip",
+            coverId: "au-1",
+            page: { label: "Hills", docs: ["au-2"] },
+          } as never)
+          const page = (yield* edgeRows("al-2", "AlbumDoc"))[0]!
+          let before = blobs.inspect().calls
+          // A root-only change: the root group (album + cover) only.
+          yield* db.aggregates.Albums.update({ albumId: "al-2" }, ({ state }) => ({
+            ...state,
+            title: "Road trip",
+          }))
+          expect(blobs.inspect().calls.put - before.put).toBe(2)
+          expect((yield* edgeRows("al-2", "AlbumDoc"))[0]!.scan).toEqual(page.scan)
+
+          // A page change re-uploads the page's values (no read pointer is reused).
+          before = blobs.inspect().calls
+          yield* db.aggregates.Albums.update({ albumId: "al-2" }, ({ state }) => ({
+            ...state,
+            page: { ...state.page, label: "Mountains" },
+          }))
+          expect(blobs.inspect().calls.put - before.put).toBe(2)
+          const rewritten = (yield* edgeRows("al-2", "AlbumDoc"))[0]!
+          expect(rewritten.scan).not.toEqual(page.scan)
+          const album = yield* db.aggregates.Albums.get({ albumId: "al-2" })
+          expect(album.title).toBe("Road trip")
+          expect(album.page.label).toBe("Mountains")
+          expect(album.page.docs[0]).toMatchObject({ body: text(2_001), scan: bytes(3, 2) })
+        }),
+      ),
+    )
+
+    it.effect(
+      "a many element holding some of the target's offloaded fields fetches only those; one holding none needs no store",
+      () => {
+        class DocScan extends Schema.Class<DocScan>("DocScan")({
+          docId: Schema.String,
+          title: Schema.String,
+          scan: Schema.optional(Schema.Uint8Array),
+        }) {}
+        class DocTitle extends Schema.Class<DocTitle>("DocTitle")({
+          docId: Schema.String,
+          title: Schema.String,
+        }) {}
+        const shelfOf = (element: Schema.Top, name: string) =>
+          Aggregate.make(Schema.Struct({ shelfId: Schema.String, docs: Schema.Array(element) }), {
+            table: MainTable,
+            schema: AppSchema,
+            pk: { field: "pk", composite: ["shelfId"] },
+            collection: { name },
+            root: { entityType: `${name}Item` },
+            edges: {
+              docs: Aggregate.many("docs", {
+                entityType: `${name}Doc`,
+                entity: AlbumDocs,
+                sk: { composite: ["docId"] },
+              }),
+            },
+          }) as unknown as {
+            readonly create: (input: unknown) => Effect.Effect<any, any, any>
+            readonly get: (key: unknown) => Effect.Effect<any, any, any>
+          }
+        const Scans = shelfOf(DocScan, "ScanShelf")
+        const Titles = shelfOf(DocTitle, "TitleShelf")
+        const docRows = (shelf: string, type: string) =>
+          Effect.map(partition(composeCollectionKey(AppSchema, shelf, ["sh-1"])), (items) =>
+            items.filter((item) => item.__edd_e__?.S === type),
+          )
+        return Effect.gen(function* () {
+          yield* provide(seed(["as-1", "as-2"]))
+          const before = blobs.inspect().calls
+          // The scan only: one GET and one upload per doc; the body is never read.
+          const created = yield* provide(Scans.create({ shelfId: "sh-1", docs: ["as-1", "as-2"] }))
+          expect(blobs.inspect().calls.get - before.get).toBe(2)
+          expect(blobs.inspect().calls.put - before.put).toBe(2)
+          expect(created.docs.map((d: DocScan) => d.scan)).toEqual([bytes(3, 1), bytes(3, 2)])
+          const rows = yield* provide(docRows("scanshelf", "ScanShelfDoc"))
+          expect(rows).toHaveLength(2)
+          for (const row of rows) {
+            expect(isBinaryPointer(row.scan)).toBe(true)
+            expect(row.body).toBeUndefined()
+          }
+          const read = yield* provide(Scans.get({ shelfId: "sh-1" }))
+          expect(read.docs.map((d: DocScan) => d.scan)).toEqual([bytes(3, 1), bytes(3, 2)])
+
+          // No offloaded field at all: no fetch, and no store in context.
+          const calls = blobs.inspect().calls
+          const noStore = Layer.mergeAll(ClientLayer, MainTable.layer({ name: tableName }))
+          const titles = yield* Titles.create({ shelfId: "sh-1", docs: ["as-1"] }).pipe(
+            Effect.provide(noStore),
+          )
+          expect(titles.docs).toEqual([{ docId: "as-1", title: "doc as-1" }])
+          expect(blobs.inspect().calls.get).toBe(calls.get)
+          expect(
+            (yield* Titles.get({ shelfId: "sh-1" }).pipe(Effect.provide(noStore))).docs,
+          ).toEqual([{ docId: "as-1", title: "doc as-1" }])
+        })
+      },
+    )
+
+    it.effect("a create over an existing aggregate deletes its uploads (DynamoDB cancels it)", () =>
+      provide(
+        Effect.gen(function* () {
+          const db = yield* client
+          yield* seed(["ac-1", "ac-2"])
+          const input = {
+            albumId: "al-3",
+            owner: "o-3",
+            title: "Once",
+            coverId: "ac-1",
+            page: { label: "Only", docs: ["ac-2"] },
+          }
+          yield* db.aggregates.Albums.create(input as never)
+          const kept = blobs.inspect().versions.length
+          const before = blobs.inspect().calls
+          const error = yield* Effect.flip(db.aggregates.Albums.create(input as never))
+          expect(error._tag).toBe("ConditionalCheckFailed")
+          expect(blobs.inspect().calls.put - before.put).toBe(4)
+          expect(blobs.inspect().versions).toHaveLength(kept)
+        }),
+      ),
+    )
+  })
 
   describe("binary inputs (§3.8, §7)", () => {
     const content = Uint8Array.from({ length: 40 }, (_, i) => (i * 13) % 256)

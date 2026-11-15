@@ -152,3 +152,24 @@ export const callStream = <A>(
 
 /** The key of a ref in maps: key and version, separated by U+0000 (in neither). */
 export const refKey = (ref: BlobRef): string => `${ref.key}\u0000${ref.version}`
+
+/**
+ * A `BlobStoreError` that refused one of a multi-request write's requests (an
+ * upload over the store's `maxUploadAge`, design §6.1), saying what the write
+ * had already committed before it — a batch's earlier chunks, an aggregate's
+ * earlier sub-aggregate groups — as every other mid-write failure does. Any
+ * other error unchanged.
+ */
+export const expiredWithCommitted = <E>(error: E, committed: string): E =>
+  error instanceof BlobStoreError && error.reason === "Expired"
+    ? (new BlobStoreError({
+        entityType: error.entityType,
+        attribute: error.attribute,
+        operation: error.operation,
+        action: error.action,
+        reason: error.reason,
+        ref: error.ref,
+        committed: error.committed,
+        cause: `${String(error.cause)} by that request; ${committed}`,
+      }) as E)
+    : error
