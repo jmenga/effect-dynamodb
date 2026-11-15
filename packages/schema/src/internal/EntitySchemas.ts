@@ -45,6 +45,7 @@ import {
   holdsPlainBigint,
   holdsUndefined,
   isDecodingDefault,
+  isSameSchemaNode,
   isSchemaLike,
   isSetDeclaration,
   keyRenamesOf,
@@ -1187,15 +1188,21 @@ export const optionalField = (field: Schema.Top): OptionalField | undefined => {
 /**
  * @internal Whether a ref's declaration takes `null` (`Schema.NullOr`, a union with `Schema.Null`)
  * or, as a member of its own union, `undefined` (`Schema.UndefinedOr`), beneath an optional wrapper
- * or not. `Schema.optional`'s own `undefined` is the wrapper's, not the ref's.
+ * or not. `Schema.optional`'s own `undefined` is the wrapper's, not the ref's. Neither where the
+ * union holds no member a walk takes for a ref to `model` ({@link unionHoldsRef}): the ref's target
+ * replaces such a union whole, as up to 1.42.1, and holds neither.
  */
 export const refNullish = (
   declared: Schema.Top | undefined,
+  model: Schema.Top | undefined,
 ): { readonly nullable: boolean; readonly undefinable: boolean } => {
   if (declared === undefined) return { nullable: false, undefinable: false }
   const optional = optionalField(declared)
   const inner = optional?.union ?? optional?.inner ?? declared
-  const members = SchemaAST.isUnion(inner.ast) ? inner.ast.types : []
+  const members =
+    SchemaAST.isUnion(inner.ast) && (model === undefined || unionHoldsRef(inner, model))
+      ? inner.ast.types
+      : []
   return {
     nullable: members.some((member) => SchemaAST.isNull(member)),
     undefinable: optional === undefined && members.some((member) => SchemaAST.isUndefined(member)),
@@ -3040,23 +3047,43 @@ const withHeldRefs = (
  * @internal The member of a nested ref's declaration that holds the ref, as a walk below the ref
  * takes it, or `undefined` for anything else: an optional wrapper, a union (`NullOr`, one with other
  * members), a decoding default, which the walk goes through to the member beneath, kept as declared,
- * and a member that isn't the ref (`null`, a string). The member is the model of the ref's entity, or
- * a `DynamoModel.ref` of it. It is what a read of that entity returns (`refHeldTarget`) wherever its
- * own schema can't be walked (`DynamoModel.ref` hides a class's fields) or holds more than that read;
- * elsewhere the member as declared, as 1.42.1 walked it.
+ * and a member that isn't the ref (`null`, a string). The member is the model of the ref's entity, a
+ * copy of it that changes only its annotations or checks (`Team.annotate({ description })`,
+ * `isSameSchemaNode`), a `Schema.suspend` of it, or a `DynamoModel.ref` of any of these. It is what
+ * a read of that entity returns (`refHeldTarget`) wherever its own schema can't be walked
+ * (`DynamoModel.ref`, `.annotate` and `Schema.suspend` hide a class's fields) or holds more than
+ * that read; elsewhere the member as declared, as 1.42.1 walked it.
  */
 export const heldRefMember = (member: Schema.Top, model: Schema.Top): Schema.Top | undefined => {
+  const ast = member.ast
   if (
     optionalField(member) !== undefined ||
-    SchemaAST.isUnion(member.ast) ||
+    SchemaAST.isUnion(ast) ||
     decodingDefaultField(member) !== undefined ||
-    (member !== model && !isRef(member))
+    !(
+      member === model ||
+      isRef(member) ||
+      isSameSchemaNode(SchemaAST.isSuspend(ast) ? ast.thunk() : ast, model.ast)
+    )
   ) {
     return undefined
   }
   const held = refHeldTarget(model)
   return schemaFieldsOf(member) !== undefined && held === model ? member : held
 }
+
+/**
+ * Whether a union a ref is declared in holds a member the walk takes for the ref
+ * ({@link heldRefMember}), directly or in a union among its members. Where it holds none (another
+ * class, a struct declared again with the model's fields), the walk would take the member as
+ * declared, so the ref's target replaces the union whole, as up to 1.42.1.
+ */
+const unionHoldsRef = (union: Schema.Top, model: Schema.Top): boolean =>
+  ((union as { readonly members?: ReadonlyArray<Schema.Top> }).members ?? []).some((member) =>
+    SchemaAST.isUnion(member.ast)
+      ? unionHoldsRef(member, model)
+      : heldRefMember(member, model) !== undefined,
+  )
 
 /** The walk's {@link heldRefMember} at `schema` (`heldRef`), with what it walks that member with. */
 const heldMemberOf = (
@@ -3393,8 +3420,10 @@ export const buildDerivedSchemas = (
     // ref the model declares in a union (`Schema.NullOr`, `Schema.UndefinedOr`, one with other
     // members) keeps it: the walk re-points the ref's member alone (`heldRef`), as it does a ref
     // nested in a ref's target, so a row holding `null` for it reads. Up to 1.42.1 the target
-    // replaced the union, and a `null` failed every read (`Expected object`).
-    const inUnion = SchemaAST.isUnion((optional?.union ?? optional?.inner ?? declared).ast)
+    // replaced the union, and a `null` failed every read (`Expected object`). A union holding no
+    // member the walk takes for the ref (`unionHoldsRef`) is still replaced, as 1.42.1 replaced it.
+    const union = optional?.union ?? optional?.inner ?? declared
+    const inUnion = SchemaAST.isUnion(union.ast) && unionHoldsRef(union, resolved)
     const held = (options: DeepSubstitutionOptions) =>
       inUnion
         ? substituteSchemaDeep(declared, { ...options, heldRef: { model: resolved, refs: nested } })
@@ -3496,10 +3525,17 @@ export const buildDerivedSchemas = (
   // ref optional, which then stores no ref. Up to 1.40.0 the id was always required. Where the model
   // declares the ref nullable (`Schema.NullOr`) the id takes `null` too, which stores `null` for the
   // ref and fetches nothing, and `undefined` where it declares `Schema.UndefinedOr`.
+  const refModelOf = (ref: (typeof resolvedRefs)[number]): Schema.Top | undefined => {
+    const model = ref.refEntity?.model
+    return isConfiguredModel(model) ? (model.model as Schema.Top) : model
+  }
   const refIdInput = (ref: (typeof resolvedRefs)[number]): Schema.Top => {
     const declared = modelFields[ref.fieldName]
     const optional = declared === undefined ? undefined : optionalField(declared as Schema.Top)
-    const { nullable, undefinable } = refNullish(declared as Schema.Top | undefined)
+    const { nullable, undefinable } = refNullish(
+      declared as Schema.Top | undefined,
+      refModelOf(ref),
+    )
     const id = nullable ? Schema.NullOr(ref.keySchema as Schema.Codec<any>) : ref.keySchema
     if (optional !== undefined) return optional.rewrap(id)
     return undefinable ? Schema.UndefinedOr(id as Schema.Codec<any>) : id
@@ -3572,7 +3608,10 @@ export const buildDerivedSchemas = (
       if (pkComposites.has(ref.fieldName) || pkComposites.has(ref.idFieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
       // `null` detaches a ref the model declares nullable, as `.remove()` an optional one.
-      const nullable = refNullish(ownValue(modelFields, ref.fieldName) as Schema.Top).nullable
+      const nullable = refNullish(
+        ownValue(modelFields, ref.fieldName) as Schema.Top,
+        refModelOf(ref),
+      ).nullable
       const id = nullable ? Schema.NullOr(ref.keySchema as Schema.Codec<any>) : ref.keySchema
       setOwn(acc, ref.idFieldName, Schema.optionalKey(id as Schema.Top))
     }

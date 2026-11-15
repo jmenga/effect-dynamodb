@@ -57,6 +57,7 @@ import {
   type DeepSubstitutionOptions,
   entityRefsOf,
   type HeldRefs,
+  heldRefMember,
   keepsAsGiven,
   matchDateRepresentation,
   optionalField,
@@ -1926,6 +1927,26 @@ const keepsWrapper = (field: Schema.Top): boolean => {
     : optional.union === undefined && !SchemaAST.isUnion(optional.inner.ast)
 }
 
+/**
+ * A ref declared in a union (`Schema.NullOr(DynamoModel.ref(Team))`, `Schema.NullOr(Team.annotate(…))`),
+ * beneath an optional wrapper or not, as an entity's read holds it: the union, its member that holds
+ * the ref taken as {@link heldRefMember} takes it (what a read of the ref's entity returns, where the
+ * walker can't see into the member), and every other member as declared. `undefined` where that
+ * changes no member. The walker re-applies the optional wrapper.
+ */
+const heldInUnion = (field: Schema.Top, model: Schema.Top): Schema.Top | undefined => {
+  const optional = optionalField(field)
+  const union = optional?.union ?? optional?.inner ?? field
+  const members = (union as { readonly members?: ReadonlyArray<Schema.Top> }).members
+  if (!SchemaAST.isUnion(union.ast) || members === undefined) return undefined
+  const held = members.map((member) => heldRefMember(member, model) ?? member)
+  return held.every((member, at) => member === members[at])
+    ? undefined
+    : (Schema.Union(
+        held as unknown as ReadonlyArray<Schema.Codec<unknown>>,
+      ) as unknown as Schema.Top)
+}
+
 /** The structural slice of an edge's target entity that ref resolution reads. */
 interface RefTargetEntity {
   readonly model?: Schema.Top
@@ -2013,6 +2034,11 @@ const collectRefTargets = (
         if (field !== undefined && keepsWrapper(field)) {
           if (isOpaqueRefField(field)) register(field, held.model, false)
           else registerHeld(field)
+        } else if (field !== undefined && !targets.has(field)) {
+          // In a union, its member alone. Up to 1.42.1 a pure definition's was replaced whole, so
+          // a `null` failed; on this package's `Entity.make`, a date there was stored as a map.
+          const union = heldInUnion(field, held.model)
+          if (union !== undefined) targets.set(field, union)
         }
         nested(held.model, held.refs, new Set([...on, held.model]))
       }

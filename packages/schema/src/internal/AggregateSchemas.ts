@@ -38,6 +38,7 @@ import {
   extractKeyedValue,
   getSchemaFields as getSchemaFieldsImpl,
   isFieldOptional as isFieldOptionalImpl,
+  isSameSchemaNode,
 } from "./SchemaAccessors.js"
 
 // ---------------------------------------------------------------------------
@@ -743,30 +744,6 @@ export const keyValueOf = (field: Schema.Top, value: unknown): Option.Option<unk
 // ---------------------------------------------------------------------------
 // A `many` element's references: which values `create` fetches an entity for
 // ---------------------------------------------------------------------------
-
-/** What a copy of a schema node may change without changing what the node holds. */
-const notWhatItHolds: ReadonlySet<string> = new Set(["annotations", "checks", "context"])
-
-/**
- * Whether two schema nodes are one schema: the same node, or a copy of it that changes only its
- * annotations (`DynamoModel.ref`, `.annotate`), its checks (`.check`) or the optionality of the key
- * it's under. Every other part is the same object. Decided from the definitions alone: a struct
- * declared again with the same fields is another schema.
- */
-const isSameSchemaNode = (a: SchemaAST.AST, b: SchemaAST.AST): boolean => {
-  if (a === b) return true
-  if (a._tag !== b._tag) return false
-  const held = (ast: SchemaAST.AST) => Object.keys(ast).filter((key) => !notWhatItHolds.has(key))
-  const keys = held(a)
-  return (
-    keys.length === held(b).length &&
-    keys.every(
-      (key) =>
-        (a as unknown as Record<string, unknown>)[key] ===
-        (b as unknown as Record<string, unknown>)[key],
-    )
-  )
-}
 
 /**
  * Whether a schema is the entity's own model: the schema its definition declares (its
