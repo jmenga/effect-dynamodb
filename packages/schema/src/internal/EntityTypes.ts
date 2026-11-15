@@ -504,18 +504,21 @@ type OptionalKeysOf<T> = { [K in keyof T]-?: {} extends Pick<T, K> ? K : never }
  * The `${ref}Id` fields a `put` / `create` input takes (#241): required where the model requires
  * the ref, optional where it declares the ref optional (`Schema.optionalKey`, and `Schema.optional`,
  * which takes `undefined` too), so an optional ref can be left out. Up to 1.40.0 every id was
- * required.
+ * required. Each takes `null` where the model declares the ref nullable (`Schema.NullOr`), and a
+ * required one `undefined` where it declares `Schema.UndefinedOr`.
  */
 type RefIdInputFields<TModel extends Schema.Top, TRefs> = {
   readonly [K in keyof TRefs & string as K extends OptionalKeysOf<ModelType<TModel>>
     ? never
-    : `${K}Id`]: EntityIdentifierValue<TRefs[K]>
+    : `${K}Id`]:
+    | EntityIdentifierValue<TRefs[K]>
+    | Extract<ModelType<TModel>[K & keyof ModelType<TModel>], null | undefined>
 } & {
   readonly [K in keyof TRefs & string as K extends OptionalKeysOf<ModelType<TModel>>
     ? `${K}Id`
     : never]?:
     | EntityIdentifierValue<TRefs[K]>
-    | Extract<ModelType<TModel>[K & keyof ModelType<TModel>], undefined>
+    | Extract<ModelType<TModel>[K & keyof ModelType<TModel>], null | undefined>
 }
 
 /** Entity ref input type: when refs present, replace ref fields with branded ID fields */
@@ -575,10 +578,13 @@ export type EntityRefUpdateType<
         Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes> | (keyof TRefs & string)>
       > & {
         // A ref's id that is a primary key composite is part of the key, which no update changes.
+        // `null` detaches a ref the model declares nullable.
         readonly [K in keyof TRefs & string as Exclude<
           `${K}Id`,
           string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>
-        >]?: EntityIdentifierValue<TRefs[K]>
+        >]?:
+          | EntityIdentifierValue<TRefs[K]>
+          | Extract<ModelType<TModel>[K & keyof ModelType<TModel>], null>
       },
       TTimestamps,
       TVersioned,

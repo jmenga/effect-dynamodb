@@ -1185,6 +1185,24 @@ export const optionalField = (field: Schema.Top): OptionalField | undefined => {
 }
 
 /**
+ * @internal Whether a ref's declaration takes `null` (`Schema.NullOr`, a union with `Schema.Null`)
+ * or, as a member of its own union, `undefined` (`Schema.UndefinedOr`), beneath an optional wrapper
+ * or not. `Schema.optional`'s own `undefined` is the wrapper's, not the ref's.
+ */
+export const refNullish = (
+  declared: Schema.Top | undefined,
+): { readonly nullable: boolean; readonly undefinable: boolean } => {
+  if (declared === undefined) return { nullable: false, undefinable: false }
+  const optional = optionalField(declared)
+  const inner = optional?.union ?? optional?.inner ?? declared
+  const members = SchemaAST.isUnion(inner.ast) ? inner.ast.types : []
+  return {
+    nullable: members.some((member) => SchemaAST.isNull(member)),
+    undefinable: optional === undefined && members.some((member) => SchemaAST.isUndefined(member)),
+  }
+}
+
+/**
  * Options for {@link substituteSchemaDeep}, applied only at the IMMEDIATE
  * (top-level) fields of the passed schema — recursion into nested structures
  * proceeds without them.
@@ -3355,7 +3373,8 @@ export const buildDerivedSchemas = (
       : targetModel
     // As optional as the model declares it (#241): a row an optional ref was left out of, or
     // removed from, reads without it. Up to 1.40.0 the target replaced the declaration whole.
-    const optional = optionalField(ownValue(modelFields, ref.fieldName) as Schema.Top)
+    const declared = ownValue(modelFields, ref.fieldName) as Schema.Top
+    const optional = optionalField(declared)
     const asDeclared = (target: Schema.Top) =>
       optional === undefined ? target : optional.rewrap(target)
     // In the storage the target's `DynamoModel.configure` gives its fields, which the ref holds them
@@ -3370,23 +3389,21 @@ export const buildDerivedSchemas = (
       ...(storage === undefined ? {} : { configuredStorage: storage }),
       ...(Object.keys(nested).length === 0 ? {} : { heldRefs: nested }),
     }
-    // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
-    setOwn(
-      fields,
-      ref.fieldName,
-      asDeclared(refHeldSchema(resolved, { enforceChecks: true, ...configured })),
-    )
-    setOwn(
-      readFields,
-      ref.fieldName,
-      asDeclared(
-        refHeldSchema(resolved, {
-          legacyReads: true,
-          absentReads: true,
-          ...configured,
-        }),
-      ),
-    )
+    // What a read of the target returns (`refHeldSchema`): its required hidden fields left out. A
+    // ref the model declares in a union (`Schema.NullOr`, `Schema.UndefinedOr`, one with other
+    // members) keeps it: the walk re-points the ref's member alone (`heldRef`), as it does a ref
+    // nested in a ref's target, so a row holding `null` for it reads. Up to 1.42.1 the target
+    // replaced the union, and a `null` failed every read (`Expected object`).
+    const inUnion = SchemaAST.isUnion((optional?.union ?? optional?.inner ?? declared).ast)
+    const held = (options: DeepSubstitutionOptions) =>
+      inUnion
+        ? substituteSchemaDeep(declared, { ...options, heldRef: { model: resolved, refs: nested } })
+        : asDeclared(refHeldSchema(resolved, options))
+    setOwn(fields, ref.fieldName, held({ enforceChecks: true, ...configured }))
+    const read = held({ legacyReads: true, absentReads: true, ...configured })
+    // ...and, as every other field of a read, an absent attribute as the value it stands for (a
+    // `Schema.UndefinedOr` ref left out reads as `undefined`).
+    setOwn(readFields, ref.fieldName, inUnion ? readingAbsent(read) : read)
   }
 
   // Each of Effect's look-alike declarations (a `BigDecimal`, a `Duration`, an address, a date in
@@ -3476,11 +3493,16 @@ export const buildDerivedSchemas = (
   const refFieldSet = new Set(resolvedRefs.map((r) => r.fieldName))
   // A ref's id is taken as the model takes the ref (#241): required where it's required, and left
   // out (`Schema.optionalKey`) or `undefined` too (`Schema.optional`) where the model declares the
-  // ref optional, which then stores no ref. Up to 1.40.0 the id was always required.
+  // ref optional, which then stores no ref. Up to 1.40.0 the id was always required. Where the model
+  // declares the ref nullable (`Schema.NullOr`) the id takes `null` too, which stores `null` for the
+  // ref and fetches nothing, and `undefined` where it declares `Schema.UndefinedOr`.
   const refIdInput = (ref: (typeof resolvedRefs)[number]): Schema.Top => {
     const declared = modelFields[ref.fieldName]
     const optional = declared === undefined ? undefined : optionalField(declared as Schema.Top)
-    return optional === undefined ? ref.keySchema : optional.rewrap(ref.keySchema)
+    const { nullable, undefinable } = refNullish(declared as Schema.Top | undefined)
+    const id = nullable ? Schema.NullOr(ref.keySchema as Schema.Codec<any>) : ref.keySchema
+    if (optional !== undefined) return optional.rewrap(id)
+    return undefinable ? Schema.UndefinedOr(id as Schema.Codec<any>) : id
   }
   const buildInputFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
     const acc: globalThis.Record<string, Schema.Top> = {}
@@ -3549,7 +3571,10 @@ export const buildDerivedSchemas = (
       // A ref's id that is a primary key composite is part of the key, which no update changes.
       if (pkComposites.has(ref.fieldName) || pkComposites.has(ref.idFieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      setOwn(acc, ref.idFieldName, Schema.optionalKey(ref.keySchema as Schema.Top))
+      // `null` detaches a ref the model declares nullable, as `.remove()` an optional one.
+      const nullable = refNullish(ownValue(modelFields, ref.fieldName) as Schema.Top).nullable
+      const id = nullable ? Schema.NullOr(ref.keySchema as Schema.Codec<any>) : ref.keySchema
+      setOwn(acc, ref.idFieldName, Schema.optionalKey(id as Schema.Top))
     }
     return acc
   }
@@ -3949,8 +3974,8 @@ type UnionWayAt = {
   readonly original: Schema.Top
   readonly asDeclared: boolean
   readonly parent: UnionParent
-  /** The nested ref `original` holds, if it holds one (`DeepSubstitutionOptions.heldRef`). */
-  readonly heldRef?: HeldRef | undefined
+  /** Where `original` is: the segments to it, the field's name first ({@link storedSchema}). */
+  readonly path: ReadonlyArray<string | number>
 }
 
 /**
@@ -4589,8 +4614,10 @@ export const makePathValueEncoder = (
       parent: UnionParent,
     ): void => {
       if (depth === rest.length) {
-        const heldRef = nestedRefAt(segments)
-        ways.push({ choices, end: { _tag: "At", original: schema, asDeclared, parent, heldRef } })
+        ways.push({
+          choices,
+          end: { _tag: "At", original: schema, asDeclared, parent, path: segments },
+        })
         return
       }
       const segment = rest[depth]!
@@ -4612,18 +4639,25 @@ export const makePathValueEncoder = (
     walk(start, 0, new Map(), false, "other")
     return ways
   }
-  const wayStored = new Map<Schema.Top, Map<HeldRef | undefined, Schema.Top>>()
+  const wayStored = new Map<Schema.Top, Map<string, Schema.Top>>()
+  /**
+   * What a row holds at a way's end: below a field, as a write stores it there ({@link storedSchema}:
+   * a ref's target's fields in the storage its `configure` gives them, at any depth). Up to 1.42.1 a
+   * way's end was taken in the default storage, so a whole ref written below a union on the way
+   * (`pathSet(["a", "b", "team"], team)` through a `NullOr`) failed in epoch storage.
+   */
   const wayDeclared = (way: UnionWayAt): Schema.Top => {
     if (way.asDeclared) return way.original
-    const byRef = wayStored.get(way.original) ?? new Map<HeldRef | undefined, Schema.Top>()
-    wayStored.set(way.original, byRef)
-    const found = byRef.get(way.heldRef)
+    const byPath = wayStored.get(way.original) ?? new Map<string, Schema.Top>()
+    wayStored.set(way.original, byPath)
+    const key = JSON.stringify(way.path)
+    const found = byPath.get(key)
     if (found !== undefined) return found
-    const stored = substituteSchemaDeep(way.original, {
-      enforceChecks: true,
-      ...(way.heldRef === undefined ? {} : { heldRef: way.heldRef }),
-    })
-    byRef.set(way.heldRef, stored)
+    const stored =
+      way.path.length > 1
+        ? storedSchema(way.path, way.original)
+        : substituteSchemaDeep(way.original, { enforceChecks: true })
+    byPath.set(key, stored)
     return stored
   }
   const wayValidators = new Map<Schema.Top, (encoded: unknown) => unknown>()
@@ -4711,7 +4745,7 @@ export const makePathValueEncoder = (
       original: schema,
       asDeclared,
       parent,
-      heldRef: nestedRefAt(path),
+      path,
     }
     if (strict && ending.length > 0 && (ending.length > 1 || further.length > 0)) return false
     for (const { clause } of ending) {
