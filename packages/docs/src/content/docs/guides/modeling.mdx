@@ -189,7 +189,7 @@ Rows an earlier release stored aren't touched. They stay as they are and still f
 
 #### Untyped fields
 
-A `Schema.Unknown` or `Schema.Any` field, or a position of one anywhere in a field, stores the value as given, so only the value can say whether DynamoDB keeps it. A value holding a part DynamoDB doesn't store fails its write with a `ValidationError` (`EDD-9161`) naming the path, and nothing is written:
+A `Schema.Unknown`, `Schema.Any` or `Schema.ObjectKeyword` field, or a position of one anywhere in a field, stores the value as given, so only the value can say whether DynamoDB keeps it. A value holding a part DynamoDB doesn't store fails its write with a `ValidationError` (`EDD-9161`) naming the path, and nothing is written:
 
 - a `Date`, valid or not, and a `RegExp`, which the marshaller writes as an empty map that reads back as `{}`;
 - a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`, whose content isn't in its properties;

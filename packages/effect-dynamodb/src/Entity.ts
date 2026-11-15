@@ -378,6 +378,7 @@ import {
   allCompositeAttributes,
   allKeyFieldNames,
   type DerivedSchemas,
+  entityRefsOf,
   getSchemaFields,
   heldStorageOf,
   inferDefaultEncoding,
@@ -385,6 +386,7 @@ import {
   type PathSetValue,
   primaryKeyComposites,
   type ResolvedSystemFields,
+  refHeldTarget,
   resolveUniqueFields,
   type UnionClause,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
@@ -1932,12 +1934,17 @@ export type VectorIndexNames<TVectorIndexes> =
 
 /**
  * What `.keepRefs()` takes (#263): the ids of the refs an update can keep, each typed as `.set()`
- * takes it (`{ playerId?: string }`). `never` for an entity without refs, which makes `.keepRefs()`
- * uncallable on it.
+ * takes it (`{ playerId?: string }`), without the `null` that detaches a nullable ref. `never` for
+ * an entity without refs, which makes `.keepRefs()` uncallable on it.
  */
 export type KeptRefIds<TRefs, TUpdate> = [TRefs] extends [undefined]
   ? never
-  : Pick<TUpdate, `${keyof TRefs & string}Id` & keyof TUpdate>
+  : {
+      [K in keyof Pick<TUpdate, `${keyof TRefs & string}Id` & keyof TUpdate>]: Exclude<
+        TUpdate[K],
+        null
+      >
+    }
 
 export interface BoundEntity<
   TModel extends Schema.Top,
@@ -2888,6 +2895,18 @@ const makeImpl = <
     isSchemaClass,
     hasHiddenFields,
   } = data
+  /**
+   * Whether a ref of the model holds less than its target's class (`refHeldTarget`: a required
+   * hidden field left out), a plain object the model's own constructor refuses. Up to 1.42.1 a read
+   * of such a class model in "model" mode, which a ref to this entity hydrates through, died.
+   */
+  const refsHoldLess = (
+    data.resolvedRefs as ReadonlyArray<{ readonly refEntity?: { readonly model?: unknown } }>
+  ).some((ref) => {
+    const model = ref.refEntity?.model
+    const target = (isConfiguredModel(model) ? model.model : model) as Schema.Top | undefined
+    return target !== undefined && refHeldTarget(target) !== target
+  })
   /** Which stored attributes are this entity's sparse map entries, as a row's reader takes them. */
   const sparseEntries = sparseReader(sparseFields)
   /** The attributes `field:` renames store sparse maps under whole, by attribute. */
@@ -3064,6 +3083,20 @@ const makeImpl = <
       ).flatMap((ref) => {
         const storage = heldStorageOf(ref.refEntity)
         return storage === undefined ? [] : [[ref.fieldName, storage] as const]
+      }),
+    ),
+    // ...and its target's own refs as what a read of each of their entities returns, at any depth.
+    Object.fromEntries(
+      (
+        data.resolvedRefs as ReadonlyArray<{
+          readonly fieldName: string
+          readonly refEntity?: { readonly model?: unknown }
+        }>
+      ).flatMap((ref) => {
+        const model = ref.refEntity?.model
+        if (model === undefined) return []
+        const target = (isConfiguredModel(model) ? model.model : model) as Schema.Top
+        return [[ref.fieldName, { model: target, refs: entityRefsOf(ref.refEntity) }] as const]
       }),
     ),
   )
@@ -5976,11 +6009,48 @@ const makeImpl = <
    * on the guarded path after the item is marshalled, and the marshaller
    * would refuse a `NaN` as a defect.
    */
+  /**
+   * A write of a whole item giving no id (`null`, or left out) for a ref whose id is a primary key
+   * composite: every item has a primary key, and a ref without an id has none to compose it from.
+   * Refused before anything is sent (`EDD-9169`). Up to 1.42.1 a left-out id died in key
+   * composition (`Missing composite attribute`), and a nullable ref's `null` failed decoding.
+   */
+  const refuseUnkeyedRefs = (
+    record: globalThis.Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    const ref = resolvedRefs.find(
+      (r) => primaryKeyComposites.includes(r.idFieldName) && given(record, r.idFieldName) == null,
+    )
+    return ref === undefined
+      ? Effect.void
+      : Effect.fail(
+          new ValidationError({
+            entityType,
+            operation,
+            cause:
+              `[EDD-9169] the primary key is composed from "${ref.idFieldName}", the id of ref ` +
+              `"${ref.fieldName}", and the write ${given(record, ref.idFieldName) === null ? "gives null" : "leaves it out"}: ` +
+              "every item has a primary key, and a ref without an id has none to compose it from. " +
+              `Give "${ref.idFieldName}". Nothing was sent.`,
+          }),
+        )
+  }
+
   const composeAllKeys = (
     record: globalThis.Record<string, unknown>,
     operation: string,
     /** {@link ownSchema} for a write of the item's own values; a restore composes what's stored. */
     under: DynamoSchema.DynamoSchema = schema,
+  ) =>
+    Effect.andThen(refuseUnkeyedRefs(record, operation), () =>
+      composeAllKeysOf(record, operation, under),
+    )
+
+  const composeAllKeysOf = (
+    record: globalThis.Record<string, unknown>,
+    operation: string,
+    under: DynamoSchema.DynamoSchema,
   ) =>
     composeKeysOrFail(entityType, operation, () => {
       const keys = KeyComposer.composeAllKeys(
@@ -6432,7 +6502,7 @@ const makeImpl = <
             : schemas.itemSchema
       return Schema.decodeUnknownEffect(targetSchema as Schema.Codec<any>)(raw).pipe(
         Effect.map((decoded) =>
-          mode === "model" && isSchemaClass && !hasHiddenFields
+          mode === "model" && isSchemaClass && !hasHiddenFields && !refsHoldLess
             ? new (rawModel as any)(decoded)
             : mode !== "item"
               ? attachPrototype(decoded)
@@ -8695,7 +8765,10 @@ const makeImpl = <
     Effect.gen(function* () {
       const given = uState.keepRefs
       if (given === undefined) return undefined
-      const named = Object.keys(given).filter((name) => given[name] !== undefined)
+      // A `null` (a detached ref's id, which the types refuse here) keeps nothing.
+      const named = Object.keys(given).filter(
+        (name) => given[name] !== undefined && given[name] !== null,
+      )
       if (named.length === 0) return undefined
       const primaryComposites = new Set([
         ...config.indexes.primary.pk.composite,
@@ -8776,11 +8849,18 @@ const makeImpl = <
   /**
    * What an update's `.remove()` removes, as the index key composer is told (`removedSet`): the
    * fields named, and the id of each ref removed, which is the composite a cascade index is keyed
-   * by (#241), so the row leaves that index as it leaves the ref.
+   * by (#241), so the row leaves that index as it leaves the ref. A nullable ref an update sets to
+   * `null` (`.set({ teamId: null })`) is detached as `.remove()` detaches an optional one.
    */
-  const removedSetOf = (removed: ReadonlyArray<string> | undefined): Set<string> | undefined => {
-    if (removed === undefined) return undefined
-    const set = new Set(removed)
+  const removedSetOf = (uState: {
+    readonly remove?: ReadonlyArray<string> | undefined
+    readonly updates?: unknown
+  }): Set<string> | undefined => {
+    const updates = (uState.updates ?? {}) as globalThis.Record<string, unknown>
+    const detached = resolvedRefs.filter((ref) => ownValue(updates, ref.idFieldName) === null)
+    if (uState.remove === undefined && detached.length === 0) return undefined
+    const set = new Set(uState.remove)
+    for (const ref of detached) set.add(ref.fieldName)
     for (const ref of resolvedRefs) if (set.has(ref.fieldName)) set.add(ref.idFieldName)
     return set
   }
@@ -8802,13 +8882,15 @@ const makeImpl = <
   > =>
     Effect.gen(function* () {
       // A ref whose id isn't given (an optional ref left out, #241) names nothing: nothing is
-      // fetched for it and nothing stored. Up to 1.40.0 its id was required.
+      // fetched for it and nothing stored. Up to 1.40.0 its id was required. A `null` id (a ref
+      // the model declares nullable) names nothing either: the ref holds `null`.
       const refsToProcess = (refs ?? resolvedRefs).filter(
-        (ref) => decoded[ref.idFieldName] !== undefined,
+        (ref) => decoded[ref.idFieldName] !== undefined && decoded[ref.idFieldName] !== null,
       )
       const hydrated = { ...decoded }
       for (const ref of refs ?? resolvedRefs) {
-        if (hydrated[ref.idFieldName] === undefined) delete hydrated[ref.idFieldName]
+        if (hydrated[ref.idFieldName] === null) hydrated[ref.fieldName] = null
+        if (hydrated[ref.idFieldName] == null) delete hydrated[ref.idFieldName]
       }
       if (refsToProcess.length === 0) return hydrated
 
@@ -10115,7 +10197,7 @@ const makeImpl = <
           // first, so a shard it can compute is not refused here (#183).
           {
             onMissingShardSource: "keep",
-            ...(uState.remove === undefined ? {} : { removedSet: removedSetOf(uState.remove)! }),
+            ...(removedSetOf(uState) === undefined ? {} : { removedSet: removedSetOf(uState)! }),
           },
         ),
       )
@@ -10530,7 +10612,7 @@ const makeImpl = <
         // update doesn't give is the one the row holds (`heldRefsOf`, #263), so the half composes
         // as a `put` of the row would, guarded as read below. Up to 1.41.0 those ids were missing
         // here, so such a half was truncated before the first.
-        const retainRemovedSet = removedSetOf(uState.remove)
+        const retainRemovedSet = removedSetOf(uState)
         const heldRefs = heldRefsOf(
           newItem,
           withRefIds(hydratedUpdates, encodedUpdates),
@@ -11641,8 +11723,9 @@ const makeImpl = <
       //     attribute from the item only. They do NOT cascade GSI drops —
       //     under v3 two-way classification, the structural composer just
       //     treats the attribute as absent. (EDD-9025 guarantees these
-      //     are never composites.)
-      const removedSet = removedSetOf(uState.remove)
+      //     are never composites.) A nullable ref's id set to `null` is
+      //     neither: its ref is detached as `remove` detaches an optional one.
+      const removedSet = removedSetOf(uState)
       if (uState.remove) {
         for (const attr of uState.remove) {
           const nameKey = `#r${removeClauses.length}`
@@ -13572,6 +13655,11 @@ const makeImpl = <
             )
           ) {
             return yield* guardedUpsert(input, mode, opts)
+          }
+
+          // Before another ref is read: a primary key composed from a ref's id needs it.
+          if (hasRefs) {
+            yield* refuseUnkeyedRefs(encodedInput as globalThis.Record<string, unknown>, "upsert")
           }
 
           // Hydrate refs: replace ID fields with full entity domain data

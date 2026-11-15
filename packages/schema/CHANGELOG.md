@@ -1,5 +1,27 @@
 # @effect-dynamodb/schema
 
+## 1.42.2
+
+### Patch Changes
+
+- [#279](https://github.com/jmenga/effect-dynamodb/pull/279) [`1f5c1c4`](https://github.com/jmenga/effect-dynamodb/commit/1f5c1c4875b1f4ad103804b0ecb7270c21897e69) Thanks [@jmenga](https://github.com/jmenga)! - `Aggregate.list` no longer drops a list key value given after a sort key composite left out. On a list keyed `sk: [league, season, name]`, `list({ league: "bbl", name: "Smith" })` returned every `bbl` aggregate, whatever its name; a value after the gap now matches an aggregate as it would in the key, whole and by its key text, so the schema's casing applies to it as to the leading values (`{ league: "BBL", name: "smith" }` finds `Smith` under the default casing). A number, or any value under a casing that doesn't fold text, is compared in the root-item filter; text under a folding casing is matched on the root items read, before any aggregate is assembled. `limit` and `cursor` page over the matches. With a gap, `prefix: true` changes nothing. A key without a gap sends the same requests as before.
+
+  A `list` filter operand that is a plain number, bigint or boolean is now sent in the form the root row stores its field, as an entity's filter operand is: `eq(t.caps, 7)` on a `Schema.NumberFromString` root field sends `"7"` and matches, where it was sent as a number and matched nothing. Text compared with a text-stored field is sent as given, as before. A `DateTime` against a `Schema.DateTimeUtcFromString` root field ([#124](https://github.com/jmenga/effect-dynamodb/issues/124)) has been sent as its ISO text since 1.41.0.
+
+- [#283](https://github.com/jmenga/effect-dynamodb/pull/283) [`0c1e10e`](https://github.com/jmenga/effect-dynamodb/commit/0c1e10e2bc257000918cbe4ca5352fec3b978e6c) Thanks [@jmenga](https://github.com/jmenga)! - A ref declared as a copy of its target's class that changes only its annotations (`team: Team.annotate({ description: "…" })`), or as a `Schema.suspend` of it (or of a suspend of it), now works wherever the class itself does. Nested in a ref's target (`Selection` refs `Player`, whose model declares `team` that way), a `Selection` `put` stored its row and then failed with `Expected DateTime.Utc at player.team.founded`, as did every read of it, and a condition or `pathSet` on `player.team.founded` sent the date in the wrong form; it now sends what the plain class sends, and the rows such a `put` left behind read. Declared nullable (`Schema.NullOr(Team.annotate(…))`), the ref takes `null` as `Schema.NullOr(Team)` does, and so does a ref whose `null` is in a union inside its union (`Schema.UndefinedOr(Schema.NullOr(Team))`, `Schema.Union([Schema.String, Schema.NullOr(Team)])`), whose ID took no `null` up to 1.42.1.
+
+  In an aggregate, a ref that an edge entity's model declares in a union (`Schema.NullOr(DynamoModel.ref(Team))`, `Schema.NullOr(Team.annotate(…))`, a union inside one included) or as a `Schema.suspend` of its target now stores a date below it as ISO text and reads it back, and holds `null` where its union takes it. Up to 1.42.1, under an edge entity made with `Entity.make`, the date was stored as a map and read back as a plain object; rows holding such maps read as dates. A ref's union keeps its other members (and so holds `null`) only where none of them can take an object: `null`, `undefined`, a string, a number or a literal beside the target. A union holding another class or a struct, beside the target or in its place, is replaced by the target, as before, and the ref's ID takes no `null`.
+
+- [#281](https://github.com/jmenga/effect-dynamodb/pull/281) [`3b4f0ce`](https://github.com/jmenga/effect-dynamodb/commit/3b4f0cef4060e56cdff57256dfc699cee88cbb94) Thanks [@jmenga](https://github.com/jmenga)! - A ref whose target's model declares a ref of its own with `DynamoModel.ref` (`Selection` refs `Player`, whose model holds `team: DynamoModel.ref(Team)`) now works as it does when `Player` declares `team: Team` with `configure`'s `{ ref: true }`, at any depth. Up to 1.42.1 a `Selection` `put` stored its row and then failed with `Expected DateTime.Utc at player.team.founded`, as did every read of it, and a condition, filter or `pathSet` on `player.team.founded` sent the date as a map. Both forms now send the requests the `configure` form sent in 1.42.1, the date in the team entity's storage (`storedAs` included). The rows such a `put` left behind hold those bytes and now read, and a nested date a 1.42.1 `pathSet` stored as a map reads as the date it holds.
+
+  Two levels deep, a ref whose innermost target has a required `DynamoModel.Hidden` field (`League` refs `Club`, which refs `Team`) no longer fails `League`'s write, whichever way the refs are declared. In an aggregate, a ref held by an edge entity's model, and the refs below it, now store their transformed fields encoded (a date as ISO text) and read them back. Up to 1.42.1, under an edge entity made with `Entity.make`, a date there was stored as a map and read back as a plain object; rows holding such maps read as dates.
+
+- [#282](https://github.com/jmenga/effect-dynamodb/pull/282) [`6a60541`](https://github.com/jmenga/effect-dynamodb/commit/6a60541e73d6c8f8b8664d89fdfa440d145d9af6) Thanks [@jmenga](https://github.com/jmenga)! - A ref the model declares nullable (`team: Schema.NullOr(Team).pipe(DynamoModel.ref)`, or `team: Schema.NullOr(Team)` configured `{ ref: true }`) can now hold `null`. Up to 1.42.1 it worked with a non-null ID only: its ID took no `null` (`put` failed with `Expected string at ["teamId"]`), and a row holding `null` failed every read with `Expected object`, an aggregate edge copying such a row included. It now behaves as an optional ref, with `null` stored where the optional form stores nothing: `put`, `create` and `upsert` take `teamId: null`, fetch nothing, and write no key of an index keyed by the ID and no unique constraint reservation; `.set({ teamId: null })` detaches the ref as `.remove(["team"])` detaches an optional one, and `.set({ teamId })` attaches it. `Entity.Input`, `Entity.Create` and `Entity.Update` type the ID `string | null`. A `Schema.UndefinedOr` ref's ID takes `undefined`, which stores nothing. Where the primary key is composed from a ref's ID, a non-null ID is written as before, and a `put`, `create` or `upsert` giving `null`, or leaving an optional ref's ID out, fails with a `ValidationError` (`EDD-9169`) and sends nothing; up to 1.42.1 a left-out ID died in key composition. Requests for non-null IDs, and for refs declared without `null`, are unchanged.
+
+  A path write of a whole ref below a union on the way (`pathSet(["child", "child", "child"], club)` beneath refs declared `Schema.NullOr`) is now stored in the referenced entity's storage. Up to 1.42.1 it was refused when that entity stores a date in epoch form.
+
+- [#280](https://github.com/jmenga/effect-dynamodb/pull/280) [`9ca1c2d`](https://github.com/jmenga/effect-dynamodb/commit/9ca1c2d49d5aaa5e49eb53ad881eb48ee6927f0d) Thanks [@jmenga](https://github.com/jmenga)! - A `Schema.ObjectKeyword` field is now checked as an untyped one, so a write whose value holds a part DynamoDB doesn't store (a `Date` written as an empty map, say) is refused with `EDD-9161` instead of stored as less than it is, as a packed field of that kind already refused it.
+
 ## 1.42.1
 
 ### Patch Changes
@@ -7,7 +29,6 @@
 - [#278](https://github.com/jmenga/effect-dynamodb/pull/278) [`22b6d2b`](https://github.com/jmenga/effect-dynamodb/commit/22b6d2baf48e047f012cf6b2e5bfc0b544f8bfd0) Thanks [@jmenga](https://github.com/jmenga)! - A `storedAs` set with `DynamoModel.configure` on an optional date now keeps the field optional and stores the date in the configured form.
 
   For a model field declared `Schema.optionalKey(Schema.DateTimeUtc)`, `Schema.optional(Schema.DateTimeUtc)` or `Schema.optionalKey(Schema.NullOr(Schema.DateTimeUtc))`, or an optional `Schema.Date`, with `configure(Model, { field: { storedAs: DynamoModel.DateEpochSeconds } })`:
-
   - An `optionalKey` date became required: a `put` that left it out failed with a `ValidationError` (`Missing key`). A value given was already stored in the configured form.
   - An `optional` date, and the date in `optionalKey(NullOr(...))`, ignored the setting: it was stored, compared in conditions and filters, and written by `update` as ISO text. A TTL attribute declared this way never expired, because DynamoDB's TTL only reads numbers. A model's own `optional` `createdAt` or `updatedAt` configured this way, which the library stamps in the configured form, read back as a date in January 1970.
 
@@ -38,7 +59,6 @@
 - [#276](https://github.com/jmenga/effect-dynamodb/pull/276) [`2bc58a0`](https://github.com/jmenga/effect-dynamodb/commit/2bc58a05bc7bc8f46fce285950a7c54be989040d) Thanks [@jmenga](https://github.com/jmenga)! - A ref now reads, compares and writes a field in the storage the referenced entity's `DynamoModel.configure` gives it.
 
   When the referenced entity's model sets a date field's stored form with `configure(Model, { field: { storedAs: ... } })` (for example `DateEpochSeconds`), the ref copy already held the field in that form, because the referenced item is stored as that entity encodes it. The referencing entity treated the copy as the default form instead:
-
   - `get`, queries and scans read the date wrong: epoch seconds were taken as milliseconds, giving a date in January 1970. A nullable date stored that way failed every read of the row, and the `put` that wrote it returned a `ValidationError` after writing the row.
   - A `.condition()` or `.filter()` on the field (`t.player.born`) sent ISO text, so it never matched.
   - `pathSet(["player", "born"], ...)` wrote ISO text into the copy.
@@ -123,7 +143,6 @@
 - [#251](https://github.com/jmenga/effect-dynamodb/pull/251) [`5119bad`](https://github.com/jmenga/effect-dynamodb/commit/5119badc4603bfa78bbf11f336d3f05e25b6b8e3) Thanks [@jmenga](https://github.com/jmenga)! - Effect's own value types: packed storage, key composites, and two fixes found on the way.
 
   **Run `rekey` first if you ran 1.38.0, 1.39.0 or 1.40.0 with `effect` 4.1.3 and a key or a unique constraint holds a zoned date or a named zone, at any depth (a list of them, a tuple, an `Option`), whose id the runtime resolves to a different id (an alias such as `Etc/UTC`, `GMT` or `US/Pacific`, or a renamed zone such as `Asia/Kolkata`): run `db.tables.<Table>.rekey({ repairIndexKeys: true })` before the table serves traffic on 1.41.0. Those releases keyed such a row by the name the zone was given, and 1.41.0 keys it by the name the runtime resolves it to, the key 1.40.0 composed on `effect` 4.1.2. `rekey` moves those rows, their snapshots, tombstones, time-series events, unique sentinels and aggregate rows, and rewrites their index keys. Before it runs, 1.41.0 treats such a row as absent, as at any key holding nothing: `get` reports `ItemNotFound` and an index accessor returns nothing; an `update` reports `ItemNotFound` and writes nothing; a `delete` reports success and leaves the row, except on an entity with a unique constraint or soft delete, whose delete reads the item first and reports `ItemNotFound`; an aggregate's `get`, `update` and `delete` report `AggregateAssemblyError`; a `put` writes a second row beside it, which `rekey` then reports as `bothKeys` and leaves; and the unique value the row holds isn't enforced, so another item can take it: then every `rekey` reports the row `taken` and leaves the row as it was (its zones and its index keys) and that value's sentinel where it is, as a dry run says, both items holding the value, until the other item lets go of it (a `delete`, say), after which the next `rekey` moves the sentinel and rewrites the row in one run and the value is enforced again. Separately, and for every named zone those releases stored on `effect` 4.1.3, whatever its name, not only an alias in a key: an equality condition or filter on a named-zone field, or a zoned date's, doesn't match the rows they wrote, on either Effect, as they stored the zone with its `resolvedId` (a date's text under the name given); `rekey` rewrites those values in the same pass (`zonesRewritten`) wherever the schema puts a zone in an entity's field, and leaves a zone in a sparse map's entries, in an aggregate's rows under their current keys, in an event stream's events and in an untyped field as 1.40.0 left it, matched once the row is next written. The resolved name is what the runtime's `Intl` makes of a zone's name, as it has been since 1.38.0, so it depends on the runtime's time zone data: a runtime that resolves a zone to another name keys it under another text.**
-
   - **Packed storage takes Effect's instances.** A packed write refused a real `Duration`, `BigDecimal`, time zone, cookie or cookie jar, `UrlParams`, `SemVer` / `SemVerRange`, address, network, interface or host, DNS record, `Option` or `Result` ("an instance of Object"), in an entity's packed field, an aggregate edge's, event data and an inline snapshot alike, though a native attribute stores each as a map and reads it back. Each is now packed as that map, keys in the order DynamoDB Local hands it back, as a real `DateTime` already was: exactly the bytes 1.40.0 packed for the map a native read hands back for it. Where the schema declares one it reads back as the instance, which writes back as the same bytes; in a `Schema.Unknown` it reads back as the map, as it does natively. What JSON can't hold is still refused at its path: a `MacAddress`'s or a TLSA record's bytes, a `BigDecimal` or a `Duration` past 2^53, and a bigint, a `Date` or bytes inside an `Option` or a `Result`. Nothing 1.40.0 packed changes by a byte, with one exception: a named zone's map holding a `resolvedId` (what 1.40.0 packed for every named zone on `effect` 4.1.3, and any map in an untyped field shaped like one) is packed as 1.40.0 packed it on 4.1.2, its `id` the resolved name and no `resolvedId` (below).
   - **Effect's look-alikes as key composites.** A `Duration`, `BigDecimal`, time zone, `UrlParams`, `SemVer` / `SemVerRange`, address or DNS record composite, or an `Option` or `Result` holding one, was refused with `EDD-9128` (a row read back composed `[object Object]`). A key read back from a row now composes from the instance it stands for, so it's the key `put` wrote, and rows 1.39.0 wrote under such a key are found, restored, updated and released as before. `restore` of a 1.39.0 tombstone lands under the key `put` wrote, an aggregate `update` of such a root works, and `rekey` moves none of these rows. An item 1.39.0's or 1.40.0's `restore` put back under `[object object]`, where `get` didn't find it, is moved by `rekey` to the key `put` wrote, with its index keys; the unique sentinel that `restore` wrote there is left and counted `unrecognizedKey`, and the value stays reserved by the one `put` wrote, which moves with the item when `escapeKeys` is turned on. `rekey` reads each composite of a key as each earlier release keyed it, in every combination (up to 64 readings of a row, each release's reading by itself always among them, and two readings composing one key text counted as two; a row past that is left and counted `unrecognizedKey`), so an item 1.39.0 restored on `effect` 4.1.3 under a key holding both a map's text and a zone under its given name is moved too. A `Cookie` or `Cookies` composite stays refused.
   - **A named time zone is stored the same on Effect 4.1.2 and 4.1.3.** Effect 4.1.3 gave a named zone a `resolvedId` and kept the name it was made from (`Etc/UTC`, where 4.1.2 resolved it to `UTC`), so on 4.1.3 every stored named zone, native or packed, gained an entry, and a zone made from an alias was stored, keyed and written as ISO text under another name. A named zone is now stored, keyed and compared as 1.40.0 stored it on 4.1.2, whichever Effect is installed, however it's reached (in a date, an `Option`, a list, an untyped field, behind a getter) and whether it was made or read: two zones Effect holds equal have one key text, unique sentinel and ISO text, wherever the schema puts them (a list or a tuple of zones or of zoned dates, an `Option`, a `Result`, a struct or a record in one, a union, a class instance in an `Option`, a list or an `Option` of one of Effect's string codecs). On 4.1.3 a list of zones keyed `timezone.named(etc/utc)`, so a `get` with the zone made from `UTC` didn't find the item and a unique constraint took both names. A zone already stored with a `resolvedId` reads back as the same zone on either Effect (where no schema types it, as the map it is, as 4.1.2's map always has), and is written in 4.1.2's form the next time the item is written; an `update` that doesn't touch the field leaves it as it is. `rekey` rewrites every such zone, and a zoned date's text naming the zone as given, wherever the schema puts one in an entity's rows (a field, a list, an `Option`, a struct, a packed field; items, snapshots, tombstones and time-series events), in place under a condition that each attribute is still as read, or in the row's move, and counts them in `zonesRewritten`; a value no schema types, Effect's codecs' text, a sparse map's entries, an aggregate's rows under their current keys and an event stream's events keep theirs, left as 1.40.0 left them until the row is next written, and a row holding none costs no request. Effect's own string codecs (`Schema.TimeZoneNamedFromString`, `Schema.TimeZoneFromString`, `Schema.DateTimeZonedFromString`) are Effect's, and still write the name the zone was made from on 4.1.3: the stored string for an alias zone differs after an upgrade from Effect 4.1.2 to 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`). Reads take both, and every key composed from such a field (a sort key, an index key, a unique sentinel, a time-series event's key, a `history().where()` bound) names the zone as 4.1.2 did, on either Effect. An equality condition or filter on that attribute compares the stored string, so it matches only the form the row holds.
@@ -184,7 +203,6 @@
   **Credentials given in part now fail the layer with the `Config`'s error for what is missing, and nothing is sent. A deployment that sets a key and secret, reads the token with `Config.String("TOKEN")` and has no token, started and signed with the default chain; it now fails at startup. Read a token that may be absent with `Config.String("TOKEN").pipe(Config.withDefault(undefined))`.** An empty value counts as missing, as it did.
 
   The layer fails only when the credentials are shown to be given in part. With one or two of the missing values stood in for, the `Config` must yield credentials, and each stand-in must be one of their three parts. A value the provider holds must be one of the parts too (trimming and case aside), and when it changes, that part must change with it and the other parts must not. Anything else still reads as absent, as before:
-
   - a profile, mode or flag that selects what to read, set with no keys, also when its value is the fixed text of a part;
   - a setting that would be a part only under a mode that is missing and has a default;
   - a key whose value the `Config` takes for none (`KEY=none`);
@@ -210,7 +228,6 @@
   A model field whose own name holds `#` and is stored under another name (`field:`) is named by that name in path writes and conditions, as filters and projections already named it. A path write and a condition took such a first segment as a literal attribute name, so `pathSet(["a#b"])` on a field `a#b` stored as `stored` set a top-level `a#b` that no read looks at, and a condition on `t["a#b"]` tested an attribute `put` never stores, failing whatever the row held, as on 1.39.0. The refusal of a `pathRemove` of a sparse map's entry asks about the attribute the path names after that rename, as `.remove()`'s does, so a field named like an entry (`data#x#y`, stored as `counter`) is removed where it's stored. 1.39.0 removed the entry `x#y` instead, and 1.40.0 refused the removal. An entry named through its map (`.entry("b")`, `.set({ g: { b } })`, `removeEntries`, `clearMap`) is still the entry's attribute when a field carries the same name: only a bare segment the caller spells like an entry names the field. A path write on segments `.entry()` built, on an entity whose unique constraint names such a field, wrote the field on 1.40.0; it writes the entry.
 
   A `pathRemove` that leaves a row no read can decode is refused in more places, with a `ValidationError` and nothing sent, and each was sent on 1.39.0 and 1.40.0:
-
   - Below a sparse map's entry (`pathRemove(["data#2026-01", "views"])`): judged against the map's own schema, as a read rebuilds the map. A map a `field:` rename stores whole isn't judged.
   - A list position whose removal moves a value where its position can't hold it: `f[0]` of a `[string, number?]` leaves the number where the string was.
   - A list position whose shortened list only a member its tag rules out reads: `p[0]` of `{ kind: "a", p: [string, string] }` beside `{ kind: "b", p: [string] }`.
@@ -265,7 +282,6 @@
   A write over a row 1.40.0 wrote (no token) is conditioned on every projection's bookkeeping as read, so it never replaces a 1.40.0 write landed since and never stalls. The other direction is not fixed in this release: a process still on 1.40.0 conditions its write on its own checkpoint or revision alone, so during a rolling deployment its stale write can still replace another projection's, as on 1.40.0. The token protects a row once every writer of the read model runs 1.41.0 or later.
 
   A read model with one projection carries no token and sends what 1.40.0 did, with these exceptions:
-
   - `create` over a tombstone is conditioned on the projections' bookkeeping as it read it, beside the removal stamp, so a row written over the tombstone and removed again within the same millisecond no longer lets `create` carry the older tombstone's checkpoints.
   - A projection with `removal` and no revision, writing over a tombstone it read, checks that it is still a tombstone, so it no longer replaces a row `create` wrote there.
   - On a read model with `removal`, a projection's write for a row it read absent no longer replaces a tombstone written since (1.39.0 and 1.40.0 lost the removal for good), and no longer reads the key a second time.
@@ -303,7 +319,6 @@
   **A planned update's or delete's condition with an empty part is refused in `Transaction.transactWrite`.** An `or()` with no parts or a `NaN` operand in the condition of an update, or of a retained entity's delete, made the transaction die with a defect (`compileExpr: or() has no parts`), sometimes after a `GetItem`. It's now refused with a `ValidationError` (`transactWrite.condition`) before any op of the transaction reads or sends anything, as the same write alone is. Also on 1.39.0.
 
   **A record operation on a value of another kind is refused on every path, as DynamoDB refuses its expression.** An update that reads its row first (a `versioned: { retain: true }` entity's, one changing a unique field, one computing an index composite) applies `.add()`, `.subtract()`, `.append()` and `.deleteFromSet()` to the row it read, where any other update sends them as an expression, which DynamoDB refuses on a value of another kind. Each of these now fails as the expression does, with `DynamoValidationError` (`TransactWriteItems`) and nothing written. Some of them completed on 1.40.0, and now fail:
-
   - `.append()` to a string: wrote the string's characters and the operand as a list, then failed (`ValidationError`), leaving a row that no longer read;
   - `.subtract()` from a string: died on `NaN` (an index composite computed: `ValidationError`, nothing written);
   - `.add()` of a number to a string: stored `"abc2"`;
@@ -345,7 +360,6 @@
   Without `ownsRows`, neither `update` nor `rekey` deletes or moves a row the aggregate's value doesn't key. On a `many` edge whose custom `decompose` encodes its keyed field itself (`f / 10` on a field that multiplies by 10), the value read back keys the edge's rows elsewhere. So removing an element leaves its row, and `get` still returns it. Changing the keyed value leaves the old row beside the new one, and `rekey` leaves the edge's rows under the old partition key. An edge row a custom `assemble` drops stays too. Two aggregates that share a partition and an entity type can still delete each other's rows where their keys collide. All of this is as on 1.39.0.
 
   With `ownsRows: true` on `Aggregate.make`:
-
   - **`update`** sends the transactions it sends without the option. After the last one commits, it deletes the rows it read of each edge that changed, where the new value doesn't write their keys. An edge changed when the update writes its transaction and the edge's items differ, compared as the update always compares them: entity types and stored attributes in order, not keys. After an update that changes an edge, that edge's rows are exactly what it decomposes to, but for a row another edge of the same entity type could hold, which is left. So a custom `decompose` that leaves out an element the value keeps loses that element's row. An edge the update doesn't change keeps its rows. These `Delete`s go in their own requests, up to 100 at a time, each on condition that the row is gone or still of the type read. A cancelled request is sent once more without the `Delete`s whose condition failed. The mutation never runs again and nothing is read again. If that fails too, the update fails as when a later sub-aggregate's transaction fails, and the rows it didn't delete stay until the next update that changes their edge. An update whose new value decomposes to what the old one did writes nothing: a codec that stores every number as 0 makes changing 50 to 60 a no-op.
   - **`rekey`** moves exactly the rows it moves without the option, with the same requests. Where any other row of the aggregate's types would go can't be told from what's stored, so it isn't moved. When such a row's own partition key changes, `rekey` reports the aggregate as a `failed` conflict naming the row and moves none of it. Otherwise it leaves the row and counts it under `skipped.unrecognizedKey`. An update that changes the row's edge deletes the row, which repairs a failed aggregate, unless another edge of the same entity type could hold the row. The dry run reports the same.
   - Neither reads, assembles or decomposes anything more than without the option.
@@ -374,7 +388,6 @@
   Where a transformation has one type on both sides, an aggregate took a value as its stored form if the stored side accepted it. On a field that multiplies by 10 on decode, `create(50)` returned 500 and stored 50, where an entity stores 5. Every `update`, whatever it changed, did it again to every such field in every row: the row then stored 500 and `get` returned 5000, then 5000 and 50000. Context fields and a hydrated ref's fields compounded the same way.
 
   Now `create(50)` stores 5 and returns 50, `get` returns 50, and an `update` of another field leaves it. A mutation that sets a field stores its encoded form, and a value that's neither form is still refused. An update that changes nothing still writes nothing.
-
   - **What this affected:** a custom transformation with one type on both sides, whatever the value, and `Schema.StringFromBase64`, `StringFromBase64Url`, `StringFromHex`, `StringFromUriComponent` and `fromJsonString`, for a value already valid in that form (`create("aGVsbG8=")` returned `"hello"`). That includes a plain word that happens to be valid base64: `create("test")` on `Schema.StringFromBase64` returned `"��-"` and stored `77+977+9LQ==`, so what it was given is gone. An entity stores `dGVzdA==` and reads `"test"`. It didn't affect a transformation that gives the same result twice, such as `Schema.Trim`, or one with different types on its two sides, such as `Schema.NumberFromString`, whose stored bytes don't move.
   - **If you pass the stored form to `create`, you need to change it, and nothing will warn you.** On 1.39.0 the stored form was the only input on these fields that read back as you meant: on a field that multiplies by 10, `create(5)` read 50, and on `Schema.StringFromBase64`, `create("aGVsbG8=")` read `"hello"`. It's a valid domain value too, and no check can tell the two apart, so it's now taken as one, with no error. `create(5)` now stores `0.5` and reads 5, and `create("aGVsbG8=")` stores `YUdWc2JHOD0=` and reads `"aGVsbG8="`. Pass the value you want to read instead: `create(50)` and `create("hello")` store `5` and `aGVsbG8=`, what those two calls stored before. If you encode a value before passing it to `create`, or set an encoded value in an `update`, stop encoding it.
   - **Rows already stored stay as they are, and can't be recovered.** The library can't tell what such a row should have held, so those rows keep what they store and read as they did on 1.39.0. A row that went through `update` has compounded, once for each update. An `update` no longer makes it worse. To repair a row you need to know the right value yourself: set it in an `update`, which stores its encoded form.
@@ -410,7 +423,6 @@
 - [#206](https://github.com/jmenga/effect-dynamodb/pull/206) [`a4c5e43`](https://github.com/jmenga/effect-dynamodb/commit/a4c5e431df311ec3dfbf446123076ee914eb816d) Thanks [@jmenga](https://github.com/jmenga)! - An empty set inside an `Option`, a `Result`, an `Exit` or a `Cause` is an absent attribute like any other, and the value reads back as it was written.
 
   Leaving out an empty set dropped everything an instance keeps on its prototype, so `put` of `Option.some({ tags: new Set(), name: "x" })` stored `{"value":{"name":"x"}}` and every read of the row failed with `Expected Option`. No release wrote such a row: 1.39.0 died in the marshaller on any empty set, with nothing stored.
-
   - **What's stored** is what the same value with something in the set stores, without the set: the tag, the op and the marker stay. A value holding no empty set is marshalled exactly as before, with nothing extra looked at.
   - **What's read** is the value as written, the absent set an empty set, on entity reads, aggregates, events, their metadata, snapshots and outbox effects. That goes for a struct under a declaration, a `Schema.Class` or `Schema.TaggedClass` under one, one nested in another, an `Option.some` of the set itself, and lists and records of them. It also goes for a `Schema.suspend`, a `Schema.Class` with `.check()` or `.annotate()`, and a transformation's stored side, where an absent set used to be a decode failure.
   - **A union still tries every member as declared first**, so a member reading an absent set doesn't take a row a later member takes. A `oneOf` union stays whole. A set with a `.check()` refusing an empty one still has to be there.
@@ -420,7 +432,6 @@
   These are the codecs whose `encode` takes what it returns and changes it again: `Schema.StringFromBase64`, `StringFromBase64Url`, `StringFromHex` and `StringFromUriComponent`, and a custom codec such as one that prepends a prefix (`x:`) and whose `decode` strips it, or one that scales a number. Every other codec keeps every key byte for byte: one whose `encode` gives back what it's given, such as `Schema.Trim`, and one whose `encode` refuses its own output, such as `Schema.NumberFromString` or a date codec.
 
   `put` stores `"MiX"` under such a prefix codec as `x:MiX`. 1.39.0 keyed that row by the stored text encoded once more (`x:x:mix`), while every path that composed a key from a caller's values encoded the value once (`x:mix`). The entity's own `get`, `update` and `delete` agreed with `put`, and nothing else found the row. Now `put` and every other path key it `x:mix`, once:
-
   - **Queries and collections find the item.** Index accessors (`db.entities.X.byIndex(...)` and `X.query.byIndex(...)`), `.where()`, `.within()` (a key range, a skip-scan, and a Z-order index's prefix and dimension levels), collections (`db.collections.*` and `Collection.make`), a vector index's `.partition()` and a geo search's composites.
   - **History finds the item.** `versions`, `deleted.list`, `history` and `history().where()`.
   - **`Batch` and `Transaction` find, check and delete the item.** They take the same domain values, and send the same key they sent on 1.39.0. What changed is that `put` now writes there. On 1.39.0, `Batch.get` and `transactGet` returned nothing for the item, a condition check on it was cancelled, and `Batch.write` and `transactWrite` deletes left it in place.
@@ -428,7 +439,6 @@
   - **`reembed` keeps the vector partition `put` wrote.** On 1.39.0 it rewrote the partition out of the one queries read.
 
   **Before serving traffic on 1.40.0, run `rekey`** on every table holding such an entity, whatever `escapeKeys` says. Until it has run, a `get`, `update` or `delete` of a row 1.39.0 wrote finds nothing, and a `put` of the same key writes a second row beside it, which `rekey` then reports as a conflict (`bothKeys`) and leaves. `rekey` moves every row kind 1.39.0 keyed this way, to the key a write gives it now:
-
   - live items' table keys
   - index keys, including Z-order prefix segments, and vector and geo partitions, rewritten in place
   - version snapshots and soft-delete tombstones
@@ -440,7 +450,6 @@
   One `rekey` pass also handles turning `escapeKeys` on: it moves each row straight to the escaped text of the value it stores. Where that brings a row 1.39.0 keyed and a row keyed by the stored text to one key (the read model's removal tombstone, or a write's row beside 1.39.0's), the second takes it, whichever `rekey` reaches first, and 1.39.0's row is left and reported as above. The bump is minor: nothing else moves, and no other entity's keys change.
 
 - [#208](https://github.com/jmenga/effect-dynamodb/pull/208) [`677faf9`](https://github.com/jmenga/effect-dynamodb/commit/677faf9eb58a81097348fd50f67afb9ee0dd21cd) Thanks [@jmenga](https://github.com/jmenga)! - An aggregate takes what `Schema.OptionFromOptional` makes, and `update` no longer refuses the state it was handed.
-
   - **`aggregate.create` takes the `Option` that `Schema.OptionFromOptional` and `Schema.OptionFromOptionalKey` make, at any position.** It refused `Option.some(5n)` with a `ValidationError`, writing nothing, and only took what's stored, `"5"`. Both are taken now, in the root, a `one` edge, a `many` element and a sub-aggregate. `Option.none()` stores nothing, as leaving the field out does.
   - **`aggregate.update` works on an aggregate holding one.** A mutation returning `{ ...state, note }` failed with `Expected string`, whatever it changed, so a row with such a field could be created and read but not updated. What it didn't change stays stored as it was, and a value that's neither what the step makes nor what's stored is still refused.
   - **A step of your own encoded as optional reads back when it holds a bigint or a date.** A step from an optional key to a `Schema.Array(Schema.BigInt)`, a struct or a list works the same way as `Schema.OptionFromOptional`, on an entity, an aggregate and a stream.
@@ -450,13 +459,11 @@
   - **A list decoded to or from a list of bigints reads back on an entity.** A `Schema.Array(Schema.String)` decoded to a list of bigints, a list of bigints decoded to strings, a list held as `Schema.fromJsonString` holding a `Schema.BigIntFromString`, and a step from an optional list to a list of lists all wrote the row and then failed, so `put`, `create`, `upsert`, an update and a time-series `append` reported a failure for a write that had landed, and every read failed. They read back now, from what was stored already.
 
   What's stored for these is what 1.39.0 stored, and no row needs rewriting. Three things do change for new writes through an aggregate, and rows already stored read as they did:
-
   - **A `Schema.Unknown` beneath a step, given as an `Option`.** Beneath `Schema.OptionFromOptional`, `Schema.OptionFromOptionalKey`, `Schema.OptionFromNullOr`, `Schema.OptionFromNullishOr` or `Schema.OptionFromUndefinedOr`, it stored Effect's internal form of the `Option` and read back as an `Option` holding an `Option`. It now stores the value, as an entity does, and reads back as the `Option` it was given.
   - **A transformation with one type on both sides, inside an `Option` or a `Result`.** It ran an extra time on `create`, so a transformation multiplying by ten stored 500 for 50 and read 5000. It now stores 50 and reads 500.
   - **A transformation inside an `Option` or a `Result`, given in its stored form.** It stored the domain form, which its own `get` refused. It now stores what it was given, and that reads.
 
 - [#205](https://github.com/jmenga/effect-dynamodb/pull/205) [`b617f37`](https://github.com/jmenga/effect-dynamodb/commit/b617f37ad932bf01815105ecb95174999992d8f3) Thanks [@jmenga](https://github.com/jmenga)! - A `Schema.BigInt` reads back wherever it's stored, under a declaration, a `Schema.suspend` or a transformation too, and on every owner.
-
   - **`Schema.Option(Schema.BigInt)`, `Schema.Result`, `Schema.ReadonlySet(Schema.BigInt)` and a `Schema.BigInt` under a `Schema.suspend` now read back on an entity and an aggregate, as they do on a stream.** Each was stored as a number and read as `Expected bigint`, unless it was past 2^53. A recursive schema reads back all the way down. What's stored doesn't change, and no row needs rewriting.
   - **A transformation over `Schema.BigInt` reads back on every owner.** `Schema.DurationFromNanos`, `Schema.ByteSizeFromBigInt`, `Schema.OptionFromNullOr(Schema.BigInt)` and your own were stored as a number, and every read failed. They aren't refused at load any more, and `aggregate.create` and `update` take them.
   - **Fewer unions are refused on a stream, a snapshot and an outbox, judged in the order a read tries the members.** `Schema.Union([Schema.Option(Schema.BigInt), Schema.Struct({ x: Schema.optional(Schema.String) })])` and `Schema.Union([Schema.Struct({ a: Schema.Number, c: Schema.String }), Schema.Struct({ a: Schema.BigInt })])` read back and are taken. `Schema.Union([Schema.Struct({ a: Schema.BigInt }), Schema.Struct({ a: Schema.Number, c: Schema.String })])` is refused (`EDD-9125`), where a value written through the second member read back as the first, without `c`. An entity or an aggregate has the same refusal under a declaration, a `Schema.suspend` or a transformation, where a read lifts the number before the union sees it.
@@ -478,7 +485,6 @@
   **These definitions now fail at load, and each has never worked:** `version` as an index composite without `retain` (`EDD-9121`: no write knows the next value, and no item ever held the key; it's a compile error too); `updatedAt` or `version` in a primary key or `shards.by` (`EDD-9121`: a primary key never changes, and a shard would go stale on every write); and a `configure` `field:` rename of the version attribute (`EDD-9122`: every write after the first failed; use `versioned: { field }`).
 
   Other behaviour that changes:
-
   - A `Schema.optional` date `createdAt` or `updatedAt` on an entity is now stamped unless supplied, as `Schema.optionalKey` always was.
   - `upsert` over a secondary index composite that's `createdAt` or `immutable` now keeps the stored value in the key as well as the attribute; before, the key held what the input said, or there was none. It adds no read. It's one `UpdateItem` with a condition, and the rejected write returns the row at no read charge where one write can't get the key right: an input naming another value of an `immutable` composite in a key holding something else, a row with no key, or `[status, createdAt]` with a changed status and no `createdAt` in the input. Those take a second write, and the rejected one is charged write capacity. With a primary key over an unsupplied `createdAt` it creates, where `put` used to die.
   - A time-series `append` over a `createdAt` composite now keeps its key, with no read before the write, so the row joins that index. Where the rest of the key changed, a rejected transaction is followed by a second one. With `skipFollowUp` it sends no read at all.
@@ -494,7 +500,6 @@
   - `put`'s type no longer offers a plain `createdAt: Schema.String` as optional: the runtime always required it. An update may name one, as the runtime always let it.
 
   **Values that can't be stored are now a `ValidationError`, on every path, with nothing sent.**
-
   - A `NaN` in a `Schema.Number` key composite is refused with `EDD-9096` with `escapeKeys` off, as it is with it on. The stored text of every other value is unchanged. Up to now it composed `0000000000000NaN`, so `get` and `delete` looked for a key nothing holds, `purge`, a query, a batch and a transactional delete reported success having sent it, and a `put` died in the marshaller. A `Schema.NumberFromString` composite's `NaN`, stored as `"NaN"`, keeps that text with `escapeKeys` off, as up to 1.39.0: its row is written, read, queried, updated and deleted by its key on every path, and `rekey` finds it in place. With `escapeKeys` on it's refused like any `NaN`, and `rekey` reports a row stored under it as the conflict `uncomposable`. 1.37 and 1.38 refused both.
   - A value with no DynamoDB form, `NaN`, `Infinity` or a number past `Number.MAX_SAFE_INTEGER`, is a `ValidationError` (`EDD-9124`) from any write, condition or filter, where it was a defect. `Expression.condition`, a plain builder, throws the tagged `UnstorableValue`.
   - **A query accessor, `.where()` or `.within()` given such a value no longer throws when called.** It returns a builder whose terminal fails with the `ValidationError`, nothing sent, and whose `.explain()` is the `empty` plan with the reason. That includes `versions`, `deleted.list`, `history`, collections, and a Z-order bound a dimension can't place (`EDD-9092`). Code catching the throw should handle the failure instead. A missing composite and other misuse the types catch still throw.
@@ -505,7 +510,6 @@
   `.remove()` of a `createdAt` or `updatedAt` that isn't a date now compiles, as it always ran: that field is the caller's. So is `Schema.UndefinedOr` of a date, which nothing stamps, so `put`'s type asks for it as the runtime does. A date under `Schema.optional`, or required, stays a compile error and a `ValidationError`, since the library stamps it.
 
   **Aggregates:**
-
   - `create` stamps a `Schema.Record` `many` edge with a custom `decompose` and `assemble`, and its dates are stored in their own form. It failed with `Missing key` before, or with no `entity` stored a date as a map no read could decode. The input type and `inputSchema` make those dates optional.
   - `sk.composite` on a `Schema.Record` `many` edge now compiles, and each name is checked against the record's value. It had been a compile error whatever the name, since the check read only an array's element.
   - A `one` edge with no `entity` takes its value in the input, as `create` always did. The type and `inputSchema` asked for an id it can't use.
@@ -549,7 +553,6 @@
   A cursor `list` can't decode is a `ValidationError` (`[EDD-9094]`, `operation: "list"`) with nothing sent, where it used to be a defect. So is a `.within()` or sharded query's cursor, and so is an empty string, which used to read from the start. A sharded list still refuses every cursor with `EDD-9051`.
 
 - [#214](https://github.com/jmenga/effect-dynamodb/pull/214) [`d8ae91a`](https://github.com/jmenga/effect-dynamodb/commit/d8ae91a923bd5baba81270a4d5f229b1420253cd) Thanks [@jmenga](https://github.com/jmenga)! - An aggregate `create` no longer dies or drops an id hydrating an edge with an `entity`, and a multi-item op finds an item whose key composite is a codec.
-
   - **A `many` edge whose element is the entity's own model, given whole, is stored as given.** Its key field (`lineId` of a `Line`) was taken for an id to fetch because its name was `${field}Id`, and `create` died with `Missing composite attribute "lineId"`, or fetched it and refused the element without its key. Where 1.39.0 fetched it and completed (the key is the model's identifier, the entity's only key composite, and optional in the model), it is fetched as before, and the element is stored without it. A `many` element takes an id of the entity's key type only where its definition says it holds the entity: the element is the entity, or it is a plain `Schema.Struct` or `Schema.Class` whose field of the entity's name is the entity's own model (under `Schema.optional` at most, `DynamoModel.ref` and checks included) and which declares no `${field}Id` of its own. The entity's own model is the schema the entity was made with (its `DynamoModel.configure` wrapper taken off), or that schema annotated, checked or branded, compared by reference: a class that shares the entity's identifier, or a struct declaring its fields again, is another schema. That element takes the entity whole, its id beside it or not, or its id under `${field}Id`, in its input schema and its input type, beside the forms 1.39.0's input type took, which are kept for an entity one id names. For an entity keyed by more than one composite, the input type takes the entity whole and no longer an id: every such id died at run time on 1.39.0. The type sees that field for an entity whose model is a `Schema.Struct` (in a `DynamoModel.configure` wrapper or not) with a string literal `entityType`; for any other model, a `Schema.Class` included, the element is typed as on 1.39.0.
   - **A `one` or `ref` edge's id follows the rule a `many` element's does.** A string `${field}Id` is fetched exactly as on 1.39.0, whatever the model or the element declares. A number, bigint or `Date` id is fetched only where the model's field of the edge's name is the entity's own model, the model doesn't declare `${field}Id` itself (then it is the model's own data, stored as given), and the entity isn't given whole (then it is stored as given, never replaced or read again).
   - **Every other `many` element hydrates as on 1.39.0.** A union element (through a transformation or `suspend` too), an element through a transformation, and one whose field of the entity's name is a scalar, an `Option`, a `Result`, another struct or the entity under `NullOr`, or which declares `${field}Id` itself, is hydrated when it's given a string `${field}Id` (or a string as the element), at the root and in a sub-aggregate, and its input schema and type are 1.39.0's. The one change is a string id of no type of the entity's key composite (`"5"` for a number key), which fails with `EDD-9131` as everywhere else.
@@ -578,7 +581,6 @@
   A request the library doesn't split (`Transaction.transactWrite`, `EventStore.append`, an aggregate's writes) is still sent as you built it. If DynamoDB refuses it for its size (HTTP 413), the error now names the request's three largest items, once the library has measured the body it sent and confirmed it is over 16 MB. Otherwise DynamoDB's error passes through unchanged.
 
   Two planning additions:
-
   - `stream.measureAppend` returns `requestBytes`, the exact request body the append would send. It includes the transaction's client token and, when capacity reporting is on, the `ReturnConsumedCapacity` field. It now also takes the append's `additionalItems` and measures the request with them in it, built by the same code `append` uses, since adding items changes the request: a lone event's `PutItem` becomes a `TransactWriteItems`. `transactionBytes` then counts them too. It still sends no request and keeps its type. An additional item `append` reads the table to build (a put of a versioned or unique-constrained entity, a `create` over a projection tombstone) has no size without that read, so it fails the measurement with a `ValidationError` naming the read; before, every additional item was refused.
   - `StorageEncoding.limits` has `request: 16_777_216`. AWS documents 16 MB for `BatchWriteItem`, and DynamoDB Local rejects any request body over 16 MiB with HTTP 413.
 
@@ -595,7 +597,6 @@
 - [#223](https://github.com/jmenga/effect-dynamodb/pull/223) [`cb12a10`](https://github.com/jmenga/effect-dynamodb/commit/cb12a104507af20d2e6cb117f53f565845cbc6c1) Thanks [@jmenga](https://github.com/jmenga)! - Effect's own value types read back as the instances written, on rows already stored too.
 
   `Schema.Duration`, `Schema.BigDecimal`, the time zones, `Schema.Cookie` and `Schema.Cookies`, `Schema.UrlParams`, `Schema.SemVer` and `Schema.SemVerRange`, the IP, MAC, socket, host and DNS record types, and a `Schema.DateTimeUtc` or `Schema.DateTimeZoned` inside a `Schema.Option` or a `Schema.Result` are stored as maps. So is a `Schema.DateTimeUtc` or `Schema.DateTimeZoned` directly in a stream's event, snapshot or outbox, which the entry on field types covers. Each type's guard takes that map, so a read handed it back: a plain object that passed for the value and wasn't one. `Equal.equals` with the value written was `false`, `.pipe` was `undefined`, and `BigDecimal.sum` threw below 2^53. Reads on an entity, an aggregate and a stream now return the real instance. What's stored doesn't change, except a cookie's expiry.
-
   - **Your own code that inspects one of these values on a read now sees the instance, where it saw the map.** That's a `.check()` on it or on what holds it, a transformation from it, and a class or a declaration of your own holding it. A check that passed on the map and fails on the instance now fails the read, and one that failed on the map can now pass. A row is still decoded once, and each check, transformation, constructor and default runs as often as it did.
   - **A transformation of your own onto one of these types reads the instance too**, when its step hands the stored map on as it is. Effect's own codecs (`Schema.DurationFromMillis`, `Schema.BigDecimalFromString`, `Schema.DateTimeUtcFromString`, ...) made the instance already and aren't touched.
   - **A value stored with properties of its own keeps them.** `Object.assign(Duration.millis(5), { source: "invoice" })` is stored with `source`, read back as a `Duration` holding `source`, and written again with it. A value is handed back as an instance only where writing that instance stores what was read: one holding properties of its own inside it, such as a cookie's `maxAge` or a jar's cookie, and a jar keyed other than by its cookies' names, read back as the map stored, as 1.39.0 read them.
@@ -646,7 +647,6 @@
   **`pathRemove` below a field is refused only where no stored value survives it, and sent as 1.39.0 sent it otherwise.** A refusal needs the whole way from the field to the removed property or position to pass through schema nodes the guard models exactly as a read decodes them: a struct with fixed properties only, a record with one index signature keyed by plain `Schema.String`, an array, a tuple whose rest (if any) is one element with nothing after it, a union of these, a scalar, a `Schema.Class` as its struct and a `Schema.suspend` as what it suspends, each with no transformation and no check. Anything else (`Schema.Unknown`, a record with several index signatures, a tuple with elements after its rest, a struct with an index signature, `Schema.Struct({})`, a transformed or checked node) makes the verdict unknown, and the removal is sent. Every way through a union is judged against every member, so a member that reads what's left of another member's value, or holds no such value and is left as it was, gets the removal sent: `f.x` of `Union([{ x, y }, { y }])` or of a tagged union whose other member has no `x`, `f.a.x` of `Union([{ a: { x, y }, b }, { b }])`. A list closes up when an element is removed, so a list position is judged by length alone, and refused only when every list there holds the position and none one shorter is a length a list accepts: any position of a `[string, string]`, of a `NullOr([string, string])` or of a `Union([[string, string], [number, number]])`. `f[0]` of a `[string, string?]`, either position of a `Union([[string, string], [string]])`, `f[2]` of a `Union([[string, string, string], []])` holding `[]` (DynamoDB leaves a list too short to hold it as it was) and an array's element are sent, as on 1.39.0. Length alone can't see that what's left puts a value where its position can't hold it (`f[0]` of a `[string, number?]`) or is a list only a member its tag rules out accepts, so such a removal is sent and leaves a row that can't be read, as on 1.39.0. So a removal below a record with two index signatures is sent in either order of its signatures, as on 1.39.0, even where it leaves a row that can't be read; one below a tuple with elements after its rest, or in a union with a `Schema.Unknown` member, is sent and the row reads, as on 1.39.0; and `.remove(["f"])` and `.set({ f: undefined })` of a required field are refused as before. All of these do what 1.39.0 did standalone, in a transaction, on a retained entity and on one with a unique constraint.
 
 - [#211](https://github.com/jmenga/effect-dynamodb/pull/211) [`b6add38`](https://github.com/jmenga/effect-dynamodb/commit/b6add381e0513a7f48d110c5da0fa08a192e10f6) Thanks [@jmenga](https://github.com/jmenga)! - A row read back from DynamoDB composes the keys `put` wrote, on every path that composes keys from a stored row.
-
   - **`restore`, an update or `patch` of a `versioned: { retain: true }` entity, in a `transactWrite` too, and the updates that read the item first (a unique constraint, a vector index) no longer die with `EDD-9050`** on a `Schema.OptionFromNullOr(Schema.BigInt)` or a `Schema.BigInt` under a decoding default holding a value below 2^53. DynamoDB hands such a value back as a number, and neither form of the schema took one. The composite key form now takes it as the `bigint` it was stored from, so primary, index, history and sentinel keys are the ones `put` wrote, byte for byte. `aggregate.list` lists such an aggregate, and `rekey` moves such a row and repairs its index keys.
   - **A delete releases the unique-constraint sentinel `put` reserved** on a `bigint` field below 2^53, `Schema.BigInt` included. It deleted a key composed from the number DynamoDB handed back, which `put` never wrote, and left the reservation in place, so the value couldn't be taken again. A reservation an earlier release left this way stays until you delete it with the raw `DynamoClient`.
   - **A `Schema.suspend(() => Schema.BigInt)` key composite keeps the keys `put` wrote.** Read back below 2^53 it was taken as a number, so `restore` put the item back under the number's key text, where `get` didn't find it, and an update reading the item first, a delete releasing its unique-constraint sentinel, `rekey` and an aggregate's `update` and `list` composed the same wrong key. A suspended schema is now read as the schema it suspends.
@@ -675,13 +675,11 @@
 - [#184](https://github.com/jmenga/effect-dynamodb/pull/184) [`f8f7131`](https://github.com/jmenga/effect-dynamodb/commit/f8f71315f1e70ad2e797ef4239744a6a100c21ab) Thanks [@jmenga](https://github.com/jmenga)! - GSI write sharding ([#183](https://github.com/jmenga/effect-dynamodb/issues/183)), one flag for key text, and the fix for inverted indexes. **1.39.0 fixes the inverted index problem 1.37.0 and 1.38.0 have, and reverses 1.37.0's key change by default.**
 
   **Key text is one setting: `DynamoSchema.make({ escapeKeys })`, off by default for all of 1.x.** On by default is planned for the next major release.
-
   - **Off, the default,** composes the key text 1.36 composed, for strings and numbers: a string as it is, a number or bigint zero-padded `String(n)`, a time-series event key the `orderBy` attribute's stored value.
   - **`escapeKeys: true`** composes every key, partition and sort, with every character up to `%` as `%` and two hex digits, and numbers in the numeric key text 1.37.0 introduced. Key order is then value order, and a value may hold `#`.
   - A value with none of those characters, and a non-negative integer below 1e16 (1e38 for a `bigint`), compose the same text either way.
 
   **What to do about your rows:**
-
   - **From 1.36 or earlier:** nothing. Key text is what 1.36 composed, so every row is where the library looks for it. Upgrade and deploy. The query conditions 1.37.0 changed stay: a full pin sends `sk = key`, and `beginsWith` on a numeric composite sends `eq`.
   - **From 1.37.0 or 1.38.0: run `rekey` before serving traffic.** Those releases escaped sort keys, changed the text of some numbers and put an `orderBy`'s key text in event keys, and the default no longer looks there. That concerns a row with a character up to `%` in a sort key; a row with a number whose text 1.37.0 changed in a key (negative, fractional, 1e16 and up, a `bigint` that's negative or 1e38 and up, `Infinity`, or an epoch date before 1970); and a time-series event of a `NumberFromString` or `BigIntFromString` `orderBy`. Either keep the default, and `db.tables.<Table>.rekey()` moves those rows back to the 1.36 text, or set `escapeKeys: true`, and it moves them, and every row with a character to escape in a partition key, to escaped text. Rows 1.38.0 wrote count the same as rows 1.37.0 wrote: the two store identical keys. An instance of either release still running writes their text, so run `rekey` again once the last one has gone.
   - **To turn `escapeKeys` on over existing data:** set the flag, and run `rekey` before serving traffic.
@@ -692,7 +690,6 @@
   **`rekey` moves rows to whatever the setting composes, in either direction.** It covers items, index keys including a Z-order index's partition key and prefix, unique-constraint sentinels, snapshots, tombstones, time-series events, aggregates, event streams and projection rows, from the text of 1.36, of 1.37.0 and 1.38.0, and of `escapeKeys: true`. A row is moved or counted, never silently left: what it can't place is in `conflicts` or `skipped.unrecognizedKey`. When keys spell each other's (`foo bar` under escaping belongs where `foo%20bar` was stored) the holder moves first, and nothing is overwritten or merged. A dry run agrees with the real run, a chain blocked by a row that can't move included, and a second run changes nothing. `guides/upgrading` lists what it moves and what it can't. A partition key mixing an escape and a changed number, an escape in each half of a row, an aggregate's mixed partition and a sentinel mixing an escape and a changed number are all recognised now.
 
   **Limitations of the default,** none of them new against 1.36, and documented in `guides/indexes`:
-
   - Numbers don't sort numerically in a key, and `.history()` on a string-encoded numeric `orderBy` is in text order.
   - A range on a sort key composite that isn't the last can return wrong rows when a value holds a character below `#`, and `gt` under a pin on the last composite can miss a longer value continuing below `#`.
   - A `#` in a value can imitate a segment: `a#b` + `c` and `a` + `b#c` compose one key.
@@ -701,7 +698,6 @@
   - `NaN` composes 1.36's text rather than failing with `EDD-9096`, which stays under `escapeKeys: true`.
 
   **GSI write sharding.** `shards: n` or `{ count, by?, previous? }` on a secondary index stores one logical partition in N physical ones, for an index key that takes more than a partition's 1,000 WCU/s. Writes hash the item to pick a shard, and every terminal reads the shards and merges them into index order, so no caller names a shard.
-
   - **Key text:** `!<count>.<shard>` right after the entity type or collection name, before all values, so no value can spell it and two layouts can't overlap.
   - **`by`:** hash sort key composites instead of the primary key, so a query pinning them reads one shard. An update that changes a `by` attribute moves the entry, and fails with `EDD-9100` when the new key can't be composed, including when the sort key can't follow it under `preserve`. An unsharded key is never written.
   - **Reads:** `.concurrency(n)` and `Query.concurrency`, `QueryExplain.fanOut`, cursors with one position per shard, `.maxPages(n)` counted in rounds. `.within()`, skip-scan, `.zorder()` and `GeoIndex` are refused on a sharded index (`EDD-9104`).
@@ -712,7 +708,6 @@
   **Fix: inverted indexes, as 1.37.0 and 1.38.0 left them.** With an index half in a table key attribute, those releases composed the attribute's text differently in its two roles, so a value a sort key escapes overwrote a table key: `userId: "u 1"` stored `pk` as `userid_u%201`, so `get` failed and `delete` reported success and left the row, and `groupId: "a b"` made `put` fail. One rule now composes every key, so both roles build one text under either setting. `rekey` recognises the row those releases left and moves it, an escape in each half included. An inverted index is supported, not encouraged: index keys belong in dedicated attributes.
 
   **Behaviour change: definitions refused at load.**
-
   - **`EDD-9106`:** two key halves of one entity sharing an attribute without the same fields, in the same order and casing, or a sharded partition key sharing one with a half not sharded the same way. Such a definition worked for `put` and query while no item held both accessors' composites, but a row can't show which half owns the attribute: the one written last overwrites the other, and an ordinary update corrupts even a row that only used one. The check runs per entity, so several entities can still overload one index. Two number-only or numeric Z-order halves with different casings are refused too.
   - **`EDD-9108`:** one entity using one physical index twice, even over the same fields.
   - **`EDD-9109`:** a model attribute, a system timestamp or a version field stored in an attribute of the table's primary key, by a `field` rename or by its own name. A `put` would overwrite the key it composed.
@@ -723,7 +718,6 @@
   **Behaviour change: an update refuses to name a table key attribute.** `.remove()`, `.set()` and the other update operations naming an attribute of the table's primary key by its stored name fail with a `ValidationError` and write nothing. No write path sets any part of the primary key: a key changes only by moving the row.
 
   **Public API.**
-
   - `KeyComposer.composeEventSk` takes the schema first. The old three-argument form still works, is deprecated, and doesn't follow `escapeKeys`.
   - `KeyComposer.composeSortKeyCondition` can return `{ between }` too: a partial prefix on a secondary index under `escapeKeys: true`. A caller handling only `eq` and `beginsWith` needs a branch for it.
   - `KeyComposer.serializeValue` and `extractComposites` keep the numeric text 1.37.0 gave them under either setting, which differs from 1.36 for a number whose text changed. `compositeText`, `keyValueText` and `extractKeyComposites` follow the setting.
@@ -752,7 +746,6 @@
   **Effect 4.1.** The `effect` peer dependency moves from `^4.0.0` to `^4.1.0`. Effect 4.1 removed its top-level `Crypto` module, so importing 1.37.0 or earlier on it failed with `The requested module 'effect' does not provide an export named 'Crypto'`. Its replacement, `effect/crypto`, does not exist in 4.0, so one build cannot import from both.
 
   If you cannot move to Effect 4.1 yet, stay on 1.37.0 with Effect 4.0.2 or earlier, and pin `@effect-dynamodb/schema` to 1.37.0 too. The published 1.37.0 depends on `^1.37.0`, so a fresh install would otherwise take a newer schema package: `npm i --save-exact effect-dynamodb@1.37.0 @effect-dynamodb/schema@1.37.0 effect@4.0.2`. Effect 4.0.3 turned `Crypto.randomUUIDv4` and `randomUUIDv7` into functions, so 1.37.0 imports on 4.0.3 to 4.0.7 but its writes to `generatedId` and `versioned` entities die at runtime.
-
   - **`DynamoClient.make({ crypto })` now takes a `SecureRandom` service from `effect/crypto`** instead of `Crypto.Crypto`. Replace `Crypto.make({ randomBytes, digest })` with `SecureRandom.make(randomBytes)`. Most programs do not pass this option and need no change: the default is still backed by `globalThis.crypto`, and bound operations stay `R = never`.
   - **`generatedId: { version: "v7" }` ids are now monotonic.** Effect 4.1 orders the UUIDv7s of each `SecureRandom`: within a millisecond a counter orders them, in place of random bits, and the timestamp can run slightly ahead of the `Clock`. The default service is per client, so ids sort in creation order within one client. Their text form is unchanged, and so are version 4 ids.
   - **Minting event ids:** `crypto.randomULID` and `crypto.randomUUIDv7` become `random.ulid` and `random.uuidV7()` on the `SecureRandom` service, and `SecureRandom.layerWebCrypto` provides it. ULIDs from one service are monotonic too, so a test with a frozen `TestClock` and fixed bytes gets one value and then its increments, and must build a fresh service for each run to repeat them.
@@ -805,7 +798,6 @@
   any other kind keeps its 1.36 key text and requests. A row 1.36 wrote with one keeps its old key
   until it moves: through 1.37.x the 1.36 key fallback keeps it working, and `rekey` moves it
   ("Upgrading from 1.36" below).
-
   - **Numbers, in every key.** `number` and `bigint` key composites (partition, sort and index keys,
     unique-constraint sentinels, a time-series `orderBy`) are written as text that sorts in numeric
     order. Non-negative integers below 1e16 (1e38 for a bigint) keep their exact 1.36 bytes, so a
@@ -863,7 +855,6 @@
   rerun moves nothing and reports no conflicts, turn the fallback off with
   `DynamoSchema.make({ name, version, legacyKeys: false })`. The fallback and the setting are
   removed in the next major release. The new "Upgrading from 1.36" guide walks through it.
-
   - **What the fallback keeps working.** `get`, `getVersion`, `deleted.get`, `Batch.get` and
     `Transaction.transactGet` read the 1.36 key when the current key misses (`transactGet` with a
     second `TransactGetItems`: two snapshots, not one). `put`, `create`, `upsert`, `update`, `patch`,
@@ -1030,7 +1021,6 @@
 - [#176](https://github.com/jmenga/effect-dynamodb/pull/176) [`fe9f8ae`](https://github.com/jmenga/effect-dynamodb/commit/fe9f8ae511da9f5b53a73bef0ba5fa0e278f52df) Thanks [@jmenga](https://github.com/jmenga)! - Report consumed capacity and request counts for every library operation ([#174](https://github.com/jmenga/effect-dynamodb/issues/174)).
 
   Provide `ConsumedCapacity.layer()` (off by default) and every library operation (`Entity.get`, `Entity.query`, `EventStream.read`, `EventStream.append`, `Batch.write`, `Transaction.transactWrite`, `Aggregate.update`, projections, geo, checkpoint store, …) asks DynamoDB for its `ConsumedCapacity`, sums it over every request it sends, and:
-
   - runs in a span `effect-dynamodb.<operation>` (kind `client`, or `internal` when nested in another operation) carrying `aws.dynamodb.consumed_capacity.total` / `.read` / `.write`, `aws.dynamodb.table_names` and `effect_dynamodb.request_count` (pages, for a read);
   - delivers one `OperationReport` per root operation to an optional `onOperation` observer: capacity units (read / write split), requests, requests by command, per-table (and, with `level: "indexes"`, per-index) breakdown, vector bytes, outcome, and the nested library operations it ran. Summing reports never double counts.
 
@@ -1140,7 +1130,6 @@
 ### Minor Changes
 
 - [#150](https://github.com/jmenga/effect-dynamodb/pull/150) [`8120f58`](https://github.com/jmenga/effect-dynamodb/commit/8120f582a25d54ff56228f9084124f2c50812f8b) Thanks [@jmenga](https://github.com/jmenga)! - EventStore GSI stream indexes can derive their partition, so several streams share one partition of a GSI, and their snapshots can be in it ([#149](https://github.com/jmenga/effect-dynamodb/issues/149)).
-
   - `partition: (event, version, streamId) => string | undefined` on a `type: "gsi"` index replaces the stream's partition key with a derived value, stored raw. Streams that declare the same GSI write one partition of it, and one query reads the group. The partition can come from the event, for a stream keyed by something other than the group. Both `partition` and `key` run for every appended event, and an event is indexed only when both return a string.
   - `snapshot: (state, asOfVersion, streamId) => { partition, key } | undefined` puts the snapshot item in the index. It requires `partition` and a stream `snapshot` config. The attributes are written by the same `Put`: an inline snapshot enters the index in the append's own transaction, and `writeSnapshot` and `commandHandler` snapshots carry them too. `undefined` leaves the snapshot out, and takes it out of the index.
   - Within one append, every event's partition and the inline snapshot's must be the same. Otherwise the append fails with `ValidationError` before anything is written. An empty or over-long partition is DynamoDB's to reject, and is reported as a `ValidationError` naming the index and the item.
@@ -1157,7 +1146,6 @@
 - [`b393fd8`](https://github.com/jmenga/effect-dynamodb/commit/b393fd8557ec749453149f5e27ffeffdb2230341) - Packed storage: store an entity field, an EventStore event's `data` or a snapshot's `state` as one JSON string, compressed over a threshold ([#147](https://github.com/jmenga/effect-dynamodb/issues/147))
 
   A large object stored as a native DynamoDB map is slow to read and write, and its size counts every attribute name. `DynamoModel.Packed({ format: "json", compression?: { codec, threshold? } })` is one declarative config, shared by entities and EventStore, that stores such a value as one JSON string (`S`) or, when compression is configured, the JSON is at least `threshold` bytes (default 1024) and compressing makes it smaller, as header-prefixed compressed bytes (`B`). Nothing changes for code that does not opt in: the default stays a native map, and no attribute is added to any item.
-
   - **Entity fields.** `DynamoModel.configure(model, { field: { storedAs: DynamoModel.Packed(...) } })`, a sibling of `SparseMap`. Packed on every write path (put / create / upsert / update `.set()` / `Batch.write` / `Transaction.transactWrite` / time-series `append`) and read by stored form on every read path. A packed field cannot be a key or index composite, `timeSeries.orderBy`, a unique-constraint field, a ref, or a vector index partition or filter field (`[EDD-9072]`–`[EDD-9075]`). Conditions and filters take only `exists` / `notExists` on the whole field, updates only a whole-value `.set()` / `.remove()`, projections only the whole field (`[EDD-9076]`, `[EDD-9077]`); PathBuilder callbacks refuse the rest at compile time. Aggregate edges store their edge entity's packed fields packed.
   - **EventStore.** `makeStream({ storedAs: { data } })` and `snapshot: { storedAs }`. `append` / `commandHandler` pack each event (and the inline snapshot, inside the append transaction). Every read path decodes by stored form; raw rows (`Query.select`) return `data` as parsed JSON through every stream-index projection; `Query.filterExpr` on `data.*` is refused, pointing to `Query.filterBy`. Metadata stays a map.
   - **Self-describing, no migration.** Readers dispatch on the stored value (native, `S`, or `B` whose first byte names the format and codec), never on the current config, so switching a field or stream between map, JSON and compressed needs no rewrite, and a stream or table holding a mix reads correctly.
@@ -1168,7 +1156,6 @@
   - **Measured.** A downstream benchmark on Lambda (arm64, Node 24; 5,990 small events read from a stream index) read JSON `data` about 2× faster than a map through the library (121 vs 261 ms select + fold), at about 19% more stored bytes and read units. A ~47 KB state took 5 write units as zstd-compressed JSON, against 47 as JSON and 38 as a map. Compressing every small event (threshold `0`) cut read units by 24% but made reads about 4× slower, so keep the 1 KB default threshold. The Packed Storage guide has the full tables and method.
 
   Compatibility notes:
-
   - No error channel changes: every operation keeps its 1.25.0 error type and `R`. A missing compressor is reported through the existing `ValidationError` (inspect `cause` for `CompressorNotRegistered`), or, for a codec a bound member or stream config names, as an `[EDD-9078]` defect at bind or first use.
   - `Entity` / `EntityDefinition` gain a trailing, defaulted `TPackedFields` type parameter.
   - `DynamoClient.layer` / `layerConfig` return `Layer<DynamoClient | Compression, …>` only when given `compressors`.
@@ -1184,7 +1171,6 @@
 - [`4906069`](https://github.com/jmenga/effect-dynamodb/commit/49060695ea5fb9cc5ed19970e6131c9f819ff390) - EventStore per-event metadata and timestamps on `append` and `commandHandler`, and write limits diagnosed from DynamoDB's rejection instead of pre-checked ([#144](https://github.com/jmenga/effect-dynamodb/issues/144))
 
   `append`'s `metadata` is one value copied onto every event of the append. Metadata that belongs to one event (an event id used as a publish message id, the id of an imported event in the store it came from) had nowhere to go but a list packed into that value, so every item stored every entry: N² entries for an append of N events, copied again by any stream index. The options below are additive; no option combination that works today changes behaviour. Error reporting for writes DynamoDB rejects for a limit changes as described under **Write limits**.
-
   - **`eventMetadata` on `append`.** One entry per event, in the order of `events`: entry `i` is written onto event `i` and read back as that event's `StreamEvent.metadata`. Each defined entry is encoded through the stream's metadata schema, as `metadata` is, and an encode failure names its index (`operation: "EventStore.append.eventMetadata[<i>]"`). An `undefined` entry writes its event without a `metadata` attribute. A length that differs from `events.length` fails with `ValidationError` before anything is sent, even for an append of no events. The read side is unchanged.
   - **`eventMetadata` on `commandHandler`.** A function of the `Decision` (`{ events, state, previous, version }`, as a function-form `additionalItems` receives) returning the entries, or an `Effect` of them whose error and requirements join the handler's. It runs after the new events are folded and before `additionalItems`, is not called on a no-op, and is re-run on every attempt (each `VersionConflict` retry and the re-decision under `verifySnapshot: false`). A result of the wrong length fails with `ValidationError` (`operation: "EventStore.commandHandler.eventMetadata"`); neither that nor a failure of the returned `Effect` is retried. Minting ids with the `Crypto` service's `randomULID` (or `randomUUIDv7`) keeps them deterministic under `TestClock` and a test `Crypto` layer with fixed bytes.
   - **`metadata` and `eventMetadata` are mutually exclusive**, on `append`, the bound stream and the handler. Passing both is a type error, and a `ValidationError` for untyped callers. `undefined` counts as absent, so `{ metadata: undefined, eventMetadata: [...] }` is accepted.
@@ -1208,7 +1194,6 @@
   - **`Batch.write` splits versioned-put transactions at exactly DynamoDB's limits:** 100 items and 4,194,304 bytes, each put counted with its create-only condition. This replaces a 3.5 MB budget on an estimate, so fewer transactions are sent. If DynamoDB still rejects a chunk for size, `Batch.write` fails with a `ValidationError` giving the library's measure and DynamoDB's reported size; the chunk is not re-split or retried. A failed batch now says exactly what it had already written (versioned-put transactions and non-versioned requests) and what was not sent. Application transactions (`transactWrite`, `append`, `commandHandler`, entity writes) are never split.
 
   Type-level notes:
-
   - `AppendOptions`, `CommandOptions` and `IdempotentCommandOptions` are now type aliases (an intersection with a union, which is how the exclusivity is typed) instead of interfaces. Using them as types is unchanged; an `interface X extends AppendOptions<…>` in user code no longer compiles, since an interface cannot extend a union. Spreading options and adding a key, as in `{ ...options, metadata }` where `options` is one of these types, no longer compiles either, because the spread may already carry `eventMetadata`. Build the object from one branch, or omit `eventMetadata` from the spread. New exported types: `AppendOptionsBase`, `AppendMetadataOptions`, `CommandOptionsBase`, `CommandMetadataOptions` and `EventMetadataInput`.
   - New exported type `EventTimestampsInput`. `CommandHandler` and `BoundCommandHandler` gain four trailing, defaulted type parameters: `E3` / `R3` for an effectful `eventMetadata` and `E4` / `R4` for an effectful `eventTimestamps`, separate from each other and from `additionalItems`' `E2` / `R2` so effects with different error types are inferred as a union; `CommandOptionsBase` gains `E4` / `R4`. Call sites infer them; hand-written instantiations keep working.
   - `AppendTooLarge`, `TransactionOverflow` and `AggregateTransactionOverflow` gain an optional `cause` holding DynamoDB's rejection. Constructing them without it still compiles.
@@ -1240,7 +1225,6 @@
   Everything is additive. Two defaults of `commandHandler` change, and neither
   changes a successful result: it now loads state with strongly consistent reads
   ([#139](https://github.com/jmenga/effect-dynamodb/issues/139)), and it folds the new events into state **before** appending them ([#137](https://github.com/jmenga/effect-dynamodb/issues/137)).
-
   - **Consistent reads ([#139](https://github.com/jmenga/effect-dynamodb/issues/139)).** `read`, `readFrom`, `currentVersion` and the new
     `readLatest` take `{ consistentRead?: boolean }`, which sets `ConsistentRead`
     on every `Query` page. `commandHandler` loads strongly consistently by
@@ -1351,7 +1335,6 @@
   real `DateTime`s.
 
   ### Before you upgrade
-
   - **Upgrade every reader before any writer, and don't roll back past this
     version once new rows are written.** A self date (`Schema.DateTimeUtc`,
     `Schema.Date`, or one with `storedAs`) inside a `NullOr` or other union, a
@@ -1686,7 +1669,6 @@
   a hydrated ref, and a self date inside a union, record or tuple.
 
   **Now working.** None of these worked on 1.22.0:
-
   - A ref in a `many` element, declared as `player: Player.pipe(DynamoModel.ref)`
     (it could not be read back even after a fresh write) or as the element itself,
     `Schema.Array(Player.pipe(DynamoModel.ref))` (`update` failed). The plain
@@ -1741,7 +1723,6 @@
   snapshots) now encode their value through the schema at the path, as `.set()`
   does. Before, they wrote the raw value: a `DateTime` became a map even on a
   plain date field, and a `NumberFromString` value was stored as a number. Now:
-
   - A plain object on a class-typed field is encoded as that class, and a class
     instance is always encoded whole.
   - A plain object or array that mixes wire and domain parts, or holds an
@@ -1832,7 +1813,6 @@
   `OptimisticLockError` with the real `actualVersion`, a failed `.condition()` is
   a `ConditionalCheckFailed`, and a missing item is an `ItemNotFound`. Three cases
   used to be the other way round:
-
   - A versioned update with `expectedVersion` and a `.condition()` reported a
     failed condition as `OptimisticLockError(-1)`.
   - A retain update with a `.condition()` did the same.
@@ -1943,7 +1923,6 @@
   current value, so spread records work; a different value is refused.
 
   **Known limitations.** Both are inherent:
-
   - On unversioned entities, nothing can prove an unguarded attribute unchanged.
     So the item a unique-field update returns may show stale values for
     attributes it neither reads nor writes, wide items use the fallback guard
@@ -2177,7 +2156,6 @@
 
   Two further bugs on the `restore` path, both independent of any rename, are
   fixed alongside:
-
   - **`softDelete: { preserveUnique: true }` made `restore` impossible.** The
     delete deliberately keeps the reservation, so the restore-time sentinel Put's
     `attribute_not_exists` guard could never hold: every restore of a constrained
@@ -2216,7 +2194,6 @@
   Added on `Query`, `BoundQuery` and `Aggregate.list`'s `ListOptions` (as `filterBy`), so there is one vocabulary rather than three. On an aggregate it runs on the root item **before assembly**, for the same reason `ListOptions.filter` is worth pushing server-side: a rejected root item never pays for its partition read.
 
   Two corners are closed rather than left to be discovered:
-
   - **`.count()`** would have reported the unfiltered count, since `Select: "COUNT"` returns no items to run the predicate against. It now reads the rows and counts the accepted ones — correct, at the cost of the read. Its error channel gains `ValidationError` accordingly, since decoding can now fail during a count.
   - **`.select()` with a predicate** raises **EDD-9054**. A projection returns only the attributes it names, and a predicate is an opaque closure whose attribute reads the library cannot see — so it cannot borrow them into the `ProjectionExpression` the way key attributes are borrowed for cursor rebuilding, and the predicate would be handed items missing the fields it tests.
 
@@ -2292,7 +2269,6 @@
 
   `list` now takes the paging vocabulary the rest of the library settled on in
   1.16.0, plus a server-side predicate:
-
   - **`filter`** — a `FilterExpression` on the **root-item** query, in the same
     callback and shorthand forms `BoundQuery.filter()` takes. This is a
     performance fix as much as an ergonomic one: `list` assembles each surviving
@@ -2324,7 +2300,6 @@
   An aggregate whose model carried a transformed field could not round-trip: the write path stored Type-side values, so a `bigint` landed as `{"N":"5"}` and assembly's `Schema.BigIntFromString` decode rejected a number. Aggregate attributes are now encoded to their wire form before marshalling, at the root, sub-aggregate roots, `one` edges, `many` elements and propagated context values.
 
   Two further causes are fixed with it:
-
   - **`fieldsOf` did not see through `DynamoModel.configure`**, so any edge whose model is configured — which is most, since `identifier: true` requires it — received **no encoders at all**. Dates on those edges were stored as `{"M":{…}}` or `{"M":{}}`, meaning the date handling added in [#72](https://github.com/jmenga/effect-dynamodb/issues/72) was silently not applying to them.
   - **`aggregate.update` recognised only date transforms** when re-decoding mutated state, so a non-date transform was rejected before any item was built — even when the mutation touched only an untransformed field. The tolerance now covers every leaf transform, and remains scoped to the aggregate decode path: entities pass no such option.
 
@@ -2370,7 +2345,6 @@
 
   Applying `.condition(...)` now widens the operation's error channel with `ConditionalCheckFailed`,
   on every surface it is exposed:
-
   - `BoundPut.condition()` — `db.entities.Users.put(input).condition(...)`
   - `BoundUpdate.condition()` — `db.entities.Users.update(key).set(...).condition(...)`
   - `BoundDelete.condition()` — `db.entities.Users.delete(key).condition(...)`
@@ -2424,7 +2398,6 @@
   Composition now follows one rule at every site: compose from the Encoded form, except when the domain type is numeric and the encoded form is a string, where the numeric Type form is used so it pads. `DynamoModel.DateEpochMs` composites use the padded epoch.
 
   **⚠️ Migration.** Rows keyed on either shape below were written under the old key and will not be found after upgrading — no error, the partition simply does not resolve. Read them by scan and re-`put` before or during the upgrade.
-
   - **Entity primary keys and GSI keys** with a `Schema.BigIntFromString` or `Schema.NumberFromString` composite. On 1.15.0 `put` **succeeded** and wrote these rows (only `get` was broken), so this data exists.
   - **Aggregate partition and collection keys** with a `DateEpochMs` / `DateEpochSeconds` composite, which move from their ISO form to the padded epoch.
 
@@ -2433,7 +2406,6 @@
   Eleven modules previously decided independently what to hand the key composer, which is what produced the divergence. `test/KeyFormInvariant.test.ts` now reads each module as source text and fails if a `KeyComposer` call receives a record that did not go through the shared form.
 
   Fixed by the same change, each previously a silent wrong result:
-
   - `update()` rewrote GSI keys in a different format than `put()` wrote them, evicting the row from its own GSI.
   - `Transaction.transactWrite` / `Batch.write` composed a different primary key than `Entity.put`, producing unreadable orphan rows; `Batch.get`, `transactGet`, `transactWrite(delete)` and `Transaction.check` used the caller's raw key.
   - `purge()` reported success and deleted nothing.
@@ -2448,7 +2420,6 @@
 - [#112](https://github.com/jmenga/effect-dynamodb/pull/112) [`0d67a51`](https://github.com/jmenga/effect-dynamodb/commit/0d67a51b1b27907c746c6fe808f929716d12f504) Thanks [@jmenga](https://github.com/jmenga)! - Separate `limit` (results) from `pageSize` (round trips) on queries and scans
 
   `limit` and page size were two different ideas sharing one word. They are now two combinators:
-
   - **`limit(n)`** — return **at most `n` items**. A contract on results. It no longer sets DynamoDB's `Limit`; the query accumulates across as many requests as it takes to reach `n` accepted items or exhaust the key range.
   - **`pageSize(n)`** — fetch in **batches of `n` rows**. This is what sets DynamoDB's `Limit` (rows _examined_ per request). A contract on round trips, not on what comes back.
   - **`maxPages(n)`** — unchanged. Still the hard stop on the number of requests, and the escape hatch when a filter is selective enough that `limit` would otherwise walk a large partition.
@@ -2481,14 +2452,12 @@
   A declared `sk.composite` is now **authoritative**: it replaces the ref-identifier heuristic rather than extending it, so it decides both uniqueness and the order elements sort in. Entries name attributes on the decomposed element and may use a dotted path to reach a hydrated ref (`"umpire.id"` — hydration replaces the id field with the referenced object, so the bare name no longer exists at the top level).
 
   Two related fixes for the same defect — a `many` edge whose sort key is not derived from anything distinguishing:
-
   - **"Element IS the ref" edges now compose a sort key.** `Schema.Array(Player)` hydrates each element to the entity's own flat fields, and the identifier fallback only recognised a field literally named `id`. An entity whose identifier is `playerId` produced _no_ composites, so every element collapsed onto one row. The edge entity's declared `DynamoModel.identifier` field is now used.
   - **Colliding sort keys fail as `AggregateDecompositionError`.** Decomposition detects two items composing the same sort key and fails with the aggregate, the edge and the colliding key — instead of an opaque `DynamoValidationError` naming nothing. This is checked before any write, so nothing is persisted.
 
   A declared composite must resolve to a **scalar** — string, number, bigint, boolean or date. Naming the hydrated ref object itself (`sk: { composite: ["umpire"] }`) rather than a scalar path (`"umpire.id"`) previously serialised the whole object into the sort key; it now fails with `AggregateDecompositionError` pointing at the dotted form.
 
   **Migration.** Sort keys change for two shapes, both of which could not previously hold more than one element:
-
   - edges that already declared `sk.composite` (previously ignored)
   - "element IS the ref" edges whose entity identifier is not named `id` — a single-element edge stored as `$app#v1#matchplayer` now stores as `$app#v1#matchplayer#p-1`
 
@@ -2509,7 +2478,6 @@
   through the same composer the write path uses, applying value serialization, the
   `<name>_` prefix and the schema casing. Additional behaviour that follows from
   composing correctly:
-
   - A condition on a **non-terminal** SK composite covers that value's whole
     subtree — `eq` compiles to a subtree `begins_with`, and inclusive upper bounds
     span the subtree.
@@ -2550,7 +2518,6 @@ value` in a single key condition, so this is refused rather than silently
   table with no modification timestamp and no way to add one. Aggregates now take the same
   `TimestampsConfig` and stamp every row they write: the root item, `one` and `many` edges, and
   every row inside a sub-aggregate transaction group.
-
   - `updated` is per row — a diff-based `update` rewrites only the groups whose content changed,
     so rows the mutation leaves alone keep their stored value.
   - `created` is carried forward on rewrite; aggregate writes are `Put`, not `UpdateItem`.
@@ -2628,7 +2595,6 @@ value` in a single key condition, so this is refused rather than silently
   arguments) touch modules the library does not consume.
 
   Consumers pick up upstream improvements for free:
-
   - Faster synchronous `Schema` decode/encode (completed parser exits plus a direct loop for
     common struct parsers) — this library decodes every item it reads.
   - Faster `SchemaError` construction (stack frame capture is now skipped) — validation
@@ -2678,12 +2644,10 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   exhaustively matching on `append`'s error union will need three more cases.
 
 - [#87](https://github.com/jmenga/effect-dynamodb/pull/87) [`f846367`](https://github.com/jmenga/effect-dynamodb/commit/f846367a541fefb9c29f40684f87f89c8333745b) Thanks [@jmenga](https://github.com/jmenga)! - EventStore: guard `append` against TransactWriteItems limits and expectedVersion-ahead version gaps ([#82](https://github.com/jmenga/effect-dynamodb/issues/82))
-
   - New `AppendTooLarge` tagged error and `TRANSACT_WRITE_ITEMS_LIMIT` constant, exported from both `@effect-dynamodb/schema` and `effect-dynamodb`. `append` now pre-validates the transact-item count and fails with `AppendTooLarge` before issuing any request instead of surfacing a raw AWS validation error. The batch is deliberately never chunked — chunking would break append atomicity.
   - `append` now enforces version contiguity. When `expectedVersion > 0` the transaction carries a `ConditionCheck` requiring the event at exactly `expectedVersion` to exist, so an _ahead_ expected version fails with `VersionConflict` instead of silently writing past the stream head and leaving a permanent gap in the version sequence. The check occupies one transact item, so a single append holds up to 100 events at `expectedVersion === 0` and up to 99 otherwise.
 
 - [#90](https://github.com/jmenga/effect-dynamodb/pull/90) [`5127a60`](https://github.com/jmenga/effect-dynamodb/commit/5127a606049d89da5de92b44f74dc2182e8b4418) Thanks [@jmenga](https://github.com/jmenga)! - EventStore: snapshot support and a `commandHandler` retry option ([#84](https://github.com/jmenga/effect-dynamodb/issues/84)).
-
   - **Snapshots** — opt in with `makeStream({ ..., snapshot: { schema, every? } })`. One
     snapshot item per stream lives in the stream partition under a distinct sort key
     (`$<schema>#v<n>#<stream>.snapshot`) that can never collide with an event sort key.
@@ -2821,7 +2785,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
 - [`bfec5f2`](https://github.com/jmenga/effect-dynamodb/commit/bfec5f22ca03961b2bcc13dfa62b323a7bab6375) Thanks [@mixja](https://github.com/mixja)! - Upgrade to Effect 4.0.0-rc.109 (release candidate)
 
   The workspace moves from `effect@4.0.0-beta.85` to `effect@4.0.0-rc.109` (now published from the main Effect-TS/effect repo). The `effect` peer range is raised to `^4.0.0-rc.109` accordingly. Migrations applied:
-
   - **`Schema.DateValid` removed** — `Schema.Date` now rejects invalid dates itself; all `DateValid` usages (DynamoModel Unsafe date codecs, date-transform substitution) migrate to `Schema.Date` with identical validation semantics.
   - **AST introspection moved to `representation` identities** — the RC removed the `typeConstructor` / `meta` annotation payloads that date/Redacted detection sniffed via `SchemaAST.resolve`. Detection now reads the stable `representation.id` (`effect/schema/Date`, `effect/schema/DateTimeUtc`, `effect/schema/DateTimeZoned`, `effect/schema/Redacted`) through a shared `matchDateRepresentation` helper (deduplicating the former Aggregate.ts matchers).
   - **`Schema.Struct(...)` is now a function** — the `isSchemaClass` detection gains an AST-tag guard (`Declaration` vs `Objects`); without it, Struct-modeled entities were decoded through `new Struct(...)` and silently returned empty objects. A canary test locks the discriminator down.
@@ -2848,7 +2811,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   A pure `EntityDefinition` produced by `@effect-dynamodb/schema`'s `Entity.make` — the AWS-free authoring surface introduced by the schema/runtime split ([#62](https://github.com/jmenga/effect-dynamodb/issues/62)) — was accepted by `DynamoClient.make` but bound to `never`: `db.entities.X` exposed no usable methods, and any call would also have crashed at runtime because pure definitions carry no operations or `_decodeRecord`. The single-source-of-truth goal of the split was unreachable — entities had to be re-authored with the runtime `Entity.make` to get a working client.
 
   This completes the split's end-to-end path:
-
   - **Type:** `TypedClient`'s entity mapping now matches a pure `EntityDefinition` (a second conditional branch) in addition to the runtime `Entity`, so `db.entities.X` resolves to the full bound entity (CRUD + index accessors + `scan`) for both authoring styles.
   - **Runtime:** `DynamoClient.make` transparently _promotes_ a pure definition to a full operational entity at bind time via `Entity.fromDefinition` — a thin op-attach over the definition's retained derivation data. This also fixes the silent `db.collections.*` decode crash for pure-authored members. CRUD, index queries, `scan`, collections, and table GSI derivation all work.
   - **Refs:** pure entities with refs are fully supported. Write-time ref hydration calls `.get()` on each ref target, so promotion now promotes ref targets too (one level — a `.get` does not itself hydrate, which also sidesteps cyclic refs). This package's `AnyRefValue` is unified onto the shared structural `RefEntity` carrier (also used by aggregate edges), so ref-derived id composites survive into the bound client and a ref target may be authored in either package.
@@ -2866,7 +2828,6 @@ ConditionCheck` is checked against the shared `TRANSACT_WRITE_ITEMS_LIMIT` (100)
   Two follow-ups to the #62 schema/runtime split, both blocking its headline use case
   (deriving a typed aggregate input/create payload from `@effect-dynamodb/schema` with
   no AWS SDK):
-
   - **#66** — the pure edge constructors (`Aggregate.ref` / `one` / `many`) required a
     `RefEntity` with a runtime `get` method, so aggregate edges could not be authored
     from pure `Entity.make` definitions (which have no `get`). `RefEntity` is now the

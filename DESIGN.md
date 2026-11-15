@@ -3472,7 +3472,40 @@ language service's params (a collection query pins no sort key composites); `Agg
 `#`). Its `prefix: true` option (#264) sends 1.36's bare `begins_with(<key text>)`, so
 the last value given matches as a prefix, as `.where(beginsWith)` does on an entity; a
 numeric last value has no text prefix and keeps the rule above
-(`KeyComposer.matchesTextPrefix`). A full pin on a time-series entity's primary accessor reads the current item
+(`KeyComposer.matchesTextPrefix`). The list key's sort key condition holds the
+leading values only, up to the first composite not given. A value given after
+that gap matches a root row as it would in the key: where the key text composed
+from it (`keyValueText` of its key form, as the leading values) is the text
+composed from the row's value for that composite, the text `create` put in the
+row's list sort key (the value as a read takes it, `decodeAsRead`, through the
+key encoders and the key form). Schema casing, `escapeKeys`, number and date
+key text all apply, so a gap value behaves as the same value would in the
+leading run. Where comparing the stored attribute is that test, the value is
+an equality ANDed into the root-item `FilterExpression` ahead of the list's own
+`filter`, sent as `create` stores it (`rootStoredValue`: `2025` on a
+`Schema.NumberFromString` as `"2025"`): a number, or any value under a casing
+that doesn't fold text (`preserve`), where the root's encoder takes it whole.
+Otherwise (text under `lowercase` or `uppercase`, which DynamoDB can't compare
+case-insensitively, or a value the encoder doesn't take, such as a date given as
+ISO text) the root items the query returns are matched on their key text
+(`listGapMatch`) before any is assembled, through the `accept` predicate
+`filterBy` uses (ANDed ahead of it), so no condition for it is sent. Only the
+composites matched are read off the row, so a list index that projects just
+them (`INCLUDE`) works. Read capacity is the same either way: a
+`FilterExpression` runs after the read. A row with no readable value for a
+composite matched (not projected, or held as something its field can't read)
+has no key text, and the call is a `ValidationError` (`EDD-9168`) rather than a
+guess. A composite compared in the filter must be projected onto the list index
+too: the library doesn't know the index's projection, and DynamoDB's filter
+matches nothing on an attribute the index row doesn't hold. A value no condition can
+compare (`NaN`) is a `ValidationError` (`EDD-9124`), nothing sent. `prefix` then
+changes nothing. `limit` and the cursor follow the filtered-list rules: rows are
+dropped after the read either way, and the cursor is rebuilt from the last
+aggregate returned.
+Up to 1.42.1 such a value was dropped, so `list({ league, name })` on
+`sk: [league, season, name]` returned every aggregate of the league. A key
+without a gap sends what it sent (`AggregateListGap.test.ts`,
+`connected.aggregate-list-gap.test.ts`). A full pin on a time-series entity's primary accessor reads the current item
 only, never its `#e#` rows. Z-order halves pin prefix segments only and are
 unaffected. An index whose sort key has no composites (an empty-composite half)
 pins nothing: its accessor sends the partition key alone, and on the primary key
@@ -3935,10 +3968,15 @@ entity's model, which the stored ref holds in its stored form, so
 `eq(t.player.id, 5)` on a player keyed by a `NumberFromString` compares the
 `"5"` the ref holds. Up to 1.41.0 every primitive was sent as given, so such a
 comparison never held (a number against text; `ne` always held). An aggregate's
-`list` filter still sends a primitive as given: the root's attribute encoders
-are left as they were. Pinned by `OperandsAsStored.test.ts`,
-`TransactionCheckOperands.test.ts` and `helpers/EntityRefOperands.ts`
-(recording table and DynamoDB Local).
+`list` filter follows the same rule against its root's attribute encoders, the
+encoders its writes store the root row with (`buildAttrEncoders`, a `storedAs`
+date included): `eq(t.caps, 7)` on a root
+`Schema.NumberFromString` sends `"7"` (#124). Through 1.42.1 every primitive
+there was sent as given, and such a comparison never held; an instance (the
+issue's `DateTime.Utc` against a `Schema.DateTimeUtcFromString`) has been sent
+in the stored form since 1.41.0. Pinned by `OperandsAsStored.test.ts`,
+`TransactionCheckOperands.test.ts`, `AggregateListGap.test.ts` and
+`helpers/EntityRefOperands.ts` (recording table and DynamoDB Local).
 
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first
@@ -4159,10 +4197,13 @@ wire AND validates as the domain type (`StringFromBase64` given `"aGk="`,
 `"hi"` on `StringFromBase64` is not valid wire and is encoded. Paths into and
 under a TOP-LEVEL `DynamoModel.ref` field follow the ref target's model
 (`refTargets`), whose read schema is substituted, so they are encoded like any
-other path. An opaque class (built with `.check()` or `.annotate()`, or a
-`DynamoModel.ref` nested inside a ref target) is deliberately not followed by
-`childAtSegment`: its `.fields` are gone, so the read schema keeps it
-unsubstituted and decodes its leaves exactly as `put` stores them, and a path
+other path, and so are paths under a ref nested in a ref target, at any depth,
+through the model of the entity the target's entity names for it (`heldRefs`,
+`heldRef`, `heldRefMember`), however the target's model declares it, within the
+wrappers it declares around it (up to 1.42.1 a nested `DynamoModel.ref` was
+opaque here). An opaque class (built with `.check()` or
+`.annotate()`) is deliberately not followed by `childAtSegment`: its `.fields`
+are gone, so the read schema keeps it unsubstituted and decodes its leaves exactly as `put` stores them, and a path
 value under it is passed through as given so the item stays readable. Known
 limitation: plain dates inside such a class are still stored as maps (also by
 `put` / `.set()`), as on 1.22.0. Only those and paths no schema describes (under
@@ -5202,9 +5243,9 @@ When Entity encounters a `ref`-annotated field:
 
 | Derived Type | Behavior |
 |---------|----------|
-| `Entity.Input<E>` | Ref field becomes its ID type (`player: Player` → `playerId: string`) |
+| `Entity.Input<E>` | Ref field becomes its ID type (`player: Player` → `playerId: string`; `player: Schema.NullOr(Player)` → `playerId: string \| null`) |
 | `Entity.Record<E>` | Ref field is the full entity domain type (`player: Player`) |
-| `Entity.Update<E>` | Ref field becomes optional ID (`playerId?: string`) |
+| `Entity.Update<E>` | Ref field becomes optional ID (`playerId?: string`; `string \| null` for a nullable ref, where `null` detaches it) |
 | DynamoDB storage | Core domain data stored as embedded map attribute |
 | Create/Put | Entity auto-hydrates: receives ID → fetches entity → embeds domain data |
 
@@ -5695,11 +5736,13 @@ the hidden set `hiddenFieldNamesOf` that the entity's own read uses too): where 
 hidden field is required, the ref is the target's other fields, a plain object.
 Up to 1.40.0 the ref was read as the whole target, so a `put` naming one wrote its
 row without the field and failed (`Missing key`), as did every read of it
-(`fixtures/entity-ref-hidden-1.40.0.json`, `EntityRefHidden.test.ts`). Named, not
-changed: two levels deep (`League` refs `Club`, which refs `Team`, whose hidden
-field is required), `League`'s write still fails, as on 1.40.0, since its ref's
-read builds a `Club` by the class's constructor, which checks `team` as a whole
-`Team` (`RefHiddenPositions.test.ts`). For an
+(`fixtures/entity-ref-hidden-1.40.0.json`, `EntityRefHidden.test.ts`). Two levels
+deep (`League` refs `Club`, which refs `Team`, whose hidden field is required),
+`League`'s write failed through 1.42.1, since its ref's read built a `Club` by the
+class's constructor, which checks `team` as a whole `Team`. An entity one of whose
+refs holds less than its target's class (`refHeldTarget`) is now read in "model"
+mode by prototype, as its other reads are (`refsHoldLess`), whichever way the refs
+are declared (`RefHiddenPositions.test.ts`). For an
 entity whose identifier is its key, nothing a `put` sends or stores changes
 (`fixtures/entity-ref-keys-1.39.0.json`, `EntityRefKeys.test.ts`,
 `connected.entity-ref-keys.test.ts`). An entity keyed by more than one composite
@@ -5746,12 +5789,31 @@ it. With `Selection` → `Player` → `Team`, `Team` configuring `founded`, `Sel
 and path-written in it (`helpers/EntityRefStoredAs.ts`). An entity can only ref one made before
 it, so the tree is built from finished entities and can't loop. A copy 1.41.0 wrote holds the
 ISO text of the 1970 date `Player` read then, and reads as that date; setting the ref again
-stores it right. Named, not changed: a middle model declaring its ref opaque (`team:
-DynamoModel.ref(Team)` in `Player`'s class, not `team: Team` with `configure`'s `ref: true`)
-isn't looked into, and such a `Selection` fails its `put` and reads (`Expected DateTime.Utc at
-player.team.founded`) whatever the storage, as it did before. A whole-ref
+stores it right. A middle model may declare its ref either way (`team: DynamoModel.ref(Team)` in
+`Player`'s class, or `team: Team` with `configure`'s `ref: true`): each entity also records at
+`make`, by ref field, the model of the entity it refs and that entity's own refs (`HeldRefs`,
+read by `entityRefsOf`), and the ref schemas (`DeepSubstitutionOptions.heldRefs`) and the path
+encoder (`makePathValueEncoder`'s `heldRefs`) walk a ref of a ref's target as what a read of its
+entity returns (`heldRefMember`), at any depth. The walk keeps the wrapper the model declares
+around such a ref exactly (`NullOr`, `UndefinedOr`, `optional`, `optionalKey`, `optionalKey`
+of a `NullOr`, a `Union` with other members), as it keeps the one around a date: the field
+carries the ref down (`DeepSubstitutionOptions.heldRef`) through the wrappers the walker already
+passes through, and only the ref member inside is replaced, so a player without a team (`team:
+Schema.NullOr(Team)`) reads, and is path-written `null`, as 1.42.1 did. `DynamoModel.ref` hides a class's fields, so up to
+1.42.1 the annotated form wasn't looked into: such a `Selection`'s `put` stored its row and then
+failed, as did its reads (`Expected DateTime.Utc at player.team.founded`), and a condition,
+filter or `pathSet` on `player.team.founded` sent the date as a map. Both forms now send what the
+configure form sent in 1.42.1, byte for byte; the row such a `put` left behind holds those bytes
+and reads, and a copy a 1.42.1 `pathSet` left as a map reads as the date it holds
+(`helpers/EntityRefNested.ts`). A ref back to a model on the way (a model that refs itself,
+through `Schema.suspend`) is held to the depth its entities give it, as the tree is. A whole-ref
 `pathSet(["player"], value)` the ref's schema refuses as a whole is encoded part by part over
-the raw model, without the storage. An aggregate's ref and `one` edge copies are encoded by the
+the raw model, without the storage. A path write whose way passes a union (a whole ref written
+at `["child", "child", "child"]` beneath refs declared `Schema.NullOr`) is judged and encoded at
+each way's end in the path's storage (`wayDeclared` through `storedSchema`, the schema the path
+encoder writes that path with); up to 1.42.1 a way's end was taken in the default storage, so in
+epoch storage such a write was refused (`leave a value no member of its union reads`). An
+aggregate's ref and `one` edge copies are encoded by the
 aggregate's own encoders over the raw model (`buildAttrEncoders`), so they hold the default
 form and read it back with the same: consistent, and unchanged.
 
@@ -5776,6 +5838,33 @@ an index keyed by its id stored) and the ref may be removed by its field
 (`.remove(["team"])`, which takes the row out of that index); a required ref, and any
 `${field}Id`, is still refused by `.remove()`
 (`fixtures/entity-ref-writes-1.40.0.json`, `helpers/EntityRefWrites.ts`).
+
+**A ref the model declares nullable behaves as an optional one, holding `null`.** `team:
+Schema.NullOr(Team)` (configured `{ ref: true }`, or `DynamoModel.ref(Schema.NullOr(Team))`)
+derives `teamId: string | null`, a required key (optional too under `Schema.optionalKey`); a
+`Schema.UndefinedOr` ref's id is a required key taking `undefined` (`refNullish`, read through
+`optionalField`). The ref's own read and write fields keep the declared union, the ref member
+replaced (`heldRef`, as for a nested ref), and a missing attribute reads as what it stands for
+(`readingAbsent`). A `null` id is the optional form's absent id with `null` stored: `put` /
+`create` / `upsert` fetch nothing (`hydrateRefs` stores `team: null` and drops the id), and the
+key composer takes `null` as a missing composite, so no key of an index keyed by the id and no
+unique sentinel is written. The update schema's id takes `null` too; `.set({ teamId: null })`
+detaches the ref as `.remove(["team"])` detaches an optional one (`removedSetOf` names the
+ref and its id in `removedSet`, so the halves holding the id are REMOVEd under both policies
+and a changed unique field releases its sentinel), storing `null`; `.keepRefs()` takes no
+`null` (`KeptRefIds`). A `transactWrite` update plans the entity's own update and agrees; a
+`transactWrite` put of a ref entity is refused as before. Up to 1.42.1 the target replaced the
+whole field: a non-null id wrote and read as it does now (the requests are unchanged), but the id
+took no `null` and a row holding `null` failed every read (`Expected object`), which also failed
+an aggregate edge copying such a row. A primary key composed from a ref's id takes a non-null id
+as before; a write of a whole item (`put` / `create` / `upsert`) giving `null`, or leaving out an
+optional ref's id, is refused before anything is sent, another ref's read included
+(`refuseUnkeyedRefs`, from `composeAllKeys` and the plain upsert before its hydration;
+`EDD-9169`): every item has a primary key, and a ref without an id has none to compose it from.
+Up to 1.42.1 the `null` failed decoding and a left-out optional id died in key composition
+(`Missing composite attribute`). A key-taking op is refused by its key schema, which takes no
+`null`, and an update can't set a primary key composite, as before
+(`helpers/EntityRefNullable.ts`, `EntityNullableRefs.types.test.ts`).
 
 **Reassigning one ref of a half that holds two (#263).** An update composes a half from its
 payload and its key record, under the index policy (§7): a plain update reads no row, so
@@ -6020,7 +6109,14 @@ inside sub-aggregate edges and `many` elements (found by
 `deriveEntityFieldName`), a `many` field whose element *is* an opaque ref
 (`Schema.Array(X.pipe(DynamoModel.ref))`, re-pointed as a whole at
 `Schema.Array(<entity model>)` because the walker re-points fields, not
-elements), and refs nested in an edge entity's own model (#116). A
+elements), and refs nested in an edge entity's own model (#116) and in their
+entities' models in turn (`entityRefsOf`; up to 1.42.1 only a pure definition's,
+one level down, whatever its wrapper), each only where the field is the ref or an
+optional key or property of it (`keepsWrapper`), since the resolver re-applies only
+optionality: a nested ref beneath a `NullOr` or a `Union` is walked as declared, as
+1.42.1 walked a runtime entity's. A ref back to a model already on the way (a model that refs
+itself through `Schema.suspend`) is not registered, so the walk ends; its dates
+are encoded as 1.42.1 encoded them. A
 plain-class element field is walked directly and needs no registration. Targets
 are keyed by **field schema identity**, not field name: the resolver is
 consulted at every depth, and a name-keyed table re-pointed any same-named field
@@ -6169,8 +6265,8 @@ date, comparing an expiry as the marshaller writes it (`optionsWriteAs`), so a c
 it, and a jar keyed other than by its cookies' names stay the map.
 
 **What an untyped position doesn't keep (1.41.0, `EDD-9161`).** At a position no schema
-types (`Schema.Unknown`, `Schema.Any`, at any depth, `holdsUntyped`), the value is
-marshalled as given, so only the value can say whether DynamoDB keeps it. Up to 1.40.0 a
+types (`Schema.Unknown`, `Schema.Any`, `Schema.ObjectKeyword` from 1.42.2, at any depth,
+`holdsUntyped`), the value is marshalled as given, so only the value can say whether DynamoDB keeps it. Up to 1.40.0 a
 `Date` there was written as an empty map and read back as `{}`, with no error.
 `internal/LostValues.ts` (schema package) is the one decision: `lostAs` says what of one
 value is lost, `lostElement` what of a list's element, and `lostIn` walks a value as the
@@ -9008,12 +9104,14 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9158` | Retired, never released | Allocated during 1.41's development for refusing an entity-level ref's `${field}Id` for an entity keyed by more than one composite, and retired before release: a key whose other composites have an encoding default composes from the identifier alone, and 1.40.0 fetches and stores it. Such an id is fetched under the identifier, as on 1.40.0, and fails as it did where the key can't be composed. Don't reuse the number |
 | `EDD-9159` | `Aggregate.ts` (`givenOverRowReason`, `customOverRowReason`, through `refuseGivenOverRows`), at `create` only (`AggregateDecompositionError`, nothing sent) | A `create` whose input gives, at the top of a row's value (the root's, a sub-aggregate's root, a `one` edge's value, a `many` element, or a `many` edge's value through its custom `decompose` / `assemble`), a value for a name the library writes on that row (`__edd_e__`, the partition key attribute, `sk`, the collection sort key's copy, the root's list keys on a write composing them; on a row beneath the root, a context attribute) that a `get` right after would not return (#241): the row as built, read as a `get` reads it (unpacked, renamed, sparse fields restored, decoded by the member's own schema), compared with the value given (`sameValue`: sets by members, dates by instant, otherwise strictly, `5n` ≠ `5`, `-0` ≠ `0`, `1.5` ≠ `1.50`). A union or `Schema.suspend` root or sub-aggregate is read whole (`nodeReadOf`). Up to 1.40.0 the library's value replaced it and the read handed back something else, or failed. Equal: written as on 1.40.0. Given no value, a name the member places with another schema than the root's is refused only where that read fails (`unreadOverRowReason`, `customUnreadReason`). The value given is looked up under the name the input holds it by (`inputNameIn`: a `many` edge's `inputField`). Not judged: a discriminator, a name the library doesn't write on that row, a nested value, and `update`. `Aggregate.make` refuses nothing. The message names the member and the field and shows the value given and what the read returns (or its failure), each rendered unambiguously |
 | `EDD-9160` | `Aggregate.ts` (`refuseOtherSettingRows`), at `update` (`ValidationError`, nothing written) | An aggregate `update` about to write a group one of whose rows is stored under another sort key than this configuration composes for the value read from it (`sortKeyOf`, through `rowsReadAt`): written under the other `escapeKeys` setting (a `$`, `#` or other escaped character, a number other than a non-negative integer below 1e16, a negative `bigint`, in a `many` element's sort key or a discriminator value, or an `entity:` edge's composite its model encodes), before the setting was turned over (#241). Up to 1.40.0 the update wrote the group's rows under the new text beside the old, so every element read twice (or a doubled sub-aggregate root failed to read, or, with texts aliasing across the settings, one element's row overwrote another's). Not refused: a key whose text is the same under both settings, a row the update moves itself (an `entity:` edge's under 1.40.0's composition), a group the update doesn't write. The message names the member, the row's sort key and `rekey` |
-| `EDD-9161` | `internal/LostValues.ts` (schema, `lostAs`, `lostIn`, `readJudged`), through `internal/RoundTrip.ts` (`readBackOf`, `notReadBack`) on `Entity.ts` (`encodeForWrite`, `unstorableOperand`, `_refuseNotReadBack`), `Marshaller.ts` (`marshallStorable`: a part behind a getter, judged as it's called), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox), `Aggregate.ts` (`refuseLost`), and `internal/PackedCodec.ts` (`written`) | A write's value, at a position no schema types (`Schema.Unknown`, `Schema.Any`, at any depth, `holdsUntyped`), holding a part DynamoDB doesn't store: a `Date` (valid or not) or a `RegExp`, written as an empty map that reads back as `{}`; a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`; an `Error` holding a `message` or a `cause` that isn't an enumerable property; a `Redacted`, of which only the marker is stored; a `Map` with a key that isn't a string, whose keys read back as text; and the binary data 1.40.0 stored as less than it is or failed to send, kind by kind: an `ArrayBuffer`, a `DataView` or a `Blob` (a `File` is one), stored as empty bytes; a `SharedArrayBuffer`, stored as an empty map; an instance of a subclass of any of them, stored as the map of its enumerable properties; and the typed arrays `Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`, `BigInt64Array` and `BigUint64Array` themselves, which the AWS SDK fails to serialise (up to 1.40.0 a `DynamoError` holding its `TypeError`). Any other binary kind (a `Float16Array`, a subclass of a typed array, a kind a later runtime adds) is stored as 1.40.0 stored it. A cookie's expiry is stored as ISO text, so it isn't one, and a list holding `undefined`, a function or a hole closes up as it always has. A `ValidationError` naming the path, with nothing written, on every write path: `put` / `create` / `upsert`, an update's `.set` and path operations, `transactWrite`, `Batch.write`, a time-series `append`, an aggregate's `create` and `update`, an event stream's `append` (event and metadata) and snapshot, and a projection's outbox. A packed field refuses the same values with the same words, through the same function, where it refused them before as JSON can't hold them (a map and binary data still as not JSON). A part behind a getter is judged as the marshaller calls the getter, which is called as often as 1.40.0 called it. Only a schema holding an untyped position pays for the walk. Rows already stored as `{}` read as `{}`. |
+| `EDD-9161` | `internal/LostValues.ts` (schema, `lostAs`, `lostIn`, `readJudged`), through `internal/RoundTrip.ts` (`readBackOf`, `notReadBack`) on `Entity.ts` (`encodeForWrite`, `unstorableOperand`, `_refuseNotReadBack`), `Marshaller.ts` (`marshallStorable`: a part behind a getter, judged as it's called), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox), `Aggregate.ts` (`refuseLost`), and `internal/PackedCodec.ts` (`written`) | A write's value, at a position no schema types (`Schema.Unknown`, `Schema.Any`, `Schema.ObjectKeyword` from 1.42.2, at any depth, `holdsUntyped`), holding a part DynamoDB doesn't store: a `Date` (valid or not) or a `RegExp`, written as an empty map that reads back as `{}`; a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`; an `Error` holding a `message` or a `cause` that isn't an enumerable property; a `Redacted`, of which only the marker is stored; a `Map` with a key that isn't a string, whose keys read back as text; and the binary data 1.40.0 stored as less than it is or failed to send, kind by kind: an `ArrayBuffer`, a `DataView` or a `Blob` (a `File` is one), stored as empty bytes; a `SharedArrayBuffer`, stored as an empty map; an instance of a subclass of any of them, stored as the map of its enumerable properties; and the typed arrays `Int8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`, `BigInt64Array` and `BigUint64Array` themselves, which the AWS SDK fails to serialise (up to 1.40.0 a `DynamoError` holding its `TypeError`). Any other binary kind (a `Float16Array`, a subclass of a typed array, a kind a later runtime adds) is stored as 1.40.0 stored it. A cookie's expiry is stored as ISO text, so it isn't one, and a list holding `undefined`, a function or a hole closes up as it always has. A `ValidationError` naming the path, with nothing written, on every write path: `put` / `create` / `upsert`, an update's `.set` and path operations, `transactWrite`, `Batch.write`, a time-series `append`, an aggregate's `create` and `update`, an event stream's `append` (event and metadata) and snapshot, and a projection's outbox. A packed field refuses the same values with the same words, through the same function, where it refused them before as JSON can't hold them (a map and binary data still as not JSON). A part behind a getter is judged as the marshaller calls the getter, which is called as often as 1.40.0 called it. Only a schema holding an untyped position pays for the walk. Rows already stored as `{}` read as `{}`. |
 | `EDD-9162` | `internal/ObjectKeyText.ts` (schema, `defaultObjectText`, `objectKeyRefusal`, `judgeObjectKeyText`), decided where a key is composed (`KeyComposer.siteCompositeText`) under a write's own schema (`Entity.ts` `ownSchema`, `DynamoSchema.objectKeys`) | A write composing a key from an object whose key text is its default `[object …]` tag (a struct, a `Data` class, a class of one's own without a `toString`), which every such object composes alike: in the primary key, an index, a unique constraint, a vector partition or a time-series `orderBy`, on `put`, `create`, `upsert`, an update recomposing an index key, `append`, and a transaction's and a batch's put. A `ValidationError` naming the field and what composes it, with nothing written. A key-taking read or delete (`get`, `delete`, a query accessor, an update's own key record, `restore`) still composes the text, to reach a row an earlier release wrote under it. A value with a key form isn't refused. A key the write doesn't compose (sparse, a half an update leaves) refuses nothing. An aggregate's `create` and `update` too, through `Aggregate.ts` (`ownKeys`, `buildDynamoItems`): the partition key (`create`), the collection sort key, the list keys and a row's static discriminators; an `update` keeps a root composite equal to the one read. |
 | `EDD-9163` | `internal/WriteDiagnosis.ts` (`OperandType`, a site's opt-in diagnosis), rewritten by `Entity.ts` (the time-series `append`, `orderByRefusal`) | A time-series `append` whose `orderBy` value is stored as a type DynamoDB's `<` doesn't take: a map (an `Option`, a `Result`, a `Duration`, a `BigDecimal`, a zone), a list, a boolean or null. The append guards on the stored `orderBy` being below the new one (`#_tsob < :_tsNewOb`), and DynamoDB refuses that condition whatever the item holds, so such an entity can never `append` (a nullable one, each append holding null). It isn't checked: the append is sent, and DynamoDB's refusal (`Incorrect operand type for operator or function; operator or function: <, operand type: M`), confirmed on the request sent (the guard `#_tsob < :_tsNewOb` is in its condition and `:_tsNewOb` is of the type DynamoDB named), is rewritten into a `ValidationError` naming `timeSeries.orderBy`, its field and the type, with DynamoDB's error as the cause and nothing written. A refusal of the caller's own condition is DynamoDB's error, unchanged. A struct's `orderBy` is refused before that, as its key text (`EDD-9162`). |
 | `EDD-9165` | `Marshaller.ts` (`protoEntryAt`, in the walk `marshallStorable` makes of every item it marshals; `fromAttributeMap` and `fromAttributeValue` on the read), through `marshalOrFail` and `unstorableIn`; `Entity.ts` (`protoAttributeIn` and `unstorableFields` for an update's record operations, `unstorableOperand` for a path operation's segments); `internal/Expr.ts`; `internal/EntitySchemas.ts` (schema, `protoAbsent`, a payload's decode or encode through a derived struct, see `EDD-9152`) | An attribute or a map entry named `__proto__` that a write would send: an own map entry keyed `__proto__` at any depth (a `Schema.Record` entry, a `Map` entry, any object marshalled as a map), and an attribute so named: an optional model field stored under that name given a value (a packed one included), a field stored under an attribute so named given a value, an index key attribute so named given a key (its composites present: a key attribute with no value, `KeyValueError` in `KeyComposer`'s `keyAttribute`, made a `ValidationError` where a write composes its keys), `.set()`, `.add()`, `.subtract()` or `.append()` of it, and a path operation with a segment `__proto__`, naming the attribute or an entry of a map (every one but `pathRemove`). The AWS SDK's marshaller and unmarshaller assign each to a plain object, and assigning `__proto__` sets that object's prototype instead, so it is never sent, and one stored otherwise is never read back. A `ValidationError` naming the field and the key, on any write, condition or filter (`Transaction.check`'s included, `TransactWriteOps`), with nothing written (an aggregate `update` reads its state first). The `Expression` builders, which have no error channel, compile such an entry as 1.40.0 did (left out of the map: `unsent` in `internal/Expr.ts` remembers it), and the operation sending the result refuses it; 1.40.0 sent it, and DynamoDB refused it ("Supplied AttributeValue is empty"). `Marshaller.toAttributeValue` and `toAttributeMap` throw `UnstorableValue` with this code. Only that name, and only an own property: the `__proto__` every object inherits is not one, every other `Object.prototype` name is an entry like any other, and a sparse map's entry keyed `__proto__` (its own attribute, `field#__proto__`) and one in JSON text (a packed field, `Schema.fromJsonString`, never marshalled as a map) are stored and read back as any other. 1.40.0 stored an item without an attribute so named (an index key so named left the row out of the index; a field stored under it failed every `put` and `get`, and `upsert` died), sent a write holding such an entry for DynamoDB to refuse ("Supplied AttributeValue is empty"), and a path operation stored the entry. A row holding one (stored before, or by another writer) is read without it, whatever it holds: the reader leaves it out before the AWS SDK's unmarshaller sees it, where 1.40.0's set the row's or the map's prototype from a map stored there (any read of a row holding such an attribute died, whatever it held; a struct field holding such an entry read the entry's map as its own fields). `pathRemove` removes it |
 | `EDD-9166` | `Entity.ts` (`keptRefsOf`), at `update` / `patch` and a planned `transactWrite` update (`ValidationError`, `operation: "update.keepRefs"`, nothing sent) | `.keepRefs()` naming something that is no ref id an update can give: a model field, a typo, or a ref's id that is a primary key composite (no update changes the key). Typed callers can't write one (`KeptRefIds`). The message lists the ids it takes (#263). |
 | `EDD-9167` | `Entity.ts` (`keptRefsOf`), as `EDD-9166` | `.keepRefs()` keeping a ref the same update reassigns (`.set({ playerId })`) or removes (`.remove(["player"])`): keep it or change it, not both (#263). |
+| `EDD-9168` | `Aggregate.ts` (`listGapMatch`), at `list` (`ValidationError`, through `Capacity.refusalsFail`; nothing returned) | An aggregate `list` key giving a value after a list sort key composite left out, matched on the root items read (text under a folding casing), meets a list index row with no readable value for that composite: the index doesn't project it, or the row holds something its field can't read (`readListComposite`). Such a row has no key text to compare, so the call is refused rather than the row kept or dropped. The message names the composite, to project onto the list index. Only the composites matched are read: one the key doesn't give after the gap is never asked for. |
+| `EDD-9169` | `Entity.ts` (`refuseUnkeyedRefs`, from `composeAllKeys` and the plain `upsert` before its ref reads), at `put` / `create` / `upsert` (`ValidationError`; nothing sent) | A write of a whole item giving no id for a ref whose id (`${field}Id`) is a primary key composite: `null` for a ref the model declares nullable, or none for one it declares optional. Every item has a primary key, and a ref without an id has none to compose it from. Up to 1.42.1 the `null` failed decoding (`Expected string`) and a left-out id died in key composition (`Missing composite attribute`). A non-null id is written as before. |
 | `EDD-9172` | `Entity.ts` (schema, the `unique` check in `make`), pure and operational | A `unique` constraint naming a ref (`"team"` for `refs: { team }`, or a field the model marks `ref: true`). The ref's value is the referenced item's data, which composed the key text `[object object]` for every item, so the first item written took the value for all of them (#266). Refused at load, naming the constraint and the ref and saying to write its id (`teamId`), which a constraint takes as an index composite does. The `unique` type leaves refs out, so it is a compile error too. |
 
 Next free code: `9111`, else none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9114`–`9120` are taken on branches in flight, and `9107` and `9113` are retired, don't reuse them); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
