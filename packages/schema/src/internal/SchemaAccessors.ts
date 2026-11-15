@@ -37,6 +37,31 @@ export const hasFields = (
   typeof (schema as { readonly fields?: unknown }).fields === "object" &&
   (schema as { readonly fields?: unknown }).fields !== null
 
+/** What a copy of a schema node may change without changing what the node holds. */
+const notWhatItHolds: ReadonlySet<string> = new Set(["annotations", "checks", "context"])
+
+/**
+ * Whether two schema nodes are one schema: the same node, or a copy of it that changes only its
+ * annotations (`DynamoModel.ref`, `.annotate`), its checks (`.check`) or the optionality of the key
+ * it's under. Every other part is the same object. Decided from the definitions alone: a struct
+ * declared again with the same fields is another schema. Whether a schema is an entity's model, an
+ * aggregate's or a ref's, is asked of this.
+ */
+export const isSameSchemaNode = (a: SchemaAST.AST, b: SchemaAST.AST): boolean => {
+  if (a === b) return true
+  if (a._tag !== b._tag) return false
+  const held = (ast: SchemaAST.AST) => Object.keys(ast).filter((key) => !notWhatItHolds.has(key))
+  const keys = held(a)
+  return (
+    keys.length === held(b).length &&
+    keys.every(
+      (key) =>
+        (a as unknown as Record<string, unknown>)[key] ===
+        (b as unknown as Record<string, unknown>)[key],
+    )
+  )
+}
+
 /**
  * Whether a struct-field schema is optional.
  *

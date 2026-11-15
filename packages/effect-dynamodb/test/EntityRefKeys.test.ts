@@ -6,6 +6,7 @@
  */
 
 import { Effect, Layer } from "effect"
+import { suite as annotatedSuite } from "./helpers/EntityRefAnnotated.js"
 import { suite as cascadeSuite } from "./helpers/EntityRefCascade.js"
 import { suite as keepSuite } from "./helpers/EntityRefKeep.js"
 import { type Harness, INDEXES, suite } from "./helpers/EntityRefKeys.js"
@@ -50,3 +51,4 @@ operandsSuite(harness)
 storedAsSuite(harness)
 nestedSuite(harness)
 nullableSuite(harness)
+annotatedSuite(harness)
