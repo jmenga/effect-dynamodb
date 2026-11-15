@@ -1936,23 +1936,27 @@ const beneathOptional = (field: Schema.Top): Schema.Top => {
 
 /**
  * A ref declared in a union (`Schema.NullOr(DynamoModel.ref(Team))`, `Schema.NullOr(Team.annotate(…))`),
- * beneath an optional wrapper or not, as an entity's read holds it: the union, each member that holds
- * the ref taken as {@link heldRefMember} takes it (what a read of the ref's entity returns, where the
- * walker can't see into the member), in a union among the members too, and every other member as
- * declared. `undefined` where that changes no member. The walker re-applies the optional wrapper.
+ * beneath an optional wrapper or not, as an entity's read holds it, where that union is walked member
+ * by member ({@link unionHoldsRef}): the union, each member that holds the ref taken as
+ * {@link heldRefMember} takes it (what a read of the ref's entity returns, where the walker can't see
+ * into the member), in a union among the members too, and every other member as declared.
+ * `undefined` where that changes no member, or the union isn't walked so. The walker re-applies the
+ * optional wrapper.
  */
 const heldInUnion = (field: Schema.Top, model: Schema.Top): Schema.Top | undefined => {
   const union = beneathOptional(field)
-  const members = (union as { readonly members?: ReadonlyArray<Schema.Top> }).members
-  if (!SchemaAST.isUnion(union.ast) || members === undefined) return undefined
-  const held = members.map(
-    (member) => heldInUnion(member, model) ?? heldRefMember(member, model) ?? member,
-  )
-  return held.every((member, at) => member === members[at])
-    ? undefined
-    : (Schema.Union(
-        held as unknown as ReadonlyArray<Schema.Codec<unknown>>,
-      ) as unknown as Schema.Top)
+  if (!SchemaAST.isUnion(union.ast) || !unionHoldsRef(union, model)) return undefined
+  const held = (schema: Schema.Top): Schema.Top | undefined => {
+    const members = (schema as { readonly members?: ReadonlyArray<Schema.Top> }).members
+    if (!SchemaAST.isUnion(schema.ast) || members === undefined) return undefined
+    const each = members.map((member) => held(member) ?? heldRefMember(member, model) ?? member)
+    return each.every((member, at) => member === members[at])
+      ? undefined
+      : (Schema.Union(
+          each as unknown as ReadonlyArray<Schema.Codec<unknown>>,
+        ) as unknown as Schema.Top)
+  }
+  return held(union)
 }
 
 /**

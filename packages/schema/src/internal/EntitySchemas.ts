@@ -1562,7 +1562,10 @@ const childOptions = (
     // A nullable ref (`NullOr(Team)`): its struct member holds what the ref's entity holds.
     ...(opts?.configuredStorage ? { configuredStorage: opts.configuredStorage } : {}),
     ...(opts?.heldRefs ? { heldRefs: opts.heldRefs } : {}),
-    ...(opts?.heldRef ? { heldRef: opts.heldRef } : {}),
+    // ...where the union is walked member by member (`unionHoldsRef`); else as declared, as 1.42.1.
+    ...(opts?.heldRef && membersHoldRef(container.children, opts.heldRef.model)
+      ? { heldRef: opts.heldRef }
+      : {}),
   }
 }
 
@@ -3075,17 +3078,59 @@ export const heldRefMember = (member: Schema.Top, model: Schema.Top): Schema.Top
 }
 
 /**
- * @internal Whether a union a ref is declared in holds a member the walk takes for the ref
- * ({@link heldRefMember}), directly or in a union among its members. Where it holds none (another
- * class, a struct declared again with the model's fields), the walk would take the member as
- * declared, so the ref's target replaces the union whole, as up to 1.42.1.
+ * Whether a member of a ref's union can't take an object, so can't take the ref's value before the
+ * ref's own member does: `null`, `undefined`, `void`, a primitive keyword, a literal, an enum, a
+ * template literal, or a union of these, none with an encoding of its own. Anything else (a struct,
+ * another class, a record, an array, `unknown`, an object keyword, a declaration, a suspend, a
+ * transformation) might.
+ */
+const takesNoObject = (ast: SchemaAST.AST): boolean =>
+  ast.encoding === undefined &&
+  (SchemaAST.isUnion(ast)
+    ? ast.types.every(takesNoObject)
+    : SchemaAST.isNull(ast) ||
+      SchemaAST.isUndefined(ast) ||
+      SchemaAST.isVoid(ast) ||
+      SchemaAST.isString(ast) ||
+      SchemaAST.isNumber(ast) ||
+      SchemaAST.isBoolean(ast) ||
+      SchemaAST.isBigInt(ast) ||
+      SchemaAST.isSymbol(ast) ||
+      SchemaAST.isLiteral(ast) ||
+      SchemaAST.isEnum(ast) ||
+      SchemaAST.isTemplateLiteral(ast))
+
+/**
+ * Whether a union's members, through unions among them, hold a member the walk takes for the ref
+ * ({@link heldRefMember}) and nothing else that can take an object ({@link takesNoObject}).
+ */
+const membersHoldRef = (members: ReadonlyArray<Schema.Top>, model: Schema.Top): boolean => {
+  let holds = false
+  const onlyRefOrNoObject = (all: ReadonlyArray<Schema.Top>): boolean =>
+    all.every((member) => {
+      if (heldRefMember(member, model) !== undefined) {
+        holds = true
+        return true
+      }
+      const inner = (member as { readonly members?: ReadonlyArray<Schema.Top> }).members
+      return SchemaAST.isUnion(member.ast) && member.ast.encoding === undefined && inner
+        ? onlyRefOrNoObject(inner)
+        : takesNoObject(member.ast)
+    })
+  return onlyRefOrNoObject(members) && holds
+}
+
+/**
+ * @internal Whether a ref's union is walked member by member: it holds a member the walk takes for
+ * the ref ({@link heldRefMember}), and every other member, through unions among them, can't take
+ * an object (`null`, `undefined`, a string, a literal, …; {@link takesNoObject}), so a value of the
+ * ref's target decodes as that member alone. Otherwise (another class or a struct beside the ref,
+ * or no member the walk takes for it) the ref's target replaces the union whole, as up to 1.42.1,
+ * and the ref's id takes no `null`; where 1.42.1 walked the union as declared (a ref nested in a
+ * ref's target, an aggregate edge entity's ref), it still is.
  */
 export const unionHoldsRef = (union: Schema.Top, model: Schema.Top): boolean =>
-  ((union as { readonly members?: ReadonlyArray<Schema.Top> }).members ?? []).some((member) =>
-    SchemaAST.isUnion(member.ast)
-      ? unionHoldsRef(member, model)
-      : heldRefMember(member, model) !== undefined,
-  )
+  membersHoldRef((union as { readonly members?: ReadonlyArray<Schema.Top> }).members ?? [], model)
 
 /** The walk's {@link heldRefMember} at `schema` (`heldRef`), with what it walks that member with. */
 const heldMemberOf = (

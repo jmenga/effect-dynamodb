@@ -184,6 +184,33 @@ const nestedUnions: ReadonlyArray<{
   },
 ]
 
+/**
+ * The ref beside a member that can take the team's value too (a struct holding part of it), before
+ * it and after it, annotated and not: such a union isn't walked member by member, and the target
+ * replaces it, as in 1.42.1.
+ */
+const besideObject: ReadonlyArray<{
+  readonly name: string
+  readonly declare: (team: typeof Team) => Schema.Top
+}> = [
+  {
+    name: "StructFirst",
+    declare: () => Schema.Union([Schema.Struct({ id: Schema.String }), annotated()]),
+  },
+  {
+    name: "TargetFirst",
+    declare: () => Schema.Union([annotated(), Schema.Struct({ id: Schema.String })]),
+  },
+  {
+    name: "StructFirstClass",
+    declare: (team) => Schema.Union([Schema.Struct({ id: Schema.String }), team]),
+  },
+  {
+    name: "TargetFirstClass",
+    declare: (team) => Schema.Union([team, Schema.Struct({ id: Schema.String })]),
+  },
+]
+
 /** The ways a model declares the ref in a union around an annotated copy (or a suspend) of Team. */
 const unionForms: ReadonlyArray<{
   readonly name: string
@@ -336,6 +363,46 @@ export const suite = (
         }),
       ))
 
+    for (const pure of [false, true]) {
+      it(`beside another member that takes an object${pure ? " (a pure definition)" : ""}, is replaced by the target, as in 1.42.1`, () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            // On the branch before this rule, the struct took the team's value first: a read
+            // returned only `{ id }`, of a row 1.42.1 stored as of a new one.
+            const whole = (id: string) => ({ ok: { id, team: { id: "t1", founded: FOUNDED } } })
+            for (const form of besideObject) {
+              const { Teams, Players } = players(form.name, form.declare, {
+                ...(pure ? { make: PureEntity.make } : {}),
+              })
+              yield* onTable(harness, { Teams, Players }, ({ db, exec, step, seed }) =>
+                Effect.gen(function* () {
+                  const P = db.entities.Players
+                  yield* exec(db.entities.Teams.put({ id: "t1", founded: at(FOUNDED) }))
+                  yield* seed({
+                    id: { S: "p1" },
+                    team: heldTeam,
+                    __edd_e__: { S: "Player" },
+                    ...playerKey("p1"),
+                  })
+                  const read = yield* step(P.get({ id: "p1" }))
+                  expect({ form: form.name, read: outcome(read.exit) }).toEqual({
+                    form: form.name,
+                    read: whole("p1"),
+                  })
+                  const put = yield* step(P.put({ id: "p2", teamId: "t1" }))
+                  expect({ form: form.name, sent: put.sent }).toEqual({
+                    form: form.name,
+                    sent: putPins("p2"),
+                  })
+                  expect(outcome(put.exit)).toEqual(whole("p2"))
+                  expect(outcome((yield* step(P.get({ id: "p2" }))).exit)).toEqual(whole("p2"))
+                }),
+              )
+            }
+          }),
+        ))
+    }
+
     it("nested in a ref's target, is put, read, conditioned and path-written as the class itself is", () =>
       Effect.runPromise(
         Effect.gen(function* () {
@@ -379,7 +446,7 @@ export const suite = (
         }),
       ))
 
-    it("in a union holding no member taken for the ref, in a pure definition edge entity's model, is held as 1.42.1 held it, the target in place of the union", () =>
+    it("in a union not walked member by member (no member taken for the ref, or another that takes an object), in a pure definition edge entity's model, is held as 1.42.1 held it, the target in place of the union", () =>
       Effect.runPromise(
         Effect.gen(function* () {
           class TeamName extends Schema.Class<TeamName>("AnnRefTeamName")({ id: Schema.String }) {}
@@ -391,6 +458,7 @@ export const suite = (
             () => Schema.NullOr(TeamName),
             () => Schema.UndefinedOr(Schema.NullOr(TeamName)),
             () => Schema.NullOr(TeamView.annotate({ description: "A view of the team" })),
+            ...besideObject.map((form) => form.declare),
           ]) {
             const { Teams, Players, Player } = players("Unheld", declare, { make: PureEntity.make })
             class Lineup extends Schema.Class<Lineup>("AnnRefUnheldLineup")({
@@ -414,10 +482,15 @@ export const suite = (
                   yield* exec(db.entities.Teams.put({ id: "t1", founded: at(FOUNDED) }))
                   yield* exec(db.entities.Players.put({ id: "p1", teamId: "t1" }))
                   yield* exec(db.aggregates.Lineups.create({ id: "l1", playerId: "p1" }))
+                  // The row 1.42.1 stored, and reads whole.
                   const edge = (yield* rows).find((r) => r.__edd_e__?.S === "LineupPlayer")!
                   expect(edge.team).toEqual(heldTeam)
                   const read = yield* exec(db.aggregates.Lineups.get({ id: "l1" }))
                   same(read.player.team.founded, at(FOUNDED))
+                  expect(JSON.parse(JSON.stringify(read.player.team))).toEqual({
+                    id: "t1",
+                    founded: FOUNDED,
+                  })
                 }),
               { Lineups },
             )
