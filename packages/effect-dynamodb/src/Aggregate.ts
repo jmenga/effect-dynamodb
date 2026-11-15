@@ -64,6 +64,7 @@ import {
   refHeldTarget,
   resolveSystemFields,
   substituteSchemaDeep,
+  unionHoldsRef,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
@@ -1927,19 +1928,26 @@ const keepsWrapper = (field: Schema.Top): boolean => {
     : optional.union === undefined && !SchemaAST.isUnion(optional.inner.ast)
 }
 
+/** What a field holds beneath the `Schema.optional` / `Schema.optionalKey` wrapper it declares. */
+const beneathOptional = (field: Schema.Top): Schema.Top => {
+  const optional = optionalField(field)
+  return optional?.union ?? optional?.inner ?? field
+}
+
 /**
  * A ref declared in a union (`Schema.NullOr(DynamoModel.ref(Team))`, `Schema.NullOr(Team.annotate(…))`),
- * beneath an optional wrapper or not, as an entity's read holds it: the union, its member that holds
+ * beneath an optional wrapper or not, as an entity's read holds it: the union, each member that holds
  * the ref taken as {@link heldRefMember} takes it (what a read of the ref's entity returns, where the
- * walker can't see into the member), and every other member as declared. `undefined` where that
- * changes no member. The walker re-applies the optional wrapper.
+ * walker can't see into the member), in a union among the members too, and every other member as
+ * declared. `undefined` where that changes no member. The walker re-applies the optional wrapper.
  */
 const heldInUnion = (field: Schema.Top, model: Schema.Top): Schema.Top | undefined => {
-  const optional = optionalField(field)
-  const union = optional?.union ?? optional?.inner ?? field
+  const union = beneathOptional(field)
   const members = (union as { readonly members?: ReadonlyArray<Schema.Top> }).members
   if (!SchemaAST.isUnion(union.ast) || members === undefined) return undefined
-  const held = members.map((member) => heldRefMember(member, model) ?? member)
+  const held = members.map(
+    (member) => heldInUnion(member, model) ?? heldRefMember(member, model) ?? member,
+  )
   return held.every((member, at) => member === members[at])
     ? undefined
     : (Schema.Union(
@@ -1947,9 +1955,28 @@ const heldInUnion = (field: Schema.Top, model: Schema.Top): Schema.Top | undefin
       ) as unknown as Schema.Top)
 }
 
+/**
+ * Whether the walker, given a ref field as its model declares it, holds the ref as a read of the
+ * ref's entity does: a union holding a member taken for the ref ({@link unionHoldsRef}, which
+ * {@link heldInUnion} re-points where it must), or a member {@link heldRefMember} takes as declared
+ * (the model's class itself, which the walker walks).
+ */
+const walkerHoldsRef = (field: Schema.Top, model: Schema.Top): boolean => {
+  const value = beneathOptional(field)
+  return SchemaAST.isUnion(value.ast)
+    ? unionHoldsRef(value, model)
+    : heldRefMember(value, model) === value
+}
+
 /** The structural slice of an edge's target entity that ref resolution reads. */
 interface RefTargetEntity {
   readonly model?: Schema.Top
+  readonly _data?: {
+    readonly resolvedRefs?: ReadonlyArray<{
+      readonly fieldName: string
+      readonly refEntity?: { readonly model?: Schema.Top }
+    }>
+  }
 }
 
 const unwrapEntityModel = (model: Schema.Top): Schema.Top =>
@@ -2017,33 +2044,49 @@ const collectRefTargets = (
     const held = refHeldTarget(inner)
     if (held !== inner) targets.set(field, held)
   }
-  // The refs of an edge entity's model, and of their entities' models in turn (`entityRefsOf`): a
-  // read of the edge entity holds each as a read of its own entity returns it. An opaque one is
-  // registered, a class only where its read holds less (`registerHeld`), as for an edge, each only
-  // where the walker re-points it within the wrapper its model declares (`keepsWrapper`). Up to
-  // 1.42.1 only a pure definition's refs were, one level down, whatever their wrapper: an entity
-  // made with this package's `Entity.make` had none, so a `DynamoModel.ref` in its model stored a
-  // date as a marshalled map. A ref back to a model on the way (A → B → A) isn't followed.
+  // Edge entities, in the walk's order, whose models' refs `registerHeldRefs` takes after the walk.
+  const edgeEntities: Array<RefTargetEntity> = []
+  // 1.42.1's registration of an edge entity's refs, made where and as 1.42.1 made it: a pure
+  // definition's own (`_data.resolvedRefs`, one level down), each field replaced whole by its target.
+  // Left out only where the walker holds the ref as the field declares it (`walkerHoldsRef`).
   const registerNested = (entity: RefTargetEntity | undefined) => {
     if (entity?.model === undefined) return
+    const fields = getSchemaFields(unwrapEntityModel(entity.model))
+    for (const ref of entity._data?.resolvedRefs ?? []) {
+      const field = ownValue(fields, ref.fieldName)
+      const target = ref.refEntity?.model
+      if (field !== undefined && target !== undefined) {
+        if (!walkerHoldsRef(field, unwrapEntityModel(target))) register(field, target, false)
+      }
+    }
+    edgeEntities.push(entity)
+  }
+  // Then the refs of an edge entity's model, and of their entities' models in turn (`entityRefsOf`),
+  // into fields still unregistered: a read of the edge entity holds each as a read of its own entity
+  // returns it. One the walker can't see into (a declaration without fields, a `Schema.suspend`) is
+  // registered, a class only where its read holds less (`registerHeld`), as for an edge, within the
+  // wrapper its model declares (`keepsWrapper`); in a union, the members that hold the ref
+  // (`heldInUnion`). Up to 1.42.1 an entity made with this package's `Entity.make` had none
+  // registered, so a `DynamoModel.ref` in its model stored a date as a marshalled map. A ref back to
+  // a model on the way (A → B → A) isn't followed.
+  const registerHeldRefs = (entity: RefTargetEntity) => {
     const nested = (model: Schema.Top, refs: HeldRefs, on: ReadonlySet<Schema.Top>) => {
       const fields = getSchemaFields(model)
       for (const [name, held] of Object.entries(refs)) {
         if (on.has(held.model)) continue
         const field = ownValue(fields, name)
         if (field !== undefined && keepsWrapper(field)) {
-          if (isOpaqueRefField(field)) register(field, held.model, false)
-          else registerHeld(field)
+          if (isOpaqueRefField(field) || SchemaAST.isSuspend(unwrapOptionalField(field).ast)) {
+            register(field, held.model, false)
+          } else registerHeld(field)
         } else if (field !== undefined && !targets.has(field)) {
-          // In a union, its member alone. Up to 1.42.1 a pure definition's was replaced whole, so
-          // a `null` failed; on this package's `Entity.make`, a date there was stored as a map.
           const union = heldInUnion(field, held.model)
           if (union !== undefined) targets.set(field, union)
         }
         nested(held.model, held.refs, new Set([...on, held.model]))
       }
     }
-    const model = unwrapEntityModel(entity.model)
+    const model = unwrapEntityModel(entity.model as Schema.Top)
     nested(model, entityRefsOf(entity), new Set([model]))
   }
   const walk = (
@@ -2120,6 +2163,7 @@ const collectRefTargets = (
     }
   }
   walk(rootFields, rootEdges, true, false)
+  for (const entity of edgeEntities) registerHeldRefs(entity)
   return targets
 }
 

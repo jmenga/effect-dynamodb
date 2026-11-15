@@ -1199,9 +1199,12 @@ export const refNullish = (
   if (declared === undefined) return { nullable: false, undefinable: false }
   const optional = optionalField(declared)
   const inner = optional?.union ?? optional?.inner ?? declared
+  // A union among the members is one with them (`Schema.UndefinedOr(Schema.NullOr(Team))`).
+  const flat = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> =>
+    SchemaAST.isUnion(ast) ? ast.types.flatMap(flat) : [ast]
   const members =
     SchemaAST.isUnion(inner.ast) && (model === undefined || unionHoldsRef(inner, model))
-      ? inner.ast.types
+      ? flat(inner.ast)
       : []
   return {
     nullable: members.some((member) => SchemaAST.isNull(member)),
@@ -3049,22 +3052,21 @@ const withHeldRefs = (
  * members), a decoding default, which the walk goes through to the member beneath, kept as declared,
  * and a member that isn't the ref (`null`, a string). The member is the model of the ref's entity, a
  * copy of it that changes only its annotations or checks (`Team.annotate({ description })`,
- * `isSameSchemaNode`), a `Schema.suspend` of it, or a `DynamoModel.ref` of any of these. It is what
- * a read of that entity returns (`refHeldTarget`) wherever its own schema can't be walked
- * (`DynamoModel.ref`, `.annotate` and `Schema.suspend` hide a class's fields) or holds more than
- * that read; elsewhere the member as declared, as 1.42.1 walked it.
+ * `isSameSchemaNode`), a `Schema.suspend` of it (a suspend of a suspend too), or a
+ * `DynamoModel.ref` of any of these. It is what a read of that entity returns (`refHeldTarget`)
+ * wherever its own schema can't be walked (`DynamoModel.ref`, `.annotate` and `Schema.suspend` hide
+ * a class's fields) or holds more than that read; elsewhere the member as declared, as 1.42.1
+ * walked it.
  */
 export const heldRefMember = (member: Schema.Top, model: Schema.Top): Schema.Top | undefined => {
   const ast = member.ast
+  let suspended = ast
+  while (SchemaAST.isSuspend(suspended)) suspended = suspended.thunk()
   if (
     optionalField(member) !== undefined ||
     SchemaAST.isUnion(ast) ||
     decodingDefaultField(member) !== undefined ||
-    !(
-      member === model ||
-      isRef(member) ||
-      isSameSchemaNode(SchemaAST.isSuspend(ast) ? ast.thunk() : ast, model.ast)
-    )
+    !(member === model || isRef(member) || isSameSchemaNode(suspended, model.ast))
   ) {
     return undefined
   }
@@ -3073,12 +3075,12 @@ export const heldRefMember = (member: Schema.Top, model: Schema.Top): Schema.Top
 }
 
 /**
- * Whether a union a ref is declared in holds a member the walk takes for the ref
+ * @internal Whether a union a ref is declared in holds a member the walk takes for the ref
  * ({@link heldRefMember}), directly or in a union among its members. Where it holds none (another
  * class, a struct declared again with the model's fields), the walk would take the member as
  * declared, so the ref's target replaces the union whole, as up to 1.42.1.
  */
-const unionHoldsRef = (union: Schema.Top, model: Schema.Top): boolean =>
+export const unionHoldsRef = (union: Schema.Top, model: Schema.Top): boolean =>
   ((union as { readonly members?: ReadonlyArray<Schema.Top> }).members ?? []).some((member) =>
     SchemaAST.isUnion(member.ast)
       ? unionHoldsRef(member, model)

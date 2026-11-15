@@ -1,13 +1,14 @@
 /**
  * A ref whose declared member is a copy of the target's class that changes only its annotations
- * (`Team.annotate({ description })`), or a `Schema.suspend` of it, is held as the class itself is,
- * wherever the ref is declared: beneath a union (`Schema.NullOr`, `Schema.UndefinedOr`, an optional
- * key over one, `DynamoModel.ref` of one), nested in a ref's target, and in an aggregate edge
- * entity's model. Such a copy hides the class's fields, so a walk that took only the class itself
- * for the ref left its dates as declared: reading a row that holds the team failed with
- * `Expected DateTime.Utc at ["team"]["founded"]`, after a `put` had stored it. A union holding no
- * member that is the target's model (another class) is replaced by the target whole, and its id
- * takes no `null`, as in 1.42.1.
+ * (`Team.annotate({ description })`), or a `Schema.suspend` of it (a suspend of a suspend too), is
+ * held as the class itself is, wherever the ref is declared: beneath a union (`Schema.NullOr`,
+ * `Schema.UndefinedOr`, an optional key over one, `DynamoModel.ref` of one, a union inside one),
+ * nested in a ref's target, and in an aggregate edge entity's model. Such a copy hides the class's
+ * fields, so a walk that took only the class itself for the ref left its dates as declared: reading
+ * a row that holds the team failed with `Expected DateTime.Utc at ["team"]["founded"]`, after a
+ * `put` had stored it. A union holding no member that is the target's model (another class) is
+ * replaced by the target whole, and its id takes no `null`, as in 1.42.1, in a pure definition
+ * edge entity's model too.
  *
  * One suite, run on a recording table (`EntityRefKeys.test.ts`) and against DynamoDB Local
  * (`connected.entity-ref-keys.test.ts`), with their harnesses.
@@ -160,6 +161,29 @@ const putPins = (id: string) => [
   },
 ]
 
+/** A union in the ref's union, and a suspend of a suspend, each taking `null`. */
+const nestedUnions: ReadonlyArray<{
+  readonly name: string
+  readonly declare: (team: typeof Team) => Schema.Top
+}> = [
+  {
+    name: "UndefinedOrNullOr",
+    declare: () => Schema.UndefinedOr(Schema.NullOr(annotated())),
+  },
+  {
+    name: "NullOrUnion",
+    declare: () => Schema.NullOr(Schema.Union([annotated(), Schema.String])),
+  },
+  {
+    name: "UnionNullOr",
+    declare: () => Schema.Union([Schema.String, Schema.NullOr(annotated())]),
+  },
+  {
+    name: "DoubleSuspend",
+    declare: (team) => Schema.NullOr(Schema.suspend(() => Schema.suspend((): typeof Team => team))),
+  },
+]
+
 /** The ways a model declares the ref in a union around an annotated copy (or a suspend) of Team. */
 const unionForms: ReadonlyArray<{
   readonly name: string
@@ -192,6 +216,7 @@ const unionForms: ReadonlyArray<{
     configured: true,
     nullable: true,
   },
+  ...nestedUnions.map((form) => ({ ...form, configured: true, nullable: true })),
 ]
 
 /** Selection → player → team, `Player.team` declared as `declare` gives it, configured a ref. */
@@ -322,6 +347,7 @@ export const suite = (
             NullOrAnnotated: () => Schema.NullOr(annotated()),
             OptionalAnnotated: () => Schema.optional(annotated()),
             Suspend: (team: typeof Team) => Schema.suspend((): typeof Team => team),
+            ...Object.fromEntries(nestedUnions.map((form) => [form.name, form.declare])),
           }
           const { steps, row } = reference
           const team = (iso: string) => ({ M: { id: { S: "t1" }, founded: seconds(iso) } })
@@ -353,15 +379,69 @@ export const suite = (
         }),
       ))
 
+    it("in a union holding no member taken for the ref, in a pure definition edge entity's model, is held as 1.42.1 held it, the target in place of the union", () =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          class TeamName extends Schema.Class<TeamName>("AnnRefTeamName")({ id: Schema.String }) {}
+          class TeamView extends Schema.Class<TeamView>("AnnRefTeamView")({
+            id: Schema.String,
+            founded: Schema.DateTimeUtc,
+          }) {}
+          for (const declare of [
+            () => Schema.NullOr(TeamName),
+            () => Schema.UndefinedOr(Schema.NullOr(TeamName)),
+            () => Schema.NullOr(TeamView.annotate({ description: "A view of the team" })),
+          ]) {
+            const { Teams, Players, Player } = players("Unheld", declare, { make: PureEntity.make })
+            class Lineup extends Schema.Class<Lineup>("AnnRefUnheldLineup")({
+              id: Schema.String,
+              player: DynamoModel.ref(Player),
+            }) {}
+            const Lineups = (main: any) =>
+              Aggregate.make(Lineup, {
+                table: main,
+                schema,
+                pk: { field: "pk", composite: ["id"] },
+                collection: { name: "lineup" },
+                root: { entityType: "Lineup" },
+                edges: { player: Aggregate.one({ entityType: "LineupPlayer", entity: Players }) },
+              } as never)
+            yield* onTable(
+              harness,
+              { Teams, Players },
+              ({ db, exec, rows }) =>
+                Effect.gen(function* () {
+                  yield* exec(db.entities.Teams.put({ id: "t1", founded: at(FOUNDED) }))
+                  yield* exec(db.entities.Players.put({ id: "p1", teamId: "t1" }))
+                  yield* exec(db.aggregates.Lineups.create({ id: "l1", playerId: "p1" }))
+                  const edge = (yield* rows).find((r) => r.__edd_e__?.S === "LineupPlayer")!
+                  expect(edge.team).toEqual(heldTeam)
+                  const read = yield* exec(db.aggregates.Lineups.get({ id: "l1" }))
+                  same(read.player.team.founded, at(FOUNDED))
+                }),
+              { Lineups },
+            )
+          }
+        }),
+      ))
+
     for (const pure of [false, true]) {
       it(`in a union in an aggregate edge entity's model${pure ? " (a pure definition)" : ""}, stores and reads the team's date, and null`, () =>
         Effect.runPromise(
           Effect.gen(function* () {
             // Up to 1.42.1, on this package's `Entity.make`, the edge row held `team.founded` as a
             // map and a read returned that map; a pure definition's held no `null`.
-            for (const declare of [
-              () => Schema.NullOr(annotated()),
-              (team: typeof Team) => Schema.NullOr(DynamoModel.ref(team)),
+            for (const { declare, nullable } of [
+              { declare: () => Schema.NullOr(annotated()), nullable: true },
+              {
+                declare: (team: typeof Team) => Schema.NullOr(DynamoModel.ref(team)),
+                nullable: true,
+              },
+              ...nestedUnions.map((form) => ({ declare: form.declare, nullable: true })),
+              {
+                declare: (team: typeof Team) => Schema.suspend((): typeof Team => team),
+                nullable: false,
+              },
             ]) {
               const { Teams, Players, Player } = players("Edge", declare, {
                 ...(pure ? { make: PureEntity.make } : {}),
@@ -388,7 +468,6 @@ export const suite = (
                   Effect.gen(function* () {
                     yield* exec(db.entities.Teams.put({ id: "t1", founded: at(FOUNDED) }))
                     yield* exec(db.entities.Players.put({ id: "p1", teamId: "t1" }))
-                    yield* exec(db.entities.Players.put({ id: "p0", teamId: null }))
                     const made = yield* exec(
                       db.aggregates.Lineups.create({ id: "l1", playerId: "p1" }),
                     )
@@ -412,7 +491,9 @@ export const suite = (
                       (yield* exec(db.aggregates.Lineups.get({ id: "l1" }))).player.team.founded,
                       at(FOUNDED),
                     )
+                    if (!nullable) return
                     // A player without a team.
+                    yield* exec(db.entities.Players.put({ id: "p0", teamId: null }))
                     yield* exec(db.aggregates.Lineups.create({ id: "l0", playerId: "p0" }))
                     expect((yield* edge("l0"))!.team).toEqual({ NULL: true })
                     const none = yield* exec(db.aggregates.Lineups.get({ id: "l0" }))
