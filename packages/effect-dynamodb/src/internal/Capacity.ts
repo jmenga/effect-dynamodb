@@ -13,6 +13,9 @@
  *   every enclosing one; the outermost (root) scope delivers one report to the
  *   observer, so reports never double count. See
  *   `docs/designs/consumed-capacity.md`.
+ * - The same choke point settles offloaded-value uploads (#179): a write
+ *   request of an operation whose upload ledger holds entries goes through
+ *   `BlobLedger.guard` first (`docs/designs/blob-offload.md` §6.2).
  */
 
 import type {
@@ -26,6 +29,7 @@ import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import { Cause, Context, Effect, Exit, Stream, Tracer } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
+import * as BlobLedger from "./BlobLedger.js"
 import * as SentRequest from "./SentRequest.js"
 
 // ---------------------------------------------------------------------------
@@ -696,10 +700,14 @@ export const operationStream = <A, E, R>(
 
 /**
  * Strip per-call state from a context captured for later use: the current
- * operation scope and the tracer's parent span.
+ * operation scope, the upload ledger (#179) and the tracer's parent span.
  */
 export const detachContext = <R>(context: Context.Context<R>): Context.Context<R> =>
-  Context.omit(CurrentOperation, Tracer.ParentSpan)(context) as Context.Context<R>
+  Context.omit(
+    CurrentOperation,
+    BlobLedger.CurrentLedger,
+    Tracer.ParentSpan,
+  )(context) as Context.Context<R>
 
 /**
  * `(name, fn)` → `fn` as the operation `<prefix>.<name>` with `target`, for
@@ -723,13 +731,17 @@ export const CapturedReporting: unique symbol = Symbol.for(
   "effect-dynamodb/Capacity/CapturedReporting",
 )
 
-/** Run `effect` outside any current operation (a long-lived forked fiber). */
+/**
+ * Run `effect` outside any current operation and upload ledger (a long-lived
+ * forked fiber): its writes are settled by ledgers of their own.
+ */
 export const detached = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-  Effect.withFiber((fiber) =>
-    fiber.getRef(CurrentOperation) === SUPPRESSED
-      ? effect
-      : Effect.provideService(effect, CurrentOperation, undefined),
-  )
+  Effect.withFiber((fiber) => {
+    const unledgered = Effect.provideService(effect, BlobLedger.CurrentLedger, undefined)
+    return fiber.getRef(CurrentOperation) === SUPPRESSED
+      ? unledgered
+      : Effect.provideService(unledgered, CurrentOperation, undefined)
+  })
 
 // ---------------------------------------------------------------------------
 // Recording one request
@@ -815,6 +827,24 @@ const notSentErrors = new WeakSet<object>()
 export const markNotSent = <A extends object>(error: A): A => {
   notSentErrors.add(error)
   return error
+}
+
+/** @internal True iff `error` is a failure {@link markNotSent} marked. */
+export const isNotSent = (error: unknown): boolean =>
+  typeof error === "object" && error !== null && notSentErrors.has(error)
+
+/** Clients that record writes instead of sending them (a transaction's planning). */
+const recordingClients = new WeakSet<DynamoClientService>()
+
+/**
+ * @internal Mark a client as one that records its writes instead of sending
+ * them (`TransactPlan.planWrite`): its writes are not uploads' sends, so the
+ * upload ledger neither prepares nor settles them — the transaction that
+ * carries the plan does.
+ */
+export const markRecording = <A extends DynamoClientService>(client: A): A => {
+  recordingClients.add(client)
+  return client
 }
 
 const tablesOf = (command: Command, input: Record<string, unknown>): ReadonlyArray<string> => {
@@ -935,8 +965,7 @@ const describeRequest = (
   } else {
     const error = Cause.findErrorOption(exit.cause)
     if (error._tag === "Some") {
-      if (typeof error.value === "object" && error.value !== null && notSentErrors.has(error.value))
-        return undefined
+      if (isNotSent(error.value)) return undefined
       raw = capacityOfError(error.value)
     }
   }
@@ -1063,7 +1092,33 @@ type AnyMethod = (input: Record<string, unknown>) => Effect.Effect<unknown, unkn
 const sendAs = (raw: AnyMethod, input: Record<string, unknown>) =>
   raw(input).pipe(Effect.tapError((error) => Effect.sync(() => SentRequest.remember(error, input))))
 
-const send = (command: Command, raw: AnyMethod, input: Record<string, unknown>) =>
+/**
+ * Send one data-plane request: through the upload ledger first when the
+ * fiber's holds entries and the request writes (#179), then reported.
+ */
+const send = (
+  command: Command,
+  raw: AnyMethod,
+  input: Record<string, unknown>,
+  recording: boolean,
+): Effect.Effect<unknown, unknown> =>
+  Effect.withFiber((fiber) => {
+    const ledger = recording
+      ? undefined
+      : BlobLedger.settling(fiber.getRef(BlobLedger.CurrentLedger), command)
+    return ledger === undefined
+      ? report(command, raw, input)
+      : BlobLedger.guard(
+          ledger,
+          command,
+          input,
+          (prepared) => report(command, raw, prepared),
+          isNotSent,
+        )
+  })
+
+/** Send one request, recording what it consumed into the current operation when reporting is on. */
+const report = (command: Command, raw: AnyMethod, input: Record<string, unknown>) =>
   Effect.withFiber((fiber) => {
     const settings = fiber.getRef(Reporting)
     if (!settings.enabled) return sendAs(raw, input)
@@ -1115,12 +1170,13 @@ export const instrument = (service: DynamoClientService): DynamoClientService =>
   if (cached !== undefined) return cached
   // Prototype-backed, so a class-based client keeps its other members.
   const view = Object.create(service) as Record<string, unknown>
+  const recording = recordingClients.has(service)
   for (const [method, command] of DATA_PLANE) {
     if (typeof (service as unknown as Record<string, unknown>)[method] !== "function") continue
     // Looked up per call, so a client whose methods are swapped later is honoured.
     const raw: AnyMethod = (input) =>
       ((service as unknown as Record<string, AnyMethod>)[method] as AnyMethod).call(service, input)
-    view[method] = (input: Record<string, unknown>) => send(command, raw, input)
+    view[method] = (input: Record<string, unknown>) => send(command, raw, input, recording)
   }
   Object.defineProperty(view, InstrumentedTypeId, { value: true, enumerable: false })
   const instrumented = view as unknown as DynamoClientService

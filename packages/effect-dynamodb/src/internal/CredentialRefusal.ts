@@ -33,6 +33,10 @@ const CREDENTIAL_REFUSALS: ReadonlySet<string> = new Set([
   "ExpiredTokenException",
   "ExpiredToken",
   "RequestExpired",
+  // S3's own (#179's blob store): S3 can echo a refused token in a `Token-0` field
+  "InvalidAccessKeyId",
+  "InvalidToken",
+  "TokenRefreshRequired",
 ])
 
 /**

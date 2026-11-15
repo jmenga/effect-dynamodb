@@ -1,0 +1,718 @@
+---
+title: "Offloaded Storage"
+description: "Keep large and binary attribute values in a versioned blob store such as S3, with a pointer in the item: written S3-first, settled against DynamoDB's answer, read eagerly or lazily, and garbage-collected table-locally."
+---
+
+import { Aside } from "@astrojs/starlight/components"
+
+A DynamoDB item is capped at 400 KB, and every write is billed per KB of the **whole** item. A field that is occasionally large makes every write of its item expensive and some writes impossible, and binary content (scans, images, exports) bloats every read, stream record and backup of the item. The usual answer is the claim-check pattern: upload the value to S3, keep a pointer in the item, and keep the two consistent. effect-dynamodb does that for declared fields:
+
+- **Overflow fields**: `DynamoModel.Packed({ ..., external })`. A [packed](/effect-dynamodb/guides/packed-storage/) JSON value that stays inline in the item below a size threshold, and goes to the blob store at or above it.
+- **Binary fields**: `DynamoModel.External()` on a `Uint8Array` field. Always in the blob store.
+
+Offloaded storage is new in 1.43.0, and it needs [escaped key text](#key-text-escapekeys-true): `DynamoSchema.make({ ..., escapeKeys: true })`.
+
+The item keeps a small **pointer** to one exact object version. The library uploads before it writes to DynamoDB, deletes an upload only when DynamoDB provably rejected the write, resolves pointers on every read path, and ships an opt-in garbage collector for superseded versions. Whole items are never offloaded: DynamoDB evaluates conditions and filters against the stored item, so the rest of the item stays in DynamoDB.
+
+## When to offload
+
+- **A value that can approach the item limit.** Packed compression moves the cliff; offloading removes it. An overflow field costs nothing extra while it is small, because it stays inline.
+- **A value that makes every write expensive.** A 300 KB item costs about 300 write units on every write, even when only its status changed. An offloaded value costs an S3 `PUT` only when that value itself is written, and its pointer is around 150 bytes.
+- **Binary content.** PDFs, images and exports belong in object storage, where reads can be ranged, streamed and presigned.
+
+Keep a value in the item when it is small: an S3 round trip costs more than the read units a few KB of inline data saves, and each offloaded write adds a `PUT`. The default threshold is 64 KiB of stored bytes. Tune it per workload.
+
+<Aside type="caution" title="Upgrade every reader before any writer offloads">
+A version of effect-dynamodb without offloaded storage can't read a pointer: it fails with a `ValidationError`. Before any writer stores a pointer, upgrade every reader, including stream consumers. See [Rolling out](#rolling-out) for the details and two caveats.
+</Aside>
+
+## Configuring fields
+
+```typescript region="model" example="guide-blob-offload.ts"
+class Body extends Schema.Class<Body>("Body")({
+  text: Schema.String,
+  words: Schema.Number,
+}) {}
+
+class Document extends Schema.Class<Document>("Document")({
+  docId: Schema.String,
+  owner: Schema.String,
+  title: Schema.String,
+  body: Body,
+  scan: Schema.Uint8Array,
+}) {}
+
+const DocumentModel = DynamoModel.configure(Document, {
+  // Overflow field: JSON inline (S) below 16 KiB stored, in the blob store at or above it
+  body: {
+    storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 16_384 } }),
+  },
+  // Binary field: always in the blob store, with this Content-Type
+  scan: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
+})
+```
+
+- **`Packed({ format, compression?, external: { threshold? } })`** returns an `ExternalPackedConfig`. The threshold compares **stored** bytes: the JSON text, or the compressed bytes when the field compresses, so compression runs first and a value that compresses under the threshold stays inline. The default is `65_536`; `0` always offloads. An overflow field is a packed field, so every [packed-storage rule](/effect-dynamodb/guides/packed-storage/#what-a-packed-field-accepts) applies, and its inline values are stored exactly as a plain packed field's.
+- **`External({ contentType? })`** marks a field whose **encoded** side is `Uint8Array` (`Schema.Uint8Array`, optionally under `optional`, `optionalKey` or `NullOr`). The content type, default `application/octet-stream`, is the object's when a write doesn't name one. `Uint8ArrayFromBase64` encodes to a string, so it is refused.
+- **`field` renames and `immutable`** work with both kinds. Nothing else combines with them: an offloaded field can't be a key or index composite, a `timeSeries.orderBy`, a unique field, a ref, the entity's identifier, or a vector index filter field (a binary field can't be a vector source either). `Entity.make` throws `[EDD-9111]`/`[EDD-9142]` (binary) or the packed codes (overflow) otherwise.
+
+The plain `Packed` options type has `external?: never`, and an `ExternalPackedConfig` is not assignable to `PackedConfig`. So a config that offloads can't be typed as one that doesn't, and the entity's types (below) always see it.
+
+```typescript region="entity" example="guide-blob-offload.ts"
+const Documents = Entity.make({
+  model: DocumentModel,
+  entityType: "Document",
+  primaryKey: {
+    pk: { field: "pk", composite: ["docId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    byOwner: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["owner"] },
+      sk: { field: "gsi1sk", composite: ["docId"] },
+    },
+  },
+  // Offload overflow fields, largest first, until the stored item fits 300,000 bytes
+  offload: { itemBudget: 300_000 },
+})
+```
+
+`offload` is optional:
+
+| Option | Meaning |
+|---|---|
+| `itemBudget` | Stored item bytes (1 … 409,600) the library keeps the item under, by offloading overflow fields that are still inline, largest first (ties by name), whatever their threshold. A routing decision, not a limit check: DynamoDB's own limits are still diagnosed from the failed request. Needs an overflow field. |
+| `prefix` | Replaces the store's prefix for every object this entity writes, so its objects can have their own lifecycle, replication or IAM rule. RFC 3986 unreserved characters and `/`, at most 256 bytes, not starting with `/`. |
+
+The item budget applies where the library builds the whole item: `put` / `create`, an update on the read-merge path (retain, unique constraints, computed composites), `Batch.write` and `transactWrite` puts, aggregate edge items, and EventStore event and snapshot items. A plain `UpdateItem` applies thresholds only; if DynamoDB rejects it for item size and the entity has a budget, the update runs once more on the read-merge path, reusing its uploads. Time-series `append` and path-op updates have no read-merge path and use thresholds only.
+
+Invalid options throw `[EDD-9141]` (field configs) or `[EDD-9114]` (`offload`). The resolved settings are on `Documents.offload`: `{ itemBudget, prefix, overflow, binary }`, the last two the offloaded field names.
+
+The same configs work beyond entities:
+
+- **EventStore streams** offload event `data` and snapshot `state` with `storedAs: { data: Packed({ ..., external }) }` and `snapshot: { storedAs: Packed({ ..., external }) }`, plus an `offload` option of their own. See [EventStore streams](#eventstore-streams).
+- **Aggregate edges** offload by their edge entity's config. See [Aggregates](/effect-dynamodb/guides/aggregates/#offloaded-edge-fields).
+- **Geo entities** offload through `GeoIndex`. See [Geospatial](/effect-dynamodb/guides/geospatial/#offloaded-fields).
+
+## Key text: `escapeKeys: true`
+
+Offloading requires the table's schema to set `escapeKeys: true`:
+
+```typescript region="schema" example="guide-blob-offload.ts"
+// Offloading requires escaped key text: objects are named after their row's key
+const AppSchema = DynamoSchema.make({ name: "blob-demo", version: 1, escapeKeys: true })
+```
+
+Each object is named from a hash of its row's key text, and S3 has no rename. A row that holds a pointer must therefore stay at the key text it was written under. With `escapeKeys: true`, every write composes its row's final key text, and `rekey` never moves a row that is already under it. So a row holding a pointer is only ever written where it stays.
+
+On any other setting, every place a member is bound refuses a member with an offloaded field: `DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind` / `bindProjection`, `GeoIndex.bind`, `BlobGc.make` and the streams given to `rekey` throw the `[EDD-9146]` defect, naming every such member and field. An unbound write fails with a `ValidationError` (`[EDD-9146]`) before anything is uploaded or sent. Reads are never refused: a pointer already stored resolves whatever the setting.
+
+**An existing 1.x application** turns the setting on before it declares any offloaded field:
+
+1. Set `escapeKeys: true` on the table's `DynamoSchema`, and run `rekey` to move every existing row to escaped key text, as [Turning `escapeKeys` on over existing data](/effect-dynamodb/guides/upgrading/#turning-escapekeys-on-over-existing-data) describes. A rerun that moves nothing means the table is done.
+2. Then add `external` / `External` to the fields that should offload, and roll out as [Rolling out](#rolling-out) describes.
+
+**Turning `escapeKeys` off again** over rows that hold pointers isn't supported: `rekey` would have to move them. It refuses instead. The run stops at the first row it meets holding a pointer with a `ValidationError` (`[EDD-9146]`) naming it, and leaves that row where it is; rows the run reached before it may already have moved, and the failed run returns no report or resume token. A dry run fails the same way. To go back, every row holding a pointer has to go first, not only live items:
+
+- **Live items:** remove the offload config and rewrite each item's offloaded fields with a `put` or `.set()`, so they are stored inline again.
+- **History rows:** retain snapshots, soft-delete tombstones and time-series event items keep the pointers they copied, and nothing rewrites them. Purge them, delete them, or let them expire (their TTL) before the setting goes off.
+- **EventStore streams:** events are immutable, so a stream that ever offloaded event data or a snapshot can't be rekeyed off escaped text at all.
+
+A table whose members kept offloaded history or event data therefore keeps `escapeKeys: true`.
+
+## The blob store
+
+Offloaded values live in a `BlobStore` service. Like `Compression`, it is read with `Effect.serviceOption`, so no operation gains a requirement (`R`). The S3 store ships from its own entry point, with `@aws-sdk/client-s3` as an optional peer dependency that the main entry never imports:
+
+```bash
+pnpm add @aws-sdk/client-s3
+```
+
+```typescript
+import * as S3BlobStore from "effect-dynamodb/blob/s3"
+
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layer({ region: "eu-west-1" }),
+  S3BlobStore.layer({
+    bucket: "documents-blobs",
+    prefix: "prod/",
+    clientConfig: { region: "eu-west-1" },
+  }),
+)
+```
+
+`layerConfig` reads the same settings through Effect `Config`. Here it is pointed at MinIO, with an observer for uploads the library could not settle:
+
+```typescript region="layers" example="guide-blob-offload.ts"
+// The S3 store (effect-dynamodb/blob/s3) on a bucket with versioning enabled.
+// Here it is configured for MinIO; on AWS, omit endpoint and forcePathStyle.
+const S3Layer = S3BlobStore.layerConfig({
+  bucket: Config.String("BLOB_BUCKET").pipe(Config.withDefault(BUCKET)),
+  prefix: Config.succeed("demo/"),
+  endpoint: Config.String("S3_ENDPOINT"),
+  forcePathStyle: Config.succeed(true),
+  region: Config.succeed("us-east-1"),
+  credentials: Config.all({
+    accessKeyId: Config.String("S3_ACCESS_KEY_ID").pipe(Config.withDefault("minioadmin")),
+    secretAccessKey: Config.String("S3_SECRET_ACCESS_KEY").pipe(Config.withDefault("minioadmin")),
+  }),
+  // Writers and GC must agree on it: an upload older than this never reaches DynamoDB
+  maxUploadAge: Config.succeed(Duration.hours(1)),
+  // BlobHandle.presignedUrl, through @aws-sdk/s3-request-presigner
+  presign: { getSignedUrl },
+})
+
+// Every upload the library could not settle: queue its item for gc.sweep
+const ObserverLayer = Offload.layerObserver({
+  onUnsettled: (upload) =>
+    Console.log(`unsettled (${upload.reason}): ${upload.table} ${JSON.stringify(upload.rowKey)}`),
+})
+```
+
+### S3 store options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `bucket` | — | The bucket. **Versioning must be enabled**: every upload's response is checked, with no `GetBucketVersioning` pre-check. |
+| `prefix` | `""` | Store prefix, at most 256 bytes, not starting with `/`; ends with `/` by convention. An entity's `offload.prefix` replaces it. |
+| `client` / `clientConfig` | — | An `S3Client` you own (left open), or the config of one the store builds and destroys with the layer. Not both. A built client defaults `responseChecksumValidation` to `"WHEN_REQUIRED"`: the library verifies every full read itself. |
+| `partSize` | 8 MiB | Multipart part size, 5 MiB … 5 GiB. Raised for a known length so an upload fits 10,000 parts. |
+| `uploadConcurrency` | `4` | Parts of one upload in flight. |
+| `readConcurrency` | `16` | Store reads per operation when resolving values eagerly. |
+| `writeConcurrency` | `8` | Uploads per operation. |
+| `maxUploadAge` | 1 hour | An upload that would commit later than this after it started fails with `Expired`, and nothing is written to DynamoDB. 1 minute … 7 days. Every process writing or collecting against the bucket configures the same value. |
+| `serverSideEncryption`, `storageClass` | — | Passed through to every upload (`ServerSideEncryption`, `SSEKMSKeyId`, `BucketKeyEnabled`, `StorageClass`). |
+| `notFoundRetry` | none | A `Schedule` that retries a read finding no such version: for a replica region whose bucket lags the writer's. |
+| `presign` | none | `{ getSignedUrl }` from `@aws-sdk/s3-request-presigner`, which the library never imports. Without it, `presignedUrl` fails with `Unsupported`. |
+
+`S3BlobStore.make(options)` returns the store in a `Scope`, for wiring by hand. Invalid options are the `[EDD-9116]` defect.
+
+The S3 store refuses a `PutObject`, `CompleteMultipartUpload` or `CopyObject` answer without a real `VersionId` (none, or `"null"`): the write fails with `BlobStoreError { reason: "Unversioned" }`, naming the bucket, and the object it wrote is deleted by `VersionId: "null"`, which leaves no delete marker. If that delete is refused, the store falls back to a plain `DeleteObject` (`s3:DeleteObject`), which in a versioning-suspended bucket can leave a `null` delete marker, harmless to reads by version. No pointer can name the object. S3 Express One Zone directory buckets have no versioning and are refused the same way.
+
+### Where the store comes from
+
+1. `DynamoClient.make({ entities, ..., blobStore })`, bundled into every bound operation of that client, including bound builders handed to `Batch`, `Transaction` and `EventStream.append({ additionalItems })`.
+2. A `BlobStore` in context when the client or stream is bound: `DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind`, `EventStore.bindProjection`, `GeoIndex.bind`, `BlobGc.make`.
+3. A `BlobStore` in context when an unbound operation or a decode helper runs.
+
+A member with an offloaded field needs a store where it is first resolvable: binding it without one is the `[EDD-9115]` defect (checked after `[EDD-9146]`), naming every member and field, as is the first operation of an unbound stream or of `EventStore.processBatch` / `runChangeFeed` over an offloading stream. An unbound entity operation can't be checked up front: one that needs the store fails with `BlobStoreError { reason: "NotProvided" }`.
+
+### Custom stores and tests
+
+`BlobStore.layer(service)` provides any implementation of the `BlobStoreService` contract: `put` returns an immutable reference (`{ key, version }`), `get` streams a reference's bytes with an optional byte range, `delete` is idempotent, and `copy`, `list`, `head`, `marks` and `presign` are optional capabilities (the sweeps need `list` and `marks`, `sweepStore` also `head`). A store without versioning can satisfy it by returning a new key per write with version `""`. `BlobStore.crc64nvme` is the checksum the library computes, for implementers.
+
+```typescript region="memory-layer" example="guide-blob-offload.ts"
+// In tests (or without an S3 endpoint): the in-memory store, with presigning
+const MemoryLayer = BlobStore.layerMemory({ presign: true })
+```
+
+`BlobStore.memory(options)` is a full in-memory store: versioned or key-per-write, with every capability, simulated multipart uploads, fault injection and `inspect()`. See [Testing](/effect-dynamodb/guides/testing/#offloaded-storage).
+
+### IAM
+
+| Permission | Needed for |
+|---|---|
+| `s3:PutObject` | uploads (`PutObject`, the multipart calls), the target of a copy |
+| `s3:AbortMultipartUpload` | aborting a failed or interrupted multipart upload |
+| `s3:GetObjectVersion` | reads by version, `HeadObject` (store-wide sweep), the source of a copy |
+| `s3:ListBucket` | so a missing version reads as `404 NotFound`, not `403 AccessDenied` |
+| `s3:DeleteObject` | optional: only the fallback cleanup of an object written to a bucket without versioning (the delete by `VersionId: "null"` it falls back from uses `s3:DeleteObjectVersion`) |
+| `s3:DeleteObjectVersion` | rollback, the reaper, the sweeps, purge, the cleanup of an unversioned write |
+| `s3:GetObjectVersionTagging`, `s3:PutObjectVersionTagging` | the sweep's unreferenced-since marks |
+| `s3:ListBucketVersions` | the sweeps, and purge |
+| `kms:GenerateDataKey`, `kms:Decrypt` | SSE-KMS uploads (multipart needs both) and reads |
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject", "s3:AbortMultipartUpload", "s3:GetObjectVersion",
+        "s3:DeleteObjectVersion",
+        "s3:GetObjectVersionTagging", "s3:PutObjectVersionTagging"
+      ],
+      "Resource": "arn:aws:s3:::documents-blobs/prod/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucketVersions",
+      "Resource": "arn:aws:s3:::documents-blobs",
+      "Condition": { "StringLike": { "s3:prefix": "prod/*" } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::documents-blobs"
+    }
+  ]
+}
+```
+
+`s3:ListBucket` is granted without a prefix condition. S3 consults it when a read finds no such version (without it, the answer is `403 AccessDenied`), and AWS documents no `s3:prefix` key for that check, so a prefix-conditioned grant can't be relied on to turn the `403` into a `404`. `StringLikeIfExists` is no tighter: a listing that names no prefix passes it. The grant lets the principal list **every key in the bucket**, other prefixes included, so give offloaded storage a bucket of its own, one per environment. Object keys are hashed, so a listing reveals no item keys or contents, only object counts, sizes and times. Every entity `offload.prefix` (and any earlier prefix whose objects GC still has to delete) needs the object and `ListBucketVersions` statements too. With SSE-KMS, add `kms:GenerateDataKey` and `kms:Decrypt` on the key.
+
+The policy above serves every role. To split it: a reader needs `s3:GetObjectVersion`, `s3:ListBucket` and `kms:Decrypt`. A writer adds `s3:PutObject`, `s3:AbortMultipartUpload`, `s3:DeleteObjectVersion` (rollback) and `kms:GenerateDataKey`, plus `s3:ListBucketVersions` if it purges. The collector (`BlobGc`) needs the reader's permissions plus `s3:ListBucketVersions`, `s3:DeleteObjectVersion` and the two version-tagging actions.
+
+**Unsupported bucket settings.** Object Lock and MFA Delete block deletes by version: writes and reads work, but rollback and GC deletes fail as `AccessDenied`. Lifecycle rules: see [Lifecycle rules](#lifecycle-rules).
+
+## Writing
+
+```typescript region="put" example="guide-blob-offload.ts"
+// The body (about 20 KB of JSON) is at its threshold or over: uploaded, then the
+// item is written holding a pointer to that exact object version.
+// The scan always goes to the store.
+yield* db.entities.Documents.put({
+  docId: "d-1",
+  owner: "ada",
+  title: "Quarterly report",
+  body: bodyOf(20_000, 1),
+  scan: pdfBytes(300_000),
+})
+
+// A small body stays inline, as packed JSON
+yield* db.entities.Documents.put({
+  docId: "d-2",
+  owner: "ada",
+  title: "Note",
+  body: new Body({ text: "short", words: 1 }),
+  scan: pdfBytes(1_000),
+})
+```
+
+(`bodyOf` and `pdfBytes` build sample content.) [`insert()`](/effect-dynamodb/guides/add-only-writes/), the add-only PartiQL write, offloads the same way, and returns the values it wrote without reading them back from the store:
+
+```typescript region="insert" example="guide-blob-offload.ts"
+// insert() — a PartiQL INSERT, refused when the item exists — uploads as put does
+const memo = yield* db.entities.Documents.insert({
+  docId: "d-4",
+  owner: "lin",
+  title: "Memo",
+  body: bodyOf(18_000, 4),
+  scan: pdfBytes(2_000),
+})
+// memo.body → the Body written, read back from the upload without a GET
+```
+
+A duplicate item's uploads are deleted: DynamoDB's `DuplicateItemException` on a statement sent once proves nothing was written. Every write path routes offloaded fields: `put`, `create`, `upsert`, `insert()`, `update` / `patch` `.set()`, time-series `append`, `Batch.write`, `Transaction.transactWrite`, aggregate writes, `EventStream.append` / `commandHandler` / `writeSnapshot`, projection rows and `GeoIndex.put`.
+
+### What the item holds
+
+An offloaded value is stored as a **pointer**: a self-describing [packed layout](/effect-dynamodb/guides/packed-storage/#stored-form) (`010`) carrying the object key, its `VersionId`, the object and content sizes, a CRC64NVME content checksum, and the codec (overflow) or content type (binary). It names no bucket, so each region's layer can name its own replica bucket. An overflow field stores it as `B`; a binary field stores the same bytes as `S` text, `~edbp:` and unpadded base64url, so that a reader without this feature fails loudly instead of returning the pointer's bytes as the field's content.
+
+```typescript region="stored-form" example="guide-blob-offload.ts"
+// What the item holds: pointers, read without touching the store
+const stored = yield* rawItem("d-1")
+const bodyPointer = StorageEncoding.pointer(stored.body!) // Option<BlobPointer>, a B value
+const scanPointer = StorageEncoding.pointer(stored.scan!) // the S text "~edbp:…"
+// bodyPointer.value → { kind: "json", ref: { key, version }, contentSize, checksum, … }
+```
+
+Readers dispatch on the stored value, never on the current config, so one field can be inline in one item and offloaded in the next, and adding `External` to an existing `Uint8Array` field needs no rewrite.
+
+**Object keys** are hashed: `<offload.prefix, else the store prefix><partition>/<item family>/<row and attribute>`, each a 128-bit SHA-256 hex digest computed by a vendored implementation (independent of any service a test could stub, since GC trusts the keys). Item keys never appear in S3 keys, logs or inventories, and every key fits S3's 1,024 bytes. Every write of a field uploads a new **version** of its stable key. A time-series append keys its object by the event item, so a hot series never piles versions onto one key.
+
+**Object metadata** records the table (`edd-table`), entity type (`edd-entity`), attribute (`edd-attr`) and, while S3's 2 KB metadata limit allows, the row key (`edd-item`), for incident tooling and the store-wide sweep.
+
+### Binary inputs
+
+A binary field takes a `Uint8Array`, a `Stream` of `Uint8Array`, a `BlobHandle`, or `Offload.source(body, { contentType?, contentLength? })` to name the object's content type and length:
+
+```typescript region="put-stream" example="guide-blob-offload.ts"
+// A binary field also takes a Stream of bytes: single-use, uploaded once
+// (multipart above the store's part size), never buffered whole
+const chunks = [pdfBytes(64_000), pdfBytes(64_000), pdfBytes(64_000)]
+yield* db.entities.Documents.put({
+  docId: "d-3",
+  owner: "grace",
+  title: "Scanned contract",
+  body: new Body({ text: "contract", words: 1 }),
+  scan: Offload.source(Stream.fromIterable(chunks), {
+    contentType: "application/pdf",
+    contentLength: 192_000,
+  }),
+})
+```
+
+- **A `Stream` is single-use.** The library runs it once, for one object; a retry or re-plan of the same upload reuses the result. Giving the same `Stream` value to a second field, a second item, or a later operation fails with `[EDD-9120]`, since it may already be drained. Pass a fresh `Stream` (or a `Uint8Array`) per use.
+- **Multipart.** A body longer than the part size is uploaded in parts at `uploadConcurrency`, with S3's full-object CRC64NVME, written directly against `@aws-sdk/client-s3`. Interruption aborts the upload.
+- **Failures.** A failing source stream, or one longer or shorter than its `contentLength`, fails the write with `BlobStoreError { reason: "SourceFailed" }`.
+- **A `BlobHandle`** (from a read) is content to **copy** into a new version under this item's key, never a pointer to share: server-side `CopyObject` when it was read through the same store, otherwise its bytes are streamed into a put.
+- `Entity.Input`, `Create`, `Update` and every write builder type binary fields this way. An overflow field takes its domain value only; a `Stream`, handle or source there (reachable only from untyped code) is `[EDD-9120]`.
+
+### Which writes upload
+
+A write uploads exactly the offloaded fields it names. There is no carry-on-equal: restating a field uploads it again as a new version, even when the content is identical. To change one field, `update().set()` it:
+
+```typescript region="update-one-field" example="guide-blob-offload.ts"
+// Only what a write names is uploaded: this update writes no object
+yield* db.entities.Documents.update({ docId: "d-1" }).set({ title: "Q3 report" })
+
+// Restating a field uploads it again as a new version, even with the same content
+yield* db.entities.Documents.update({ docId: "d-1" }).set({ body: bodyOf(24_000, 2) })
+```
+
+A pointer a write did not upload is only ever written under a condition that pins it: lifecycle copies (retain snapshots, soft-delete tombstones, `restore`, time-series event items) carry the live row's pointers in the same transaction, guarded by it. A `put` replaces the whole item, so it uploads every offloaded field it is given.
+
+An **immutable** offloaded field restated with the stored value is compared by checksum and size first, confirmed structurally (overflow) or byte for byte (binary) before a mismatch is refused, and dropped from the write when it matches: never re-uploaded or re-pointed. A binary immutable restated with a handle is compared by checksum and size alone; one restated with a `Stream` is refused (`[EDD-9120]`), since its content can't be compared without consuming it.
+
+### Consistency
+
+Writes go to the blob store first, then to DynamoDB:
+
+1. **Upload.** Each value goes up as a new object version. A failed upload fails the operation before DynamoDB is touched.
+2. **Write.** The item is written with pointers to those exact versions.
+3. **Settle.** When the operation exits, each upload is settled by DynamoDB's answer:
+   - **Committed**, or possibly committed: the version is kept.
+   - **Provably not committed**: the version is deleted. That is a refusal of a request sent once (`$metadata.attempts` 1), a cancelled `TransactWriteItems` carrying the library's own `ClientRequestToken`, a `BatchWriteItem` item left unprocessed, or a conditional failure whose `ALL_OLD` image shows the row doesn't hold the pointer. For [`insert()`](/effect-dynamodb/guides/add-only-writes/), a PartiQL `ExecuteStatement` refused for a duplicate item (`DuplicateItemException`) when sent once, or a cancelled `ExecuteTransaction` (a unique-constrained insert) carrying the library's `ClientRequestToken`.
+   - **Unknown** (a timeout, an `InternalServerError`, an interruption in flight, a refusal after an SDK retry): the version is **kept**, logged at `Warning`, and reported to the observer. Deleting it could break a row that did commit.
+
+Uploads are memoised per operation, so a transaction re-plan or a retried put reuses them. An upload that would commit later than the store's `maxUploadAge` after it started fails with `Expired`, and nothing is written: GC relies on this to treat older unreferenced versions as settled. For a multi-request write (`Batch.write`, an aggregate write), the error names what earlier requests already committed.
+
+`Offload.layerObserver({ onUnsettled })` receives every upload the library could not settle, once the operation exits: `inDoubt`, `rollbackFailed` (DynamoDB rejected the write but the delete failed), `completeLost` (a multipart completion whose response was lost), `interrupted` (an interruption cut a store call short) and `answerRefused` (a store answer broke the contract). Each report names the table, entity type, attribute, operation, the row's key (`rowKey`: the row the object is keyed by — an event item for a time-series append), the object key and `ref`, an `Option<BlobRef>` that is none when the version is unknown. Queue the row for [`gc.sweep`](#sweeps). A failing observer is logged and never changes the operation's result.
+
+<Aside type="caution" title="Retries belong in the SDK client">
+The ledger settles each upload by the outcome of the DynamoDB call it sees. An Effect-level retry or timeout inside a custom `DynamoClient` wrapper hides earlier attempts from it, so a rejected write could be read as provably rejected after an earlier attempt committed. For a table with offloaded fields, put retries in the SDK client's retry strategy, not in a wrapper.
+</Aside>
+
+## Reading
+
+| Kind | Default mode | Eager result | Lazy result |
+|---|---|---|---|
+| Overflow (`Packed({ external })`) | `"eager"` | the domain value | `OffloadedValue<A>`: `read()` |
+| Binary (`External`) | `"lazy"` | `Uint8Array` | `BlobHandle`: `read`, `stream`, `presignedUrl` |
+
+```typescript region="lazy-handles" example="guide-blob-offload.ts"
+// Defaults: overflow fields eager (the value), binary fields lazy (a BlobHandle)
+const doc = yield* db.entities.Documents.get({ docId: "d-1" })
+const words = doc.body.words // fetched and verified with the item
+
+const scan = doc.scan // BlobHandle: nothing fetched yet
+const header = yield* scan.read({ range: { offset: 0, length: 4 } }) // %PDF
+const all = yield* scan.read() // the whole object, verified by size and checksum
+const streamed = yield* Stream.runFold(scan.stream(), () => 0, (n, chunk) => n + chunk.length)
+const url = yield* scan.presignedUrl({ expiresIn: "5 minutes" })
+```
+
+- **Lazy values** carry `location` (`"inline"` or `"external"`), `ref` (`Option<BlobRef>`), `size`, `checksum` and, for a handle, `contentType`. They capture the store and compressors of the fiber that read them, so `read()` and `stream()` have `R = never`. An inline value resolves with no I/O.
+- **`BlobHandle`s are `Equal`** by location and ref (or by checksum and size when inline): `Equal.equals(a, b)` is a cheap "same stored value" test.
+- **`presignedUrl`** defaults to 15 minutes, equal to the reaper's default grace, so a URL for a version that is then superseded stays valid for its whole life. A longer expiry needs a reaper grace at least as long. It fails with `Unsupported` on an inline handle or a store without `presign`.
+- **Integrity.** A full read is verified by object size, then by content size and CRC64NVME after decompression, failing with `ChecksumMismatch`. A ranged read can't be verified and isn't. `stream()` without a range verifies as its last chunk arrives, so a corrupt object fails the stream after its bytes were emitted.
+
+### Read modes
+
+`.offloaded(mode)` overrides the defaults per read and re-types the result. A string sets both kinds; an object sets the kinds it names:
+
+```typescript region="modes" example="guide-blob-offload.ts"
+// Both kinds eager: scan is the Uint8Array itself
+const eager = yield* db.entities.Documents.get({ docId: "d-1" }).offloaded("eager")
+const bytes: Uint8Array = eager.scan
+
+// Both kinds lazy: body is an OffloadedValue<Body>, fetched only on read()
+const lazy = yield* db.entities.Documents.byOwner({ owner: "ada" }).offloaded("lazy").collect()
+const firstBody = yield* lazy[0]!.body.read()
+
+// One kind: binary eager, overflow at its default (eager)
+const withScan = yield* db.entities.Documents.get({ docId: "d-3" }).offloaded({
+  binary: "eager",
+})
+
+// A projection that omits the offloaded fields never fetches them
+const titles = yield* db.entities.Documents.byOwner({ owner: "ada" })
+  .select(["docId", "title"])
+  .collect()
+```
+
+- **Where.** On `BoundGet`, `BoundQuery` (index accessors, scans, `history()`, `versions()`, `deleted.list()`), collection queries, vector searches, and the CRUD builders (`put`, `update`, `delete`, `upsert`, `append`) for the values they return. Unbound: `Entity.offloaded(mode)` and `Query.offloaded(mode)`, data-first or pipeable. `Batch.get` and `Transaction.transactGet` honour each get's own mode.
+- **Eager reads** resolve a page's values together, in a prefetch within the query's `limit`, at the store's `readConcurrency`. Rows past the `limit` are never fetched.
+- **`filterBy`.** Its predicate runs on the decoded item, so with eager overflow fields every row of the response is fetched before the predicate drops it. `.offloaded("lazy")` keeps a `filterBy` scan from downloading every row. Call `.offloaded()` before `.filterBy()`: after it, or with an unknown mode from untyped code, it throws `[EDD-9117]`.
+- **Fixed modes.** Write results read in their builder's modes; the current item an error carries (`ConditionalCheckFailed`, `ConcurrentModification`, `StaleAppend`) is always lazy, with no store I/O. Aggregate reads and `GeoSearch.nearby` are always eager for both kinds.
+- **Other defaults.** EventStore reads are eager by default and stream-image decoding (`decodeMarshalledItem`, `decodeStreamRecord`, `decodeStreamImage`) lazy; each takes a mode (below, and [Streams](/effect-dynamodb/guides/streams/)).
+- **Projections** (`select`, `selectPaths`, `Entity.project`, a vector search's `select`) that name an offloaded field return an overflow field as its fetched, parsed JSON (the wire form, as for a packed field) and a binary field as a `BlobHandle`. One that names none fetches nothing.
+- **Auto-discovered collections** (`db.collections.*`) are typed with the offloaded fields of all the client's entities, because their accessors aren't typed per member.
+- **`asNative`** returns the stored pointers untouched; `asRecord` and `asItem` resolve per mode as `asModel` does.
+
+### Conditions, filters and updates
+
+DynamoDB sees an offloaded field as one opaque value. Conditions and filters may only test its existence (`exists` / `notExists`), projections take it whole, and updates `.set()` or `.remove()` it whole. A path copy from it into another attribute (`pathSet` / `pathSubtract` with `isPath` and `valueSegments`) is refused too: it would copy the pointer out of the field. `[EDD-9076]` and `[EDD-9077]` cover binary fields as they cover packed ones. The typed `PathBuilder` exposes such a field as a `PackedPath`.
+
+### Missing versions
+
+A read of a version that no longer exists fails with `BlobStoreError { reason: "NotFound" }` (or `AccessDenied` without `s3:ListBucket`). Causes: a handle held past the reaper's grace after its row moved on, a table restored from before a GC run, a replica bucket that hasn't caught up, or a delete out of band. The library doesn't re-read the item, since it can't know a newer pointer is what the caller wants.
+
+## Errors
+
+`BlobStoreError` (`entityType`, `attribute`, `operation`, `action`, `reason`, `ref?`, `committed`, `cause`) is in an operation's error channel only when the member declares an offloaded field:
+
+- **Every write**, including `Batch.write`, `Transaction.transactWrite` and `EventStream.append`'s `additionalItems`, which add the errors of the ops they're given. An aggregate's `delete` is the exception: it never reaches the store.
+- **Reads** only where the effective mode is eager for a kind the member has. Overflow fields are eager by default, so their reads carry it; an entity with only binary fields keeps its read error types by default, and a lazy handle carries the error on its own `read`, `stream` and `presignedUrl`.
+
+A member without offloaded fields sees exactly the error types it had before.
+
+| `reason` | Meaning |
+|---|---|
+| `NotProvided` | no `BlobStore` in context |
+| `Unversioned` | the bucket answered without a real `VersionId`: enable versioning |
+| `NotFound` | no such version (see [Missing versions](#missing-versions)) |
+| `AccessDenied` | the store refused (IAM, Object Lock, MFA Delete) |
+| `Throttled` | the store throttled after retries |
+| `ChecksumMismatch` | an upload or a verified read didn't match its checksum |
+| `TooLarge` | the object is too large for the store |
+| `SourceFailed` | the input `Stream` failed, or didn't match its `contentLength` |
+| `Expired` | the upload finished after `maxUploadAge`; nothing was written to DynamoDB |
+| `Unsupported` | a capability the store lacks (`presign`, `list`, …), or presigning an inline handle |
+| `Unavailable` | 5xx or transport failure after retries |
+| `Rejected` | any other refusal |
+
+**`committed: true`** means the DynamoDB write was applied and only reading its result back failed. Don't retry a non-idempotent write on it.
+
+What is wrong with the **stored form** stays a `ValidationError`, as for packed values: a malformed pointer, a corrupt payload after a verified fetch, an unusable input (`[EDD-9120]`), and a pointer met on a field that is no longer offloaded, whose resolution failure is the error's `cause`.
+
+## Streams and change detection
+
+Stream consumers decode images **lazily** by default: an offloaded field comes back as an `OffloadedValue` or `BlobHandle`, so a consumer only pays a GET for what it reads. `Entity.decodeStreamRecord` decodes both images of a record and classifies what the change did to each offloaded field, from the two pointers alone:
+
+```typescript region="decode-stream-record" example="guide-blob-offload.ts"
+// A NEW_AND_OLD_IMAGES record, as Lambda, EventBridge Pipes or the change feed deliver it
+const change = yield* Entity.decodeStreamRecord(Documents, record)
+if (Option.isSome(change) && change.value.offloaded.body !== "unchanged") {
+  // offloaded → { body: "changed", scan: "unchanged" }, decided from the two
+  // pointers alone. Items are lazy by default: the new body is fetched only here.
+  const { newItem } = change.value
+  const newBody = Option.isSome(newItem) ? yield* newItem.value.body.read() : undefined
+}
+```
+
+| Classification | Meaning |
+|---|---|
+| `unchanged` | the same object version (or inline values with the same content) |
+| `rewritten` | another version (or stored form) with the same checksum algorithm, checksum and content size: **probably** the same content |
+| `changed` | different content |
+| `added` / `removed` | only in the new / old image |
+
+`rewritten` is probable, not proven: a CRC can be matched by crafted content. A consumer that must never miss a change (an indexer, a malware scanner) treats `rewritten` as `changed`, or compares the content. The stream must use `NEW_AND_OLD_IMAGES`: a record whose view type is another, or that lacks an image its event needs, fails with `[EDD-9119]`. See [DynamoDB Streams](/effect-dynamodb/guides/streams/#offloaded-fields-in-stream-records) for `decodeMarshalledItem`, `Offload.compareStored` and `StorageEncoding.pointer`.
+
+**A lagging consumer can read `NotFound`.** A handle decoded from an old record names a version that may have been superseded and then reaped after the grace. The newer record carries the newer pointer, so treat `NotFound` as "superseded" and skip the field, rather than failing the batch and wedging the shard:
+
+```typescript region="not-found" example="guide-blob-offload.ts"
+// A consumer reading the superseded body after the reaper freed it
+const stale = yield* oldBody.read().pipe(
+  Effect.as("read"),
+  Effect.catchTag("BlobStoreError", (error) =>
+    error.reason === "NotFound" ? Effect.succeed("superseded") : Effect.fail(error),
+  ),
+)
+// stale → "superseded": the newer record carries the newer pointer
+```
+
+Choose a reaper grace at least as long as the slowest consumer's tolerated lag.
+
+## EventStore streams
+
+```typescript
+const Ledger = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Ledger",
+  events: [Recorded, Voided],
+  streamId: { composite: ["ledgerId"] },
+  // Event data at or over 128 KiB, and any snapshot state at or over 64 KiB, offloaded
+  storedAs: { data: DynamoModel.Packed({ format: "json", external: { threshold: 131_072 } }) },
+  snapshot: {
+    schema: LedgerState,
+    mode: "inline",
+    storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" }, external: {} }),
+  },
+  offload: { itemBudget: 350_000 },
+})
+```
+
+- **Writes.** `append` uploads every event's `data` before its transaction; `commandHandler` reuses an upload when it retries at the same version, and deletes a cancelled attempt's uploads. `writeSnapshot` rolls back the upload of a snapshot that loses its race. `stream.offload` reports `{ itemBudget, prefix, overflow }`.
+- **Reads** are eager by default: `read`, `readFrom`, `readLatest`, `readSnapshot` and `readIndex` take `{ offloaded: "lazy" }`, and `query.events` / `query.index` take `Query.offloaded("lazy")`, returning `LazyStreamEvent`s (`event.data.read()`) and `LazySnapshot`s. `currentVersion` never reads `data`.
+- **Change feed and projections are lazy**: `decodeStreamImage`, `EventProjection` / `MultiProjection` handlers, `EventStore.processBatch` and `runChangeFeed` hand `LazyStreamEvent`s for streams with offloaded `data`. A projection defined with `{ offloaded: "eager" }` receives resolved events. A record whose decode fails reading the store is never a poison record. See [Projections](/effect-dynamodb/guides/projections/#offloaded-event-data).
+- **Errors** are per kind: writes (`append`, `commandHandler`, `appendOp`) carry `BlobStoreError` when `data` or the snapshot `state` offloads (an inline snapshot uploads its state); `writeSnapshot` and an eager `readSnapshot` only when `state` does; eager event reads only when `data` does, and `readLatest`, which reads both, when either does.
+- **Planning.** `measureAppend` and `measureSnapshot` upload nothing: they count each value the append would offload as its pointer at an upper bound (exact but for the `VersionId`'s bytes) and list it in `AppendMeasurement.offloaded` (`{ item, attribute, objectBytes }`). Measuring an offloading stream needs a store, for its limits.
+
+Event objects are immutable and keyed per event, so the reaper never frees them: they are removed only by purge. A snapshot's superseded state is freed directly.
+
+## Garbage collection
+
+Every write of an offloaded field adds a version, so superseded versions accumulate (and are billed) until something deletes them. GC is opt-in: `BlobGc`.
+
+```typescript region="gc" example="guide-blob-offload.ts"
+const gc = yield* BlobGc.make({
+  entities: { Documents },
+  // Free a superseded version 15 minutes after its record (presigned URLs and
+  // lagging readers of the old row stay valid that long)
+  reaper: { gracePeriod: "15 minutes" },
+  // Delete a version only after it has been unreferenced for a day
+  sweep: { gracePeriod: "1 day" },
+})
+```
+
+`BlobGc.make({ entities?, aggregates?, streams?, reaper?, sweep? })` resolves the `BlobStore`, the `DynamoClient` and each member's `TableConfig` once; the collector's operations have no requirements. Members are the entities, aggregates and streams that offload, by the name the sweeps take. Invalid options are the `[EDD-9118]` defect.
+
+**GC is table-local.** A version is a member's own only when its key's partition and family hashes are the ones the member computes from **its own table name**. Every other pointer a row holds is foreign: never a candidate, never listed, never deleted, only counted (`foreign`). So a table restored from a backup or point in time, an import, or a copy made with `asNative` rows never deletes its source's versions, and its own writes upload under its own keys. This needs the copy's table name to differ from the source's, or a different bucket: a restore into another region or account that keeps the name and points at the same bucket computes the same keys.
+
+### The reaper
+
+`gc.reap(records, options?)` is a batch processor for DynamoDB Streams records (`NEW_AND_OLD_IMAGES`): from a Lambda trigger, an EventBridge Pipe, or the [polled change feed](/effect-dynamodb/guides/change-feed/):
+
+```typescript region="gc-reap" example="guide-blob-offload.ts"
+// A batch of records from Lambda, Pipes or the change feed: each own version
+// a record superseded is freed once the grace has passed
+const report = yield* gc.reap([record])
+// report → { records: 1, candidates: 1, freed: 1, retained: 0, foreign: 0, skipped: 0 }
+```
+
+1. **Every record is checked** before any is acted on: a record without the images it needs is the `[EDD-9119]` defect.
+2. **Candidates.** A record is read only as the members on the table it came from: the table its `eventSourceARN` (Lambda, Pipes) or `tableName` (Kinesis Data Streams) names, else the `table` option, else the collector's one table. A change feed batch's records name no table: pass `{ table: batch.streamArn }`. Feed a collector only its own tables' records. Each own pointer in a record's `OldImage` that its `NewImage` doesn't hold (all of them on `REMOVE`, including TTL deletes) is a candidate.
+3. **Grace.** It waits until the newest candidate record is `gracePeriod` old (default 15 minutes). The grace covers index and eventually consistent reads, replica reads, lazy handles and presigned URLs of the superseded row.
+4. **Free.** Plain entities, aggregate edges and EventStore snapshots free directly: a superseded pointer is never written back. `retain`, `softDelete` and `timeSeries` entities share versions between rows, so a candidate is freed only after a **confirm-read** of the item family (its sort-key ranges, bracketed by strongly consistent reads of the live row so a concurrent `restore` can't hide a holder) finds no row still holding it. A family whose live row keeps changing is left (`retained`); one sequence it can't see is listed under [Limits](#limits). EventStore events and a `retain` entity's live-row `MODIFY` supersede nothing (`skipped`).
+5. **Delete** in one store call per batch. Deletes are idempotent, so at-least-once delivery, duplicates and reordering are harmless.
+
+```typescript
+// A Lambda handler. The grace is spent inside the invocation: keep it under the timeout.
+const gc = yield* BlobGc.make({ entities: { Documents }, reaper: { gracePeriod: "2 minutes" } })
+yield* gc.reap(event.Records)
+
+// The polled change feed, beside the projections it already runs: the batch
+// is acknowledged only after the reaper is done with it
+yield* runChangeFeed(changeFeed({ streamArn }), {
+  projections: { summaries: OrderSummaryProjection },
+  onBatch: (batch) => Effect.asVoid(gc.reap(batch.records, { table: batch.streamArn })),
+})
+```
+
+- **In Lambda** the 15-minute default equals Lambda's maximum timeout. Set a shorter `gracePeriod` (and keep presign expiries and consumer lag within it), or run the reaper on the change feed, where a batch can wait out the grace.
+- **Readers per shard.** AWS advises at most two simultaneous readers per shard, Lambda triggers and Pipes included. That is why `reap` is a batch processor you can call from a consumer you already run.
+- **`confirm: "always"`** confirm-reads for every entity member, reading every range. Use it for an entity whose `retain` or `softDelete` was turned off while its history rows still exist (its snapshots or tombstones may share the live row's versions), or whose rows other tooling copies.
+
+### Sweeps
+
+The reaper only sees what the stream delivers. The sweeps are the backstop: for an outage longer than the stream's 24-hour retention, an unknown write outcome the observer reported, a crashed process.
+
+```typescript region="gc-sweep" example="guide-blob-offload.ts"
+// A periodic job: one pass marks each version no row holds (and old enough
+// not to be in flight); a pass at least the grace later deletes it
+const report = yield* gc.sweep("Documents", { docId: "d-1" })
+// report → { referenced: 2, listed: 3, marked: 1, deleted: 0, … }
+```
+
+`gc.sweep(name, key)` sweeps one entity item family; `gc.sweepPartition(name, key)` an aggregate's partition or a stream (every event of it). Each:
+
+1. reads every row of the family, whole, with the confirm-read's bracket (a pointer on any attribute holds its version);
+2. lists the family's own versions (`list`);
+3. keeps every referenced version, and every version younger than `maxUploadAge` + 15 minutes (its write may still be in flight); **marks** the others "unreferenced since now"; and **deletes** a version marked at least `gracePeriod` ago.
+
+So a version is deleted only after one pass saw it unreferenced and a later pass, at least the grace afterwards, still did. Marks are object version tags (`edd-unref-since`) merged with the version's other tags. The default grace is the larger of 24 hours and `maxUploadAge` + 15 minutes; it must be at least 1 hour and at least `maxUploadAge` + 15 minutes. Run daily, the default removes a version 24–48 hours after it was first seen unreferenced. A family whose rows never settle is reported `busy: true` and left alone. A sweep reads every row of the family, so it is a backstop, not a routine pass.
+
+```typescript region="gc-sweep-store" example="guide-blob-offload.ts"
+// The store-wide backstop for leaks no row records: run rarely, in bounded runs.
+// Each family is Swept (with its SweepReport), Foreign (another table's or
+// not the library's: never deleted) or Unattributable (handle by hand)
+const results = yield* Stream.runCollect(gc.sweepStore({ maxFamilies: 1_000 }))
+const deleted = results.reduce(
+  (n, family) => (family._tag === "Swept" ? n + family.report.deleted : n),
+  0,
+)
+
+// The next run resumes after the last family this one reached
+const last = results.at(-1)
+const next =
+  last === undefined
+    ? []
+    : yield* Stream.runCollect(
+        gc.sweepStore({ startAfter: last.familyPrefix, maxFamilies: 1_000 }),
+      )
+```
+
+`gc.sweepStore({ prefix?, startAfter?, maxFamilies? })` lists the store (by default the store prefix and every member's `offload.prefix`), reads one version's metadata per item family (`head`) and sweeps each family a member owns. It finds leaks no row records and no process reported, without a table scan. A family whose metadata names another table, or no table the library wrote, is `Foreign` (`table` an `Option`); one whose row key was too long for its metadata is `Unattributable`, with its version count and bytes. Cost: one listing page per 1,000 versions plus one `HeadObject` and one sweep per family. Run it weekly or so, resumably.
+
+### Purge
+
+```typescript region="purge" example="guide-blob-offload.ts"
+// purge deletes every row of the item, then its object versions
+yield* db.entities.Documents.purge({ docId: "d-3" })
+```
+
+`purge` needs the `BlobStore` up front (without one it fails with `NotProvided` before any row is deleted). After every row delete succeeds, it re-reads the family with the confirm-read's bracket and deletes the versions the purged rows named, and any other version old enough not to be in flight. A younger unnamed version (the upload of a write racing the purge) is left for the sweep. Purge doesn't wait for a grace: it is an explicit "delete this item's data".
+
+### Lifecycle rules
+
+The current S3 version of a key is not necessarily the referenced one: a concurrent writer, a crashed rollback, a retain snapshot, a tombstone or a time-series event can pin a noncurrent version.
+
+| Rule on the offload prefix | Safe? |
+|---|---|
+| `AbortIncompleteMultipartUpload` (days > `maxUploadAge`) | **yes**: the backstop for crashed multipart uploads |
+| `ExpiredObjectDeleteMarker` | **yes**: the library leaves no delete marker in a versioned bucket. The one it can leave, after a write to a versioning-suspended bucket when the store falls back to a plain `DeleteObject`, is a `null` marker, harmless to reads by version, which this rule removes |
+| Transition to Standard-IA, Intelligent-Tiering (without archive tiers), Glacier Instant Retrieval | yes: a cost and latency trade-off |
+| Transition to Glacier Flexible Retrieval or Deep Archive, Intelligent-Tiering archive tiers | **no**: reads fail until restored |
+| `NoncurrentVersionExpiration`, `NewerNoncurrentVersions` | **never**: they delete noncurrent versions that rows still reference |
+| `Expiration` | **never**: on a versioned bucket it adds a delete marker, which makes the referenced current version noncurrent. Reads by version still work, until a `NoncurrentVersionExpiration` rule deletes it |
+| Any rule filtered on the `edd-unref-since` tag | **no**: a mark is not a decision to delete |
+
+### Backups, point-in-time recovery and table copies
+
+A restored or copied table never deletes its source's versions (they are foreign to it). The reverse doesn't hold: the source's GC doesn't know about its copies, and a version it frees may still be referenced by a restore, which then reads `NotFound`. The reaper's grace is bounded by the stream's 24-hour retention, so it can't cover a 35-day restore window.
+
+For a table whose restores must be whole, **run only the sweeps, with a grace at least as long as the restore window, and no reaper**: a sweep keeps every version at least its grace after it was first seen unreferenced, so any point inside the window restores whole. Purge and rollback deletes aren't covered: purged data is gone by request, and a rolled-back version was never committed. A copy that must outlive the window rewrites its offloaded values into its own keys (any `put` or `.set()` of the field).
+
+### Versions per key
+
+S3 throttles a key with too many versions (AWS's guidance is to stay well below about 100,000). A hot item updated millions of times between GC passes, or a `retain` entity keeping that many snapshots, can get there; the reaper is what keeps a hot item's key short. Time-series appends are keyed per event and immune.
+
+## Global Tables and replication
+
+- **One pointer, many buckets.** The pointer names no bucket, and S3 replication keeps keys and `VersionId`s, so each region's layer names its own replica bucket. Both buckets need versioning; multi-active writers need two-way replication.
+- **Replica lag.** S3 replication of a large object can lag DynamoDB's by minutes to hours without S3 Replication Time Control (RTC). A replica-region read can get `NotFound` until the object arrives; `notFoundRetry` helps only for short lags. Use RTC for latency-sensitive replica reads.
+- **GC per region.** Deletes by version aren't replicated, so each region runs its own reaper over its own stream replica against its own bucket, and a version rolled back in the writer's region after it replicated is reclaimed by the replica region's sweep. If every region points at **one** bucket, run GC in one region only.
+- **A region added later** needs its bucket backfilled (S3 Batch Replication): live replication doesn't copy existing objects.
+
+## Rolling out
+
+1. **Escape the key text.** Set `escapeKeys: true` and run `rekey` first, if the table isn't escaped yet (see [Key text](#key-text-escapekeys-true)).
+2. **Upgrade every reader**, including stream consumers, before any writer enables offloading. Older readers fail loudly: an overflow pointer with the unsupported-layout `ValidationError`, a binary pointer (stored as `S`) with a schema `ValidationError`. Two caveats:
+   - an overflow field whose schema is opaque (`Schema.Unknown`, `Schema.Any`, `Schema.Json`) and that the old reader doesn't configure `Packed` reads the pointer as its value, as for packed storage;
+   - an older **writer** that round-trips such a value (or `asNative` rows) can write a stale pointer back. Upgrade writers before enabling GC.
+3. **Provide the store** wherever the members are bound, and set the observer.
+4. **Add the config.** New writes offload; existing items keep reading and move over on their next write of the field. Nothing is rewritten for you.
+5. **Turn on GC**: the reaper on the table's stream (the stream needs `NEW_AND_OLD_IMAGES`), and a periodic sweep.
+
+**What changes for code that decodes images.** Adding `external` to a field changes what lazy decoders return: `decodeMarshalledItem` and `decodeStreamRecord` return `OffloadedValue`s for that field (inline values included), and an EventStore stream with offloaded `data` hands `LazyStreamEvent`s to projections. The typed overloads make this visible; code that casts an `unknown` result only sees it at run time. Binary `External` fields read as `BlobHandle`s by default.
+
+**Turning offloading off.** Removing `external` (or `External`) leaves existing pointers readable: they resolve eagerly through the store in context, and a store failure is the `cause` of a `ValidationError`. The reaper stops freeing that field's superseded versions. The sweeps keep covering them, and never delete one a row holds, only while the entity still offloads another field: once it offloads none, `BlobGc.make` refuses it as a member, `sweepStore` reports its families `Foreign`, and GC no longer covers its objects at all. Rewrite the items first (any `put` or `.set()` of the field stores it inline again), keep GC running until the rewrite is done, then remove the config.
+
+## Limits
+
+- **Fields only.** Whole items are never offloaded.
+- **No deduplication.** Identical content written twice is two versions.
+- **Stores.** The S3 store needs versioning; Object Lock and MFA Delete are unsupported for rollback and GC. Native GCS, Azure Blob and Cloudflare R2 stores don't ship; the contract allows a key-per-write store for a backend without versioning.
+- **Checksums** detect corruption and classify changes; they aren't tamper evidence.
+- **S3 requests** aren't included in [consumed capacity](/effect-dynamodb/guides/consumed-capacity/) reports.
+- **Aggregates** read eagerly and take only `Uint8Array` for binary edge fields. `rekey` of a table with offloading aggregates reads each aggregate partition eagerly too (the ref-holder pass included), so it downloads every offloaded edge value and needs the `BlobStore` where it runs. Without one, an aggregate is reported as a failed conflict rather than refused.
+- **The reaper's confirm-read** can miss one sequence: a `restore` and then a soft delete of the same item, both committing inside the few milliseconds the reaper spends confirming that item, with the live row absent before and after. The version the new tombstone holds is then freed. [Sweeps](#sweeps) don't cover this: the version is gone. It takes two writes to one item inside one confirm-read, so it is listed here rather than paid for on every soft delete.
+
+## Error codes
+
+| Code | Raised when |
+|---|---|
+| `EDD-9141` | `Packed({ external })` or `External()` options are invalid |
+| `EDD-9111` | an `External` field isn't on the model, or its encoded side isn't `Uint8Array` |
+| `EDD-9142` | an `External` field is a key, index, `orderBy`, unique, ref, identifier or vector field, or an aggregate discriminator / `many` sort-key composite |
+| `EDD-9143` | a ref's schema includes a field the referenced entity offloads (reference a subset model without it) |
+| `EDD-9114` | `offload` options are invalid |
+| `EDD-9115` | a member with an offloaded field is bound, or an unbound stream runs, with no `BlobStore` |
+| `EDD-9116` | store options are invalid |
+| `EDD-9117` | an unknown read mode, or `.offloaded()` after `.filterBy()` |
+| `EDD-9118` | `BlobGc` options or calls are invalid, or a sweep's store lacks a capability it needs |
+| `EDD-9119` | a stream record lacks the images reaping or change detection needs (`NEW_AND_OLD_IMAGES`) |
+| `EDD-9120` | an offloaded field's write input is unusable, or a `Stream` is used twice |
+| `EDD-9146` | a member with an offloaded field is bound, or written unbound, on a table whose schema doesn't set `escapeKeys: true`; or `rekey` would move a row that holds a pointer |
+
+## What's next?
+
+- [Packed Storage](/effect-dynamodb/guides/packed-storage/): the JSON and compressed storage an overflow field builds on
+- [DynamoDB Streams](/effect-dynamodb/guides/streams/): decoding stream records, and change detection
+- [Lifecycle](/effect-dynamodb/guides/lifecycle/): how snapshots and tombstones share offloaded versions
+- [Testing](/effect-dynamodb/guides/testing/#offloaded-storage): the in-memory store, and MinIO for connected tests

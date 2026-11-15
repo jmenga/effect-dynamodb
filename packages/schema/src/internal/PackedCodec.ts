@@ -12,23 +12,29 @@
  * |-----------------------|-------------------------------------------------------------|
  * | `undefined` / `null`  | as is                                                       |
  * | `string` (`S`)        | `JSON.parse`                                                |
- * | `Uint8Array` (`B`)    | header byte → decompress per codec → UTF-8 (fatal) → `JSON.parse` |
+ * | `Uint8Array` (`B`), layout `001` | header byte → decompress per codec → UTF-8 (fatal) → `JSON.parse` |
+ * | `Uint8Array` (`B`), layout `010` | a {@link BlobPointer} (an offloaded value, #179) — returned, never fetched |
  * | anything else         | a legacy native value (map, list, …), unchanged             |
  *
  * ## `B` header (byte 0): `vvv ff ccc`
  *
- * - bits 7–5, layout version: `001` = v1. `000` invalid; `010`–`111` reserved
- *   for future layouts, which may add bytes after byte 0.
+ * - bits 7–5, layout version: `001` = v1 (an inline value). `010` = a blob
+ *   pointer (see `BlobPointer.ts`). `000` invalid; `011`–`111` reserved for
+ *   future layouts, which may add bytes after byte 0.
  * - bits 4–3, format: `00` json; `01` binary — reserved for SchemaBinary;
- *   `10`, `11` reserved.
+ *   `10`, `11` reserved. (In a pointer, these bits are its kind.)
  * - bits 2–0, codec: `000` none, `001` gzip, `010` brotli, `011` zstd;
  *   `100`–`111` reserved.
  *
  * v1 writers emit `0x21` (gzip), `0x22` (brotli), `0x23` (zstd); v1 readers also
- * accept `0x20` (json, uncompressed). Every v1 header byte lies in `0x20`–`0x3F`,
- * so the base64 text of a v1 `B` value starts with one of `I`–`P` — a character
- * no `JSON.stringify` output starts with. A future layout version must keep that
- * property (see {@link isBase64PackedText}).
+ * accept `0x20` (json, uncompressed). Every v1 header byte lies in `0x20`–`0x3F`
+ * and every pointer header byte in `0x40`–`0x5F`, so the base64 text of either
+ * starts with one of `I`–`X` — a character no `JSON.stringify` output starts
+ * with. A future layout version must keep that property (see
+ * {@link isBase64PackedText}).
+ *
+ * The codec stays synchronous and never fetches: a pointer is handed back to
+ * the caller, which resolves it (or refuses it).
  *
  * No `node:zlib` and no AWS SDK here: compression goes through a
  * {@link CompressionRegistry}.
@@ -36,13 +42,22 @@
 
 import { Effect, Schema, SchemaAST } from "effect"
 import type { CompressionRegistry } from "../Compression.js"
-import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
+import type { CompressionCodec, ExternalPackedConfig, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
 import { type Lost, lostAs, lostRefusal } from "./LostValues.js"
 import { classOf } from "./OwnNames.js"
 import { storedFormOf, ZONE_MARKER, zoneEntriesWritten } from "./StoredForm.js"
 
 export { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./StoredForm.js"
+
+import {
+  type BlobPointer,
+  decode as decodePointer,
+  decodeText as decodePointerText,
+  isPointerHeader,
+  type PointerHeader,
+  parsePointerHeader,
+} from "./BlobPointer.js"
 
 // ---------------------------------------------------------------------------
 // Header layout
@@ -82,21 +97,28 @@ export const headerByte = (
 ): number =>
   (LAYOUT_VERSION_V1 << 5) | (format << 3) | (codec === "none" ? CODEC_NONE : codecCodes[codec])
 
-/** A header this version can read. */
+/** A v1 (inline value) header this version can read. */
 export interface PackedHeader {
   readonly version: 1
   readonly format: "json"
   readonly codec: CompressionCodec | "none"
 }
 
+export type { PointerHeader } from "./BlobPointer.js"
+
 const hex = (byte: number): string => `0x${byte.toString(16).padStart(2, "0")}`
 
-/** Parse byte 0 of a `B` value. Returns a reason string when this version cannot read it. */
-export const parseHeader = (byte: number): PackedHeader | string => {
+/**
+ * Parse byte 0 of a `B` value: a v1 header (an inline value), a pointer
+ * header (layout `010`, `0x40`–`0x43` json and `0x48` bytes), or the reason
+ * this version cannot read it (a reserved pointer kind or codec included).
+ */
+export const parseHeader = (byte: number): PackedHeader | PointerHeader | string => {
   const version = byte >>> 5
   const format = (byte >>> 3) & 0b11
   const codec = byte & 0b111
   if (version === 0) return `header byte ${hex(byte)} has layout version 0, which is invalid`
+  if (isPointerHeader(byte)) return parsePointerHeader(byte)
   if (version !== LAYOUT_VERSION_V1) {
     return (
       `header byte ${hex(byte)} has layout version ${version}, which this version does not ` +
@@ -116,16 +138,17 @@ export const parseHeader = (byte: number): PackedHeader | string => {
 }
 
 /**
- * True iff `text` is the base64 encoding of a v1 `B` value: its first
- * character encodes the top six bits of a header byte in `0x20`–`0x3F`
- * (`I`–`P`). JSON text never starts with one of those characters, so a string
+ * True iff `text` is the base64 encoding of a `B` value of a layout this
+ * version reads: its first character encodes the top six bits of a header
+ * byte in `0x20`–`0x3F` (v1, `I`–`P`) or `0x40`–`0x5F` (a blob pointer,
+ * `Q`–`X`). JSON text never starts with one of those characters, so a string
  * on a packed attribute of an unmarshalled stream image is base64 exactly when
  * this holds.
  */
 export const isBase64PackedText = (text: string): boolean => {
   const first = text.charCodeAt(0)
-  // "I" (0x49) .. "P" (0x50)
-  return first >= 0x49 && first <= 0x50
+  // "I" (0x49) .. "X" (0x58)
+  return first >= 0x49 && first <= 0x58
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +214,27 @@ export const notRegistered = (
       operation: ctx.operation,
     }),
   })
+
+/**
+ * The `ValidationError` of a read that met a blob pointer (an offloaded value,
+ * #179) it cannot resolve — a synchronous one, which does no I/O: it names the
+ * attribute and the object version the pointer pins, then `hint` (what
+ * resolves it). Stored data never reads as the pointer itself.
+ */
+export const unresolvedPointer = (
+  ctx: OperationContext,
+  attribute: string,
+  pointer: BlobPointer,
+  hint = "read it through its entity's or stream's decoder, which resolves pointers through " +
+    "the BlobStore in context",
+): ValidationError =>
+  invalid(
+    ctx,
+    attribute,
+    `the stored value is a blob pointer to an offloaded ${pointer.kind} value (object ` +
+      `"${pointer.ref.key}", version "${pointer.ref.version}"), which this read cannot ` +
+      `resolve: it does no I/O. ${hint}`,
+  )
 
 // ---------------------------------------------------------------------------
 // Strict JSON serialisation
@@ -373,7 +417,7 @@ export type PackedStored = string | Uint8Array | null | undefined
  * operation by the caller.
  */
 export const packValueSync = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: OperationContext,
@@ -439,7 +483,7 @@ export const packValueSync = (
  * `"compress"`).
  */
 export const packValue = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
@@ -457,9 +501,15 @@ const parseJsonSync = (text: string, ctx: OperationContext, attribute: string): 
 }
 
 /**
- * {@link unpackBytes} without an Effect: the JSON wire form, or the
- * `ValidationError` it fails with (returned, never thrown). A parsed JSON value
- * is never a `ValidationError`, so `instanceof ValidationError` tells them apart.
+ * {@link unpackBytes} without an Effect: the JSON wire form, the
+ * {@link BlobPointer} a layout-`010` value holds, or the `ValidationError` it
+ * fails with (returned, never thrown). A parsed JSON value is never a
+ * `ValidationError` nor a `BlobPointer`, so `instanceof ValidationError` and
+ * `isBlobPointer` tell the three apart.
+ *
+ * A pointer is decoded, never fetched: the caller resolves it. A malformed
+ * pointer, or one of kind bytes (a binary field's, which a packed attribute
+ * never stores), is a `ValidationError`.
  */
 export const unpackBytesSync = (
   stored: Uint8Array,
@@ -467,26 +517,8 @@ export const unpackBytesSync = (
   ctx: OperationContext,
   attribute: string,
 ): unknown => {
-  if (stored.length === 0) return invalid(ctx, attribute, "the stored binary value is empty")
-  const header = parseHeader(stored[0]!)
-  if (typeof header === "string") return invalid(ctx, attribute, header)
-  let payload = stored.subarray(1)
-  if (header.codec !== "none") {
-    const compressor = registry.get(header.codec)
-    if (compressor === undefined) return notRegistered(ctx, attribute, header.codec, "decompress")
-    try {
-      payload = compressor.decompress(payload)
-    } catch (cause) {
-      return invalid(ctx, attribute, `the "${header.codec}" decompressor failed`, cause)
-    }
-    if (!(payload instanceof Uint8Array)) {
-      return invalid(
-        ctx,
-        attribute,
-        `the "${header.codec}" decompressor did not return a Uint8Array`,
-      )
-    }
-  }
+  const payload = unpackPayloadSync(stored, registry, ctx, attribute)
+  if (!(payload instanceof Uint8Array)) return payload
   let text = looseDecoder.decode(payload)
   if (text.includes("\uFFFD")) {
     try {
@@ -499,11 +531,57 @@ export const unpackBytesSync = (
 }
 
 /**
+ * The content of a `B` value, without parsing it: for an inline (v1) value
+ * its JSON's UTF-8 bytes, decompressed per its header's codec — the bytes a
+ * pointer's content checksum covers (design §5) — or the {@link BlobPointer}
+ * a layout-`010` value holds, or the `ValidationError` it fails with
+ * (returned, never thrown). The refusals are {@link unpackBytesSync}'s.
+ */
+export const unpackPayloadSync = (
+  stored: Uint8Array,
+  registry: CompressionRegistry,
+  ctx: OperationContext,
+  attribute: string,
+): Uint8Array | BlobPointer | ValidationError => {
+  if (stored.length === 0) return invalid(ctx, attribute, "the stored binary value is empty")
+  const header = parseHeader(stored[0]!)
+  if (typeof header === "string") return invalid(ctx, attribute, header)
+  if (header.version === 2) {
+    const pointer = decodePointer(stored)
+    if (typeof pointer === "string") return invalid(ctx, attribute, pointer)
+    if (pointer.kind !== "json") {
+      return invalid(
+        ctx,
+        attribute,
+        "the stored value is a binary field's blob pointer (kind bytes), which a packed " +
+          "attribute never holds",
+      )
+    }
+    return pointer
+  }
+  const payload = stored.subarray(1)
+  if (header.codec === "none") return payload
+  const compressor = registry.get(header.codec)
+  if (compressor === undefined) return notRegistered(ctx, attribute, header.codec, "decompress")
+  let decompressed: unknown
+  try {
+    decompressed = compressor.decompress(payload)
+  } catch (cause) {
+    return invalid(ctx, attribute, `the "${header.codec}" decompressor failed`, cause)
+  }
+  if (!(decompressed instanceof Uint8Array)) {
+    return invalid(ctx, attribute, `the "${header.codec}" decompressor did not return a Uint8Array`)
+  }
+  return decompressed
+}
+
+/**
  * {@link unpackValue} of a stored `S` (JSON text) or `B` (header + payload)
- * without an Effect: the JSON wire form, or the `ValidationError` it fails with
- * (returned, never thrown — tell them apart with `instanceof ValidationError`).
- * Callers pass only strings and bytes; every other stored value is native and
- * read as is, without a call.
+ * without an Effect: the JSON wire form, the {@link BlobPointer} a `B` pointer
+ * holds, or the `ValidationError` it fails with (returned, never thrown — tell
+ * them apart with `instanceof ValidationError` and `isBlobPointer`). Callers
+ * pass only strings and bytes; every other stored value is native and read as
+ * is, without a call.
  */
 export const unpackStoredSync = (
   stored: string | Uint8Array,
@@ -519,7 +597,8 @@ const lift = (value: unknown): Effect.Effect<unknown, ValidationError> =>
   value instanceof ValidationError ? Effect.fail(value) : Effect.succeed(value)
 
 /**
- * Decode a `B` value (header byte + payload) to its JSON wire form.
+ * Decode a `B` value (header byte + payload) to its JSON wire form, or to the
+ * {@link BlobPointer} it holds (see {@link unpackBytesSync}).
  */
 export const unpackBytes = (
   stored: Uint8Array,
@@ -530,8 +609,9 @@ export const unpackBytes = (
 
 /**
  * Unpack a stored (unmarshalled) value by its form — see the module header.
- * A `string` is JSON, a `Uint8Array` is a header + payload, and anything else
- * (absent, `null`, a legacy native map, list, number, …) is returned unchanged.
+ * A `string` is JSON, a `Uint8Array` is a header + payload (or a blob pointer,
+ * returned as a {@link BlobPointer}), and anything else (absent, `null`, a
+ * legacy native map, list, number, …) is returned unchanged.
  */
 export const unpackValue = (
   stored: unknown,
@@ -541,6 +621,49 @@ export const unpackValue = (
   typeof stored === "string" || stored instanceof Uint8Array
     ? lift(unpackStoredSync(stored, registry, ctx, ctx.attribute))
     : Effect.succeed(stored)
+
+// ---------------------------------------------------------------------------
+// Binary fields: the `S` pointer form
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a binary field's `S` value as a blob pointer: `undefined` when it does
+ * not start with `~edbp:` (it is not a pointer), the {@link BlobPointer} when
+ * it is a valid one of kind bytes, or the `ValidationError` naming the
+ * attribute when it starts with the sentinel but is not canonical unpadded
+ * base64url of a valid bytes pointer (returned, never thrown).
+ *
+ * A pointer is decoded, never fetched: the caller resolves it.
+ */
+export const parseBinaryPointerText = (
+  text: string,
+  ctx: OperationContext,
+  attribute: string,
+): BlobPointer | ValidationError | undefined => {
+  const pointer = decodePointerText(text)
+  if (pointer === undefined) return undefined
+  if (typeof pointer === "string") return invalidBinary(ctx, attribute, pointer)
+  if (pointer.kind !== "bytes") {
+    return invalidBinary(
+      ctx,
+      attribute,
+      "the stored text is an overflow field's blob pointer (kind json), which a binary " +
+        "attribute never holds",
+    )
+  }
+  return pointer
+}
+
+const invalidBinary = (
+  ctx: OperationContext,
+  attribute: string,
+  message: string,
+): ValidationError =>
+  new ValidationError({
+    entityType: ctx.entityType,
+    operation: ctx.operation,
+    cause: new Error(`Binary attribute "${attribute}": ${message}`),
+  })
 
 // ---------------------------------------------------------------------------
 // Shape rule (EDD-9073) and dispatch eligibility
@@ -658,3 +781,49 @@ export const isPackedShape = (schema: Schema.Top | SchemaAST.AST): boolean =>
  */
 export const isDispatchEligible = (schema: Schema.Top | SchemaAST.AST): boolean =>
   packedShape(schema)._tag === "Structured"
+
+// ---------------------------------------------------------------------------
+// Binary shape — the encoded side an `External` field must have (#179)
+// ---------------------------------------------------------------------------
+
+const UINT8ARRAY_REPRESENTATION = "effect/schema/Uint8Array"
+
+const binaryRefusalOf = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>): string | undefined => {
+  const encoded = SchemaAST.toEncoded(ast)
+  switch (encoded._tag) {
+    case "Declaration": {
+      const id = representationId(encoded)
+      if (id === UINT8ARRAY_REPRESENTATION) return undefined
+      const name = id?.replace(/^effect\/schema\//, "")
+      return name ? `its encoded side is ${name}` : "its encoded side is a declared type"
+    }
+    case "Suspend": {
+      if (seen.has(encoded)) return "its encoded side is an unresolvable recursive type"
+      seen.add(encoded)
+      return binaryRefusalOf(encoded.thunk(), seen)
+    }
+    case "Union": {
+      let members = 0
+      for (const member of encoded.types) {
+        const tag = SchemaAST.toEncoded(member)._tag
+        if (tag === "Null" || tag === "Undefined" || tag === "Void") continue
+        members++
+        const reason = binaryRefusalOf(member, seen)
+        if (reason !== undefined) return `a member of its union is not binary: ${reason}`
+      }
+      return members === 0 ? "its encoded side is only null / undefined" : undefined
+    }
+    default:
+      return `its encoded side is ${scalarReason[encoded._tag] ?? encoded._tag}`
+  }
+}
+
+/**
+ * Why a schema cannot hold an `External` binary field, or `undefined` when its
+ * encoded side is a `Uint8Array` — `Schema.Uint8Array`, optionally under
+ * `optional` / `optionalKey` / `NullOr` (a union whose other members are only
+ * `null` / `undefined`). `Uint8ArrayFromBase64` encodes to a string, so it is
+ * refused: it stores text, not bytes.
+ */
+export const binaryShapeRefusal = (schema: Schema.Top | SchemaAST.AST): string | undefined =>
+  binaryRefusalOf(Schema.isSchema(schema) ? schema.ast : schema, new Set())

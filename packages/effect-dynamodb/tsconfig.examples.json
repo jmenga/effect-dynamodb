@@ -5,7 +5,10 @@
     "noEmit": true,
     "declaration": false,
     "declarationMap": false,
-    "sourceMap": false
+    "sourceMap": false,
+    "paths": {
+      "effect-dynamodb": ["./src/index.ts"]
+    }
   },
   "include": ["src", "examples", "bench"],
   "exclude": ["node_modules", "dist", "examples/_walkthrough.ts"]

@@ -1,11 +1,13 @@
 /**
  * @internal BoundQuery — Fluent query builder with pre-resolved services.
  *
- * `BoundQuery<Model, SkRemaining, A, W>` wraps a `Query<A>` with a pre-resolved
+ * `BoundQuery<Model, SkRemaining, A, W, O>` wraps a `Query<A, E, O>` with a pre-resolved
  * `provide` function so all terminals return `Effect` with `R = never`.
  *
  * - Combinators return a new `BoundQuery` (immutable).
- * - `where` consumes `SkRemaining` → `BoundQuery<Model, never, A, never>`.
+ * - `where` consumes `SkRemaining` → `BoundQuery<Model, never, A, never, O>`.
+ * - `offloaded` (#179) sets the read modes of the items' offloaded fields,
+ *   carried by the offload state `O`.
  * - `where` is only available when `SkRemaining` is not `never`.
  * - `within` (#171) bounds the sort key composites `W` names; it and `where`
  *   exclude each other. On a Z-order accessor it bounds the dimensions and
@@ -15,15 +17,18 @@
  */
 
 import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
 import { toAttributeValue } from "../Marshaller.js"
+import type { NoOffloadState, OffloadModes, OffloadState } from "../Offload.js"
 import * as Query from "../Query.js"
 import * as Capacity from "./Capacity.js"
 import type { ConditionOps, ConditionShorthand, Expr, StoredFormAt } from "./Expr.js"
 import { ExprTag, operandsAsStored, parseSimpleShorthand } from "./Expr.js"
+import type { OffloadedView, ReadErrors, WithItem, WithModes } from "./OffloadTypes.js"
 import {
   entryOfPath,
   type PackedPath,
@@ -269,13 +274,14 @@ export interface BoundQueryBase<
   SkRemaining,
   A,
   W extends WithinSpec<any, WithinKind> = never,
+  O extends OffloadState = NoOffloadState,
 > {
   /** Add a filter expression (post-read). Callback or shorthand. */
   readonly filter: {
     (
       fn: (t: PathBuilder<Model, Model, never>, ops: ConditionOps<Model>) => Expr,
-    ): BoundQuery<Model, SkRemaining, A, W>
-    (shorthand: ConditionShorthand): BoundQuery<Model, SkRemaining, A, W>
+    ): BoundQuery<Model, SkRemaining, A, W, O>
+    (shorthand: ConditionShorthand): BoundQuery<Model, SkRemaining, A, W, O>
   }
 
   /**
@@ -298,7 +304,7 @@ export interface BoundQueryBase<
    *
    * Cannot be combined with `.select()` — see EDD-9054.
    */
-  readonly filterBy: (predicate: (item: A) => boolean) => BoundQuery<Model, SkRemaining, A, W>
+  readonly filterBy: (predicate: (item: A) => boolean) => BoundQuery<Model, SkRemaining, A, W, O>
 
   /** Select specific attributes (projection). Callback or string array. */
   readonly select: {
@@ -306,8 +312,22 @@ export interface BoundQueryBase<
       fn: (
         t: PathBuilder<Model, Model, never>,
       ) => ReadonlyArray<Path<Model, any, any> | PackedPath<Model, any, any>>,
-    ): BoundQuery<Model, SkRemaining, Record<string, unknown>, W>
-    (attributes: ReadonlyArray<string>): BoundQuery<Model, SkRemaining, Record<string, unknown>, W>
+    ): BoundQuery<
+      Model,
+      SkRemaining,
+      Record<string, unknown>,
+      W,
+      WithItem<O, Record<string, unknown>>
+    >
+    (
+      attributes: ReadonlyArray<string>,
+    ): BoundQuery<
+      Model,
+      SkRemaining,
+      Record<string, unknown>,
+      W,
+      WithItem<O, Record<string, unknown>>
+    >
   }
 
   /**
@@ -318,7 +338,7 @@ export interface BoundQueryBase<
    * `.pageSize("natural")` for 1.36's sizing; a query with `.maxPages()` keeps
    * 1.36's sizing too.
    */
-  readonly limit: (n: number) => BoundQuery<Model, SkRemaining, A, W>
+  readonly limit: (n: number) => BoundQuery<Model, SkRemaining, A, W, O>
 
   /**
    * Fetch in batches of `n` — sets DynamoDB's `Limit` (rows examined per
@@ -326,7 +346,7 @@ export interface BoundQueryBase<
    * sizes requests exactly as 1.36 did (natural 1 MB pages under a filter);
    * any other string throws `[EDD-9095]`.
    */
-  readonly pageSize: (size: number | "natural") => BoundQuery<Model, SkRemaining, A, W>
+  readonly pageSize: (size: number | "natural") => BoundQuery<Model, SkRemaining, A, W, O>
 
   /**
    * Run `observer` after every request a terminal sends, with the `Limit` sent
@@ -336,23 +356,23 @@ export interface BoundQueryBase<
    */
   readonly onRequest: (
     observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
-  ) => BoundQuery<Model, SkRemaining, A, W>
+  ) => BoundQuery<Model, SkRemaining, A, W, O>
 
   /**
    * Set the maximum number of DynamoDB pages to fetch. On a sharded index, the
    * maximum number of rounds: each reads at most one page per partition.
    */
-  readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A, W>
+  readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A, W, O>
 
   /**
    * How many requests a query of a sharded index sends at once (#183). The
    * default is one per partition. Has no effect on an unsharded index. Anything
    * but a positive integer throws `[EDD-9105]`.
    */
-  readonly concurrency: (n: number) => BoundQuery<Model, SkRemaining, A, W>
+  readonly concurrency: (n: number) => BoundQuery<Model, SkRemaining, A, W, O>
 
   /** Reverse the sort order (ScanIndexForward = false). */
-  readonly reverse: () => BoundQuery<Model, SkRemaining, A, W>
+  readonly reverse: () => BoundQuery<Model, SkRemaining, A, W, O>
 
   /**
    * Resume pagination from an opaque cursor. The cursor is decoded when a
@@ -364,26 +384,51 @@ export interface BoundQueryBase<
    * query's well-formed cursor: DynamoDB may reject it
    * (`DynamoValidationError`) or the query resumes from it.
    */
-  readonly startFrom: (cursor: string) => BoundQuery<Model, SkRemaining, A, W>
+  readonly startFrom: (cursor: string) => BoundQuery<Model, SkRemaining, A, W, O>
 
   /**
    * Enable consistent reads. DynamoDB rejects them on a GSI, which it reads
    * only eventually consistently: the query then fails with a
    * `ValidationError` naming the index.
    */
-  readonly consistentRead: () => BoundQuery<Model, SkRemaining, A, W>
+  readonly consistentRead: () => BoundQuery<Model, SkRemaining, A, W, O>
 
   /** Skip the __edd_e__ entity type filter. */
-  readonly ignoreOwnership: () => BoundQuery<Model, SkRemaining, A, W>
+  readonly ignoreOwnership: () => BoundQuery<Model, SkRemaining, A, W, O>
+
+  /**
+   * Read the items' offloaded fields (#179) in `mode` — `"eager"` / `"lazy"`
+   * for both kinds, or `{ overflow?, binary? }` over the current modes
+   * (defaults: overflow eager, binary lazy). Re-types the items and the
+   * terminals' blob errors; a lazy read fetches nothing until a handle is
+   * read. Call it before `.filterBy()`, whose predicate is typed on the item:
+   * after it, it throws `[EDD-9117]`, as it does for an unknown mode (from
+   * untyped code). A member that offloads nothing is unchanged.
+   */
+  readonly offloaded: <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ) => BoundQuery<Model, SkRemaining, OffloadedView<A, O, M>, W, WithModes<O, M>>
 
   /** Execute a single page. Returns items + opaque cursor. */
-  readonly fetch: () => Effect.Effect<Query.Page<A>, DynamoClientError | ValidationError, never>
+  readonly fetch: () => Effect.Effect<
+    Query.Page<A>,
+    DynamoClientError | ValidationError | ReadErrors<O>,
+    never
+  >
 
   /** Execute and collect all pages into a single array. */
-  readonly collect: () => Effect.Effect<Array<A>, DynamoClientError | ValidationError, never>
+  readonly collect: () => Effect.Effect<
+    Array<A>,
+    DynamoClientError | ValidationError | ReadErrors<O>,
+    never
+  >
 
   /** Execute and return a lazy Stream of items. Automatically paginates. */
-  readonly paginate: () => Stream.Stream<A, DynamoClientError | ValidationError, never>
+  readonly paginate: () => Stream.Stream<
+    A,
+    DynamoClientError | ValidationError | ReadErrors<O>,
+    never
+  >
 
   /**
    * Execute a count-only query (no items returned).
@@ -393,7 +438,11 @@ export interface BoundQueryBase<
    * read and the accepted ones counted. Correct, but it pays for the read;
    * that is why the error channel carries `ValidationError` (decode can fail).
    */
-  readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
+  readonly count: () => Effect.Effect<
+    number,
+    DynamoClientError | ValidationError | ReadErrors<O>,
+    never
+  >
 
   /**
    * Describe what the terminals would send — the plan (`key`, `skip-scan`,
@@ -409,7 +458,12 @@ export interface BoundQueryBase<
 // Where method — only available when SkRemaining is not never
 // ---------------------------------------------------------------------------
 
-export interface BoundQueryWithWhere<Model, SkRemaining, A> {
+export interface BoundQueryWithWhere<
+  Model,
+  SkRemaining,
+  A,
+  O extends OffloadState = NoOffloadState,
+> {
   /**
    * Sort key condition on remaining SK composites.
    * Consumes SkRemaining — cannot be called twice.
@@ -421,7 +475,7 @@ export interface BoundQueryWithWhere<Model, SkRemaining, A> {
    */
   readonly where: (
     fn: (t: SkRemaining, ops: SkConditionOps<SkRemaining>) => RawSortKeyCondition,
-  ) => BoundQuery<Model, never, A, never>
+  ) => BoundQuery<Model, never, A, never, O>
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +562,12 @@ export interface WithinOptions {
   readonly maxSkips?: number | undefined
 }
 
-export interface BoundQueryWithin<Model, A, W extends WithinSpec<any, WithinKind>> {
+export interface BoundQueryWithin<
+  Model,
+  A,
+  W extends WithinSpec<any, WithinKind>,
+  O extends OffloadState = NoOffloadState,
+> {
   /**
    * Bound the sort key composites the accessor left open — any of them, not
    * only the leading one:
@@ -540,14 +599,20 @@ export interface BoundQueryWithin<Model, A, W extends WithinSpec<any, WithinKind
   readonly within: (
     bounds: W["bounds"],
     options?: WithinOptions,
-  ) => BoundQuery<Model, never, A, W["kind"] extends "zorder" ? ZOrderApplied : never>
+  ) => BoundQuery<Model, never, A, W["kind"] extends "zorder" ? ZOrderApplied : never, O>
 }
 
 // ---------------------------------------------------------------------------
 // ZOrder method — only on a Z-order accessor (#171)
 // ---------------------------------------------------------------------------
 
-export interface BoundQueryZOrder<Model, SkRemaining, A, W extends WithinSpec<any, WithinKind>> {
+export interface BoundQueryZOrder<
+  Model,
+  SkRemaining,
+  A,
+  W extends WithinSpec<any, WithinKind>,
+  O extends OffloadState = NoOffloadState,
+> {
   /**
    * How the box `.within()` bounds is read — before or after `.within()`;
    * later calls merge over earlier ones:
@@ -562,7 +627,7 @@ export interface BoundQueryZOrder<Model, SkRemaining, A, W extends WithinSpec<an
    * An unknown `strategy`, or a `maxRanges` / `concurrency` that isn't a
    * positive integer, throws `[EDD-9095]`.
    */
-  readonly zorder: (options: Query.ZOrderOptions) => BoundQuery<Model, SkRemaining, A, W>
+  readonly zorder: (options: Query.ZOrderOptions) => BoundQuery<Model, SkRemaining, A, W, O>
 }
 
 // ---------------------------------------------------------------------------
@@ -574,13 +639,18 @@ export type BoundQuery<
   SkRemaining,
   A,
   W extends WithinSpec<any, WithinKind> = never,
-> = BoundQueryBase<Model, SkRemaining, A, W> &
-  ([SkRemaining] extends [never] ? {} : BoundQueryWithWhere<Model, SkRemaining, A>) &
-  ([W] extends [never] ? {} : [W["bounds"]] extends [never] ? {} : BoundQueryWithin<Model, A, W>) &
+  O extends OffloadState = NoOffloadState,
+> = BoundQueryBase<Model, SkRemaining, A, W, O> &
+  ([SkRemaining] extends [never] ? {} : BoundQueryWithWhere<Model, SkRemaining, A, O>) &
+  ([W] extends [never]
+    ? {}
+    : [W["bounds"]] extends [never]
+      ? {}
+      : BoundQueryWithin<Model, A, W, O>) &
   ([W] extends [never]
     ? {}
     : W["kind"] extends "zorder"
-      ? BoundQueryZOrder<Model, SkRemaining, A, W>
+      ? BoundQueryZOrder<Model, SkRemaining, A, W, O>
       : {})
 
 // ---------------------------------------------------------------------------
@@ -625,11 +695,11 @@ export interface BoundQueryConfig<Model> {
    * Throws `[EDD-9093]` / `[EDD-9050]` for bounds it can't use. Without it,
    * `.within()` is refused (collections, scans).
    */
-  readonly planWithin?: <X>(
-    query: Query.Query<X>,
+  readonly planWithin?: <X, E, O extends OffloadState>(
+    query: Query.Query<X, E, O>,
     bounds: Record<string, unknown>,
     options: WithinOptions | undefined,
-  ) => Query.Query<X>
+  ) => Query.Query<X, E, O>
   /** Optional: the accessor reads a Z-order sort key, so `.zorder()` applies (#171). */
   readonly zorder?: boolean | undefined
   /**
@@ -654,19 +724,19 @@ export interface BoundQueryConfig<Model> {
    */
   readonly selectAs?:
     | ((
-        query: Query.Query<any>,
+        query: Query.Query<any, any, any>,
         paths: ReadonlyArray<ReadonlyArray<string | number>>,
         form: "attributes" | "paths",
-      ) => Query.Query<Record<string, unknown>>)
+      ) => Query.Query<Record<string, unknown>, any, any>)
     | undefined
 }
 
 /** The plain projection: the domain names are the stored names. */
 const plainSelect = (
-  query: Query.Query<any>,
+  query: Query.Query<any, any, any>,
   paths: ReadonlyArray<ReadonlyArray<string | number>>,
   form: "attributes" | "paths",
-): Query.Query<Record<string, unknown>> =>
+): Query.Query<Record<string, unknown>, any, any> =>
   form === "attributes"
     ? Query.select(
         query,
@@ -1282,7 +1352,7 @@ const zorderOptions = (options: Query.ZOrderOptions): Query.ZOrderOptions => {
 /** @internal */
 export class BoundQueryImpl<Model, SkRemaining, A> {
   constructor(
-    readonly _query: Query.Query<A>,
+    readonly _query: Query.Query<A, any, any>,
     readonly _config: BoundQueryConfig<Model>,
     /** The sort key constraint already applied: `.where()` and `.within()` exclude each other. */
     readonly _applied?: "where" | "within" | undefined,
@@ -1448,6 +1518,11 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     return new BoundQueryImpl(Query.ignoreOwnership(this._query), this._config, this._applied)
   }
 
+  // --- offload read modes (#179) ---
+  offloaded(mode: OffloadMode | OffloadModes): BoundQueryImpl<Model, SkRemaining, any> {
+    return new BoundQueryImpl(Query.offloaded(this._query, mode), this._config, this._applied)
+  }
+
   // --- terminals ---
   /**
    * The terminal's operation, run INSIDE `provide` so the reporting setting a
@@ -1522,8 +1597,14 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 /**
  * @internal Create a BoundQuery wrapping a Query with pre-resolved config.
  */
-export const makeBoundQuery = <Model, SkRemaining, A>(
-  query: Query.Query<A>,
+export const makeBoundQuery = <Model, SkRemaining, A, O extends OffloadState = NoOffloadState>(
+  query: Query.Query<A, any, any>,
   config: BoundQueryConfig<Model>,
-): BoundQuery<Model, SkRemaining, A> =>
-  new BoundQueryImpl<Model, SkRemaining, A>(query, config) as BoundQuery<Model, SkRemaining, A>
+): BoundQuery<Model, SkRemaining, A, never, O> =>
+  new BoundQueryImpl<Model, SkRemaining, A>(query, config) as unknown as BoundQuery<
+    Model,
+    SkRemaining,
+    A,
+    never,
+    O
+  >

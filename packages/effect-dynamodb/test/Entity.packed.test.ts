@@ -35,6 +35,11 @@ import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
+import {
+  bytesPointerText,
+  expectPointerStoreFailure,
+  jsonPointerBytes,
+} from "./helpers/BlobPointers.js"
 import { missingCompressor, unregisteredCodecDefect } from "./helpers/MissingCompressor.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
@@ -1320,6 +1325,157 @@ describe("Entity.decodeMarshalledItem — stream images", () => {
         expect((decoded as { details: unknown }).details).toEqual(bigDetails)
       }).pipe(Effect.provide(NoCodecs)),
   )
+})
+
+// ---------------------------------------------------------------------------
+// Blob pointers (#179) on a member that does not offload the attribute
+// (design §4.7, switching offload off): every read path resolves them eagerly
+// through the ambient store — here there is none, so each fails with a
+// ValidationError caused by BlobStoreError NotProvided.
+// ---------------------------------------------------------------------------
+
+describe("Entity packed fields — blob pointers (Packed layout 010) on a non-offloading member", () => {
+  const base64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64")
+
+  /** The order `put` writes, with `attribute` rewritten to an offloaded value's pointer. */
+  const writeWithPointer = (attribute: "d" | "lines" | "notes", orderId = ORDER_KEY) =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* db.entities.Orders.put(order({ orderId }))
+      const live = stored(orderId)
+      store.set(keyOf(live), { ...live, [attribute]: { B: jsonPointerBytes() } })
+    })
+
+  const ORDER = { entityType: "Order" }
+
+  it.effect(
+    "get, on a compressed packed field, a JSON packed field and a dispatch-eligible one",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* client
+        for (const attribute of ["d", "lines", "notes"] as const) {
+          yield* writeWithPointer(attribute)
+          const error = failure(yield* Effect.exit(db.entities.Orders.get({ orderId: ORDER_KEY })))
+          expectPointerStoreFailure(error, attribute, ORDER)
+        }
+        // Without a compressor in scope too: the pointer's codec names the object, never read here.
+        yield* writeWithPointer("d")
+        const unbound = failure(yield* Effect.exit(Orders.get({ orderId: ORDER_KEY }).asEffect()))
+        expectPointerStoreFailure(unbound, "d", ORDER)
+      }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("queries, scans and projections", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* writeWithPointer("d")
+      const queried = failure(
+        yield* Effect.exit(db.entities.Orders.byCustomer({ customerId: "c-1" }).collect()),
+      )
+      expectPointerStoreFailure(queried, "d", ORDER)
+      expectPointerStoreFailure(
+        failure(yield* Effect.exit(db.entities.Orders.scan().collect())),
+        "d",
+        ORDER,
+      )
+      const projected = failure(
+        yield* Effect.exit(
+          db.entities.Orders.byCustomer({ customerId: "c-1" })
+            .select(["status", "details"])
+            .collect(),
+        ),
+      )
+      expectPointerStoreFailure(projected, "d", ORDER)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("Batch.get and Transaction.transactGet", () =>
+    Effect.gen(function* () {
+      const db = yield* client
+      yield* writeWithPointer("lines")
+      expectPointerStoreFailure(
+        failure(yield* Effect.exit(Batch.get([db.entities.Orders.get({ orderId: ORDER_KEY })]))),
+        "lines",
+        ORDER,
+      )
+      expectPointerStoreFailure(
+        failure(
+          yield* Effect.exit(
+            Transaction.transactGet([db.entities.Orders.get({ orderId: ORDER_KEY })]),
+          ),
+        ),
+        "lines",
+        ORDER,
+      )
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("asNative returns the stored pointer unchanged", () =>
+    Effect.gen(function* () {
+      yield* writeWithPointer("d")
+      const native = yield* Entity.asNative(Orders.get({ orderId: ORDER_KEY }))
+      expect(Array.from(native.d!.B!)).toEqual(Array.from(jsonPointerBytes()))
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect(
+    "decodeMarshalledItem: DynamoDB JSON (B as bytes or base64) and unmarshalled images",
+    () =>
+      Effect.gen(function* () {
+        yield* writeWithPointer("d")
+        const image = stored(ORDER_KEY)
+        const images = [
+          image,
+          { ...image, d: { B: base64(jsonPointerBytes()) } },
+          { ...fromAttributeMap(image), d: base64(jsonPointerBytes()) },
+          fromAttributeMap(image),
+        ]
+        for (const candidate of images) {
+          const error = failure(yield* Effect.exit(Entity.decodeMarshalledItem(Orders, candidate)))
+          expectPointerStoreFailure(error, "d", { ...ORDER, operation: "decodeMarshalledItem" })
+        }
+      }).pipe(Effect.provide(TestLayer)),
+  )
+
+  describe("a binary field's S-form pointer through a reader without offload support", () => {
+    class Scan extends Schema.Class<Scan>("Scan")({
+      scanId: Schema.String,
+      content: Schema.Uint8Array,
+    }) {}
+    const Scans = Entity.make({
+      model: Scan,
+      entityType: "Scan",
+      primaryKey: {
+        pk: { field: "pk", composite: ["scanId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const ScanTable = Table.make({ schema: AppSchema, entities: { Scans } })
+    const ScanLayer = Layer.mergeAll(
+      InMemoryClient,
+      ScanTable.layer({ name: "packed-entity-table" }),
+    )
+
+    it.effect("fails with a ValidationError — never returns the pointer's bytes as content", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Scans }, tables: { ScanTable } })
+        const content = new Uint8Array([1, 2, 3])
+        yield* db.entities.Scans.put({ scanId: "s-1", content })
+        expect((yield* db.entities.Scans.get({ scanId: "s-1" })).content).toEqual(content)
+        const live = [...store.values()].find((item) => item.__edd_e__?.S === "Scan")!
+        store.set(keyOf(live), { ...live, content: { S: bytesPointerText } })
+        const error = failure(yield* Effect.exit(db.entities.Scans.get({ scanId: "s-1" })))
+        expect(error).toBeInstanceOf(ValidationError)
+        expect(error).toMatchObject({ entityType: "Scan" })
+        const image = failure(
+          yield* Effect.exit(
+            Entity.decodeMarshalledItem(Scans, { ...live, content: { S: bytesPointerText } }),
+          ),
+        )
+        expect(image).toBeInstanceOf(ValidationError)
+      }).pipe(Effect.provide(ScanLayer)),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------

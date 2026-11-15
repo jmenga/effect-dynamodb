@@ -33,6 +33,7 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 - **Event sourcing** — append-only `EventStore` with stream replay and snapshots, sealed streams, and atomic multi-stream appends.
 - **Change feed outside Lambda** — `effect-dynamodb/change-feed` polls a table's DynamoDB stream as an Effect `Stream` (shard lineage, checkpoints, a lease) and runs it into `EventStore` projections; works against DynamoDB Local.
 - **Packed storage (opt-in)** — store structured fields, event data and snapshot state as one JSON string, compressed (gzip / brotli / zstd) above a threshold, for ~2× faster bulk reads and far fewer write units on large values; readers decode each item by its stored form, so switching needs no rewrite.
+- **Offloaded storage (opt-in)** — keep values that can outgrow the 400 KB item (`Packed({ external })`) and binary content (`DynamoModel.External()`) in a versioned blob store such as S3 (`effect-dynamodb/blob/s3`), the item holding a pointer to one exact object version: uploads settled against DynamoDB's answer, eager or lazy reads (ranged, streamed, presigned), change detection from stream records, and opt-in garbage collection (`BlobGc`: a stream reaper and two-pass sweeps).
 - **Tagged errors** — `ItemNotFound`, `ConditionalCheckFailed`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, and more — all `catchTag`-discriminable.
 - **Add-only writes** — `insert` writes through PartiQL `INSERT`, so a role holding only `dynamodb:PartiQLInsert` can add items and IAM stops it changing them.
 - **Stream pagination** — `Stream<A>` from `.paginate()`; the runtime handles DynamoDB's pagination protocol.
@@ -189,7 +190,7 @@ Available errors include `DynamoError`, `ItemNotFound`, `ConditionalCheckFailed`
 
 ## Examples
 
-[`packages/effect-dynamodb/examples/`](./packages/effect-dynamodb/examples/) contains 17+ runnable programs that double as the source of truth for documentation snippets:
+[`packages/effect-dynamodb/examples/`](./packages/effect-dynamodb/examples/) contains 44 runnable programs that double as the source of truth for documentation snippets:
 
 ```bash
 docker run -p 8000:8000 amazon/dynamodb-local
@@ -211,6 +212,7 @@ npx tsx packages/effect-dynamodb/examples/starter.ts
 | `event-sourcing.ts` | EventStore with the decider pattern |
 | `guide-packed-storage.ts` | JSON and compressed storage for entity fields and EventStore data |
 | `guide-add-only-writes.ts` | Add-only writes through PartiQL `INSERT` |
+| `guide-blob-offload.ts` | Large and binary values in a blob store (MinIO or in memory), lazy handles, change detection, garbage collection |
 
 ## vs ElectroDB
 

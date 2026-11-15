@@ -9,12 +9,15 @@ import type {
   CascadePartialFailure,
   ConditionalCheckFailed,
 } from "@effect-dynamodb/schema/Errors.js"
+import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { type Effect, Function as Fn } from "effect"
 import type { ConditionInput } from "../Expression.js"
+import type { OffloadModes, OffloadState, View, ViewOf } from "../Offload.js"
 import {
   type AddOperand,
   type CascadeConfig,
   type CascadeTarget,
+  carryModes,
   type EntityDelete,
   EntityDeleteImpl,
   EntityDeleteTypeId,
@@ -39,6 +42,14 @@ import {
   type UpdateReturn,
 } from "./EntityOps.js"
 import { type Expr, nonEmptyCondition, toExpr } from "./Expr.js"
+import { DEFAULT_MODES, parseModes } from "./OffloadRead.js"
+import type {
+  OpBase,
+  OpOffloadedErrors,
+  OpWithItem,
+  OpWithModes,
+  RecordViewOf,
+} from "./OffloadTypes.js"
 import { type PackedAttributeGuard, packedExprRefusal, packedProjectionRefusal } from "./Packed.js"
 
 // ---------------------------------------------------------------------------
@@ -52,11 +63,11 @@ import { type PackedAttributeGuard, packedExprRefusal, packedProjectionRefusal }
 // ---------------------------------------------------------------------------
 
 /** Helper: extract Rec phantom type */
-type ExtractRec<T> = T extends EntityOp<any, infer Rec, any, any> ? Rec : never
+type ExtractRec<T> = T extends EntityOp<any, infer Rec, any, any, any> ? Rec : never
 /** Helper: extract E type */
-type ExtractE<T> = T extends EntityOp<any, any, infer E, any> ? E : never
+type ExtractE<T> = T extends EntityOp<any, any, infer E, any, any> ? E : never
 /** Helper: extract R type */
-type ExtractR<T> = T extends EntityOp<any, any, any, infer R> ? R : never
+type ExtractR<T> = T extends EntityOp<any, any, any, infer R, any> ? R : never
 
 /** `undefined` for an update set to `returnValues("none")`, else `Full`. */
 type NoneOr<Self, Full> = 0 extends 1 & ExtractRec<Self>
@@ -66,21 +77,21 @@ type NoneOr<Self, Full> = 0 extends 1 & ExtractRec<Self>
     : Full
 
 /** Decode through model schema (default for yield*). Returns clean model class instance. */
-export const asModel = <Self extends EntityOp<any, any, any, any>>(
+export const asModel = <Self extends EntityOp<any, any, any, any, any>>(
   self: Self,
 ): Effect.Effect<
-  Self extends EntityOp<infer A, any, any, any> ? A : never,
+  Self extends EntityOp<infer A, any, any, any, any> ? A : never,
   ExtractE<Self>,
   ExtractR<Self>
 > => self._exec("model") as any
 
 /** Decode through record schema (model + system fields). */
-export const asRecord = <Self extends EntityOp<any, any, any, any>>(
+export const asRecord = <Self extends EntityOp<any, any, any, any, any>>(
   self: Self,
 ): Effect.Effect<ExtractRec<Self>, ExtractE<Self>, ExtractR<Self>> => self._exec("record") as any
 
 /** Decode through item schema (model + system + keys + `__edd_e__`). Returns `Record<string, unknown>`. */
-export const asItem = <Self extends EntityOp<any, any, any, any>>(
+export const asItem = <Self extends EntityOp<any, any, any, any, any>>(
   self: Self,
 ): Effect.Effect<
   NoneOr<Self, globalThis.Record<string, unknown>>,
@@ -89,7 +100,7 @@ export const asItem = <Self extends EntityOp<any, any, any, any>>(
 > => self._exec("item") as any
 
 /** Return raw marshalled DynamoDB format (`Record<string, AttributeValue>`). No decode. */
-export const asNative = <Self extends EntityOp<any, any, any, any>>(
+export const asNative = <Self extends EntityOp<any, any, any, any, any>>(
   self: Self,
 ): Effect.Effect<
   NoneOr<Self, globalThis.Record<string, AttributeValue>>,
@@ -123,17 +134,19 @@ export const asNative = <Self extends EntityOp<any, any, any, any>>(
 export const set: {
   <Updates extends globalThis.Record<string, unknown>>(
     updates: Updates,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     updates: NoInfer<U>,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     updates: unknown,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     return new EntityUpdateImpl<A, Rec, U, E, R>(
       self._builder as any,
       { ...self._updateState, updates },
@@ -147,17 +160,19 @@ export const set: {
 export const expectedVersion: {
   (
     version: number,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     version: number,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     version: number,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     return new EntityUpdateImpl(
       self._builder as any,
       { ...self._updateState, expectedVersion: version },
@@ -172,24 +187,35 @@ export const expectedVersion: {
  * Call with no arguments to enable (defaults to true).
  */
 export const consistentRead: {
-  (): <A, Rec, E, R>(self: EntityGet<A, Rec, E, R>) => EntityGet<A, Rec, E, R>
-  <A, Rec, E, R>(self: EntityGet<A, Rec, E, R>): EntityGet<A, Rec, E, R>
+  (): <A, Rec, E, R, O extends OffloadState>(
+    self: EntityGet<A, Rec, E, R, O>,
+  ) => EntityGet<A, Rec, E, R, O>
+  <A, Rec, E, R, O extends OffloadState>(
+    self: EntityGet<A, Rec, E, R, O>,
+  ): EntityGet<A, Rec, E, R, O>
 } = Fn.dual(
   (args) =>
     args.length >= 1 &&
     typeof args[0] === "object" &&
     args[0] !== null &&
     EntityOpTypeId in (args[0] as object),
-  <A, Rec, E, R>(self: EntityGet<A, Rec, E, R>): EntityGet<A, Rec, E, R> => {
+  <A, Rec, E, R, O extends OffloadState>(
+    self: EntityGet<A, Rec, E, R, O>,
+  ): EntityGet<A, Rec, E, R, O> => {
     const impl = self as unknown as EntityGetImpl<A, Rec, E, R>
-    return new EntityGetImpl<A, Rec, E, R>(
-      impl._builder,
-      impl._entity,
-      impl._key,
-      true,
-    ) as unknown as EntityGet<A, Rec, E, R>
+    return carryModes(
+      impl,
+      new EntityGetImpl<A, Rec, E, R>(impl._builder, impl._entity, impl._key, true),
+    ) as unknown as EntityGet<A, Rec, E, R, O>
   },
 )
+
+/** The type a projected get returns: raw records, whatever the offload modes. */
+type Projected<O extends OffloadState> = OpWithItem<
+  O,
+  globalThis.Record<string, unknown>,
+  globalThis.Record<string, unknown>
+>
 
 /**
  * Select specific attributes to return (ProjectionExpression) on an EntityGet.
@@ -199,19 +225,37 @@ export const consistentRead: {
 export const project: {
   (
     attributes: ReadonlyArray<string>,
-  ): <A, Rec, E, R>(
-    self: EntityGet<A, Rec, E, R>,
-  ) => EntityGet<globalThis.Record<string, unknown>, globalThis.Record<string, unknown>, E, R>
-  <A, Rec, E, R>(
-    self: EntityGet<A, Rec, E, R>,
+  ): <A, Rec, E, R, O extends OffloadState>(
+    self: EntityGet<A, Rec, E, R, O>,
+  ) => EntityGet<
+    globalThis.Record<string, unknown>,
+    globalThis.Record<string, unknown>,
+    E,
+    R,
+    Projected<O>
+  >
+  <A, Rec, E, R, O extends OffloadState>(
+    self: EntityGet<A, Rec, E, R, O>,
     attributes: ReadonlyArray<string>,
-  ): EntityGet<globalThis.Record<string, unknown>, globalThis.Record<string, unknown>, E, R>
+  ): EntityGet<
+    globalThis.Record<string, unknown>,
+    globalThis.Record<string, unknown>,
+    E,
+    R,
+    Projected<O>
+  >
 } = Fn.dual(
   2,
-  <A, Rec, E, R>(
-    self: EntityGet<A, Rec, E, R>,
+  <A, Rec, E, R, O extends OffloadState>(
+    self: EntityGet<A, Rec, E, R, O>,
     attributes: ReadonlyArray<string>,
-  ): EntityGet<globalThis.Record<string, unknown>, globalThis.Record<string, unknown>, E, R> => {
+  ): EntityGet<
+    globalThis.Record<string, unknown>,
+    globalThis.Record<string, unknown>,
+    E,
+    R,
+    Projected<O>
+  > => {
     const impl = self as unknown as EntityGetImpl<A, Rec, E, R>
     // A packed field may be projected only whole (`[EDD-9076]`, #147).
     const guards = (impl._entity as { readonly _packedGuards?: unknown } | undefined)
@@ -221,22 +265,20 @@ export const project: {
       guards ?? [],
     )
     if (refused !== undefined) throw new Error(refused)
-    return new EntityGetImpl<
-      globalThis.Record<string, unknown>,
-      globalThis.Record<string, unknown>,
-      E,
-      R
-    >(
-      impl._builder as any,
-      impl._entity,
-      impl._key,
-      impl._consistentRead,
-      attributes,
+    return carryModes(
+      impl,
+      new EntityGetImpl<
+        globalThis.Record<string, unknown>,
+        globalThis.Record<string, unknown>,
+        E,
+        R
+      >(impl._builder as any, impl._entity, impl._key, impl._consistentRead, attributes),
     ) as unknown as EntityGet<
       globalThis.Record<string, unknown>,
       globalThis.Record<string, unknown>,
       E,
-      R
+      R,
+      Projected<O>
     >
   },
 )
@@ -249,9 +291,9 @@ export const project: {
 
 /** @internal Helper type for condition-compatible operations */
 export type ConditionTarget =
-  | EntityPut<any, any, any, any>
-  | EntityUpdate<any, any, any, any, any>
-  | EntityDelete<any, any>
+  | EntityPut<any, any, any, any, any>
+  | EntityUpdate<any, any, any, any, any, any>
+  | EntityDelete<any, any, any, any, any>
 
 /**
  * Widen a condition-capable operation's error channel with
@@ -272,12 +314,12 @@ export type ConditionTarget =
  * every piped `.condition(...)` to `EntityDelete`.
  */
 export type WithConditionalCheckFailed<T> =
-  T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R>
-    ? EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R>
-    : T extends EntityPut<infer A, infer Rec, infer E, infer R>
-      ? EntityPut<A, Rec, E | ConditionalCheckFailed, R>
-      : T extends EntityDelete<infer E, infer R, infer A, infer Mo>
-        ? EntityDelete<E | ConditionalCheckFailed, R, A, Mo>
+  T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R, infer O>
+    ? EntityUpdate<A, Rec, U, E | ConditionalCheckFailed, R, O>
+    : T extends EntityPut<infer A, infer Rec, infer E, infer R, infer O>
+      ? EntityPut<A, Rec, E | ConditionalCheckFailed, R, O>
+      : T extends EntityDelete<infer E, infer R, infer A, infer Mo, infer O>
+        ? EntityDelete<E | ConditionalCheckFailed, R, A, Mo, O>
         : never
 
 /**
@@ -318,13 +360,16 @@ export const condition: {
     // EntityDelete. `deleteIfExists`'s existence check is the op's own guard
     // (`_mustExist`), never its condition: it stays, ANDed with this one.
     const impl = self as unknown as EntityDeleteImpl<any, any>
-    return new EntityDeleteImpl(
-      impl._builder,
-      impl._entity,
-      impl._key,
-      cond,
-      impl._returnValues,
-      impl._mustExist,
+    return carryModes(
+      impl,
+      new EntityDeleteImpl(
+        impl._builder,
+        impl._entity,
+        impl._key,
+        cond,
+        impl._returnValues,
+        impl._mustExist,
+      ),
     ) as unknown as T
   }
   if (EntityUpdateTypeId in self) {
@@ -340,21 +385,24 @@ export const condition: {
   // EntityPut — `_putKind` MUST be carried through: it is what tells the
   // transact/batch compilers that an `upsert` is not a plain `Put` (#100).
   const impl = self as unknown as EntityPutImpl<any, any, any, any>
-  return new EntityPutImpl(
-    impl._builder,
-    impl._entity,
-    impl._input,
-    cond,
-    impl._withVectors,
-    impl._putKind,
+  return carryModes(
+    impl,
+    new EntityPutImpl(
+      impl._builder,
+      impl._entity,
+      impl._input,
+      cond,
+      impl._withVectors,
+      impl._putKind,
+    ),
   ) as unknown as T
 })
 
 /** @internal Operations that accept a pre-computed embedding. */
 type WithVectorTarget =
-  | EntityPut<any, any, any, any>
-  | EntityInsert<any, any, any, any>
-  | EntityUpdate<any, any, any, any, any>
+  | EntityPut<any, any, any, any, any>
+  | EntityInsert<any, any, any, any, any>
+  | EntityUpdate<any, any, any, any, any, any>
 
 /**
  * Supply a pre-computed embedding for a named vector index, skipping the
@@ -385,19 +433,24 @@ export const withVector: {
       ) as unknown as T
     }
     const impl = self as unknown as EntityPutImpl<any, any, any, any>
-    return new EntityPutImpl(
-      impl._builder,
-      impl._entity,
-      impl._input,
-      impl._condition,
-      { ...(impl._withVectors ?? {}), [name]: vector },
-      impl._putKind,
+    return carryModes(
+      impl,
+      new EntityPutImpl(
+        impl._builder,
+        impl._entity,
+        impl._input,
+        impl._condition,
+        { ...(impl._withVectors ?? {}), [name]: vector },
+        impl._putKind,
+      ),
     ) as unknown as T
   },
 )
 
 /** @internal Helper type for returnValues-compatible operations */
-type ReturnValuesTarget = EntityUpdate<any, any, any, any, any> | EntityDelete<any, any>
+type ReturnValuesTarget =
+  | EntityUpdate<any, any, any, any, any, any>
+  | EntityDelete<any, any, any, any, any>
 
 /**
  * An update's result type under a `returnValues` mode — see {@link UpdateReturn}.
@@ -405,15 +458,52 @@ type ReturnValuesTarget = EntityUpdate<any, any, any, any, any> | EntityDelete<a
  * there was none), and nothing otherwise.
  */
 export type ReturnValuesResult<T, M extends ReturnValuesMode> =
-  T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R>
+  T extends EntityUpdate<infer A, infer Rec, infer U, infer E, infer R, infer O>
     ? typeof UpdateBaseTypeId extends keyof U
       ? U extends UpdateBase<infer BA, infer BR>
-        ? EntityUpdate<UpdateReturn<BA, M>, UpdateReturn<BR, M>, U, E, R>
+        ? EntityUpdate<UpdateReturn<BA, M>, UpdateReturn<BR, M>, U, E, R, ReturnState<O, M>>
         : never
-      : EntityUpdate<UpdateReturn<A, M>, UpdateReturn<Rec, M>, U & UpdateBase<A, Rec>, E, R>
-    : T extends EntityDelete<infer E, infer R, any, infer Mo>
-      ? EntityDelete<E, R, M extends "allOld" ? Mo | undefined : void, Mo>
+      : EntityUpdate<
+          UpdateReturn<A, M>,
+          UpdateReturn<Rec, M>,
+          U & UpdateBase<A, Rec>,
+          E,
+          R,
+          ReturnState<O, M>
+        >
+    : T extends EntityDelete<infer E, infer R, any, infer Mo, infer O>
+      ? EntityDelete<
+          E,
+          R,
+          M extends "allOld" ? DeletedView<O, Mo> | undefined : void,
+          Mo,
+          DeleteReturnState<O, M>
+        >
       : T
+
+/** The item an `"allOld"` delete returns: its view under the delete's modes (#179). */
+type DeletedView<O extends OffloadState, Mo> = [
+  O["fields"]["overflow"] | O["fields"]["binary"],
+] extends [never]
+  ? Mo
+  : View<Mo, O["fields"], O["modes"]>
+
+/**
+ * An update's offload state under a `returnValues` mode: it reads the mode's
+ * share of the model / record it was made over (#179). Unchanged for a
+ * member that offloads nothing.
+ */
+type ReturnState<O extends OffloadState, M extends ReturnValuesMode> = OpWithItem<
+  O,
+  UpdateReturn<OpBase<O>[0], M>,
+  UpdateReturn<OpBase<O>[1], M>
+>
+/** A delete's offload state under a `returnValues` mode. */
+type DeleteReturnState<O extends OffloadState, M extends ReturnValuesMode> = OpWithItem<
+  O,
+  M extends "allOld" ? OpBase<O>[0] | undefined : undefined,
+  M extends "allOld" ? OpBase<O>[0] | undefined : undefined
+>
 
 /**
  * @internal The model / record types an update returned before its first
@@ -452,13 +542,16 @@ export const returnValues: {
 } = Fn.dual(2, <T extends ReturnValuesTarget>(self: T, mode: ReturnValuesMode): T => {
   if (EntityDeleteTypeId in self) {
     const impl = self as unknown as EntityDeleteImpl<any, any>
-    return new EntityDeleteImpl(
-      impl._builder,
-      impl._entity,
-      impl._key,
-      impl._condition,
-      mode,
-      impl._mustExist,
+    return carryModes(
+      impl,
+      new EntityDeleteImpl(
+        impl._builder,
+        impl._entity,
+        impl._key,
+        impl._condition,
+        mode,
+        impl._mustExist,
+      ),
     ) as unknown as T
   }
   // EntityUpdate
@@ -498,19 +591,19 @@ export type RemovableOf<U> = typeof RemovableTypeId extends keyof U
  * the model no longer declares, use `Entity.pathRemove(update, ["attribute"])`.
  */
 export const remove: {
-  <A, Rec, U, E, R>(
+  <A, Rec, U, E, R, O extends OffloadState>(
     fields: ReadonlyArray<RemovableOf<NoInfer<U>>>,
-  ): (self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): (self: EntityUpdate<A, Rec, U, E, R, O>) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     fields: ReadonlyArray<RemovableOf<NoInfer<U>>>,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     fields: ReadonlyArray<string>,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     const existing = self._updateState.remove ?? []
     return new EntityUpdateImpl<A, Rec, U, E, R>(
       self._builder as any,
@@ -529,17 +622,19 @@ export const remove: {
 export const add: {
   (
     values: globalThis.Record<string, AddOperand>,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, AddOperand>,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, AddOperand>,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     const existing = self._updateState.add ?? {}
     return new EntityUpdateImpl<A, Rec, U, E, R>(
       self._builder as any,
@@ -557,17 +652,19 @@ export const add: {
 export const subtract: {
   (
     values: globalThis.Record<string, number>,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, number>,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, number>,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     const existing = self._updateState.subtract ?? {}
     return new EntityUpdateImpl<A, Rec, U, E, R>(
       self._builder as any,
@@ -585,17 +682,19 @@ export const subtract: {
 export const append: {
   (
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     const existing = self._updateState.append ?? {}
     return new EntityUpdateImpl<A, Rec, U, E, R>(
       self._builder as any,
@@ -614,17 +713,19 @@ export const append: {
 export const deleteFromSet: {
   (
     values: globalThis.Record<string, unknown>,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, unknown>,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     values: globalThis.Record<string, unknown>,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     const existing = self._updateState.deleteFromSet ?? {}
     return new EntityUpdateImpl<A, Rec, U, E, R>(
       self._builder as any,
@@ -648,23 +749,23 @@ export const cascade: {
     readonly targets: ReadonlyArray<CascadeTarget>
     readonly filter?: globalThis.Record<string, unknown> | undefined
     readonly mode?: "eventual" | "transactional" | undefined
-  }): <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E | CascadePartialFailure, R>,
-  ) => EntityUpdate<A, Rec, U, E | CascadePartialFailure, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  }): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E | CascadePartialFailure, R, O>,
+  ) => EntityUpdate<A, Rec, U, E | CascadePartialFailure, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     config: {
       readonly targets: ReadonlyArray<CascadeTarget>
       readonly filter?: globalThis.Record<string, unknown> | undefined
       readonly mode?: "eventual" | "transactional" | undefined
     },
-  ): EntityUpdate<A, Rec, U, E | CascadePartialFailure, R>
+  ): EntityUpdate<A, Rec, U, E | CascadePartialFailure, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     config: CascadeConfig,
-  ): EntityUpdate<A, Rec, U, E | CascadePartialFailure, R> => {
+  ): EntityUpdate<A, Rec, U, E | CascadePartialFailure, R, O> => {
     return new EntityUpdateImpl<A, Rec, U, E | CascadePartialFailure, R>(
       self._builder as any,
       { ...self._updateState, cascade: config },
@@ -711,11 +812,11 @@ export const keepRefs: {
 // ---------------------------------------------------------------------------
 
 /** @internal Append an operation to a path-based update state array field. */
-const addPathOp = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+const addPathOp = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   key: keyof import("./EntityOps.js").UpdateState,
   op: unknown,
-): EntityUpdate<A, Rec, U, E, R> => {
+): EntityUpdate<A, Rec, U, E, R, O> => {
   const existing = (self._updateState[key] as ReadonlyArray<unknown> | undefined) ?? []
   return new EntityUpdateImpl<A, Rec, U, E, R>(
     self._builder as any,
@@ -726,52 +827,52 @@ const addPathOp = <A, Rec, U, E, R>(
 }
 
 /** @internal Add a path-based SET operation to the update state */
-export const pathSet = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathSet = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   op: PathSetOp,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathSets", op)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathSets", op)
 
 /** @internal Add a path-based REMOVE operation to the update state */
-export const pathRemove = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathRemove = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   segments: ReadonlyArray<string | number>,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathRemoves", segments)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathRemoves", segments)
 
 /** @internal Add a path-based ADD operation to the update state */
-export const pathAdd = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathAdd = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   op: PathAddOp,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathAdds", op)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathAdds", op)
 
 /** @internal Add a path-based SUBTRACT operation to the update state */
-export const pathSubtract = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathSubtract = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   op: PathSubtractOp,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathSubtracts", op)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathSubtracts", op)
 
 /** @internal Add a path-based APPEND operation to the update state */
-export const pathAppend = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathAppend = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   op: PathAppendOp,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathAppends", op)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathAppends", op)
 
 /** @internal Add a path-based PREPEND operation to the update state */
-export const pathPrepend = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathPrepend = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   op: PathPrependOp,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathPrepends", op)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathPrepends", op)
 
 /** @internal Add a path-based if_not_exists operation to the update state */
-export const pathIfNotExists = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathIfNotExists = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   op: PathIfNotExistsOp,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathIfNotExists", op)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathIfNotExists", op)
 
 /** @internal Add a path-based DELETE (set removal) operation to the update state */
-export const pathDelete = <A, Rec, U, E, R>(
-  self: EntityUpdate<A, Rec, U, E, R>,
+export const pathDelete = <A, Rec, U, E, R, O extends OffloadState>(
+  self: EntityUpdate<A, Rec, U, E, R, O>,
   op: PathDeleteOp,
-): EntityUpdate<A, Rec, U, E, R> => addPathOp(self, "pathDeletes", op)
+): EntityUpdate<A, Rec, U, E, R, O> => addPathOp(self, "pathDeletes", op)
 
 // ---------------------------------------------------------------------------
 // Sparse-map combinators
@@ -789,19 +890,21 @@ export const removeEntries: {
   (
     field: string,
     keys: ReadonlyArray<string>,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     field: string,
     keys: ReadonlyArray<string>,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   3,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     field: string,
     keys: ReadonlyArray<string>,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     const existing = self._updateState.sparseRemoveEntries ?? []
     return new EntityUpdateImpl<A, Rec, U, E, R>(
       self._builder as any,
@@ -830,17 +933,19 @@ export const removeEntries: {
 export const clearMap: {
   (
     field: string,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  ): <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
+  ) => EntityUpdate<A, Rec, U, E, R, O>
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     field: string,
-  ): EntityUpdate<A, Rec, U, E, R>
+  ): EntityUpdate<A, Rec, U, E, R, O>
 } = Fn.dual(
   2,
-  <A, Rec, U, E, R>(
-    self: EntityUpdate<A, Rec, U, E, R>,
+  <A, Rec, U, E, R, O extends OffloadState>(
+    self: EntityUpdate<A, Rec, U, E, R, O>,
     field: string,
-  ): EntityUpdate<A, Rec, U, E, R> => {
+  ): EntityUpdate<A, Rec, U, E, R, O> => {
     const existing = self._updateState.sparseClearFields ?? []
     if (existing.includes(field)) {
       return self
@@ -856,3 +961,126 @@ export const clearMap: {
     ) as any
   },
 )
+
+// ---------------------------------------------------------------------------
+// Offload read modes (#179, design §3.7)
+// ---------------------------------------------------------------------------
+
+/** @internal Operations `offloaded` applies to. */
+export type OffloadedTarget =
+  | EntityGet<any, any, any, any, any>
+  | EntityPut<any, any, any, any, any>
+  | EntityInsert<any, any, any, any, any>
+  | EntityUpdate<any, any, any, any, any, any>
+  | EntityDelete<any, any, any, any, any>
+
+/** An operation's type after `offloaded(m)`: its result re-typed for the new modes. */
+export type OffloadedResult<T, M extends OffloadMode | OffloadModes> =
+  T extends EntityUpdate<infer _A, infer _Rec, infer U, infer E, infer R, infer O>
+    ? EntityUpdate<
+        OffloadedOpView<_A, O, M>,
+        OffloadedOpRecord<_Rec, O, M>,
+        U,
+        E,
+        R,
+        OpWithModes<O, M>
+      >
+    : T extends EntityGet<infer _A, infer _Rec, infer E, infer R, infer O>
+      ? EntityGet<
+          OffloadedOpView<_A, O, M>,
+          OffloadedOpRecord<_Rec, O, M>,
+          OpOffloadedErrors<E, O, M>,
+          R,
+          OpWithModes<O, M>
+        >
+      : T extends EntityDelete<infer E, infer R, infer _A, infer Mo, infer O>
+        ? EntityDelete<E, R, OffloadedOpView<_A, O, M>, Mo, OpWithModes<O, M>>
+        : T
+
+/**
+ * The model view after `offloaded(m)`; `A` for a member that offloads nothing,
+ * and for an op that returns nothing (a delete without `returnValues`).
+ */
+type OffloadedOpView<A, O extends OffloadState, M extends OffloadMode | OffloadModes> = [
+  O["fields"]["overflow"] | O["fields"]["binary"],
+] extends [never]
+  ? A
+  : [O["item"]] extends [undefined]
+    ? A
+    : ViewOf<OpWithModes<O, M>>
+
+/** The record view after `offloaded(m)`; `Rec` for a member that offloads nothing. */
+type OffloadedOpRecord<Rec, O extends OffloadState, M extends OffloadMode | OffloadModes> = [
+  O["fields"]["overflow"] | O["fields"]["binary"],
+] extends [never]
+  ? Rec
+  : RecordViewOf<OpWithModes<O, M>>
+
+/**
+ * Read the operation's offloaded fields (#179) in `mode`: `"eager"` or
+ * `"lazy"` for both kinds, or `{ overflow?, binary? }` to set the kinds it
+ * names over the operation's current modes. Defaults: overflow eager, binary
+ * lazy.
+ *
+ * For a get, the result (`asModel` / `asRecord` / `asItem`) is re-typed and
+ * its blob errors follow the modes; for a write (`put`, `update`, `delete`
+ * with `returnValues`), its result. `asNative` returns the stored pointers
+ * whatever the mode. An unknown mode (from untyped code) throws
+ * `[EDD-9117]`. A member that offloads nothing is unchanged.
+ */
+export const offloaded: {
+  <const M extends OffloadMode | OffloadModes>(
+    mode: M,
+  ): <T extends OffloadedTarget>(self: T) => OffloadedResult<T, M>
+  <T extends OffloadedTarget, const M extends OffloadMode | OffloadModes>(
+    self: T,
+    mode: M,
+  ): OffloadedResult<T, M>
+} = Fn.dual(2, <T extends OffloadedTarget>(self: T, mode: OffloadMode | OffloadModes): T => {
+  if (EntityUpdateTypeId in self) {
+    const impl = self as unknown as EntityUpdateImpl<any, any, any, any, any>
+    const base = impl._updateState.offloadModes ?? DEFAULT_MODES
+    return new EntityUpdateImpl(
+      impl._builder,
+      { ...impl._updateState, offloadModes: parseModes(mode, base, "Entity.offloaded") },
+      impl._entity,
+      impl._key,
+    ) as unknown as T
+  }
+  const impl = self as unknown as EntityGetImpl<any, any, any, any>
+  const base = impl._offloadModes ?? DEFAULT_MODES
+  const next =
+    EntityDeleteTypeId in self
+      ? (() => {
+          const d = self as unknown as EntityDeleteImpl<any, any>
+          return new EntityDeleteImpl(
+            d._builder,
+            d._entity,
+            d._key,
+            d._condition,
+            d._returnValues,
+            d._mustExist,
+          )
+        })()
+      : (self as unknown as { readonly _opType: string })._opType === "get"
+        ? new EntityGetImpl(
+            impl._builder,
+            impl._entity,
+            impl._key,
+            impl._consistentRead,
+            impl._projection as Array<string> | undefined,
+          )
+        : (() => {
+            const p = self as unknown as EntityPutImpl<any, any, any, any>
+            return new EntityPutImpl(
+              p._builder,
+              p._entity,
+              p._input,
+              p._condition,
+              p._withVectors,
+              p._putKind,
+            )
+          })()
+  next._offloadModes = parseModes(mode, base, "Entity.offloaded")
+  return next as unknown as T
+})

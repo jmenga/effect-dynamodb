@@ -14,6 +14,7 @@
 
 import type { TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import type {
+  BlobStoreError,
   ConcurrentModification,
   OptimisticLockError,
   StreamSealed,
@@ -31,6 +32,7 @@ import type {
   PlanDeleteError,
   PlanUpdateError,
   PutVerdict,
+  TransactableInfo,
   WriteCancellationReason,
 } from "../Entity.js"
 import { extractTransactable } from "../Entity.js"
@@ -51,9 +53,11 @@ import {
 import {
   andRaw,
   composePrimaryKeyOrFail,
+  marshalPutItem,
   type RawCondition,
   rejectUnsupportedOp,
   resolveTableNames,
+  underCaptured,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
 import type { TransactPlan } from "./TransactPlan.js"
@@ -93,7 +97,8 @@ export { type TransactItemTarget, transactItemTarget }
 /**
  * Union of operations accepted by `transactWrite` and by `append`'s
  * `additionalItems`. The `any` positions are deliberate: op intermediates are
- * heterogeneous by design, and each element is narrowed at the call site.
+ * heterogeneous by design, and each element is narrowed at the call site (the
+ * trailing one is an op's offload state, #179).
  *
  * Bound-CRUD builders (`db.entities.X.put(...)` / `.create(...)` /
  * `.delete(...)`) are accepted alongside the unbound intermediates. They are the
@@ -101,8 +106,8 @@ export { type TransactItemTarget, transactItemTarget }
  * AWS-free `@effect-dynamodb/schema` `Entity.make` (#100).
  */
 export type TransactWriteOp =
-  | EntityPut<any, any, any, any>
-  | EntityDelete<any, any>
+  | EntityPut<any, any, any, any, any>
+  | EntityDelete<any, any, void, unknown, any>
   | BoundWriteOp
   | ConditionCheckOp
 
@@ -147,25 +152,28 @@ export interface BuiltStreamAppend {
  * Accepted only there — `Transaction.transactWrite` refuses it (its type does
  * not admit it, and at runtime it fails with `ValidationError`).
  */
-export interface StreamAppendOp {
+export interface StreamAppendOp<E = never> {
   readonly [StreamAppendTypeId]: StreamAppendTypeId
   /** The inner stream's name. */
   readonly streamName: string
   /**
    * @internal Build the nested append's items. `source` names the op in a
-   * diagnosed rejection (`"operation 0"`).
+   * diagnosed rejection (`"operation 0"`). `E` is the inner stream's own
+   * build errors: the `BlobStoreError` of a stream that offloads (#179) —
+   * its events' `data` and inline snapshot's `state` are uploaded here —
+   * which the outer append's errors carry (`WriteOpBlobErrors`).
    */
   readonly _build: (
     source: string,
   ) => Effect.Effect<
     BuiltStreamAppend,
-    ValidationError | DynamoClientError,
+    ValidationError | DynamoClientError | E,
     TableConfig | DynamoClient
   >
 }
 
 /** @internal Whether `op` is a {@link StreamAppendOp}. */
-export const isStreamAppendOp = (op: unknown): op is StreamAppendOp =>
+export const isStreamAppendOp = (op: unknown): op is StreamAppendOp<any> =>
   typeof op === "object" && op !== null && StreamAppendTypeId in op
 
 /**
@@ -173,7 +181,7 @@ export const isStreamAppendOp = (op: unknown): op is StreamAppendOp =>
  * {@link TransactWriteOp}, plus another stream's append ({@link StreamAppendOp}).
  * Accepted by `EventStream.append` and `commandHandler`, nowhere else.
  */
-export type AppendWriteOp = TransactWriteOp | StreamAppendOp
+export type AppendWriteOp = TransactWriteOp | StreamAppendOp<any>
 
 /**
  * An `update` — accepted by `Transaction.transactWrite` alone.
@@ -183,7 +191,7 @@ export type AppendWriteOp = TransactWriteOp | StreamAppendOp
  * `EventStore.append({ additionalItems })` does not, and `Batch.write` cannot
  * express an update at all, so neither accepts one at the type level.
  */
-export type TransactWriteUpdateOp = EntityUpdate<any, any, any, any, any> | BoundUpdateOp
+export type TransactWriteUpdateOp = EntityUpdate<any, any, any, any, any, any> | BoundUpdateOp
 
 /**
  * Compile an op-attached condition (`Entity.create()`'s `attribute_not_exists`,
@@ -350,6 +358,8 @@ interface PreparedOp {
   readonly type: "put" | "delete" | "conditionCheck" | "planned"
   readonly putKind?: PutKind | undefined
   readonly entity: Entity
+  /** A bound op's captured blob store and compressors (§3.6). */
+  readonly captured?: TransactableInfo["captured"] | undefined
   /** Index into the caller's `operations` array — preserved for provenance. */
   readonly opIndex: number
   readonly input?: Record<string, unknown> | undefined
@@ -504,7 +514,9 @@ export const prepareTransactWriteOps = (
           type: "planned",
           entity,
           opIndex,
-          plan: () => entity._planUpdate(key, updateState, prepared),
+          // Under a bound op's captured store and compressors (§3.6): the plan
+          // packs and uploads as the standalone update would.
+          plan: () => underCaptured(info.captured, entity._planUpdate(key, updateState, prepared)),
         })
         continue
       }
@@ -526,10 +538,13 @@ export const prepareTransactWriteOps = (
           entity,
           opIndex,
           plan: () =>
-            entity._planDelete(
-              key,
-              { condition: deleteRequest.condition, mustExist: deleteRequest.mustExist },
-              encoded,
+            underCaptured(
+              info.captured,
+              entity._planDelete(
+                key,
+                { condition: deleteRequest.condition, mustExist: deleteRequest.mustExist },
+                encoded,
+              ),
             ),
         })
         continue
@@ -546,7 +561,12 @@ export const prepareTransactWriteOps = (
           input: info.input!,
           condition: compileOpCondition(info.entity, info.condition),
           callerCondition: info.callerCondition,
-          built: yield* validateAndBuildPutItem(info.entity, info.input!, `${operation}.put`),
+          captured: info.captured,
+          // Packed under the op's captured compressor registry (§3.6).
+          built: yield* underCaptured(
+            info.captured,
+            validateAndBuildPutItem(info.entity, info.input!, `${operation}.put`),
+          ),
         })
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined, undefined, {
@@ -584,6 +604,12 @@ export const prepareTransactWriteOps = (
  * Returns the plans keyed by index into the caller's operations. Run on every
  * attempt, so a transaction cancelled by a lost race is planned again from
  * fresh reads.
+ *
+ * A planned update uploads its offloaded values as the standalone update
+ * would (#179, design §6.7) — under a bound op's captured blob store — into
+ * the caller's ledger. Its write is recorded, never sent, so nothing settles
+ * until the transaction does; a re-plan with the same content hits the
+ * ledger's memo, and a superseded attempt's uploads are rolled back at exit.
  */
 export const planTransactWriteOps = (
   prepared: PreparedTransactWrite,
@@ -621,6 +647,15 @@ export const planTransactWriteOps = (
  * and so release and claim the same sentinels. A caller adding items of its
  * own appends their targets to these.
  *
+ * Every put's item is built first, in {@link prepareTransactWriteOps} — local
+ * work, so an op refused there leaves nothing read or uploaded — then the
+ * `plans` pre-pass runs, then each put does its own reads (a tombstone's, a
+ * guarded put's row). Offloaded fields (#179, design §6.7): each put uploads
+ * its offloaded values, after its tombstone read, under a bound op's captured
+ * blob store (§3.6), into the caller's ledger, whose transaction settles them,
+ * and its item is marshalled after. A caller that builds the items again (a
+ * re-plan after a lost race) hits the ledger's memo for unchanged content.
+ *
  * A {@link StreamAppendOp} is accepted only with `{ streams: true }` — an
  * `EventStore` append's `additionalItems` — and is refused with
  * `ValidationError` otherwise. Its items are built by the inner stream
@@ -647,7 +682,7 @@ export const buildTransactWriteItems = (
     | undefined,
 ): Effect.Effect<
   BuiltTransactWriteItems,
-  ValidationError | DynamoClientError,
+  ValidationError | DynamoClientError | BlobStoreError,
   TableConfig | DynamoClient
 > =>
   Effect.gen(function* () {
@@ -759,7 +794,28 @@ export const buildTransactWriteItems = (
 
       if (op.type === "put") {
         const built = op.built!
-        if (op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")) {
+        const guardedPut =
+          op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")
+        // `create` over a projection tombstone (#154): take its place,
+        // carrying its checkpoints over, guarded on that tombstone.
+        const over =
+          !guardedPut && op.putKind === "create"
+            ? yield* op.entity._overTombstone(built.item)
+            : Option.none<{
+                readonly guard: ConditionInput
+                readonly term: RawCondition | undefined
+              }>()
+        // Offloaded fields (#179, design §6.7): routed and uploaded as the
+        // entity's own put does — after the tombstone read, before the
+        // guarded put's read — under the op's captured store (§3.6). The
+        // uploads settle by the transaction that carries their pointers.
+        if (op.entity._offloads) {
+          yield* underCaptured(
+            op.captured,
+            op.entity._offloadItem(built.item, tableName, `${operation}.put`),
+          )
+        }
+        if (guardedPut) {
           const plan = yield* op.entity._planPut({
             tableName,
             ttlAttrName: resolveTtlAttributeName(yield* op.entity._tableTag),
@@ -781,20 +837,16 @@ export const buildTransactWriteItems = (
           }
           continue
         }
-        // `create` over a projection tombstone (#154): take its place,
-        // carrying its checkpoints over, guarded on that tombstone.
-        const over =
-          op.putKind === "create"
-            ? yield* op.entity._overTombstone(built.item)
-            : Option.none<{
-                readonly guard: ConditionInput
-                readonly term: RawCondition | undefined
-              }>()
+
         push(
           {
             Put: {
               TableName: tableName,
-              Item: Option.isSome(over) ? toAttributeMap(built.item) : built.marshalled,
+              // Routed above, or taken over a tombstone: marshalled again.
+              Item:
+                op.entity._offloads || Option.isSome(over)
+                  ? yield* marshalPutItem(op.entity, built.item, `${operation}.put`)
+                  : built.marshalled,
               ...conditionFields(
                 Option.isSome(over)
                   ? andRaw(

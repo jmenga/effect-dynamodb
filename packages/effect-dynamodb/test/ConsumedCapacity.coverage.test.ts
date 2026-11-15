@@ -13,12 +13,15 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import { Duration, Effect, Layer, Schema, Stream } from "effect"
 import { beforeEach } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
+import * as BlobGc from "../src/BlobGc.js"
+import { BlobStore } from "../src/BlobStore.js"
 import * as Collection from "../src/Collection.js"
 import * as ConsumedCapacity from "../src/ConsumedCapacity.js"
 import { CheckpointStore } from "../src/change-feed/index.js"
@@ -35,7 +38,12 @@ import {
   withConsumedCapacity,
 } from "./helpers/CapacityMock.js"
 import { indexesOf } from "./helpers/DynamoExpressions.js"
-import { InMemoryClient, resetStore, tableIndexes } from "./helpers/InMemoryTables.js"
+import {
+  InMemoryClient,
+  resetStore,
+  store as rows,
+  tableIndexes,
+} from "./helpers/InMemoryTables.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -219,6 +227,26 @@ const Parcels = Entity.make({
   },
 })
 
+/** Offloaded storage (#179): GC reads the table to decide what it may free. */
+const offloaded = DynamoModel.Packed({ format: "json", external: { threshold: 16 } })
+
+class Attachment extends Schema.Class<Attachment>("Attachment")({
+  attachmentId: Schema.String,
+  body: Schema.Struct({ text: Schema.String }),
+}) {}
+
+/** Offloading requires `escapeKeys` (#179), so its members live on a table of their own. */
+const BlobSchema = DynamoSchema.make({ name: "shop", version: 1, escapeKeys: true })
+
+const Attachments = Entity.make({
+  model: DynamoModel.configure(Attachment, { body: { storedAs: offloaded } }),
+  entityType: "Attachment",
+  primaryKey: {
+    pk: { field: "pk", composite: ["attachmentId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
   entities: {
@@ -232,6 +260,8 @@ const MainTable = Table.make({
     LedgerTotals,
   },
 })
+
+const BlobTable = Table.make({ schema: BlobSchema, entities: { Attachments } })
 
 class Deposited extends Schema.Class<Deposited>("Deposited")({ amount: Schema.Number }) {}
 
@@ -248,6 +278,17 @@ const Ledgers = EventStore.makeStream({
       key: (event: Deposited, version: number) => `${event.amount}#${version}`,
     },
   },
+})
+
+class Posted extends Schema.Class<Posted>("Posted")({ text: Schema.String }) {}
+
+/** A stream whose event data offloads: its partition is one GC family set (#179). */
+const Bulletins = EventStore.makeStream({
+  table: BlobTable,
+  streamName: "Bulletin",
+  events: [Posted],
+  streamId: { composite: ["bulletinId"] },
+  storedAs: { data: offloaded },
 })
 
 const ledgerDecider: EventStore.Decider<{ readonly balance: number }, number, Deposited, never> = {
@@ -392,6 +433,52 @@ const ledgerEvents = Ledgers.read({ ledgerId: "l-1" }).pipe(
 )
 
 const ordersQuery = () => Orders.query.byCustomer({ customerId: "c-1" })
+
+/** The blob store of the GC cases, fresh per test. */
+let blobs = BlobStore.memory()
+const withBlobs = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.suspend(() =>
+    Effect.provide(
+      effect,
+      Layer.merge(BlobStore.layer(blobs), BlobTable.layer({ name: "blob-table" })),
+    ),
+  )
+const collector = () =>
+  BlobGc.make({
+    entities: { Attachments },
+    streams: { Bulletins },
+    // Every candidate confirm-read: the reaper's reads report under its name.
+    reaper: { gracePeriod: 0, confirm: "always" },
+  })
+const attachmentRow = () => [...rows.values()].find((row) => row.__edd_e__?.S === "Attachment")!
+/** The record of an update that superseded the first body: the reaper confirm-reads the item. */
+let superseded: Array<BlobGc.StreamRecordLike> = []
+const seedAttachment = () =>
+  withBlobs(
+    Effect.gen(function* () {
+      yield* Attachments.put({ attachmentId: "a-1", body: { text: "first ".repeat(8) } })
+      const before = attachmentRow()
+      yield* Attachments.update({ attachmentId: "a-1" }).pipe(
+        Entity.set({ body: { text: "second ".repeat(8) } }),
+      )
+      const after = attachmentRow()
+      superseded = [
+        {
+          eventName: "MODIFY",
+          eventSourceARN: "arn:aws:dynamodb:us-east-1:000000000000:table/blob-table/stream/1",
+          dynamodb: {
+            Keys: { pk: after.pk!, sk: after.sk! },
+            OldImage: before,
+            NewImage: after,
+            StreamViewType: "NEW_AND_OLD_IMAGES",
+            ApproximateCreationDateTime: 0,
+          },
+        },
+      ]
+    }),
+  )
+const seedBulletin = () =>
+  withBlobs(Bulletins.append({ bulletinId: "b-1" }, [new Posted({ text: "news ".repeat(8) })], 0))
 
 type Checkpoints = Effect.Success<ReturnType<typeof CheckpointStore.makeDynamoDB>>
 const lease = Duration.seconds(30)
@@ -629,6 +716,33 @@ const cases: ReadonlyArray<Case> = [
         source: "lambda",
       } as any),
   ],
+  // Offloaded storage: GC (#179)
+  [
+    "BlobGc.reap",
+    () => withBlobs(Effect.flatMap(collector(), (gc) => gc.reap(superseded))),
+    seedAttachment,
+  ],
+  [
+    "BlobGc.sweep",
+    () =>
+      withBlobs(
+        Effect.flatMap(collector(), (gc) => gc.sweep("Attachments", { attachmentId: "a-1" })),
+      ),
+    seedAttachment,
+  ],
+  [
+    "BlobGc.sweepPartition",
+    () =>
+      withBlobs(
+        Effect.flatMap(collector(), (gc) => gc.sweepPartition("Bulletins", { bulletinId: "b-1" })),
+      ),
+    seedBulletin,
+  ],
+  [
+    "BlobGc.sweepStore",
+    () => withBlobs(Effect.flatMap(collector(), (gc) => Stream.runDrain(gc.sweepStore()))),
+    seedAttachment,
+  ],
   // Change-feed checkpoints
   ...checkpointCases([
     ["CheckpointStore.load", (store) => store.load(feed)],
@@ -645,7 +759,10 @@ tableIndexes.set("shop-table", {
   // definition doesn't hold it) and the stream's index (`EventStore.indexDefinitions` emits it).
   lsi1: { pk: "pk", sk: "lsi1sk" },
 })
-beforeEach(() => resetStore())
+beforeEach(() => {
+  resetStore()
+  blobs = BlobStore.memory()
+})
 
 describe("consumed-capacity coverage", () => {
   for (const [operation, run, setup] of cases) {

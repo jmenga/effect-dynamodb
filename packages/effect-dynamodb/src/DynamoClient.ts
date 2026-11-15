@@ -115,11 +115,19 @@ import {
   type Compressor,
   make as makeCompressionRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
+import {
+  type ExternalPackedConfig,
+  isPackedConfig,
+  type NoOffload,
+  type OffloadFields,
+  type PackedConfig,
+} from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import type { EntityDefinition } from "@effect-dynamodb/schema/Entity.js"
 import {
+  type BlobStoreError,
   DynamoError,
   DynamoValidationError,
   InternalServerError,
@@ -144,11 +152,15 @@ import {
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type {
+  DefaultOffloadModes,
   EntityKeyType,
   IndexPkInput,
   IndexSkFields,
   IndexZOrderDimensions,
   IndexZOrderPrefix,
+  OffloadMode,
+  ReadBlobErrors,
+  ResolvedOffloadModes,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { given, ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
@@ -174,12 +186,17 @@ import {
 import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind, ownershipConflict } from "./Aggregate.js"
+import { BlobStore } from "./BlobStore.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import {
   bind as entityBind,
   fromDefinition as entityFromDefinition,
   storedRefIdOf,
 } from "./Entity.js"
+import {
+  type BlobStoreService,
+  validateService as validateBlobStore,
+} from "./internal/BlobStoreContract.js"
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
@@ -206,6 +223,15 @@ import {
 } from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
 import { createConditionOps, type Expr, ExprTag, type StoredFormAt } from "./internal/Expr.js"
+import type { Modes } from "./internal/OffloadRead.js"
+import type { StateOf } from "./internal/OffloadTypes.js"
+import {
+  aggregateStoreRequirements,
+  entityStoreRequirements,
+  missingStoreError,
+  type StoreRequirement,
+  unescapedKeysError,
+} from "./internal/OffloadWrite.js"
 import {
   codecRequirements,
   collectionPackedQueryOptions,
@@ -240,6 +266,7 @@ import {
   type SentTable,
   withCause,
 } from "./internal/WriteDiagnosis.js"
+import type { OffloadModes, OffloadState, ResolveModes, View } from "./Offload.js"
 import * as Query from "./Query.js"
 import type { CreateTableOptions, RekeyOptions, RekeyReport, Table, TableConfig } from "./Table.js"
 import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } from "./Table.js"
@@ -600,7 +627,7 @@ const combineRowChecks = (checks: ReadonlyArray<FieldCheck>): RowCheck | undefin
  * key form throws `[EDD-9050]` (the accessor's own encoder). `{}` plans
  * nothing: the query is returned as it is.
  */
-const planCompositeWithin = <A>(args: {
+const planCompositeWithin = <A, E, O extends OffloadState>(args: {
   readonly entityLike: EntityLike
   readonly accessor: string
   readonly indexDef: IndexDefinition
@@ -611,10 +638,10 @@ const planCompositeWithin = <A>(args: {
   /** The accessor's composites, in key form. */
   readonly pinnedKeyForm: Record<string, unknown>
   readonly pkValue: string
-  readonly query: Query.Query<A>
+  readonly query: Query.Query<A, E, O>
   readonly bounds: Record<string, unknown>
   readonly options: WithinOptions | undefined
-}): Query.Query<A> => {
+}): Query.Query<A, E, O> => {
   const { entityLike, accessor, indexDef, domainKeyForm, pinnedKeyForm } = args
   const sk = indexDef.sk.composite
   const n = sk.length
@@ -1038,7 +1065,7 @@ const withinEnds = (
  * which `.within()` turns into the query's `ValidationError`. `{}` plans nothing:
  * the query is returned as it is.
  */
-const planZOrderWithin = <A>(args: {
+const planZOrderWithin = <A, E, O extends OffloadState>(args: {
   readonly entityLike: EntityLike
   readonly accessor: string
   readonly indexDef: IndexDefinition
@@ -1048,10 +1075,10 @@ const planZOrderWithin = <A>(args: {
   readonly domainKeyForm: CompositeKeyForm
   readonly pkValue: string
   readonly plans: ZOrderPlans
-  readonly query: Query.Query<A>
+  readonly query: Query.Query<A, E, O>
   readonly bounds: Record<string, unknown>
   readonly options: WithinOptions | undefined
-}): Query.Query<A> => {
+}): Query.Query<A, E, O> => {
   const { entityLike, accessor, indexDef, domainKeyForm } = args
   const refuse = (why: string): never => {
     throw new Error(
@@ -1872,11 +1899,17 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * yield* db.collections.assignments({ userId: "123" }).collect()
    * yield* db.tables.MainTable.create()
    * ```
+   *
+   * @param config.blobStore - The store offloaded values of the bound members
+   *   are written to and read from (#179). It wins over a `BlobStore` in
+   *   context at bind time, which is captured otherwise; it is validated as
+   *   `BlobStore.layer` validates a store.
+   * @throws `[EDD-9116]` when `blobStore` is not a valid store.
    */
   static readonly make: {
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
-      TAggregates extends Record<string, AggregateType<any, any, any, any>>,
+      TAggregates extends Record<string, AggregateType<any, any, any, any, any>>,
       TTables extends Record<string, TableLike>,
     >(config: {
       readonly entities: TEntities
@@ -1885,6 +1918,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, TTables>,
       never,
@@ -1893,13 +1927,14 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
 
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
-      TAggregates extends Record<string, AggregateType<any, any, any, any>>,
+      TAggregates extends Record<string, AggregateType<any, any, any, any, any>>,
     >(config: {
       readonly entities: TEntities
       readonly aggregates: TAggregates
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, TAggregates, Record<string, TableLike>>,
       never,
@@ -1915,6 +1950,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, TTables>,
       never,
@@ -1926,6 +1962,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
+      readonly blobStore?: BlobStoreService
     }): Effect.Effect<
       TypedClient<TEntities, Record<string, never>, Record<string, TableLike>>,
       never,
@@ -1968,26 +2005,38 @@ export type CollectionSelected<TResult> = {
  * `.collect()` and `.fetch()` return the grouped result (not an array);
  * `.paginate()` streams each item tagged with its member.
  */
-export interface CollectionQuery<TResult> {
+export interface CollectionQuery<
+  TResult,
+  T extends OffloadFields = NoOffload,
+  M extends ResolvedOffloadModes = DefaultOffloadModes,
+> {
   /** Execute and collect all pages into a grouped result. */
-  readonly collect: () => Effect.Effect<TResult, DynamoClientError | ValidationError, never>
+  readonly collect: () => Effect.Effect<
+    TResult,
+    DynamoClientError | ValidationError | ReadBlobErrors<T, M>,
+    never
+  >
   /**
    * Execute a single page, grouped like `collect()`, with the cursor of the
    * next page (`None` when there are no more results).
    */
   readonly fetch: () => Effect.Effect<
     { readonly items: TResult; readonly cursor: Option.Option<string> },
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | ReadBlobErrors<T, M>,
     never
   >
   /** Stream every item, page by page, each tagged with its member. */
   readonly paginate: () => Stream.Stream<
     CollectionStreamItem<TResult>,
-    DynamoClientError | ValidationError,
+    DynamoClientError | ValidationError | ReadBlobErrors<T, M>,
     never
   >
   /** Count the members' items (every member's, together). */
-  readonly count: () => Effect.Effect<number, DynamoClientError | ValidationError, never>
+  readonly count: () => Effect.Effect<
+    number,
+    DynamoClientError | ValidationError | ReadBlobErrors<T, M>,
+    never
+  >
   /** Describe the query without sending anything (see `Query.explain`). */
   readonly explain: () => Effect.Effect<Query.QueryExplain, never, never>
   /**
@@ -2000,7 +2049,7 @@ export interface CollectionQuery<TResult> {
       | ((
           t: import("./internal/PathBuilder.js").PathBuilder<unknown, unknown, never>,
         ) => ReadonlyArray<import("./internal/PathBuilder.js").Path<unknown, any, any>>),
-  ) => CollectionQuery<CollectionSelected<TResult>>
+  ) => CollectionQuery<CollectionSelected<TResult>, T, M>
   /** Add a filter expression (post-read). */
   readonly filter: {
     (
@@ -2008,42 +2057,51 @@ export interface CollectionQuery<TResult> {
         t: import("./internal/PathBuilder.js").PathBuilder<unknown, unknown, never>,
         ops: import("./internal/Expr.js").ConditionOps<unknown>,
       ) => import("./internal/Expr.js").Expr,
-    ): CollectionQuery<TResult>
-    (shorthand: import("./internal/Expr.js").ConditionShorthand): CollectionQuery<TResult>
+    ): CollectionQuery<TResult, T, M>
+    (shorthand: import("./internal/Expr.js").ConditionShorthand): CollectionQuery<TResult, T, M>
   }
   /**
    * Return at most `n` items (a contract on results, not on round trips).
    * Under a filter, each request is sized from the observed pass rate.
    */
-  readonly limit: (n: number) => CollectionQuery<TResult>
+  readonly limit: (n: number) => CollectionQuery<TResult, T, M>
   /**
    * Fetch in batches of `n` rows — sets DynamoDB's `Limit`. `"natural"` sizes
    * requests exactly as 1.36 did.
    */
-  readonly pageSize: (size: number | "natural") => CollectionQuery<TResult>
+  readonly pageSize: (size: number | "natural") => CollectionQuery<TResult, T, M>
   /** Run `observer` after every request a terminal sends (see `Query.onRequest`). */
   readonly onRequest: (
     observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
-  ) => CollectionQuery<TResult>
+  ) => CollectionQuery<TResult, T, M>
   /** Reverse sort order. */
-  readonly reverse: () => CollectionQuery<TResult>
+  readonly reverse: () => CollectionQuery<TResult, T, M>
   /** Resume from cursor. */
-  readonly startFrom: (cursor: string) => CollectionQuery<TResult>
+  readonly startFrom: (cursor: string) => CollectionQuery<TResult, T, M>
   /** Stop after `n` DynamoDB requests. */
-  readonly maxPages: (n: number) => CollectionQuery<TResult>
+  readonly maxPages: (n: number) => CollectionQuery<TResult, T, M>
   /** Requests a sharded collection sends at once (#183); default one per partition. */
-  readonly concurrency: (n: number) => CollectionQuery<TResult>
+  readonly concurrency: (n: number) => CollectionQuery<TResult, T, M>
   /**
    * Strongly consistent reads. A collection over a GSI — every auto-discovered
    * one — is refused with a `ValidationError` when it runs: DynamoDB reads a
    * GSI only eventually consistently.
    */
-  readonly consistentRead: () => CollectionQuery<TResult>
+  readonly consistentRead: () => CollectionQuery<TResult, T, M>
   /**
    * Skip the `__edd_e__` ownership filter. Rows of no member are still never
    * returned as a member's items.
    */
-  readonly ignoreOwnership: () => CollectionQuery<TResult>
+  readonly ignoreOwnership: () => CollectionQuery<TResult, T, M>
+  /**
+   * Read every member's offloaded fields (#179) in `mode` — `"eager"` /
+   * `"lazy"` for both kinds, or `{ overflow?, binary? }` over the current
+   * modes (defaults: overflow eager, binary lazy). The terminals' blob errors
+   * follow; an unknown mode (from untyped code) throws `[EDD-9117]`.
+   */
+  readonly offloaded: <const Mo extends OffloadMode | OffloadModes>(
+    mode: Mo,
+  ) => CollectionQuery<TResult, T, ResolveModes<Mo, M>>
 }
 
 /**
@@ -2053,7 +2111,10 @@ export interface CollectionQuery<TResult> {
  */
 export type TypedClient<
   TEntities extends Record<string, { readonly _tag: "Entity" }>,
-  TAggregates extends Record<string, AggregateType<any, any, any, any>> = Record<string, never>,
+  TAggregates extends Record<string, AggregateType<any, any, any, any, any>> = Record<
+    string,
+    never
+  >,
   TTables extends Record<string, TableLike> = Record<string, TableLike>,
 > = {
   /**
@@ -2062,7 +2123,7 @@ export type TypedClient<
    * A member may be a runtime `Entity` (authored with `effect-dynamodb`'s
    * `Entity.make`) OR a pure `EntityDefinition` (authored with
    * `@effect-dynamodb/schema`'s `Entity.make` — the AWS-free contract surface).
-   * Both carry the same 11 type parameters, so both map to the same bound shape,
+   * Both carry the same 14 type parameters, so both map to the same bound shape,
    * and both branches forward the inferred refs `R` — the two packages now share
    * one structural `AnyRefValue` (`entity: RefEntity`), so ref-derived composite
    * types (e.g. `${field}Id`) survive into the bound client for either authoring
@@ -2084,18 +2145,21 @@ export type TypedClient<
       infer GenId,
       infer VI,
       infer P,
-      infer Un
+      infer Un,
+      infer O
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
+          BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un, O> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               PathModel<Schema.Schema.Type<M>, P>,
               never,
-              Schema.Schema.Type<M>
+              View<Schema.Schema.Type<M>, O>,
+              never,
+              StateOf<O, Schema.Schema.Type<M>>
             >
-          } & EntityIndexAccessors<M, I, R, P> &
-            EntityVectorAccessors<M, VI>
+          } & EntityIndexAccessors<M, I, R, P, O> &
+            EntityVectorAccessors<M, VI, O>
         >
       : TEntities[K] extends EntityDefinition<
             infer M,
@@ -2111,18 +2175,21 @@ export type TypedClient<
             infer GenId,
             infer VI,
             infer P,
-            infer Un
+            infer Un,
+            infer O
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un> & {
+            BoundEntity<M, I, R, ResolveKey<M, I, R>, TS, Ts, V, GenId, VI, P, Un, O> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 PathModel<Schema.Schema.Type<M>, P>,
                 never,
-                Schema.Schema.Type<M>
+                View<Schema.Schema.Type<M>, O>,
+                never,
+                StateOf<O, Schema.Schema.Type<M>>
               >
-            } & EntityIndexAccessors<M, I, R, P> &
-              EntityVectorAccessors<M, VI>
+            } & EntityIndexAccessors<M, I, R, P, O> &
+              EntityVectorAccessors<M, VI, O>
           >
         : never
   }
@@ -2133,9 +2200,10 @@ export type TypedClient<
       infer S,
       infer TKey,
       infer TInput,
-      infer TCreate
+      infer TCreate,
+      infer TBlobErrors
     >
-      ? BoundAggregate<S, TKey, TInput, TCreate>
+      ? BoundAggregate<S, TKey, TInput, TCreate, TBlobErrors>
       : never
   }
 
@@ -2147,7 +2215,9 @@ export type TypedClient<
    * Type safety for collection results requires explicit type annotation at the call site.
    */
   readonly collections: {
-    readonly [K: string]: (composites: Record<string, unknown>) => CollectionQuery<any>
+    readonly [K: string]: (
+      composites: Record<string, unknown>,
+    ) => CollectionQuery<any, ClientOffload<TEntities>>
   }
 
   /** Table operations keyed by table record keys. */
@@ -2167,6 +2237,21 @@ export interface CollectionAccessors {
     composites: Record<string, unknown>,
   ) => CollectionQuery<Record<string, unknown[]>>
 }
+
+/**
+ * The fields the client's entities offload (#179), together: a collection
+ * accessor is not typed per member, so its blob errors are those of any
+ * member that could be in it.
+ */
+type ClientOffload<TEntities> = {
+  readonly [K in keyof TEntities]: TEntities[K] extends {
+    readonly _offloadFields?: infer F
+  }
+    ? Exclude<F, undefined> extends infer O extends OffloadFields
+      ? O
+      : NoOffload
+    : NoOffload
+}[keyof TEntities]
 
 /** Force TypeScript to resolve an interface/intersection into a plain object for clean hover display */
 type Resolve<T> = { [K in keyof T]: T[K] }
@@ -2204,6 +2289,7 @@ type EntityIndexAccessors<
   I extends Record<string, IndexDefinition>,
   R = undefined,
   P extends string = never,
+  O extends OffloadFields = NoOffload,
 > = {
   readonly [K in keyof I & string]: <Provided extends IndexPkInput<M, I, K, R>>(
     composites: Provided,
@@ -2211,14 +2297,16 @@ type EntityIndexAccessors<
     ? import("./internal/BoundQuery.js").BoundQuery<
         PathModel<Schema.Schema.Type<M>, P>,
         never,
-        Schema.Schema.Type<M>,
-        import("./internal/BoundQuery.js").WithinSpec<ZOrderWithin<M, I, K, R>, "zorder">
+        View<Schema.Schema.Type<M>, O>,
+        import("./internal/BoundQuery.js").WithinSpec<ZOrderWithin<M, I, K, R>, "zorder">,
+        StateOf<O, Schema.Schema.Type<M>>
       >
     : import("./internal/BoundQuery.js").BoundQuery<
         PathModel<Schema.Schema.Type<M>, P>,
         ResolveSkFields<M, I, K, Provided, R>,
-        Schema.Schema.Type<M>,
-        CompositeWithin<ResolveSkFields<M, I, K, Provided, R>>
+        View<Schema.Schema.Type<M>, O>,
+        CompositeWithin<ResolveSkFields<M, I, K, Provided, R>>,
+        StateOf<O, Schema.Schema.Type<M>>
       >
 }
 
@@ -2291,7 +2379,7 @@ type VectorFilterNames<C> = C extends { readonly filters: ReadonlyArray<infer K 
  * `reembed` maintenance operation. Empty when the entity declares none — so a
  * consumer never sees vector API surface on an entity that has no vectors.
  */
-type EntityVectorAccessors<M extends Schema.Top, VI> =
+type EntityVectorAccessors<M extends Schema.Top, VI, O extends OffloadFields = NoOffload> =
   VI extends Record<string, VectorIndexConfig>
     ? {
         readonly [K in keyof VI & string]: (
@@ -2300,7 +2388,8 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
           Schema.Schema.Type<M>,
           VectorPartitionInput<M, VI[K]>,
           VectorFilterNames<VI[K]>,
-          Schema.Schema.Type<M>
+          View<Schema.Schema.Type<M>, O>,
+          StateOf<O, Schema.Schema.Type<M>>
         >
       } & {
         /**
@@ -2310,7 +2399,9 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
          * embedding model or the declared `source.fields` change. Returns the
          * number of items whose vector was rewritten. An item a write changed
          * between the scan and the rewrite (a source field or a partition
-         * composite) is skipped: that write wrote its own vector.
+         * composite) is skipped: that write wrote its own vector. An offloaded
+         * source field stored externally is fetched to derive the text (#179);
+         * no other offloaded field is.
          */
         readonly reembed: (options?: {
           readonly concurrency?: number | undefined
@@ -2318,7 +2409,8 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
           number,
           | DynamoClientError
           | import("@effect-dynamodb/schema/Errors.js").ValidationError
-          | import("@effect-dynamodb/schema/Errors.js").EmbeddingError,
+          | import("@effect-dynamodb/schema/Errors.js").EmbeddingError
+          | ReadBlobErrors<O, DefaultOffloadModes>,
           never
         >
       }
@@ -2479,7 +2571,12 @@ interface EntityLike {
   readonly _refuseTableAttributes?: ((tableConfig: TableConfig) => void) | undefined
   /** Where a stored row's values key it in an index now (#171). */
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
-  readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
+  /** Decode a stored-name row under read modes (#179; eager when omitted). */
+  readonly _decodeRecord: (
+    raw: Record<string, unknown>,
+    modes?: Modes,
+    operation?: string,
+  ) => Effect.Effect<any, ValidationError | BlobStoreError>
   /** Packed attributes an expression may not look inside (EDD-9076, #147). */
   readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
   /** The domain fields stored packed. */
@@ -2490,6 +2587,19 @@ interface EntityLike {
     | undefined
   /** The stored attributes `_unpackFields` reads (a projection naming none runs no hook). */
   readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
+  /** Load a batch of stored-name rows per read modes (#179): unpack, resolve pointers. */
+  readonly _loadRows?:
+    | ((
+        rows: ReadonlyArray<Record<string, unknown>>,
+        options: {
+          readonly operation: string
+          readonly modes: Modes
+          readonly raw?: boolean | undefined
+        },
+      ) => Effect.Effect<void, ValidationError | BlobStoreError>)
+    | undefined
+  /** The stored attributes `_loadRows` may rewrite (a projection naming none loads nothing). */
+  readonly _readAttributes?: ReadonlyArray<string> | undefined
   /** Which rows are items: a primary-key query or scan leaves the rest out (#133). */
   readonly _liveRows?: (() => Query.LiveRows | undefined) | undefined
   readonly schemas: {
@@ -2541,19 +2651,22 @@ const collectionLiveRows = (
  */
 const packedFieldConfigs = (
   entity: EntityLike,
-): Array<readonly [string, PackedAttributeGuard["storedAs"] | undefined]> =>
-  (entity._packedFields ?? []).map((field) => [
-    field,
-    entity._packedGuards?.find((guard) => guard.attribute === field)?.storedAs,
-  ])
+): Array<readonly [string, PackedConfig | ExternalPackedConfig | undefined]> =>
+  (entity._packedFields ?? []).flatMap((field) => {
+    const storedAs = entity._packedGuards?.find((guard) => guard.attribute === field)?.storedAs
+    // `_packedFields` also names `External` (binary) fields, for the
+    // expression guards (#179): they name no codec.
+    return storedAs !== undefined && !isPackedConfig(storedAs) ? [] : [[field, storedAs] as const]
+  })
 
 const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
-  readonly aggregates?: Record<string, AggregateType<any, any, any, any>>
+  readonly aggregates?: Record<string, AggregateType<any, any, any, any, any>>
   readonly tables?: Record<string, TableLike>
   readonly crypto?: SecureRandom.SecureRandom["Service"]
   readonly embedder?: EmbedderService
   readonly compressors?: ReadonlyArray<Compressor>
+  readonly blobStore?: BlobStoreService
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     // A member may be a pure `@effect-dynamodb/schema` EntityDefinition (the headline output of the
@@ -2639,10 +2752,46 @@ const makeFromConfig = (config: {
       compressionRegistry,
     )
     if (codecError !== undefined) throw codecError
-    const ctx =
+    const withCompression =
       compressionRegistry !== undefined
         ? Context.add(withEmbedder, Compression, compressionRegistry)
         : withEmbedder
+    // The blob store for offloaded values (#179): an explicit `blobStore`
+    // wins over one in context at bind time, which `baseCtx` already holds
+    // (`Capacity.detachContext` keeps it). Validated as `BlobStore.layer`
+    // validates one ([EDD-9116]).
+    const ctx =
+      config.blobStore !== undefined
+        ? Context.add(
+            withCompression,
+            BlobStore,
+            validateBlobStore("DynamoClient.make", config.blobStore),
+          )
+        : withCompression
+    // A bound member with an offloaded field uploads on every write and
+    // resolves pointers on every read, so a store must be resolvable here —
+    // a configuration defect (`[EDD-9115]`) at bind, naming every member and
+    // field, not a `NotProvided` on the first value (#179).
+    const storeRequirements = [
+      ...Object.entries(config.entities).flatMap(([key, entity]) =>
+        entityStoreRequirements(`entity "${key}"`, entity),
+      ),
+      ...Object.entries(config.aggregates ?? {}).flatMap(([key, aggregate]) =>
+        aggregateStoreRequirements(`aggregate "${key}"`, aggregate),
+      ),
+    ]
+    // Offloading requires escaped key text (`[EDD-9146]`, design §11.10):
+    // object keys are named from a row's key text, so a pointer row must be
+    // written only at its final text. Checked first: a store doesn't make the
+    // key text right.
+    const keysError = unescapedKeysError("DynamoClient.make", storeRequirements)
+    if (keysError !== undefined) throw keysError
+    const storeError = missingStoreError(
+      "DynamoClient.make",
+      storeRequirements,
+      Context.getOrUndefined(ctx, BlobStore),
+    )
+    if (storeError !== undefined) throw storeError
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
@@ -2805,7 +2954,7 @@ const makeFromConfig = (config: {
           pkValue,
           skField: indexDef.sk.field,
           entityTypes: [entityLike.entityType],
-          decoder: (raw) => entityLike._decodeRecord(raw),
+          decoder: (raw, modes) => entityLike._decodeRecord(raw, modes, "query.decode"),
           ...entityPackedQueryOptions(entityLike),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [
@@ -3126,9 +3275,12 @@ const makeFromConfig = (config: {
           definition,
           schema: entityLike._schema,
           tableTag: entityLike._tableTag,
-          decode: (raw) => entityLike._decodeRecord(raw),
-          unpackRaw: entityLike._unpackFields,
-          unpackAttributes: entityLike._dispatchAttributes,
+          // Hits read in the builder's modes (#179, design §8.4), loaded
+          // together first (`loadRows`): the decoder then finds each prepared.
+          decode: (raw, modes) =>
+            entityLike._decodeRecord(raw, modes, `vectorSearch.${logicalName}.decode`),
+          loadRows: entityLike._loadRows ?? (() => Effect.void),
+          readAttributes: entityLike._readAttributes ?? [],
           provide,
           resolveDbName: entityLike._resolveDbName ?? ((domainName: string) => domainName),
           storedAt: entityLike._storedFormAt,
@@ -3143,7 +3295,7 @@ const makeFromConfig = (config: {
           tableName: "",
           indexName: undefined,
           entityTypes: [entityLike.entityType],
-          decoder: (raw) => entityLike._decodeRecord(raw),
+          decoder: (raw, modes) => entityLike._decodeRecord(raw, modes, "scan.decode"),
           ...entityPackedQueryOptions(entityLike),
           resolveTableName: entityLike._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
@@ -3203,7 +3355,7 @@ const makeFromConfig = (config: {
         }
 
         // Collection decoder: decode and group by entity key
-        const collDecoder = (raw: Record<string, unknown>) => {
+        const collDecoder = (raw: Record<string, unknown>, modes: Modes) => {
           const entityType = raw.__edd_e__ as string | undefined
           if (!entityType) {
             return Effect.fail(
@@ -3223,7 +3375,7 @@ const makeFromConfig = (config: {
             return Effect.succeed({ _memberKey: "__unknown__", _decoded: raw })
           }
           return member.entityLike
-            ._decodeRecord(raw)
+            ._decodeRecord(raw, modes, "collection.decode")
             .pipe(Effect.map((decoded: unknown) => ({ _memberKey: entityKey, _decoded: decoded })))
         }
 
@@ -3452,6 +3604,18 @@ const makeFromConfig = (config: {
               ...Object.values(config.entities).map(operational).filter(onTable),
               ...Object.values(config.aggregates ?? {}).filter(onTable),
             ]
+            // A stream given to `rekey` that offloads needs escaped key text, as
+            // `EventStore.bind` checks it (`[EDD-9146]`, design §11.10): under it, a
+            // pointer row is written only at its final key text and never moved.
+            const streamKeysError = unescapedKeysError(
+              "rekey",
+              (options?.streams ?? []).flatMap(
+                (stream) =>
+                  (stream as { readonly _storeRequirements?: ReadonlyArray<StoreRequirement> })
+                    ._storeRequirements ?? [],
+              ),
+            )
+            if (streamKeysError !== undefined) throw streamKeysError
             for (const member of [...tableMembers, ...(options?.streams ?? [])]) {
               const handler = Rekey.handlerOf(member)
               if (handler !== undefined) handlers.add(handler)
@@ -3606,7 +3770,7 @@ const makeFromConfig = (config: {
         {
           tag: EntityLike["_tableTag"]
           entities: EntityLike[]
-          aggregates: AggregateType<any, any, any, any>[]
+          aggregates: AggregateType<any, any, any, any, any>[]
         }
       >()
       for (const [, entity] of Object.entries(config.entities)) {

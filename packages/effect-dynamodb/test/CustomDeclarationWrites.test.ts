@@ -354,6 +354,10 @@ describe("a new write path can't go unnoticed", () => {
     "Aggregate.get": "a read",
     "Aggregate.list": "a read",
     "Batch.get": "a read",
+    "BlobGc.reap": "reads rows; deletes only blob versions",
+    "BlobGc.sweep": "reads rows; marks and deletes only blob versions",
+    "BlobGc.sweepPartition": "reads rows; marks and deletes only blob versions",
+    "BlobGc.sweepStore": "reads rows; marks and deletes only blob versions",
     "CheckpointStore.acquireLease": "its own items, no model",
     "CheckpointStore.commit": "its own items, no model",
     "CheckpointStore.load": "a read",
@@ -479,20 +483,20 @@ describe("a new write path can't go unnoticed", () => {
     // `encodeForWrite`'s one encode, and `_unstorableKey`'s encode of a key record as `put` would
     // encode it, which writes nothing.
     expect(count(entity, /\bencodeOrDecodeEncode\(/g)).toBe(2)
-    // Put, update, upsert twice, a time series' append, and the ids `.keepRefs()` keeps.
-    expect(count(entity, /\bencodeForWrite\(/g)).toBe(6)
-    // A key value that reads back as the other numeric kind is refused in `encodeForWrite`, and in
-    // the check a transaction's or a batch's put goes through (`_refuseNotReadBack`).
-    expect(count(entity, /\brefuseOtherKindRead\(/g)).toBe(2)
+    // Put, update, upsert twice, a time series' append, the ids `.keepRefs()` keeps, and the
+    // input a transaction's, a batch's or a projection's put encodes (`_encodeInput`).
+    expect(count(entity, /\bencodeForWrite\(/g)).toBe(7)
+    // A key value that reads back as the other numeric kind is refused in `encodeForWrite`.
+    expect(count(entity, /\brefuseOtherKindRead\(/g)).toBe(1)
     // Path values encode in one place, and an update's operands are judged in one.
     expect(count(entity, /\bpathValues\.(?:value|elements)\(/g)).toBe(2)
     expect(count(entity, /\bnotReadBackOperand\(/g)).toBe(1)
   })
 
   it("a transaction's, a batch's and a projection's puts go through the one builder that checks", () => {
-    expect(count(source("internal/TransactableOps.ts"), /_refuseNotReadBack\(/g)).toBe(1)
-    // Its input takes its form where an entity's write's does.
-    expect(count(source("internal/TransactableOps.ts"), /\bencodeInput\(/g)).toBe(1)
+    // Its input is encoded by the entity's own `encodeForWrite`, where an entity's write's is.
+    expect(count(source("internal/TransactableOps.ts"), /\._encodeInput\(/g)).toBe(1)
+    expect(count(source("internal/TransactableOps.ts"), /\bencodeInput\(/g)).toBe(0)
     expect(count(source("Entity.ts"), /\bencodeInput\(/g)).toBe(1)
     for (const name of ["Batch.ts", "Transaction.ts", "internal/TransactWriteOps.ts"]) {
       expect(count(source(name), /\binputSchema\b/g)).toBe(0)

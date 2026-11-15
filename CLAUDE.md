@@ -6,7 +6,7 @@
 
 Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table design as a first-class pattern, composite key composition from entity attributes, type-safe index-aware queries with Stream-based pagination, and DynamoClient as an Effect Service with Layer-based dependency injection.
 
-**Status:** All modules implemented. 15632 core tests, 4001 schema tests, 72 geo tests, 256 language-service tests, 57 doctest tests, 44 examples, 6331 connected tests against DynamoDB Local.
+**Status:** All modules implemented. 24319 core tests, 4562 schema tests, 96 geo tests, 256 language-service tests, 58 doctest tests, 44 examples, 13728 core and 107 geo connected tests against DynamoDB Local (and MinIO for offloaded storage).
 **Design:** `DESIGN.md` — API specification (source of truth for implementation)
 
 ## Architecture
@@ -55,7 +55,9 @@ Effect TS ORM for DynamoDB providing Schema-driven entity modeling, single-table
 > function and marker (`internal/Shards.ts`), `Errors`,
 > `Projection`, `Compression` (the `Compressor` interface + registry
 > service for packed storage; no `node:zlib`, guarded by `node-free-guard.test.ts`), the
-> pure packed codec (`internal/PackedCodec.ts`), the entity/aggregate derivation internals
+> pure packed codec (`internal/PackedCodec.ts`), the blob pointer codec and its vendored
+> CRC-64/NVME and SHA-256 (`internal/BlobPointer.ts`, `Crc64Nvme.ts`, `Sha256.ts`), the
+> offload guards (`internal/EntityOffload.ts`), `BlobStoreError`, the entity/aggregate derivation internals
 > (`EntityConfig`, `EntityTypes`, `EntitySchemas`, `Aggregate*`, `SchemaAccessors`,
 > `DefaultCrypto`), and a **pure `Entity.make` / `Aggregate.make`** that return a
 > definition carrying the derived `inputSchema` / `updateSchema` / `createSchema`
@@ -87,7 +89,11 @@ packages/effect-dynamodb/src/
 ├── DynamoClient.ts     # Context.Service wrapping AWS SDK + DynamoClient.make({ entities, aggregates?, tables? }) typed gateway
 ├── ConsumedCapacity.ts # Opt-in consumed-capacity reporting (#174): layer / layerEffect / disabled, observer reports, withOperation(Stream), span Attributes, detachContext
 ├── Marshaller.ts       # Thin wrapper around @aws-sdk/util-dynamodb; a value with no DynamoDB form throws the tagged UnstorableValue (EDD-9124), an attribute or a map entry named `__proto__` too (EDD-9165), which a read leaves out
-├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value, valueBytes (stored size), each with a *Sync twin; limits
+├── StorageEncoding.ts  # Packed storage helpers: encode / decode (AttributeValue) / decodeUnmarshalled one value (pointers resolved through the ambient BlobStore), pointer, valueBytes (stored size), each with a *Sync twin; limits
+├── BlobStore.ts        # BlobStore service (#179): layer, memory / layerMemory (test store with fault injection + inspect), crc64nvme; the BlobStoreService contract
+├── Offload.ts          # Offloaded-storage API: read modes and types, OffloadedValue / BlobHandle, Offload.source, layerObserver (unsettled uploads), compareStored
+├── BlobGc.ts           # Opt-in blob GC: BlobGc.make → reap (stream records), sweep / sweepPartition (two-pass marks), sweepStore
+├── blob/s3.ts          # Subpath `effect-dynamodb/blob/s3` — the S3 BlobStore (make / layer / layerConfig) over blob/S3BlobStore.ts (the ONLY @aws-sdk/client-s3 import)
 ├── compression/zlib.ts # Subpath `effect-dynamodb/compression/zlib` — node:zlib gzip / brotli / zstd Compressors (the ONLY node:zlib import)
 ├── Errors.ts           # Tagged errors (DynamoError, ItemNotFound, ConditionalCheckFailed, ItemAlreadyExists, ValidationError, TransactionCancelled, UniqueConstraintViolation)
 ├── internal/           # Decomposed internals
@@ -95,6 +101,7 @@ packages/effect-dynamodb/src/
 │   ├── PathBuilder.ts  # PathBuilder — recursive Proxy for type-safe attribute path access
 │   ├── BoundQuery.ts   # BoundQuery fluent builder — wraps Query<A> with pre-resolved services; .within() / .zorder() / .explain() / .onRequest()
 │   ├── RangePlanner.ts # Pure planner for .within(): key / skip-scan / filter plans, Z-order naive / jump / precise; probe + read steps, plan LRU
+│   ├── Utf8Order.ts    # UTF-8 key order (compareUtf8, compareBytes), runtime-neutral: shared by the planner, write diagnosis, condition evaluation, the memory blob store and BlobGc
 │   ├── Rekey.ts        # rekey driver (#171): parallel Scan, each row to its member's RekeyHandler, resume tokens, the report
 │   ├── KeyText136.ts   # (schema pkg) The key texts rows can be under (1.36 and off, 1.37.0 and 1.38.0, on), the inverted form and the valueless marks, for rekey only (#171, #183)
 │   ├── Cursor.ts       # Opaque cursors: legacy btoa(LastEvaluatedKey) and v2 ("v2." + base64url JSON: fingerprint, mode, position)
@@ -105,7 +112,7 @@ packages/effect-dynamodb/src/
 │   ├── BoundVectorQuery.ts # BoundVectorQuery — SearchVectors builder (.collect() is the only terminal)
 │   ├── RoundTrip.ts    # A custom declaration's value through the real marshaller and read schema at write (EDD-9126)
 │   ├── Capacity.ts     # Consumed-capacity choke point: `Capacity.client` (instrumented DynamoClient view), operation scopes, summing, reports
-│   ├── ClientOptions.ts # What the DynamoClient and DynamoStreamsClient layers share (#190): requestHandler + maxAttempts options, their Config form, the SDK client's life inside a layer
+│   ├── ClientOptions.ts # What the DynamoClient and DynamoStreamsClient layers share (#190): requestHandler + maxAttempts options, their Config form, the SDK client's life inside a layer (and their credentials, which blob/s3's layerConfig reads too, #179)
 │   ├── EntityOps.ts    # Entity operation intermediates + UpdateState (record + path-based)
 │   ├── EntityCombinators.ts # Terminal functions, update combinators (record + path-based)
 │   ├── EntityTypes.ts  # Type-level computations for Entity derived types
@@ -114,6 +121,13 @@ packages/effect-dynamodb/src/
 │   ├── InsertStatement.ts # The PartiQL INSERT text and parameters `Entity.insert` sends
 │   ├── TransactableOps.ts # Shared Batch/Transaction helpers (table name resolution, key composition, put-item building)
 │   ├── Packed.ts       # Packed storage over items: pack/unpack attributes, stream-image normalisation (base64 B), EDD-9076 expression guards
+│   ├── OffloadWrite.ts / OffloadRead.ts / OffloadInput.ts # Offloaded fields: write routing (thresholds, item budget) + uploads; read modes + two-phase decode; binary write inputs
+│   ├── BlobLedger.ts   # Upload ledger: settles each upload by DynamoDB's answer (rollback only on provable non-commit), observer reports
+│   ├── BlobResolver.ts # Batched pointer resolution within the store's readConcurrency, size + checksum verification
+│   ├── OffloadValues.ts / OffloadTypes.ts / OffloadChange.ts # Lazy values (OffloadedValue, BlobHandle); offload type-level state; change classification + NEW_AND_OLD_IMAGES record check
+│   ├── BlobKeys.ts / BlobMetadata.ts / StoredPointer.ts # Hashed object keys, object metadata, the pointer a stored value holds
+│   ├── BlobStoreContract.ts / BlobCalls.ts / MemoryBlobStore.ts / Multipart.ts # Store contract + validation, store calls (spans, error mapping), the in-memory store, the multipart driver
+│   ├── GcSupport.ts    # What BlobGc and purge share: member row kinds, holder scans, confirm-read bracket
 │   ├── TransactWriteOps.ts # Shared TransactWriteItems builder + ConditionCheckOp (Transaction.transactWrite AND EventStore.append additionalItems)
 │   └── ...             # AggregateCursor, AggregateEdges, etc.
 └── index.ts            # Public API barrel export
@@ -139,7 +153,10 @@ DynamoModel → effect (Schema)
 DynamoSchema → (standalone)
 KeyComposer → (standalone)
 Marshaller → @aws-sdk/util-dynamodb, effect (Data)
-StorageEncoding → Marshaller, internal/Packed, Compression + PackedCodec (schema pkg)
+StorageEncoding → Marshaller, internal/Packed, Compression + PackedCodec (schema pkg), BlobStore (pointer resolution via Effect.serviceOption)
+BlobStore / Offload → internal blob modules, BlobPointer + Crc64Nvme (schema pkg); read by every operation via Effect.serviceOption (no new R)
+BlobGc → Entity, Aggregate, EventStore, BlobStore, internal/GcSupport, internal/Capacity
+blob/s3 → @aws-sdk/client-s3 (optional peer), BlobStore contract
 compression/zlib → node:zlib, Compression (schema pkg, types only)
 Projection → (standalone)
 Errors → effect (Data)
@@ -266,7 +283,7 @@ If the `Agent` tool's `isolation: "worktree"` parameter is available for the tas
 - **Dual APIs** — Public library functions transforming a data type must use `Function.dual` for data-first and data-last (pipeable) support.
 - **TypeId + Pipeable** — Every data type carries a `TypeId` (unique symbol) and implements `Pipeable` + `Inspectable`. Custom types follow the same triad.
 - **Yieldable trait** — `EntityOp`, `EntityDelete`, `BoundPut`, `BoundUpdate`, `BoundDelete` all implement `Pipeable.Pipeable` + `[Symbol.iterator]` (via `Utils.SingleShotGen`) — NOT `Effect.Effect`. They are yieldable in `Effect.gen` (`yield*` works) but cannot be passed to Effect combinators (`Effect.map`, `Effect.flip`, etc.) directly. Use `.asEffect()` to convert to `Effect` when piping to Effect combinators. **`BoundGet` is the one exception and must stay one**: `db.entities.X.get(key)` has always returned a real `Effect`, so it is built on `Effectable.Prototype` and IS an `Effect<A, E, never>` while also carrying the bound-op marker (#108). Making it merely yieldable would break `.pipe(Effect.catchTag("ItemNotFound", …))` at every call site. BoundEntity is the **composition point** — all CRUD methods AND query accessors return fluent builders. CRUD: `db.entities.Users.update(key).set({...}).expectedVersion(3)`, `db.entities.Users.put(input).condition({...})`, `db.entities.Users.delete(key).condition({...})` — every combinator is a method on the builder, no variadic rest-args. Query accessors are injected from collection memberships: `db.entities.Tasks.byProject({...})` returns a `BoundQuery`. `BoundQuery` is a fluent builder: `.filter().select().limit().collect()` / `.fetch()` / `.paginate()` / `.count()`. `scan()` also returns `BoundQuery`.
-- **Option over nullable** — `Option<A>` in services and domain logic. Convert at boundaries with `Option.fromNullable`.
+- **Option over nullable** — `Option<A>` in services and domain logic. Convert at boundaries with `Option.fromNullishOr` (`null` and `undefined`) or `Option.fromNullOr` (`null` only); v4 has no `Option.fromNullable`.
 - **No tacit style** — always explicit lambdas: `Effect.map((x) => fn(x))`.
 - **`run*` at the edge only** — never `runPromise`/`runSync` inside an Effect.
 - **Testing** — `@effect/vitest` with `it.effect` / `it.scoped`. Mock `DynamoClient` via `mockDynamoClientLayer({ putItem: mockPutItem, ... })` from `test/helpers/MockDynamoClient.ts` — it supplies a dying default for every operation, so a test declares only what it exercises and a new operation on `DynamoClientService` needs a default added in exactly one place. Never hand-roll a full `Layer.succeed(DynamoClient, { ... })` literal. Use `Effect.provide(layer, { local: true })` for test isolation.
@@ -394,7 +411,7 @@ Before committing:
 1. `pnpm lint` — zero lint/format errors (Biome)
 2. `pnpm check` — zero type errors
 3. `pnpm test` — all unit tests pass (uses `vitest.config.ts`; does NOT run the connected suite). Note that Vitest transpiles without type-checking, so a green suite says nothing about types — gate 2 is what compiles `test/` (every package's `tsconfig.test.json` includes the whole `test` directory; issue #106). Never narrow one of those `include` arrays back to a file list.
-4. `pnpm --filter effect-dynamodb test:connected` — **all integration tests pass against DynamoDB Local** (uses `vitest.connected.ts`; requires `docker run -d --rm -p 8000:8000 amazon/dynamodb-local`). **Mandatory** for any PR that touches `KeyComposer`, `Entity`, `Query`, `Collection`, `Transaction`, `Aggregate`, `EventStore`, `Errors`, the `internal/` Entity helpers, or any test fixture. Do NOT skip on the assumption that unit tests cover the same ground — the connected suite catches end-to-end fixture drift, schema-level type widening that only fails on real DDB writes, and policy-aware GSI behavior that mocks can't reproduce.
+4. `pnpm --filter effect-dynamodb test:connected` — **all integration tests pass against DynamoDB Local** (uses `vitest.connected.ts`; requires `docker run -d --rm -p 8000:8000 amazon/dynamodb-local`). The blob-offload suites also need MinIO: `docker run -d --rm -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin cgr.dev/chainguard/minio server /data` (`S3_ENDPOINT`, default `http://localhost:9000`; `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`, default `minioadmin`). They skip when DynamoDB Local or MinIO is unreachable, so a run without MinIO has not covered them. **Mandatory** for any PR that touches `KeyComposer`, `Entity`, `Query`, `Collection`, `Transaction`, `Aggregate`, `EventStore`, `Errors`, the `internal/` Entity helpers, or any test fixture. Do NOT skip on the assumption that unit tests cover the same ground — the connected suite catches end-to-end fixture drift, schema-level type widening that only fails on real DDB writes, and policy-aware GSI behavior that mocks can't reproduce.
    On a shared machine, cap vitest's workers by putting the flag straight after the script name: `pnpm --filter effect-dynamodb test:connected --maxWorkers=4` (at the root, `pnpm test --maxWorkers=4` reaches every package). Do not put `--` before it: pnpm passes the `--` through and vitest then ignores the flag, running every worker.
 5. `pnpm --filter @effect-dynamodb/doctest test` — doc snippet sync verification passes
 6. `npx tsx examples/<name>.ts` — examples run against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`). Run after changes to Entity, Query, Table, DynamoSchema, KeyComposer, Collection, Transaction, or Errors. **Note: running an example successfully is NOT a substitute for gate 4** — examples exercise one or two scenarios; the connected suite covers the cross-product of behaviors. An agent that runs examples and skips `test:connected` has not satisfied this gate.
@@ -633,6 +650,12 @@ Each of the four publishable packages must be configured on npmjs.com with this 
 - **Packing runs after encode/rename/sparse, before marshalling**, so every size measurement (diagnosis, `measureAppend`, `valueBytes`) counts stored bytes. Guards: EDD-9071–9079.
 - **Effect's instances pack as their native map (1.41.0).** A `DateTime`, a look-alike `EffectInstances` rebuilds, an `Option` or a `Result` is written as the map a native write stores, keys in DynamoDB Local's order — `storedFormOf` (`schema/internal/StoredForm.ts`), called only from `stringifyStrict`. Pinned byte-for-byte against `fixtures/packed-lookalikes-1.40.0.json`. Bytes and bigints past 2^53 inside one stay refused at their path.
 - **A `DateTime` is the one instance a packed value takes.** Nothing substitutes a date on a stream, so a read date used to pack as its look-alike map and a new date was refused. `stringifyStrict` stores a real one (and its zone) as that map's exact keys in the order DynamoDB Local returns them (`storedDate`), so what a read date packs to doesn't move. A declared date reads back real; a `Schema.Unknown` field reads back the map.
+
+### Offloaded Storage (#179, `docs/designs/blob-offload.md`, `guides/blob-offload.mdx`, DESIGN "Offloaded Storage")
+- **Opt-in per field, since 1.43.0.** `DynamoModel.Packed({ ..., external: { threshold } })` (overflow) or `DynamoModel.External()` (binary) puts a value in a `BlobStore` (S3 through `effect-dynamodb/blob/s3`, or `BlobStore.layerMemory()` in tests) and stores a pointer pinning the object's `VersionId`; S3 is written first, then DynamoDB. The store is read with `Effect.serviceOption` (no new `R`); a member that offloads needs one where it is bound (`[EDD-9115]`).
+- **Offloading requires `escapeKeys: true` (owner decision).** Objects are named from a hash of the owning row's key text and S3 has no rename, so a pointer row must never move. Every binding (`DynamoClient.make`, `Entity.bind`, `Aggregate.bind`, `EventStore.bind` / `bindProjection`, `GeoIndex.bind`, `BlobGc.make`, `rekey`'s `streams`) refuses an offloading member on any other setting with the `[EDD-9146]` defect, before the store check; an unbound write fails with a `ValidationError` (`[EDD-9146]`) where it routes, nothing uploaded. Backstop: `rekey` refuses (a `ValidationError` naming the row) to move a row holding a pointer. An existing 1.x app sets `escapeKeys: true`, runs `rekey`, then declares offloaded fields. Every offloading fixture, test, example and snippet uses an escaped schema.
+- **The upload ledger settles at the client choke point.** Uploads join a ledger owned by the outermost operation; a version is deleted only when DynamoDB provably did not commit (sent once and refused, a cancelled transaction carrying the library's `ClientRequestToken`, an unprocessed batch item, a `ALL_OLD` image without the pointer, an `insert()`'s `DuplicateItemException`); an unknown outcome is kept for GC and reported to `Offload.layerObserver`.
+- **GC is explicit.** `BlobGc.make` → `reap` (stream records), `sweep` / `sweepPartition` (two passes with unreferenced-since marks), `sweepStore`; it reads through `Capacity.client` and each entry point is a `Capacity.operation`. `purge` deletes the item's own versions after its rows.
 
 ### Consumed Capacity (#174, `docs/designs/consumed-capacity.md`, `guides/consumed-capacity.mdx`, DESIGN §16)
 - **Off by default; opt in with `ConsumedCapacity.layer({ level?, spans?, onOperation? })`.** Off = no `ReturnConsumedCapacity`, same input object, no spans. On = no type changes, `R = never` kept. Setting read at run time from the fiber; a client bound while it is in context keeps it (`disabled` included).

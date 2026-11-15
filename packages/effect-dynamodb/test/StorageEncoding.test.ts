@@ -4,12 +4,23 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { DateTime, Effect, Exit, Schema } from "effect"
+import { BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
+import { DateTime, Effect, Exit, Layer, Option, Schema } from "effect"
+import { BlobStore } from "../src/BlobStore.js"
 import * as ZlibCompression from "../src/compression/zlib.js"
 import { attributeBytes } from "../src/internal/ItemSize.js"
 import { toAttributeValue } from "../src/Marshaller.js"
 import * as StorageEncoding from "../src/StorageEncoding.js"
+import {
+  bytesPointer,
+  bytesPointerText,
+  expectPointerStoreFailure,
+  expectUnresolvedPointer,
+  jsonPointer,
+  jsonPointerBytes,
+  storeObject,
+} from "./helpers/BlobPointers.js"
 import { missingCompressor } from "./helpers/MissingCompressor.js"
 
 const compression = Compression.layer(ZlibCompression.available())
@@ -187,6 +198,204 @@ describe("StorageEncoding sync twins", () => {
     }),
   )
 })
+
+describe("StorageEncoding — blob pointers (#179)", () => {
+  const base64 = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64")
+  const thrown = (f: () => unknown): unknown => {
+    try {
+      f()
+    } catch (error) {
+      return error
+    }
+    throw new Error("expected a throw")
+  }
+  const value = { lines: [{ sku: "A", qty: 1 }], note: "x".repeat(200) }
+  const content = new TextEncoder().encode(JSON.stringify(value))
+
+  it("pointer reads both stored forms, and nothing else", () => {
+    const B = jsonPointerBytes()
+    // A bare string is read as decodeUnmarshalled reads it: base64 of a `B`
+    // value (an unmarshalled Lambda / Pipes image's) is that value.
+    for (const stored of [{ B }, { B: base64(B) }, B, base64(B)]) {
+      const read = StorageEncoding.pointer(stored)
+      expect(Option.isSome(read)).toBe(true)
+      expect(Option.getOrThrow(read)).toMatchObject({
+        kind: "json",
+        codec: "zstd",
+        ref: jsonPointer.ref,
+        objectSize: jsonPointer.objectSize,
+        contentSize: jsonPointer.contentSize,
+        checksum: jsonPointer.checksum,
+        contentType: Option.none(),
+      })
+    }
+    for (const stored of [{ S: bytesPointerText }, bytesPointerText]) {
+      expect(Option.getOrThrow(StorageEncoding.pointer(stored))).toMatchObject({
+        kind: "bytes",
+        codec: "none",
+        ref: bytesPointer.ref,
+        contentType: Option.some("application/pdf"),
+      })
+    }
+    const inlineB = StorageEncodingFixtures.inlineB()
+    const notPointers: ReadonlyArray<Parameters<typeof StorageEncoding.pointer>[0]> = [
+      { S: '{"a":1}' },
+      '{"a":1}',
+      { B: inlineB },
+      inlineB,
+      base64(inlineB),
+      { M: { a: { N: "1" } } },
+      { N: "1" },
+      { NULL: true },
+      new Uint8Array([1, 2, 3]),
+      new Uint8Array(0),
+      // The other kind than its form stores: malformed.
+      { B: BlobPointer.encode(bytesPointer) },
+      base64(BlobPointer.encode(bytesPointer)),
+      { S: BlobPointer.encodeText(jsonPointer) },
+      BlobPointer.encodeText(jsonPointer),
+      // Truncated, corrupt, not base64.
+      B.subarray(0, B.length - 1),
+      base64(B.subarray(0, B.length - 1)),
+      `${bytesPointerText}A`,
+      "~edbp:!!",
+      { B: "not base64 at all!" },
+    ]
+    for (const stored of notPointers) {
+      expect(Option.isNone(StorageEncoding.pointer(stored))).toBe(true)
+    }
+  })
+
+  it.effect("decode / decodeUnmarshalled resolve a pointer through the BlobStore in scope", () =>
+    Effect.gen(function* () {
+      const store = BlobStore.memory()
+      const plain = yield* storeObject(store, { key: "p/f/plain", kind: "json", content })
+      const gzip = ZlibCompression.gzip()
+      const packed = yield* storeObject(store, {
+        key: "p/f/gzip",
+        kind: "json",
+        content,
+        object: gzip.compress(content),
+        codec: "gzip",
+      })
+      const run = <A, E>(effect: Effect.Effect<A, E>) =>
+        Effect.provide(effect, Layer.mergeAll(BlobStore.layer(store), compression))
+      for (const pointer of [plain, packed]) {
+        const B = BlobPointer.encode(pointer)
+        expect(yield* run(StorageEncoding.decode({ B }))).toEqual(value)
+        expect(yield* run(StorageEncoding.decode({ B: base64(B) }))).toEqual(value)
+        expect(yield* run(StorageEncoding.decodeUnmarshalled(B))).toEqual(value)
+        expect(yield* run(StorageEncoding.decodeUnmarshalled(base64(B)))).toEqual(value)
+      }
+      expect(store.inspect().calls.get).toBe(8)
+    }),
+  )
+
+  it.effect("a store failure is the cause of the ValidationError", () =>
+    Effect.gen(function* () {
+      // No store in scope: NotProvided.
+      for (const stored of [{ B: jsonPointerBytes() }, { B: base64(jsonPointerBytes()) }]) {
+        expectPointerStoreFailure(
+          failure(yield* Effect.exit(StorageEncoding.decode(stored))),
+          "value",
+          { entityType: "StorageEncoding", operation: "StorageEncoding.decode" },
+        )
+      }
+      expectPointerStoreFailure(
+        failure(yield* Effect.exit(StorageEncoding.decodeUnmarshalled(jsonPointerBytes()))),
+        "value",
+        { operation: "StorageEncoding.decodeUnmarshalled" },
+      )
+      // A version that is gone, and an object that does not match its pointer.
+      const store = BlobStore.memory()
+      const gone = yield* storeObject(store, { key: "p/f/gone", kind: "json", content })
+      yield* Effect.orDie(store.delete([gone.ref]))
+      const corrupt = yield* storeObject(store, {
+        key: "p/f/corrupt",
+        kind: "json",
+        content,
+        overrides: { checksum: { algorithm: "crc64nvme", value: new Uint8Array(8) } },
+      })
+      for (const [pointer, reason] of [
+        [gone, "NotFound"],
+        [corrupt, "ChecksumMismatch"],
+      ] as const) {
+        const error = failure(
+          yield* Effect.exit(
+            Effect.provide(
+              StorageEncoding.decode({ B: BlobPointer.encode(pointer) }),
+              BlobStore.layer(store),
+            ),
+          ),
+        )
+        expect(error).toBeInstanceOf(ValidationError)
+        expect(error.cause).toBeInstanceOf(BlobStoreError)
+        expect(error.cause).toMatchObject({ reason, ref: pointer.ref, attribute: "value" })
+      }
+    }),
+  )
+
+  it("the sync twins refuse a pointer, naming it and what resolves it", () => {
+    const hint = ["StorageEncoding.decode", "StorageEncoding.pointer"]
+    expectUnresolvedPointer(
+      thrown(() => StorageEncoding.decodeSync({ B: jsonPointerBytes() })),
+      "value",
+      { operation: "StorageEncoding.decode", hint },
+    )
+    expectUnresolvedPointer(
+      thrown(() => StorageEncoding.decodeSync({ B: base64(jsonPointerBytes()) })),
+      "value",
+      { operation: "StorageEncoding.decode", hint },
+    )
+    for (const stored of [jsonPointerBytes(), base64(jsonPointerBytes())]) {
+      expectUnresolvedPointer(
+        thrown(() => StorageEncoding.decodeUnmarshalledSync(stored)),
+        "value",
+        { operation: "StorageEncoding.decodeUnmarshalled", hint },
+      )
+    }
+  })
+
+  it.effect("a binary field's ~edbp: text is not a packed value: read it with pointer", () =>
+    Effect.gen(function* () {
+      const expectRefused = (error: unknown, operation: string) => {
+        expect(error).toBeInstanceOf(ValidationError)
+        expect((error as ValidationError).operation).toBe(operation)
+        const message = ((error as ValidationError).cause as Error).message
+        expect(message).toContain("binary field's blob pointer")
+        expect(message).toContain("StorageEncoding.pointer")
+      }
+      expectRefused(
+        failure(yield* Effect.exit(StorageEncoding.decode({ S: bytesPointerText }))),
+        "StorageEncoding.decode",
+      )
+      expectRefused(
+        failure(yield* Effect.exit(StorageEncoding.decodeUnmarshalled(bytesPointerText))),
+        "StorageEncoding.decodeUnmarshalled",
+      )
+      expectRefused(
+        thrown(() => StorageEncoding.decodeSync({ S: bytesPointerText })),
+        "StorageEncoding.decode",
+      )
+      expectRefused(
+        thrown(() => StorageEncoding.decodeUnmarshalledSync(bytesPointerText)),
+        "StorageEncoding.decodeUnmarshalled",
+      )
+    }),
+  )
+})
+
+const StorageEncodingFixtures = {
+  /** An inline v1 `B` value: gzip-packed JSON. */
+  inlineB: (): Uint8Array =>
+    (
+      StorageEncoding.encodeSync(
+        DynamoModel.Packed({ format: "json", compression: { codec: "gzip", threshold: 0 } }),
+        { a: "x".repeat(400) },
+        { compressors: [ZlibCompression.gzip()] },
+      ) as { readonly B: Uint8Array }
+    ).B,
+}
 
 describe("StorageEncoding.valueBytes", () => {
   it.effect("native: the marshalled map's size", () =>

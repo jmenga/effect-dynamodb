@@ -11,6 +11,7 @@
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import {
+  type BlobStoreError,
   DynamoError,
   isAwsTransactionCancelled,
   ValidationError,
@@ -19,7 +20,15 @@ import { Effect } from "effect"
 import type { DynamoClient, DynamoClientError } from "./DynamoClient.js"
 import type { EntityDelete, EntityPut, TransactableInfo } from "./Entity.js"
 import { extractTransactable } from "./Entity.js"
-import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
+import { expiredWithCommitted } from "./internal/BlobCalls.js"
+import * as BlobLedger from "./internal/BlobLedger.js"
+import type {
+  AnyGet,
+  BoundWriteOp,
+  GetBlobErrors,
+  GetSuccess,
+  WriteOpBlobErrors,
+} from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
 import {
@@ -29,13 +38,17 @@ import {
   transactWriteShape,
   transactWriteUnit,
 } from "./internal/ItemSize.js"
+import { forEachSettled } from "./internal/OffloadWrite.js"
 import {
   batchRejectReason,
   composePrimaryKeyOrFail,
   getRejectReason,
   isProjectionTombstone,
+  loadGetRows,
+  marshalPutItem,
   rejectUnsupportedOp,
   resolveTableNames,
+  underCaptured,
   validateAndBuildPutItem,
 } from "./internal/TransactableOps.js"
 import {
@@ -97,16 +110,21 @@ export const get = <const T extends ReadonlyArray<AnyGet>>(
   config?: BatchRetryConfig,
 ): Effect.Effect<
   BatchGetResult<T>,
-  DynamoClientError | ValidationError,
+  DynamoClientError | ValidationError | GetBlobErrors<T[number]>,
   DynamoClient | TableConfig
-> => Capacity.operation("Batch.get", undefined, getCore(items, config))
+> =>
+  Capacity.operation("Batch.get", undefined, getCore(items, config)) as Effect.Effect<
+    BatchGetResult<T>,
+    DynamoClientError | ValidationError | GetBlobErrors<T[number]>,
+    DynamoClient | TableConfig
+  >
 
 const getCore = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
   config?: BatchRetryConfig,
 ): Effect.Effect<
   BatchGetResult<T>,
-  DynamoClientError | ValidationError,
+  DynamoClientError | ValidationError | BlobStoreError,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
@@ -155,12 +173,25 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
       },
     })
 
-    const results: Array<unknown> = new Array(items.length).fill(undefined)
-    for (let i = 0; i < fetched.length; i++) {
-      const item = fetched[i]
+    const rows: Array<Record<string, unknown> | undefined> = fetched.map((item, i) =>
       // A projection tombstone (#154) is no row.
-      if (item === undefined || isProjectionTombstone(item, infos[i]!.entity.entityType)) continue
-      results[i] = yield* infos[i]!.entity._decodeRecord(fromAttributeMap(item))
+      item === undefined || isProjectionTombstone(item, infos[i]!.entity.entityType)
+        ? undefined
+        : (fromAttributeMap(item) as Record<string, unknown>),
+    )
+    // Offloaded fields (#179): every get's rows resolve together, per entity
+    // and per the get's own modes, before any decode.
+    yield* loadGetRows(infos, rows, "Batch.get")
+    const results: Array<unknown> = new Array(items.length).fill(undefined)
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]
+      if (row === undefined) continue
+      const info = infos[i]!
+      // Under a bound get's captured services (§3.6), as its row was loaded.
+      results[i] = yield* underCaptured(
+        info.captured,
+        info.entity._decodeRecord(row, info.offloadModes, "Batch.get.decode"),
+      )
     }
 
     // Cast rationale: results is built as Array<A | undefined> by matching DynamoDB
@@ -181,7 +212,9 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
  * authored with the pure, AWS-free `@effect-dynamodb/schema` `Entity.make`
  * (#100).
  */
-type BatchWriteOp = EntityPut<any, any, any, any> | EntityDelete<any, any> | BoundWriteOp
+type BatchWriteOp =
+  // The trailing `any`: an op's offload state (#179) — an offloading member's ops too.
+  EntityPut<any, any, any, any, any> | EntityDelete<any, any, void, unknown, any> | BoundWriteOp
 
 /** A versioned put, sent as a create-only `TransactWriteItems` Put (#133). */
 type VersionedPut = {
@@ -263,6 +296,19 @@ const committedBeforeRequest = (
  * `ValidationError` naming the item, with DynamoDB's error as the cause. The
  * batch is not atomic: the message says exactly what it had already written.
  *
+ * **Offloaded fields** (#179). Every put routes and uploads its entity's
+ * offloaded values before any request is sent — a bound builder's to the
+ * blob store (and packed with the compressors) its `DynamoClient.make`
+ * bundled. Each upload settles by the requests that carry its pointer: kept
+ * once one of them is processed; deleted when the batch exits if DynamoDB
+ * provably applied none of them (refused, or left unprocessed by a response
+ * the SDK sent once, or a cancelled transaction of versioned puts); otherwise
+ * kept and reported to the `Offload.layerObserver` observer. An upload older
+ * than the store's `maxUploadAge` when its request is due fails the batch with
+ * `BlobStoreError { reason: "Expired" }`, saying what the batch had already
+ * written. An op over a member that offloads a field adds `BlobStoreError` to
+ * the error type; a plain op, or one typed `any`, adds nothing.
+ *
  * ```typescript
  * yield* Batch.write([
  *   Users.put({ userId: "u-3", ... }),
@@ -270,16 +316,54 @@ const committedBeforeRequest = (
  * ])
  * ```
  */
-export const write = (
-  operations: ReadonlyArray<BatchWriteOp>,
+export const write = <const T extends ReadonlyArray<BatchWriteOp>>(
+  operations: T,
   config?: BatchRetryConfig,
-): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
-  Capacity.operation("Batch.write", undefined, writeCore(operations, config))
+): Effect.Effect<
+  void,
+  DynamoClientError | ValidationError | WriteOpBlobErrors<T[number]>,
+  DynamoClient | TableConfig
+> =>
+  Capacity.operation(
+    "Batch.write",
+    undefined,
+    BlobLedger.root(writeCore(operations, config)),
+  ) as Effect.Effect<
+    void,
+    DynamoClientError | ValidationError | WriteOpBlobErrors<T[number]>,
+    DynamoClient | TableConfig
+  >
+
+/** One op of a batch, built: its item (a put) or key (a delete), and what names it. */
+type BuiltWrite = {
+  readonly tableName: string
+  readonly entity: TransactableInfo["entity"]
+  readonly keyFields: ReadonlyArray<string>
+  readonly keys: () => KeyAttributes
+  /** The table and composed primary key, as one string: the same item, the same id. */
+  readonly id: string
+} & (
+  | {
+      readonly kind: "put"
+      readonly item: Record<string, unknown>
+      /** The item as built: what an entity that offloads nothing stores. */
+      readonly marshalled: Record<string, AttributeValue>
+      readonly captured: TransactableInfo["captured"]
+    }
+  | {
+      readonly kind: "delete"
+      readonly key: Record<string, AttributeValue>
+    }
+)
 
 const writeCore = (
   operations: ReadonlyArray<BatchWriteOp>,
   config?: BatchRetryConfig,
-): Effect.Effect<void, DynamoClientError | ValidationError, DynamoClient | TableConfig> =>
+): Effect.Effect<
+  void,
+  DynamoClientError | ValidationError | BlobStoreError,
+  DynamoClient | TableConfig
+> =>
   Effect.gen(function* () {
     if (operations.length === 0) return
     const maxRetries = config?.maxRetries ?? MAX_RETRIES
@@ -287,35 +371,18 @@ const writeCore = (
 
     const client = yield* Capacity.client
 
-    // Build write requests
-    const versionedPuts: Array<VersionedPut> = []
-    // Every key the batch touches, to refuse one touched twice when a versioned
-    // put is involved: its put runs in an earlier transaction than the batch's
-    // other requests, so a repeated key would be reordered or misreported.
-    const touched = new Map<string, number>()
-    const versionedKeys = new Map<string, string>()
-    const keyOf = (
+    const idOf = (
       tableName: string,
-      entity: {
-        readonly indexes: {
-          readonly primary?:
-            | { readonly pk: { readonly field: string }; readonly sk: { readonly field: string } }
-            | undefined
-        }
-      },
-      item: Record<string, AttributeValue>,
+      entity: TransactableInfo["entity"],
+      item: Readonly<Record<string, unknown>>,
     ) => {
       const primary = entity.indexes.primary!
       return JSON.stringify([tableName, item[primary.pk.field], item[primary.sk.field]])
     }
-    type WriteRequest = {
-      tableName: string
-      request: Record<string, any>
-      entityType: string
-      keyFields: ReadonlyArray<string>
-      keys: () => KeyAttributes
-    }
-    const writeRequests: Array<WriteRequest> = []
+
+    // 1. Build every op — local work only, so a refused op (the checks below,
+    //    an invalid input) leaves nothing uploaded.
+    const built: Array<BuiltWrite> = []
     for (const op of operations) {
       const info = extractTransactable(op)
       // A rejection belongs on the error channel, not as a defect — the caller
@@ -366,53 +433,35 @@ const writeCore = (
 
       if (info.opType === "put") {
         yield* rejectUnsupportedOp(entity, "batchWrite", "put", info.putKind, info.input)
-        const built = yield* validateAndBuildPutItem(entity, info.input!, "batchWrite.put")
-        // A versioned entity's put over an existing item continues its version
-        // (#133), which a blind BatchWriteItem cannot — it would reset the item
-        // to version 1 under a new incarnation. Such puts go out as create-only
-        // TransactWriteItems Puts (`attribute_not_exists`) instead: no read, no
-        // window between a check and the write.
-        const key = keyOf(tableName, entity, built.marshalled)
-        touched.set(key, (touched.get(key) ?? 0) + 1)
-        if (entity._incarnationToken) {
-          versionedKeys.set(key, entity.entityType)
-          const transactItem: TransactWriteItem = {
-            Put: {
-              TableName: tableName,
-              Item: built.marshalled,
-              ConditionExpression: "attribute_not_exists(#pk)",
-              ExpressionAttributeNames: { "#pk": entity.indexes.primary!.pk.field },
-            },
-          }
-          versionedPuts.push({
-            tableName,
-            entityType: entity.entityType,
-            transactItem,
-            keyFields,
-            keys,
-          })
-        } else {
-          writeRequests.push({
-            tableName,
-            request: { PutRequest: { Item: built.marshalled } },
-            entityType: entity.entityType,
-            keyFields,
-            keys,
-          })
-        }
-      } else if (info.opType === "delete") {
-        yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
-        const composed = toAttributeMap(
-          yield* composePrimaryKeyOrFail(entity, info.key!, "batchWrite.delete"),
+        // Packed under the op's captured compressor registry, when it is a
+        // bound builder (§3.6): a compressor given only to `DynamoClient.make`
+        // reaches it.
+        const { item, marshalled } = yield* underCaptured(
+          info.captured,
+          validateAndBuildPutItem(entity, info.input!, "batchWrite.put"),
         )
-        const key = keyOf(tableName, entity, composed)
-        touched.set(key, (touched.get(key) ?? 0) + 1)
-        writeRequests.push({
+        built.push({
+          kind: "put",
           tableName,
-          request: { DeleteRequest: { Key: composed } },
-          entityType: entity.entityType,
+          entity,
           keyFields,
           keys,
+          id: idOf(tableName, entity, item),
+          item,
+          marshalled,
+          captured: info.captured,
+        })
+      } else if (info.opType === "delete") {
+        yield* rejectUnsupportedOp(entity, "batchWrite", "delete", undefined)
+        const composed = yield* composePrimaryKeyOrFail(entity, info.key!, "batchWrite.delete")
+        built.push({
+          kind: "delete",
+          tableName,
+          entity,
+          keyFields,
+          keys,
+          id: idOf(tableName, entity, composed),
+          key: toAttributeMap(composed),
         })
       } else {
         return yield* new ValidationError({
@@ -425,15 +474,97 @@ const writeCore = (
       }
     }
 
-    for (const [key, entityType] of versionedKeys) {
-      if ((touched.get(key) ?? 0) > 1) {
+    // Every key the batch touches, to refuse one touched twice when a versioned
+    // put is involved: its put runs in an earlier transaction than the batch's
+    // other requests, so a repeated key would be reordered or misreported.
+    const touched = new Map<string, number>()
+    for (const write of built) touched.set(write.id, (touched.get(write.id) ?? 0) + 1)
+    for (const write of built) {
+      if (write.kind !== "put" || !write.entity._incarnationToken) continue
+      if ((touched.get(write.id) ?? 0) > 1) {
         return yield* new ValidationError({
-          entityType,
+          entityType: write.entity.entityType,
           operation: "batchWrite",
           cause:
             "Batch.write touches the same item more than once alongside a versioned put. " +
             "Versioned puts are written as separate create-only transactions, so the batch's " +
             "operations on that item could not keep their order. Nothing was written.",
+        })
+      }
+    }
+
+    // 2. Offloaded fields (#179, design §6.6): every put routes and uploads —
+    //    under its captured blob store when it is a bound builder (§3.6) —
+    //    before any request is sent. The uploads are the batch's ledger's: each
+    //    settles by the request that carries its pointer. A failed upload
+    //    fails the batch once the others have settled; nothing was sent.
+    yield* forEachSettled(
+      built.filter((write) => write.kind === "put" && write.entity._offloads),
+      (write) =>
+        write.kind === "put"
+          ? Effect.asVoid(
+              underCaptured(
+                write.captured,
+                write.entity._offloadItem(write.item, write.tableName, "batchWrite.put"),
+              ),
+            )
+          : Effect.void,
+    )
+
+    // 3. The requests.
+    const versionedPuts: Array<VersionedPut> = []
+    type WriteRequest = {
+      tableName: string
+      request: Record<string, any>
+      entityType: string
+      keyFields: ReadonlyArray<string>
+      keys: () => KeyAttributes
+    }
+    const writeRequests: Array<WriteRequest> = []
+    for (const write of built) {
+      const { tableName, entity, keyFields, keys } = write
+      if (write.kind === "delete") {
+        writeRequests.push({
+          tableName,
+          request: { DeleteRequest: { Key: write.key } },
+          entityType: entity.entityType,
+          keyFields,
+          keys,
+        })
+        continue
+      }
+      // Routed above when the entity offloads a field: marshalled again.
+      const marshalled = entity._offloads
+        ? yield* marshalPutItem(entity, write.item, "batchWrite.put")
+        : write.marshalled
+      // A versioned entity's put over an existing item continues its version
+      // (#133), which a blind BatchWriteItem cannot — it would reset the item
+      // to version 1 under a new incarnation. Such puts go out as create-only
+      // TransactWriteItems Puts (`attribute_not_exists`) instead: no read, no
+      // window between a check and the write.
+      if (entity._incarnationToken) {
+        const transactItem: TransactWriteItem = {
+          Put: {
+            TableName: tableName,
+            Item: marshalled,
+            ConditionExpression: "attribute_not_exists(#pk)",
+            ExpressionAttributeNames: { "#pk": entity.indexes.primary!.pk.field },
+          },
+        }
+        versionedPuts.push({
+          tableName,
+          entityType: entity.entityType,
+          transactItem,
+          keyFields,
+          keys,
+        })
+      } else {
+        writeRequests.push({
+          tableName,
+          request: { PutRequest: { Item: marshalled } },
+          entityType: entity.entityType,
+          keyFields,
+          keys,
         })
       }
     }
@@ -461,6 +592,7 @@ const writeCore = (
       let retries = 0
       while (true) {
         const cancelled = yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
+          Effect.mapError((error) => expiredWithCommitted(error, committed)),
           Effect.as(undefined),
           // A limit DynamoDB enforced (#144) — an oversized item, the 4 MB
           // payload, an over-long sort key — named. Such a rejection carries no
@@ -584,6 +716,7 @@ const writeCore = (
           writeRequests.length - chunkStart - chunk.length,
         )
         const response = yield* client.batchWriteItem({ RequestItems: sentItems }).pipe(
+          Effect.mapError((error) => expiredWithCommitted(error, committed)),
           // An oversized item or over-long sort key (#144), named, with what
           // the batch had already written: Batch.write was never atomic.
           diagnoseFailure({

@@ -12,7 +12,11 @@
  *   (item-size diagnosis, `Batch.write` chunking) therefore sees stored bytes.
  * - **Read:** after `fromAttributeMap`, before sparse rebuild and renames —
  *   {@link unpackItem} dispatches each dispatch-eligible attribute on its
- *   stored form (native → unchanged, `S` → JSON, `B` → header + payload).
+ *   stored form (native → unchanged, `S` → JSON, `B` → header + payload). A
+ *   `B` blob pointer (an offloaded value, #179) is refused here with a
+ *   `ValidationError` naming it ({@link unpackStoredValueSync}): these steps
+ *   are synchronous and do no I/O. The members' read paths load rows through
+ *   `OffloadRead.loadRows`, which resolves pointers.
  * - **Streams:** {@link normalizeImage} turns a Streams image (DynamoDB JSON,
  *   `B`/`BS` as bytes or base64, or an already-unmarshalled item) into an
  *   unmarshalled item with real bytes, and {@link unpackImageItem} additionally
@@ -33,8 +37,15 @@ import {
   type CompressionRegistry,
   empty as emptyRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
-import type { CompressionCodec, PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
+import type {
+  CompressionCodec,
+  ExternalConfig,
+  ExternalPackedConfig,
+  PackedConfig,
+} from "@effect-dynamodb/schema/DynamoModel.js"
+import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { isBlobPointer } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import {
   isBase64PackedText,
@@ -42,13 +53,14 @@ import {
   type PackedContext,
   type PackedStored,
   packValueSync,
-  unpackBytesSync,
   unpackStoredSync,
+  unresolvedPointer,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { Context, Effect, Result } from "effect"
 import { Base64 } from "effect/encoding"
 import { fromAttributeMap } from "../Marshaller.js"
-import type { QueryRawRow } from "../Query.js"
+import type { QueryPrefetch, QueryRawRow } from "../Query.js"
+import type { Modes } from "./BlobResolver.js"
 import type { Expr, Operand } from "./Expr.js"
 
 export type { PackedContext, PackedStored } from "@effect-dynamodb/schema/internal/PackedCodec.js"
@@ -103,7 +115,9 @@ export interface CodecRequirement {
 /** The codecs `configs` (stored attribute → packed config) name. */
 export const codecRequirements = (
   owner: string,
-  configs: Iterable<readonly [attribute: string, config: PackedConfig | undefined]>,
+  configs: Iterable<
+    readonly [attribute: string, config: PackedConfig | ExternalPackedConfig | undefined]
+  >,
 ): Array<CodecRequirement> => {
   const out: Array<CodecRequirement> = []
   for (const [attribute, config] of configs) {
@@ -179,7 +193,7 @@ export const runtimeCodecCheck = (
  */
 export const packItemSync = (
   item: Record<string, unknown>,
-  packed: Readonly<Record<string, PackedConfig>>,
+  packed: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>,
   registry: CompressionRegistry,
   ctx: ItemContext,
 ): ValidationError | undefined => {
@@ -196,7 +210,7 @@ export const packItemSync = (
 /** {@link packItemSync} as an Effect. */
 export const packItem = (
   item: Record<string, unknown>,
-  packed: Readonly<Record<string, PackedConfig>>,
+  packed: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>,
   registry: CompressionRegistry,
   ctx: ItemContext,
 ): Effect.Effect<void, ValidationError> => {
@@ -217,7 +231,7 @@ export const storedToAttributeValue = (stored: PackedStored): AttributeValue | u
  * `SET #f = :v`, where the value never passes through `toAttributeMap`.
  */
 export const packAttributeValue = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: PackedContext,
@@ -226,7 +240,7 @@ export const packAttributeValue = (
 
 /** {@link packAttributeValue} without an Effect: the value, or the failure (returned). */
 export const packAttributeValueSync = (
-  config: PackedConfig,
+  config: PackedConfig | ExternalPackedConfig,
   wire: unknown,
   registry: CompressionRegistry,
   ctx: ItemContext,
@@ -239,6 +253,24 @@ export const packAttributeValueSync = (
 // ---------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------
+
+/**
+ * `unpackStoredSync` for the synchronous steps here: the JSON wire form, or
+ * the `ValidationError` it fails with (returned, never thrown). A blob pointer
+ * (an offloaded value, #179) is refused with a `ValidationError` naming the
+ * attribute and the object version it pins — a synchronous step cannot fetch
+ * it (`OffloadRead.loadRows` resolves pointers) — so stored data never reads
+ * as the pointer itself.
+ */
+export const unpackStoredValueSync = (
+  stored: string | Uint8Array,
+  registry: CompressionRegistry,
+  ctx: ItemContext,
+  attribute: string,
+): unknown => {
+  const wire = unpackStoredSync(stored, registry, ctx, attribute)
+  return isBlobPointer(wire) ? unresolvedPointer(ctx, attribute, wire) : wire
+}
 
 /**
  * True iff any listed attribute of `raw` holds a string or bytes — a value
@@ -270,7 +302,7 @@ export const unpackItemSync = (
   for (const attribute of attributes) {
     const value = ownValue(raw, attribute)
     if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
-    const wire = unpackStoredSync(value, registry, ctx, attribute)
+    const wire = unpackStoredValueSync(value, registry, ctx, attribute)
     if (wire instanceof ValidationError) return wire
     setOwn(raw, attribute, wire)
   }
@@ -381,7 +413,7 @@ const imageError = (ctx: ItemContext, message: string, cause?: unknown): Validat
   })
 
 /** Decode base64 text (or pass bytes through), or the failure naming the attribute. */
-const toBytesSync = (
+export const toBytesSync = (
   value: unknown,
   ctx: ItemContext,
   attribute: string,
@@ -541,7 +573,7 @@ export const normalizeImage = (
 /**
  * {@link unpackItemSync} for a normalised **unmarshalled** stream image: on a
  * listed attribute, a string that is base64 of a `B` value (it starts with
- * `I`–`P`, which JSON text never does — see `PackedCodec.isBase64PackedText`)
+ * `I`–`X`, which JSON text never does — see `PackedCodec.isBase64PackedText`)
  * is decoded to bytes and read as `B`; any other string is JSON.
  */
 export const unpackImageItemSync = (
@@ -555,13 +587,13 @@ export const unpackImageItemSync = (
     if (typeof value === "string" && isBase64PackedText(value)) {
       const bytes = toBytesSync(value, ctx, attribute)
       if (bytes instanceof ValidationError) return bytes
-      const wire = unpackBytesSync(bytes, registry, ctx, attribute)
+      const wire = unpackStoredValueSync(bytes, registry, ctx, attribute)
       if (wire instanceof ValidationError) return wire
       setOwn(raw, attribute, wire)
       continue
     }
     if (typeof value !== "string" && !(value instanceof Uint8Array)) continue
-    value = unpackStoredSync(value, registry, ctx, attribute)
+    value = unpackStoredValueSync(value, registry, ctx, attribute)
     if (value instanceof ValidationError) return value
     setOwn(raw, attribute, value)
   }
@@ -611,7 +643,7 @@ export const decodeImageSync = (
  *
  * In DynamoDB JSON the `S` / `B` tag says what each value is; in an
  * unmarshalled image a string on a listed attribute is read as base64 `B`
- * when it starts with `I`–`P` (see {@link unpackImageItemSync}).
+ * when it starts with `I`–`X` (see {@link unpackImageItemSync}).
  */
 export const decodeImage = (
   image: StreamImage,
@@ -626,21 +658,28 @@ export const decodeImage = (
 // ---------------------------------------------------------------------------
 
 /**
- * A packed attribute an expression or projection may not look inside: DynamoDB
- * sees one opaque `S` or `B` value, so a path below it, or any operator but
- * `attribute_exists` / `attribute_not_exists` on it as a whole, can never
- * match what the reader means.
+ * A packed or External attribute an expression or projection may not look
+ * inside: DynamoDB sees one opaque `S` or `B` value (packed JSON, or a blob
+ * pointer), so a path below it, or any operator but `attribute_exists` /
+ * `attribute_not_exists` on it as a whole, can never match what the reader
+ * means.
  */
 export interface PackedAttributeGuard {
   /** The stored (top-level) attribute name. */
   readonly attribute: string
   /** Who stores it, for the message — e.g. `EventStream "Ledger"`. */
   readonly owner: string
-  /** Its storage config (the message names the format). */
-  readonly storedAs: PackedConfig
+  /** Its storage config (the message names the format, or the External content type). */
+  readonly storedAs: PackedConfig | ExternalPackedConfig | ExternalConfig
   /** What to do instead, given the refused path as written (`data.amount`). */
   readonly alternative: (path: string) => string
 }
+
+/** How a guarded attribute is stored, for the messages: `packed (format "json")` / `External (…)`. */
+const storageOf = (storedAs: PackedAttributeGuard["storedAs"]): string =>
+  "format" in storedAs
+    ? `packed (format "${storedAs.format}")`
+    : `External (content type "${storedAs.contentType}", in the blob store)`
 
 /** Render path segments as written: `data.items[0].sku`. */
 export const formatPath = (segments: ReadonlyArray<string | number>): string =>
@@ -670,8 +709,8 @@ const refusal = (
   path: string,
   problem: string,
 ): string =>
-  `[EDD-9076] ${guard.owner}: the ${usage} ${problem}, but \`${guard.attribute}\` is stored packed ` +
-  `(format "${guard.storedAs.format}"): DynamoDB sees one opaque string or binary value and ` +
+  `[EDD-9076] ${guard.owner}: the ${usage} ${problem}, but \`${guard.attribute}\` is stored ` +
+  `${storageOf(guard.storedAs)}: DynamoDB sees one opaque string or binary value and ` +
   "cannot evaluate a path inside it, or compare it — only attribute_exists / " +
   `attribute_not_exists apply to it as a whole. ${guard.alternative(path)}`
 
@@ -789,9 +828,9 @@ export const packedProjectionRefusal = (
     const path = segments.length === 1 ? head : formatPath(segments)
     return (
       `[EDD-9076] ${guard.owner}: the projection names "${path}", but \`${guard.attribute}\` is ` +
-      `stored packed (format "${guard.storedAs.format}"): DynamoDB holds it as one opaque string or ` +
-      `binary value and cannot project a path inside it. Select "${guard.attribute}" whole — a ` +
-      "projected packed attribute comes back as its parsed JSON."
+      `stored ${storageOf(guard.storedAs)}: DynamoDB holds it as one opaque string or ` +
+      `binary value and cannot project a path inside it. Select ` +
+      `"${guard.attribute}" whole — a projected packed attribute comes back as its parsed JSON.`
     )
   }
   return undefined
@@ -810,14 +849,51 @@ export interface PackedEntityLike {
     | undefined
   /** The stored attributes `_unpackFields` reads by stored form (packed ∪ dispatch-eligible). */
   readonly _dispatchAttributes?: ReadonlyArray<string> | undefined
+  /**
+   * Load a batch of the entity's stored-name rows (#179): unpack by stored
+   * form and resolve blob pointers per the read's modes (see
+   * `OffloadRead.loadRows`). Supersedes `_unpackFields` where present.
+   */
+  readonly _loadRows?:
+    | ((
+        rows: ReadonlyArray<Record<string, unknown>>,
+        options: {
+          readonly operation: string
+          readonly modes: Modes
+          readonly raw?: boolean | undefined
+        },
+      ) => Effect.Effect<void, ValidationError | BlobStoreError>)
+    | undefined
+  /** The stored attributes `_loadRows` may rewrite (a projection naming none runs no hook). */
+  readonly _readAttributes?: ReadonlyArray<string> | undefined
 }
+
+type RowLoader = (
+  raw: Record<string, unknown>,
+  modes: Modes,
+) => Effect.Effect<unknown, ValidationError | BlobStoreError>
+
+/** How a raw row of `entity` is read: `_loadRows` in raw form, or `_unpackFields`. */
+const rawLoaderOf = (entity: PackedEntityLike): RowLoader | undefined => {
+  const load = entity._loadRows
+  if (load !== undefined) {
+    return (raw, modes) => load([raw], { operation: "query.select", modes, raw: true })
+  }
+  const unpack = entity._unpackFields
+  return unpack === undefined ? undefined : (raw) => unpack(raw)
+}
+
+/** The attributes `rawLoaderOf(entity)` may rewrite. */
+const rawAttributesOf = (entity: PackedEntityLike): ReadonlyArray<string> | undefined =>
+  entity._loadRows !== undefined ? entity._readAttributes : entity._dispatchAttributes
 
 /**
  * The raw-row hook of one entity type's projections (`Query.select` /
  * `selectPaths`): reads `attributes` of the type's **own** rows by their stored
- * form, and hands every other row back untouched. `ignoreOwnership()` lets
- * rows of other types through, and their plain strings must never be parsed
- * as packed JSON. The type is read from `__edd_e__`, borrowed into the
+ * form — and resolves their blob pointers per the query's modes (#179) —
+ * and hands every other row back untouched. `ignoreOwnership()` lets rows of
+ * other types through, and their plain strings must never be parsed as
+ * packed JSON. The type is read from `__edd_e__`, borrowed into the
  * projection (and stripped again) when the caller did not select it; a row
  * without it is not attributable, so it is left as is. No hook when there is
  * nothing to read, and none on a projection that names none of `attributes`.
@@ -825,63 +901,110 @@ export interface PackedEntityLike {
 export const ownRowsRawRow = (
   entityType: string,
   attributes: ReadonlyArray<string> | undefined,
-  unpack: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>,
+  unpack: RowLoader,
 ): QueryRawRow | undefined =>
   attributes !== undefined && attributes.length === 0
     ? undefined
     : Object.assign(
-        (raw: Record<string, unknown>) =>
-          raw.__edd_e__ === entityType ? Effect.as(unpack(raw), raw) : Effect.succeed(raw),
+        (raw: Record<string, unknown>, modes: Modes) =>
+          raw.__edd_e__ === entityType ? Effect.as(unpack(raw, modes), raw) : Effect.succeed(raw),
         { reads: ["__edd_e__"], attributes },
       )
 
-/** `Query.make` options for the queries of one entity: guards + raw-row unpack. */
+/**
+ * The page prefetch of an entity's queries (#179, design §8.2): its rows of a
+ * window loaded together — every row (a decoder reads them as the entity's),
+ * or, for a projection, only the entity's own rows (see {@link ownRowsRawRow}).
+ */
+const entityPrefetch = (entity: PackedEntityLike): QueryPrefetch | undefined => {
+  const load = entity._loadRows
+  if (load === undefined || entity._readAttributes?.length === 0) return undefined
+  return (rows, { modes, raw, operation }) =>
+    load(raw ? rows.filter((row) => row.__edd_e__ === entity.entityType) : rows, {
+      operation,
+      modes,
+      raw,
+    })
+}
+
+/** `Query.make` options for the queries of one entity: guards, raw-row hook, page prefetch. */
 export const entityPackedQueryOptions = (
   entity: PackedEntityLike,
 ): {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
   readonly rawRow: QueryRawRow | undefined
+  readonly prefetch: QueryPrefetch | undefined
 } => {
-  const unpack = entity._unpackFields
+  const loader = rawLoaderOf(entity)
   return {
     packed: entity._packedGuards ?? [],
     rawRow:
-      unpack === undefined
+      loader === undefined
         ? undefined
-        : ownRowsRawRow(entity.entityType, entity._dispatchAttributes, (raw) => unpack(raw)),
+        : ownRowsRawRow(entity.entityType, rawAttributesOf(entity), loader),
+    prefetch: entityPrefetch(entity),
   }
 }
 
 /**
  * `Query.make` options for a query over several entities (a collection): every
- * member's guards (a path packed in any member is refused, naming it), and a
- * raw-row unpack by the member the row's `__edd_e__` names.
+ * member's guards (a path packed in any member is refused, naming it), a
+ * raw-row read by the member the row's `__edd_e__` names, and a page prefetch
+ * that loads each row by its member (rows of other types are left as they are).
  */
 export const collectionPackedQueryOptions = (
   members: ReadonlyArray<PackedEntityLike>,
 ): {
   readonly packed: ReadonlyArray<PackedAttributeGuard>
   readonly rawRow: QueryRawRow | undefined
+  readonly prefetch: QueryPrefetch | undefined
 } => {
   const byType = new Map(members.map((m) => [m.entityType, m]))
   const packed = members.flatMap((m) => m._packedGuards ?? [])
-  const unpacking = members.filter(
-    (m) => m._unpackFields !== undefined && m._dispatchAttributes?.length !== 0,
-  )
-  if (unpacking.length === 0) return { packed, rawRow: undefined }
+  const reading = members.filter((m) => {
+    const attributes = rawAttributesOf(m)
+    return rawLoaderOf(m) !== undefined && attributes?.length !== 0
+  })
+  const loaders = new Map(reading.map((m) => [m.entityType, rawLoaderOf(m)!]))
+  const prefetching = members.filter((m) => entityPrefetch(m) !== undefined)
+  const prefetch: QueryPrefetch | undefined =
+    prefetching.length === 0
+      ? undefined
+      : (rows, { modes, raw, operation }) => {
+          const byMember = new Map<PackedEntityLike, Array<Record<string, unknown>>>()
+          for (const row of rows) {
+            const member = byType.get(row.__edd_e__ as string)
+            if (member?._loadRows === undefined) continue
+            let group = byMember.get(member)
+            if (group === undefined) {
+              group = []
+              byMember.set(member, group)
+            }
+            group.push(row)
+          }
+          return Effect.forEach(
+            byMember,
+            ([member, group]) => member._loadRows!(group, { operation, modes, raw }),
+            { discard: true },
+          )
+        }
+  if (reading.length === 0) return { packed, rawRow: undefined, prefetch }
   // A row of a type that is not a member is never read (`ignoreOwnership()`).
-  const rawRow = (raw: Record<string, unknown>) => {
-    const member = byType.get(raw.__edd_e__ as string)
-    const unpack = member?._unpackFields
-    return unpack === undefined ? Effect.succeed(raw) : Effect.as(unpack(raw), raw)
+  const rawRow = (raw: Record<string, unknown>, modes: Modes) => {
+    const load = loaders.get(raw.__edd_e__ as string)
+    return load === undefined ? Effect.succeed(raw) : Effect.as(load(raw, modes), raw)
   }
   // The member is named by `__edd_e__`, so a projection that does not select
   // it still reads it (borrowed, then stripped — see `Query.QueryRawRow`); a
   // projection naming none of the members' read attributes runs no hook.
-  const attributes = unpacking.every((m) => m._dispatchAttributes !== undefined)
-    ? [...new Set(unpacking.flatMap((m) => m._dispatchAttributes ?? []))]
+  const attributes = reading.every((m) => rawAttributesOf(m) !== undefined)
+    ? [...new Set(reading.flatMap((m) => rawAttributesOf(m) ?? []))]
     : undefined
-  return { packed, rawRow: Object.assign(rawRow, { reads: ["__edd_e__"], attributes }) }
+  return {
+    packed,
+    rawRow: Object.assign(rawRow, { reads: ["__edd_e__"], attributes }),
+    prefetch,
+  }
 }
 
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")

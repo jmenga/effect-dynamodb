@@ -183,3 +183,35 @@ export interface RefValue {
   readonly entity: { readonly _tag: "Entity" }
   readonly cascade?: CascadeIndexConfig
 }
+
+/**
+ * Item-level offload settings of a member with offloaded fields
+ * (`Entity.make({ offload })`, `EventStore.makeStream({ offload })`, #179).
+ * See `DESIGN.md §7 "Offloaded Storage"`.
+ */
+export interface OffloadConfig {
+  /**
+   * Stored item bytes the library keeps an item under by offloading overflow
+   * fields (`Packed({ external })`), largest first, where it builds the whole
+   * item. A safe integer in 1 … 409,600. A routing decision, not a limit
+   * check: DynamoDB's own limits are still diagnosed from the failed request.
+   * Absent: thresholds only.
+   */
+  readonly itemBudget?: number | undefined
+  /**
+   * Replaces the store's prefix for every object key this member writes — a
+   * non-empty string of RFC 3986 unreserved characters and `/`, at most 256
+   * bytes, not starting with `/`. The bucket's IAM policy must cover it.
+   */
+  readonly prefix?: string | undefined
+}
+
+/** The resolved offload settings exposed on an entity (`entity.offload`). */
+export interface ResolvedOffload {
+  readonly itemBudget: number | undefined
+  readonly prefix: string | undefined
+  /** Domain names of the overflow fields (`Packed({ external })`). */
+  readonly overflow: ReadonlyArray<string>
+  /** Domain names of the binary fields (`External()`). */
+  readonly binary: ReadonlyArray<string>
+}

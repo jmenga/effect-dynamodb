@@ -27,7 +27,7 @@ import { Data, Effect, Exit } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
 import type { PutVerdict, WriteCancellationReason } from "../Entity.js"
 import { attributeValueEquals } from "./AttributeValueEquals.js"
-import { markNotSent } from "./Capacity.js"
+import { markNotSent, markRecording } from "./Capacity.js"
 
 /**
  * A planned write: its items, and how to read a cancellation of them — the
@@ -183,7 +183,9 @@ export const planWrite = <A, E, R>(
         ),
       )
     }
-    const recording: DynamoClientService = {
+    // Marked: its writes are recorded, not sent, so the upload ledger (#179)
+    // neither prepares nor settles them — the transaction carrying the plan does.
+    const recording: DynamoClientService = markRecording({
       ...real,
       getItem: (input) =>
         real.getItem(input).pipe(
@@ -204,7 +206,7 @@ export const planWrite = <A, E, R>(
       // through would send a write the plan never sees.
       executeStatement: () => Effect.die(new UnplannableWrite({ operation })),
       executeTransaction: () => Effect.die(new UnplannableWrite({ operation })),
-    }
+    })
     const exit = yield* Effect.exit(effect.pipe(Effect.provideService(DynamoClient, recording)))
     // Checked first: the op may have swallowed the defect, but a plan of only
     // its first write would silently drop the second.

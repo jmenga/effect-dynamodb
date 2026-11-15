@@ -314,6 +314,16 @@ v4: restored   { email: "alice@acme.com", displayName: "Alice Baker" }
 
 This provides a complete audit trail of the entity's lifecycle.
 
+## Offloaded Fields
+
+Fields [offloaded to a blob store](/effect-dynamodb/guides/blob-offload/) hold a pointer to one object version, and lifecycle rows **share** those versions instead of copying the objects:
+
+- **Retain snapshots and soft-delete tombstones** carry the live row's pointers, written in the same transaction as the write or delete they record, guarded by the live row. A snapshot of a 5 MB scan costs a pointer, not another 5 MB object.
+- **`restore`** writes the tombstone's pointers back to the live row. It uploads nothing.
+- **`purge`** deletes every row of the item, then every object version those rows named. It needs the `BlobStore` up front: without one it fails with `BlobStoreError { reason: "NotProvided" }` before any row is deleted. A version uploaded by a write that is racing the purge is left for the [sweep](/effect-dynamodb/guides/blob-offload/#sweeps).
+- **Garbage collection** frees a superseded version only once no row of the item holds it: on `retain` and `softDelete` entities the [reaper](/effect-dynamodb/guides/blob-offload/#the-reaper) confirm-reads the item's rows before deleting. A version a snapshot holds lives as long as the snapshot (a snapshot `ttl` releases it).
+- **Turning `retain` or `softDelete` off** while snapshot or tombstone rows still exist leaves rows that share the live row's versions, but the reaper no longer knows to look for them. Set `reaper: { confirm: "always" }` on the collector until those rows are gone.
+
 ## Transaction Composition
 
 When multiple features are enabled, entity operations compose into DynamoDB transactions automatically:

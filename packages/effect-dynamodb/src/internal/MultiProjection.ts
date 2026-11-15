@@ -9,6 +9,7 @@
  */
 
 import type {
+  BlobStoreError,
   ConcurrentModification,
   ProjectionSourceConflict,
   StreamRecordIdentifierMissing,
@@ -17,7 +18,14 @@ import type {
 import { given, ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { Duration, Effect, Option, Pipeable, Result, type Schedule } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
-import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
+import type {
+  EventStream,
+  StreamEvent,
+  StreamIdInput,
+  StreamMetadata,
+  StreamReadErrors,
+  StreamReadMode,
+} from "../EventStore.js"
 import type { TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import {
@@ -28,6 +36,7 @@ import {
   type IdentifyBySource,
   type IdentifyWith,
   type ProcessBatchOptions,
+  type ProjectionData,
   type ProjectionKey,
   type ProjectionOutboxConfig,
   type ProjectionReadModel,
@@ -36,6 +45,7 @@ import {
   type ProjectionRevision,
   ProjectionRoutes,
   type ProjectionState,
+  projectionReadMode,
   type Route,
   refuseReadModel,
   resolveOutbox,
@@ -65,31 +75,50 @@ import {
 // Sources
 // ---------------------------------------------------------------------------
 
-type AnyStream = EventStream<any, any, any, any, any, any, any>
+type AnyStream = EventStream<any, any, any, any, any, any, any, any>
 
-type EventOfStream<St> =
-  St extends EventStream<infer A, any, infer M, any, any, any, any>
-    ? StreamEvent<A, StreamMetadata<M>>
+/**
+ * The event a source's handlers receive from stream `St` in mode `Mode`
+ * (#179): a `LazyStreamEvent` when the stream offloads `data` and the
+ * projection is lazy (the default), a `StreamEvent` otherwise.
+ */
+type EventOfStream<St, Mode extends StreamReadMode> =
+  St extends EventStream<infer A, any, infer M, any, any, any, any, infer O>
+    ? StreamEvent<ProjectionData<A, O, Mode>, StreamMetadata<M>>
     : never
 type IdOfStream<St> =
-  St extends EventStream<any, infer F, any, any, any, any, any> ? StreamIdInput<F> : never
+  St extends EventStream<any, infer F, any, any, any, any, any, any> ? StreamIdInput<F> : never
+/** What stream `St` offloads (`EventStream`'s `TOffloaded`). */
+type OffloadedOfStream<St> =
+  St extends EventStream<any, any, any, any, any, any, any, infer O> ? O : never
 
 const MultiSourceTypeId: unique symbol = Symbol.for("effect-dynamodb/MultiProjection/Source")
 
-/** One source of a multi-source projection — built with the `source` helper. */
-export interface MultiSource<St extends AnyStream, K, S, E, R> {
+/**
+ * One source of a multi-source projection — built with the `source` helper.
+ * `Mode` is the projection's `offloaded` mode (#179).
+ */
+export interface MultiSource<
+  St extends AnyStream,
+  K,
+  S,
+  E,
+  R,
+  Mode extends StreamReadMode = "lazy",
+> {
   readonly [MultiSourceTypeId]: {
     readonly _St: St
     readonly _E: E
     readonly _R: R
+    readonly _Mode: Mode
   }
   readonly stream: St
   // Methods, not function properties: bivariant parameters, so any source is
   // an `AnySource` (the same reason `EventStream.writeSnapshot` is a method).
-  key(streamId: IdOfStream<St>, event: EventOfStream<St>): K | Option.Option<K>
+  key(streamId: IdOfStream<St>, event: EventOfStream<St, Mode>): K | Option.Option<K>
   evolve(
     state: S,
-    event: EventOfStream<St>,
+    event: EventOfStream<St, Mode>,
     context: EvolveContext,
   ): Effect.Effect<S | RemoveRow | SkipEvent, E, R>
   readonly mode: "fold" | "latest"
@@ -97,9 +126,16 @@ export interface MultiSource<St extends AnyStream, K, S, E, R> {
 }
 
 /** A source's configuration. */
-export interface MultiSourceConfig<St extends AnyStream, K, S, E, R> {
+export interface MultiSourceConfig<
+  St extends AnyStream,
+  K,
+  S,
+  E,
+  R,
+  Mode extends StreamReadMode = "lazy",
+> {
   /** The row an event contributes to — `Option.none()`: none. */
-  readonly key: (streamId: IdOfStream<St>, event: EventOfStream<St>) => K | Option.Option<K>
+  readonly key: (streamId: IdOfStream<St>, event: EventOfStream<St, Mode>) => K | Option.Option<K>
   /**
    * Fold one event into the row's state (the whole row: every source's part).
    * Sources interleave in any order across writes, so a source's `evolve` must
@@ -109,7 +145,7 @@ export interface MultiSourceConfig<St extends AnyStream, K, S, E, R> {
    */
   readonly evolve: (
     state: S,
-    event: EventOfStream<St>,
+    event: EventOfStream<St, Mode>,
     context: EvolveContext,
   ) => Effect.Effect<S | RemoveRow | SkipEvent, E, R>
   /**
@@ -125,21 +161,33 @@ export interface MultiSourceConfig<St extends AnyStream, K, S, E, R> {
 }
 
 /** The `source` helper `sources` receives. */
-export type SourceBuilder<K, S> = <St extends AnyStream, E = never, R = never>(
+export type SourceBuilder<K, S, Mode extends StreamReadMode = "lazy"> = <
+  St extends AnyStream,
+  E = never,
+  R = never,
+>(
   stream: St,
-  config: MultiSourceConfig<St, K, S, E, R>,
-) => MultiSource<St, K, S, E, R>
+  config: MultiSourceConfig<St, K, S, E, R, Mode>,
+) => MultiSource<St, K, S, E, R, Mode>
 
-type AnySource = MultiSource<any, any, any, any, any>
-type SourceStream<Src> = Src extends MultiSource<infer St, any, any, any, any> ? St : never
-type SourceError<Src> = Src extends MultiSource<any, any, any, infer E, any> ? E : never
-type SourceRequirements<Src> = Src extends MultiSource<any, any, any, any, infer R> ? R : never
+type AnySource = MultiSource<any, any, any, any, any, any>
+type SourceStream<Src> = Src extends MultiSource<infer St, any, any, any, any, any> ? St : never
+type SourceError<Src> = Src extends MultiSource<any, any, any, infer E, any, any> ? E : never
+type SourceRequirements<Src> = Src extends MultiSource<any, any, any, any, infer R, any> ? R : never
+type SourceMode<Src> = Src extends MultiSource<any, any, any, any, any, infer Mode> ? Mode : never
+/** The event a source's handlers receive (see `EventOfStream`). */
+type EventOfSource<Src> = EventOfStream<SourceStream<Src>, SourceMode<Src>>
+/** The blob errors a source's eager reads raise (#179). */
+type SourceReadErrors<Src> =
+  Src extends MultiSource<infer St, any, any, any, any, infer Mode>
+    ? StreamReadErrors<OffloadedOfStream<St>, "data", Mode>
+    : never
 
 /** A decoded event of one of the sources, tagged with the source's name. */
 export type MultiSourceEvent<Sources extends Record<string, AnySource>> = {
   readonly [N in keyof Sources & string]: {
     readonly stream: N
-    readonly event: EventOfStream<SourceStream<Sources[N]>>
+    readonly event: EventOfSource<Sources[N]>
   }
 }[keyof Sources & string]
 
@@ -195,12 +243,20 @@ export interface MultiProjectionConfig<
   RM extends ProjectionReadModel,
   Sources extends Record<string, AnySource>,
   O,
+  Mode extends StreamReadMode = "lazy",
 > {
   readonly readModel: RM
   /** The state a row starts from, before the first event folded into it. */
   readonly initial: (key: ProjectionKey<RM>) => ProjectionState<RM>
   /** The sources, built with the `source` helper: `(source) => ({ name: source(stream, { … }) })`. */
-  readonly sources: (source: SourceBuilder<ProjectionKey<RM>, ProjectionState<RM>>) => Sources
+  readonly sources: (source: SourceBuilder<ProjectionKey<RM>, ProjectionState<RM>, Mode>) => Sources
+  /**
+   * How events of sources whose `data` is offloaded (#179) reach the
+   * handlers: `"lazy"` (default) — a `LazyStreamEvent`, whose `data.read()`
+   * fetches the payload; `"eager"` — resolved, every payload fetched as the
+   * event is decoded or read.
+   */
+  readonly offloaded?: Mode | undefined
   readonly checkpoints: MultiCheckpoints<ProjectionState<RM>, keyof Sources & string>
   /** The revision field (required) — see `projection`'s `revision`. */
   readonly revision: ProjectionRevision<ProjectionState<RM>>
@@ -235,20 +291,20 @@ export type MultiInstanceResult<Sources extends Record<string, AnySource>> = {
   readonly [N in keyof Sources & string]: {
     readonly source: N
     readonly streamId: string
-    readonly applied: ReadonlyArray<EventOfStream<SourceStream<Sources[N]>>>
-    readonly alreadyApplied: ReadonlyArray<EventOfStream<SourceStream<Sources[N]>>>
+    readonly applied: ReadonlyArray<EventOfSource<Sources[N]>>
+    readonly alreadyApplied: ReadonlyArray<EventOfSource<Sources[N]>>
     readonly rejected: ReadonlyArray<{
-      readonly event: EventOfStream<SourceStream<Sources[N]>>
+      readonly event: EventOfSource<Sources[N]>
       readonly error: SourceError<Sources[N]>
     }>
     /** `"latest"` mode: the instance's older events in the batch, passed over. */
-    readonly superseded: ReadonlyArray<EventOfStream<SourceStream<Sources[N]>>>
+    readonly superseded: ReadonlyArray<EventOfSource<Sources[N]>>
     /**
      * The events `evolve` skipped (`EventStore.skipEvent`), in version order —
      * never in `applied`, and not below the instance's new checkpoint unless
      * a later event of it was applied or rejected.
      */
-    readonly skipped: ReadonlyArray<EventOfStream<SourceStream<Sources[N]>>>
+    readonly skipped: ReadonlyArray<EventOfSource<Sources[N]>>
     /** The instance's checkpoint after the call. */
     readonly version: number
   }
@@ -292,6 +348,7 @@ export interface MultiBatchResult<S, K, Sources extends Record<string, AnySource
 /** What a multi-source projection's operations fail with. */
 export type MultiProjectionError<RM, Sources extends Record<string, AnySource>> =
   | SourceError<Sources[keyof Sources]>
+  | SourceReadErrors<Sources[keyof Sources]>
   | ProjectionReadModelError<RM>
   | DynamoClientError
   | ValidationError
@@ -349,6 +406,11 @@ export interface MultiProjection<S, K, Sources extends Record<string, AnySource>
       readonly decodeFailures: ReadonlyArray<{
         readonly record: Rec
         readonly error: ValidationError
+      }>
+      /** See `projection.processBatch`'s `storeFailures`. */
+      readonly storeFailures: ReadonlyArray<{
+        readonly record: Rec
+        readonly error: BlobStoreError
       }>
       readonly failedRecords: ReadonlyArray<Rec>
       readonly response: { readonly batchItemFailures: Array<{ readonly itemIdentifier: string }> }
@@ -411,8 +473,9 @@ export const multiProjection = <
   RM extends ProjectionReadModel,
   Sources extends Record<string, AnySource>,
   O = never,
+  Mode extends StreamReadMode = "lazy",
 >(
-  config: MultiProjectionConfig<RM, Sources, O>,
+  config: MultiProjectionConfig<RM, Sources, O, Mode>,
 ): MultiProjection<
   ProjectionState<RM>,
   ProjectionKey<RM>,
@@ -440,6 +503,7 @@ export const multiProjection = <
   })) as Sources
   const names = Object.keys(sources)
   const label = `EventStore.multiProjection("${readModel.entityType}")`
+  const offloaded = projectionReadMode(label, config.offloaded)
   const mapped = (config.checkpoints.sources ?? {}) as Record<
     string,
     { readonly field: string; readonly offset?: number; readonly instanceField: string }
@@ -485,6 +549,7 @@ export const multiProjection = <
       key: src.key as EngineSource["key"],
       evolve: src.evolve as EngineSource["evolve"],
       mode: src.mode,
+      offloaded,
       terminal: src.terminal as EngineSource["terminal"],
     })
   }
@@ -777,9 +842,10 @@ export const multiProjection = <
         const ids = (given(named as object, name) ?? []) as ReadonlyArray<Record<string, string>>
         const source = engineSources[name]!
         for (const streamId of ids) {
-          const events = (yield* source.stream.read(streamId, { consistentRead: true })) as Array<
-            StreamEvent<unknown, unknown>
-          >
+          const events = (yield* source.stream.read(streamId, {
+            consistentRead: true,
+            offloaded,
+          })) as Array<StreamEvent<unknown, unknown>>
           const mine: Array<StreamEvent<unknown, unknown>> = []
           for (const event of events) {
             const k = addressed<K>(yield* engine.call("key", () => source.key(streamId, event)))
@@ -804,7 +870,9 @@ export const multiProjection = <
       name,
       tag,
       stream: engineSources[tag]!.stream as unknown as DecodableStream,
-      decode: (image: StreamImage) => engineSources[tag]!.stream.decodeStreamImage(image),
+      offloaded,
+      decode: (image: StreamImage) =>
+        engineSources[tag]!.stream.decodeStreamImage(image, { offloaded }),
       applyBatch: (events, applyOptions) =>
         applyBatch(events as ReadonlyArray<Tagged>, applyOptions) as never,
     }))

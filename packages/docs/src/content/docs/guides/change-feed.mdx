@@ -95,6 +95,25 @@ const projectAll = runChangeFeed(
 
 `EventStore.processBatch` reads the change-feed records as they come: the SDK's `GetRecords` records have the shape a Lambda event source mapping delivers (`eventID`, `eventName`, `dynamodb.SequenceNumber`, `dynamodb.NewImage`), with binary attributes as bytes.
 
+### Offloaded event data
+
+For a stream whose event `data` is [offloaded to a blob store](/effect-dynamodb/guides/blob-offload/#eventstore-streams) (`storedAs: { data: Packed({ ..., external }) }`), projections receive `LazyStreamEvent`s by default: `event.data` is an `OffloadedValue`, fetched only by `yield* event.data.read()`. A projection defined with `{ offloaded: "eager" }` receives resolved events instead; see [Offloaded event data](/effect-dynamodb/guides/projections/#offloaded-event-data). The feed needs a `BlobStore` wherever `runChangeFeed` runs: its first batch over such a stream without one is the `[EDD-9115]` defect. A record whose decode fails reading the store is retried (it is reported in the result's `storeFailures`), never treated as a poison record.
+
+### Garbage collection beside projections
+
+The [reaper](/effect-dynamodb/guides/blob-offload/#the-reaper) that frees superseded offloaded versions is a batch processor of stream records, so it can run inside the feed you already consume, rather than as another reader of the shard (AWS advises at most two simultaneous readers per shard). Call it from `onBatch`, which runs before the batch is acknowledged; a feed's records don't name their table, so pass the batch's stream:
+
+```typescript
+const gc = yield* BlobGc.make({ entities: { Documents } })
+
+yield* runChangeFeed(changeFeed({ streamArn }), {
+  projections: { summaries: OrderSummaryProjection },
+  onBatch: (batch) => Effect.asVoid(gc.reap(batch.records, { table: batch.streamArn })),
+})
+```
+
+The reaper waits until a batch's newest candidate record is its grace old (15 minutes by default) before deleting, so it slows that shard's acknowledgements by up to the grace. A reaper failure ends the run before the acknowledgement, and the batch is read again on restart; deletes are idempotent, so reading it twice is harmless.
+
 ## Consuming batches yourself
 
 `changeFeed` is a `Stream` of `ChangeFeedBatch`es. Each holds one shard's records, in sequence order, together with the shard id and the first and last sequence numbers:

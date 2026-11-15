@@ -1,6 +1,8 @@
 /**
  * `DynamoModel.Packed` — config validation (EDD-9071), defaults, the brand
- * guard, `configure` integration and `getPackedFields` / `ExtractPackedFields`.
+ * guard, `configure` integration and `getPackedFields` / `ExtractPackedFields`;
+ * the `external` option (#179: EDD-9141, the 65,536 default, the
+ * `ExternalPackedConfig` overload).
  */
 import { Schema } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
@@ -29,6 +31,8 @@ describe("DynamoModel.Packed", () => {
     expect(DynamoModel.isPackedConfig(config)).toBe(true)
     expect(config.format).toBe("json")
     expect(config.compression).toBeUndefined()
+    expect(config.external).toBeUndefined()
+    expect(DynamoModel.isExternalPackedConfig(config)).toBe(false)
     expect(Object.isFrozen(config)).toBe(true)
   })
 
@@ -114,6 +118,13 @@ describe("DynamoModel.Packed", () => {
     )
   })
 
+  it("refuses an unknown option key, naming external among the expected ones (EDD-9071)", () => {
+    expectEdd9071(
+      () => DynamoModel.Packed({ format: "json", offload: {} } as never),
+      'expected "format", optional "compression" and optional "external"',
+    )
+  })
+
   it("isPackedConfig rejects look-alikes", () => {
     expect(DynamoModel.isPackedConfig({ format: "json", compression: undefined })).toBe(false)
     expect(DynamoModel.isPackedConfig(DynamoModel.SparseMap())).toBe(false)
@@ -180,5 +191,125 @@ describe("configure with storedAs: Packed", () => {
       "lines" | "details"
     >()
     expectTypeOf<DynamoModel.ExtractPackedFields<typeof Order>>().toEqualTypeOf<never>()
+  })
+})
+
+const expectEdd9141 = (thunk: () => unknown, fragment: string) => {
+  expect(thunk).toThrow(/\[EDD-9141\] DynamoModel\.Packed:/)
+  expect(thunk).toThrow(fragment)
+}
+
+describe("DynamoModel.Packed({ external })", () => {
+  it("defaults the threshold to 65,536 stored bytes", () => {
+    const config = DynamoModel.Packed({ format: "json", external: {} })
+    expect(config.external).toEqual({ threshold: 65_536 })
+    expect(DynamoModel.DEFAULT_EXTERNAL_THRESHOLD).toBe(65_536)
+    expect(DynamoModel.isPackedConfig(config)).toBe(true)
+    expect(DynamoModel.isExternalPackedConfig(config)).toBe(true)
+    expect(Object.isFrozen(config)).toBe(true)
+    expect(Object.isFrozen(config.external)).toBe(true)
+  })
+
+  it("keeps an explicit threshold, including 0 (always offload)", () => {
+    expect(
+      DynamoModel.Packed({ format: "json", external: { threshold: 131_072 } }).external,
+    ).toEqual({ threshold: 131_072 })
+    expect(DynamoModel.Packed({ format: "json", external: { threshold: 0 } }).external).toEqual({
+      threshold: 0,
+    })
+    expect(
+      DynamoModel.Packed({ format: "json", external: { threshold: undefined } }).external,
+    ).toEqual({ threshold: 65_536 })
+  })
+
+  it("combines with compression; both settings are resolved", () => {
+    const config = DynamoModel.Packed({
+      format: "json",
+      compression: { codec: "zstd", threshold: 0 },
+      external: { threshold: 1000 },
+    })
+    expect(config.compression).toEqual({ codec: "zstd", threshold: 0 })
+    expect(config.external).toEqual({ threshold: 1000 })
+  })
+
+  it("treats external: undefined as a plain packed config", () => {
+    const config = DynamoModel.Packed({ format: "json", external: undefined })
+    expect(config.external).toBeUndefined()
+    expect(DynamoModel.isExternalPackedConfig(config)).toBe(false)
+  })
+
+  it("refuses an external option that is not an object (EDD-9141)", () => {
+    for (const external of [null, 5, "big", true, [1]]) {
+      expectEdd9141(
+        () => DynamoModel.Packed({ format: "json", external } as never),
+        "external must be an object",
+      )
+    }
+  })
+
+  it("refuses an unknown external key (EDD-9141)", () => {
+    expectEdd9141(
+      () => DynamoModel.Packed({ format: "json", external: { limit: 5 } } as never),
+      'unknown external option "limit"',
+    )
+  })
+
+  it("refuses a threshold that is not a non-negative safe integer (EDD-9141)", () => {
+    for (const threshold of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, "65536"]) {
+      expectEdd9141(
+        () => DynamoModel.Packed({ format: "json", external: { threshold } } as never),
+        "external.threshold must be a non-negative safe integer",
+      )
+    }
+  })
+
+  it("isExternalPackedConfig rejects other configs", () => {
+    expect(DynamoModel.isExternalPackedConfig(DynamoModel.External())).toBe(false)
+    expect(DynamoModel.isExternalPackedConfig(DynamoModel.SparseMap())).toBe(false)
+    expect(DynamoModel.isExternalPackedConfig({ external: { threshold: 1 } })).toBe(false)
+    expect(DynamoModel.isExternalPackedConfig(null)).toBe(false)
+  })
+
+  it("returns ExternalPackedConfig only from the external overload", () => {
+    expectTypeOf(
+      DynamoModel.Packed({ format: "json", external: {} }),
+    ).toEqualTypeOf<DynamoModel.ExternalPackedConfig>()
+    expectTypeOf(DynamoModel.Packed({ format: "json" })).toEqualTypeOf<DynamoModel.PackedConfig>()
+    // Options typed as the plain `PackedOptions` cannot carry `external`, so a
+    // config the type level would not see as offloaded is never returned.
+    const plain: DynamoModel.PackedOptions = { format: "json" }
+    expectTypeOf(DynamoModel.Packed(plain)).toEqualTypeOf<DynamoModel.PackedConfig>()
+    // @ts-expect-error — `external` is not part of the plain options
+    const withExternal: DynamoModel.PackedOptions = { format: "json", external: {} }
+    void withExternal
+    // The two configs are disjoint: a plain config is not an overflow config,
+    // and an overflow config cannot be widened to a plain one — the type level
+    // would then read it as inline and drop its blob-store errors.
+    expectTypeOf<DynamoModel.PackedConfig>().not.toExtend<DynamoModel.ExternalPackedConfig>()
+    expectTypeOf<DynamoModel.ExternalPackedConfig>().not.toExtend<DynamoModel.PackedConfig>()
+    // @ts-expect-error — an overflow config is not a PackedConfig
+    const widened: DynamoModel.PackedConfig = DynamoModel.Packed({
+      format: "json",
+      external: { threshold: 0 },
+    })
+    void widened
+    // Either is a packed config to the guard.
+    const either = DynamoModel.Packed({ format: "json", external: {} }) as unknown
+    if (DynamoModel.isPackedConfig(either)) {
+      expectTypeOf(either).toEqualTypeOf<
+        DynamoModel.PackedConfig | DynamoModel.ExternalPackedConfig
+      >()
+    }
+  })
+
+  it("configure stores an overflow config as packed; getPackedFields includes it", () => {
+    const external = DynamoModel.Packed({ format: "json", external: { threshold: 0 } })
+    const model = DynamoModel.configure(Order, {
+      lines: { field: "l", immutable: true, storedAs: external },
+    })
+    expect(model.attributes.lines).toEqual({ field: "l", immutable: true, packed: external })
+    expect(model.attributes.lines?.external).toBeUndefined()
+    expect(DynamoModel.getPackedFields(model)).toEqual({ lines: external })
+    expectTypeOf<DynamoModel.ExtractPackedFields<typeof model>>().toEqualTypeOf<"lines">()
   })
 })

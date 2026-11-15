@@ -357,6 +357,16 @@ timeSeries: { orderBy: "timestamp", appendInput: ... },
 
 Current SKs become `$app#v1#telemetry#status` and `$app#v1#telemetry#diagnostics`; event SKs extend to `$app#v1#telemetry#status#e#<value>` etc. `.history({ channel, deviceId, stream: "status" })` narrows to one stream. The `stream` field must also appear in `appendInput` so each append can address a specific stream.
 
+## Offloaded fields
+
+A time-series entity can [offload](/effect-dynamodb/guides/blob-offload/) fields in `appendInput` to a blob store. Each `.append()` uploads the offloaded values it carries under a key derived from the **event** item, then writes the current item and the event item in one transaction, both holding the same pointer. So:
+
+- **A hot series never piles versions onto one key** (S3 throttles a key with very many versions): every event has its own object.
+- **The current item and the newest event share a version.** When a later append supersedes the current item's pointer, the version is still held by the event item, so the [reaper](/effect-dynamodb/guides/blob-offload/#the-reaper) confirm-reads the item's rows before freeing anything.
+- **An event item's objects live as long as the event.** With `ttl`, DynamoDB's TTL delete is a `REMOVE` record that frees them; **without `ttl`, events (and their objects) are kept forever**, until `purge`.
+- **Stale appends upload, then roll back.** The upload happens before the CAS check, so an append that turns out stale deletes its object again, and `.append()` fails with `StaleAppend` as it would without offloading.
+- **No item budget.** `.append()` has no read-merge path, so only field thresholds apply. Observer reports name the event item as the `rowKey`.
+
 ## Known limits (v1)
 
 - **Not transactable.** `.append()` is a `BoundEntity`-only terminal and cannot be composed into user-authored `Transaction.transactWrite` in v1.

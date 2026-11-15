@@ -135,7 +135,7 @@ jobs:
           # Or if a publishable package's version differs from base branch
           HAS_VERSION_BUMP=false
           git fetch origin ${{ github.base_ref }} --depth=1
-          for PKG_FILE in packages/effect-dynamodb/package.json packages/effect-dynamodb-geo/package.json packages/language-service/package.json; do
+          for PKG_FILE in packages/effect-dynamodb/package.json packages/schema/package.json packages/effect-dynamodb-geo/package.json packages/language-service/package.json; do
             CURRENT=$(node -p "require('./$PKG_FILE').version")
             BASE=$(git show origin/${{ github.base_ref }}:$PKG_FILE 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{process.stdout.write(JSON.parse(d).version)}catch{process.stdout.write('')}})")
             if [ -n "$BASE" ] && [ "$CURRENT" != "$BASE" ]; then
@@ -273,11 +273,24 @@ jobs:
         shard: [1, 2, 3, 4]
     env:
       DYNAMODB_ENDPOINT: http://localhost:8000
+      # The S3 blob store's connected tests (#179) run against MinIO.
+      S3_ENDPOINT: http://localhost:9000
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: dummy
       AWS_SECRET_ACCESS_KEY: dummy
     steps:
       - uses: actions/checkout@v6
+
+      # MinIO for the S3 blob store's connected tests (#179). A `docker run`
+      # step rather than a service container: the image has no default
+      # command (its entrypoint is `minio`), so it needs `server /data` as
+      # arguments. Started first so it boots while dependencies install.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            cgr.dev/chainguard/minio@sha256:0dab2f9fee1c1139ae8753b5e35bb4461af2a276cfe0923a2504c75a6170bc64 \
+            server /data
 
       - uses: pnpm/action-setup@v5
 
@@ -304,6 +317,20 @@ jobs:
             sleep 1
           done
           echo "DynamoDB Local did not become reachable in time"
+          exit 1
+
+      - name: Wait for MinIO
+        run: |
+          for i in {1..30}; do
+            if curl -sSf -o /dev/null http://localhost:9000/minio/health/live; then
+              echo "MinIO is reachable"
+              exit 0
+            fi
+            echo "Waiting for MinIO... ($i/30)"
+            sleep 1
+          done
+          echo "MinIO did not become reachable in time"
+          docker logs minio || true
           exit 1
 
       # vitest's `--shard` splits each package's test files by a hash of their

@@ -16,6 +16,7 @@
  */
 
 import {
+  type BlobStoreError,
   type ConcurrentModification,
   type ConditionalCheckFailed,
   type ItemNotFound,
@@ -34,11 +35,22 @@ import {
   Stream,
 } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
-import type { EventStream, StreamEvent, StreamIdInput, StreamMetadata } from "../EventStore.js"
+import type {
+  EventStream,
+  StreamEvent,
+  StreamIdInput,
+  StreamMetadata,
+  StreamOffloadKind,
+  StreamReadErrors,
+  StreamReadMode,
+} from "../EventStore.js"
+import type { OffloadState } from "../Offload.js"
 import * as Query from "../Query.js"
 import type { Table, TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import type { EntityGet, EntityPut } from "./EntityOps.js"
+import type { Offloads } from "./OffloadTypes.js"
+import type { OffloadedValue } from "./OffloadValues.js"
 import { imageEntityType, type StreamImage } from "./Packed.js"
 import {
   addressed,
@@ -73,18 +85,24 @@ export interface ProjectionReadModel {
   readonly versioned: unknown
   readonly softDelete: unknown
   readonly timeSeries: unknown
-  readonly get: (key: any) => EntityGet<any, any, any, any>
-  readonly put: (input: any) => EntityPut<any, any, any, any>
-  readonly create: (input: any) => EntityPut<any, any, any, any>
+  readonly get: (key: any) => EntityGet<any, any, any, any, any>
+  readonly put: (input: any) => EntityPut<any, any, any, any, any>
+  readonly create: (input: any) => EntityPut<any, any, any, any, any>
   readonly systemFields: { readonly createdAt: string | null }
   readonly _attachPrototype?: ((decoded: any) => any) | undefined
 }
 
-/** The state a projection folds: the read model's model type. */
+/**
+ * The state a projection folds: the read model's model type — its domain
+ * type, offloaded fields included (#179): the engine reads and writes the row
+ * eagerly, whatever its `get`'s default read modes.
+ */
 export type ProjectionState<RM> = RM extends {
-  readonly get: (key: any) => EntityGet<infer A, any, any, any>
+  readonly get: (key: any) => EntityGet<infer A, any, any, any, infer O extends OffloadState>
 }
-  ? A
+  ? Offloads<O> extends true
+    ? O["item"]
+    : A
   : never
 
 /** The read model's primary key, as its `get` takes it. */
@@ -96,10 +114,10 @@ export type ProjectionKey<RM> = RM extends { readonly get: (key: infer K) => any
  * `ConditionalCheckFailed` is the projection's own race signal, never surfaced.
  */
 export type ProjectionReadModelError<RM> =
-  | (RM extends { readonly put: (input: any) => EntityPut<any, any, infer E, any> }
+  | (RM extends { readonly put: (input: any) => EntityPut<any, any, infer E, any, any> }
       ? Exclude<E, ConditionalCheckFailed>
       : never)
-  | (RM extends { readonly get: (key: any) => EntityGet<any, any, infer E, any> }
+  | (RM extends { readonly get: (key: any) => EntityGet<any, any, infer E, any, any> }
       ? Exclude<E, ItemNotFound>
       : never)
 
@@ -140,9 +158,21 @@ export interface ProjectionConfig<
   R,
   KR extends ProjectionKey<RM> | Option.Option<ProjectionKey<RM>> = ProjectionKey<RM>,
   O = never,
+  TOffloaded extends StreamOffloadKind = never,
+  TMode extends StreamReadMode = "lazy",
 > {
   /** The source stream. One projection reads one stream. */
-  readonly stream: EventStream<TEvent, TStreamIdFields, TMetadata, any, any, any, any>
+  readonly stream: EventStream<TEvent, TStreamIdFields, TMetadata, any, any, any, any, TOffloaded>
+  /**
+   * How the handlers receive an offloaded event `data` (#179, design §10.2),
+   * on a stream whose `data` is `DynamoModel.Packed({ external })`:
+   * `"lazy"` (default) as `LazyStreamEvent`s — dispatch on `eventType`, and
+   * `yield* event.data.read()` for the payload (adding `BlobStoreError` to
+   * the handler's errors) — or `"eager"`, fetched before the handlers run.
+   * The change feed, gap reads, `catchUp` and `rebuild` all decode in this
+   * mode. Nothing changes on a stream whose `data` is not offloaded.
+   */
+  readonly offloaded?: TMode | undefined
   /** The read model (an unbound `Entity`). */
   readonly readModel: RM
   /**
@@ -160,7 +190,7 @@ export interface ProjectionConfig<
    */
   readonly key: (
     streamId: StreamIdInput<TStreamIdFields>,
-    event: StreamEvent<TEvent, StreamMetadata<TMetadata>>,
+    event: StreamEvent<ProjectionData<TEvent, TOffloaded, TMode>, StreamMetadata<TMetadata>>,
   ) => KR
   /**
    * The state a row starts from, before `event` — the first event folded into
@@ -168,7 +198,7 @@ export interface ProjectionConfig<
    */
   readonly initial: (
     streamId: StreamIdInput<TStreamIdFields>,
-    event: StreamEvent<TEvent, StreamMetadata<TMetadata>>,
+    event: StreamEvent<ProjectionData<TEvent, TOffloaded, TMode>, StreamMetadata<TMetadata>>,
   ) => ProjectionState<RM>
   /**
    * Apply one event. Return the state unchanged to fold an event that
@@ -182,7 +212,7 @@ export interface ProjectionConfig<
    */
   readonly evolve: (
     state: ProjectionState<RM>,
-    event: StreamEvent<TEvent, StreamMetadata<TMetadata>>,
+    event: StreamEvent<ProjectionData<TEvent, TOffloaded, TMode>, StreamMetadata<TMetadata>>,
   ) => Effect.Effect<ProjectionState<RM> | RemoveRow | SkipEvent, E, R>
   /** See {@link ProjectionCheckpoint}. */
   readonly checkpoint: ProjectionCheckpoint<ProjectionState<RM>>
@@ -245,8 +275,41 @@ export interface ProjectionConfig<
   readonly removal?: { readonly ttl?: Duration.Input | undefined } | undefined
   /** Side effects committed with the row — see {@link ProjectionOutboxConfig}. */
   readonly outbox?:
-    | ProjectionOutboxConfig<O, StreamEvent<TEvent, StreamMetadata<TMetadata>>, ProjectionState<RM>>
+    | ProjectionOutboxConfig<
+        O,
+        StreamEvent<ProjectionData<TEvent, TOffloaded, TMode>, StreamMetadata<TMetadata>>,
+        ProjectionState<RM>
+      >
     | undefined
+}
+
+/**
+ * The `data` a projection's handlers receive over a stream offloading `TOffloaded`
+ * in mode `TMode` (#179): `OffloadedValue<TEvent>` — a `LazyStreamEvent` — when
+ * the stream offloads `data` and the projection is lazy, `TEvent` otherwise.
+ */
+export type ProjectionData<TEvent, TOffloaded, TMode extends StreamReadMode> = [
+  Extract<unknown extends TOffloaded ? StreamOffloadKind : TOffloaded, "data">,
+] extends [never]
+  ? TEvent
+  : TMode extends "lazy"
+    ? OffloadedValue<TEvent>
+    : TEvent
+
+/** The event type of a projection's stream, from the `data` its handlers receive. */
+export type ProjectionStreamEvent<A> = A extends OffloadedValue<infer T> ? T : A
+
+/**
+ * A projection's `offloaded` option (#179): `"lazy"` when absent; `[EDD-9117]`
+ * for another value than `"eager"` / `"lazy"` (unreachable through the types).
+ */
+export const projectionReadMode = (label: string, mode: unknown): StreamReadMode => {
+  if (mode === undefined || mode === "lazy") return "lazy"
+  if (mode === "eager") return "eager"
+  throw new Error(
+    `[EDD-9117] ${label}: unknown offloaded mode ${JSON.stringify(mode) ?? String(mode)}; ` +
+      'expected "eager" or "lazy".',
+  )
 }
 
 /** A projection's `revision` — the field, or the field and its starting value. */
@@ -512,8 +575,30 @@ export interface ProcessBatchOptions<Rec> extends ApplyBatchOptions {
    * the same row gap-fills through it, fails to decode it, and fails the row
    * (that record is reported). It helps when the bad event is its stream's
    * last, or once the stored item is repaired or removed.
+   *
+   * A blob store failure — an eager projection's read of offloaded event
+   * `data` (#179), or of a pointer left on a stream that no longer offloads
+   * it (a `ValidationError` whose `cause` is the `BlobStoreError`) — is not a
+   * decode failure: it is transient, so its record is reported whatever this
+   * option says. It is in `storeFailures`, not in `decodeFailures`, and is
+   * logged at `Warning`.
    */
   readonly onDecodeFailure?: "report" | "skip" | undefined
+}
+
+/**
+ * @internal The store failure behind a record's decode failure (#179, design
+ * §10.5): the `BlobStoreError` itself, or the one a `ValidationError` wraps —
+ * a pointer met on a stream that no longer offloads `data` resolves through
+ * the store and reports the store's failure as its cause. `undefined` for a
+ * decode failure proper (poison).
+ */
+const storeFailureOf = (error: ValidationError | BlobStoreError): BlobStoreError | undefined => {
+  if (error._tag === "BlobStoreError") return error
+  const cause = error.cause as { readonly _tag?: unknown } | undefined
+  return typeof cause === "object" && cause !== null && cause._tag === "BlobStoreError"
+    ? (cause as BlobStoreError)
+    : undefined
 }
 
 /** Result of {@link EventProjection.processBatch}. */
@@ -526,9 +611,14 @@ export interface ProcessBatchResult<S, A, M, Err, Rec, K = unknown, E = unknown>
   /** Records whose image failed to decode. */
   readonly decodeFailures: ReadonlyArray<{ readonly record: Rec; readonly error: ValidationError }>
   /**
+   * Records whose decode failed reading the blob store (#179): transient, so
+   * always reported — see {@link ProcessBatchOptions.onDecodeFailure}.
+   */
+  readonly storeFailures: ReadonlyArray<{ readonly record: Rec; readonly error: BlobStoreError }>
+  /**
    * The records the response reports, in delivery order: the earliest record
-   * of each failed row, and (with `onDecodeFailure: "report"`) every record
-   * that failed to decode.
+   * of each failed row, every record in `storeFailures`, and (with
+   * `onDecodeFailure: "report"`) every record that failed to decode.
    */
   readonly failedRecords: ReadonlyArray<Rec>
   /**
@@ -538,18 +628,30 @@ export interface ProcessBatchResult<S, A, M, Err, Rec, K = unknown, E = unknown>
   readonly response: BatchItemFailuresResponse
 }
 
-const identify = <Rec>(
+/** A record's identifier, and the member it is read from. */
+const identifierOf = <Rec>(
   record: Rec,
-  index: number,
   options: IdentifyBySource | IdentifyWith<Rec>,
-): Effect.Effect<string, StreamRecordIdentifierMissing> => {
+): readonly [identifier: string | undefined, member: string] => {
   const [itemIdentifier, member] =
     "identifier" in options
       ? [options.identifier(record), "identifier"]
       : options.source === "lambda"
         ? [(record as StreamRecord).dynamodb?.SequenceNumber, "dynamodb.SequenceNumber"]
         : [(record as StreamRecord).eventID, "eventID"]
-  return typeof itemIdentifier === "string" && itemIdentifier.length > 0
+  return [
+    typeof itemIdentifier === "string" && itemIdentifier.length > 0 ? itemIdentifier : undefined,
+    member,
+  ]
+}
+
+const identify = <Rec>(
+  record: Rec,
+  index: number,
+  options: IdentifyBySource | IdentifyWith<Rec>,
+): Effect.Effect<string, StreamRecordIdentifierMissing> => {
+  const [itemIdentifier, member] = identifierOf(record, options)
+  return itemIdentifier !== undefined
     ? Effect.succeed(itemIdentifier)
     : Effect.fail(new StreamRecordIdentifierMissing({ index, member }))
 }
@@ -734,7 +836,16 @@ export interface EventProjection<
 > extends Pipeable.Pipeable {
   readonly [EventProjectionTypeId]: EventProjectionTypeId
   /** The source stream. */
-  readonly stream: EventStream<A, TStreamIdFields, any, any, any, any, any>
+  readonly stream: EventStream<
+    ProjectionStreamEvent<A>,
+    TStreamIdFields,
+    any,
+    any,
+    any,
+    any,
+    any,
+    any
+  >
   /** @internal See {@link ProjectionReadModelKey}. */
   readonly [ProjectionReadModelKey]: unknown
   /** @internal See {@link ProjectionRoutes}. */
@@ -975,14 +1086,16 @@ export const projection = <
   R = never,
   KR extends ProjectionKey<RM> | Option.Option<ProjectionKey<RM>> = ProjectionKey<RM>,
   O = never,
+  TOffloaded extends StreamOffloadKind = never,
+  TMode extends StreamReadMode = "lazy",
 >(
-  config: ProjectionConfig<TEvent, TStreamIdFields, TMetadata, RM, E, R, KR, O>,
+  config: ProjectionConfig<TEvent, TStreamIdFields, TMetadata, RM, E, R, KR, O, TOffloaded, TMode>,
 ): EventProjection<
   ProjectionState<RM>,
-  TEvent,
+  ProjectionData<TEvent, TOffloaded, TMode>,
   TStreamIdFields,
   StreamMetadata<TMetadata>,
-  ProjectionError<RM, E>,
+  ProjectionError<RM, E> | StreamReadErrors<TOffloaded, "data", TMode>,
   R | DynamoClient | TableConfig,
   ProjectionKey<RM>,
   E,
@@ -991,12 +1104,14 @@ export const projection = <
 > => {
   type S = ProjectionState<RM>
   type K = ProjectionKey<RM>
-  type Ev = StreamEvent<TEvent, StreamMetadata<TMetadata>>
-  type Err = ProjectionError<RM, E>
+  /** The `data` the handlers receive: lazy over an offloaded `data` by default (#179). */
+  type TData = ProjectionData<TEvent, TOffloaded, TMode>
+  type Ev = StreamEvent<TData, StreamMetadata<TMetadata>>
+  type Err = ProjectionError<RM, E> | StreamReadErrors<TOffloaded, "data", TMode>
   type Req = R | DynamoClient | TableConfig
   type Id = StreamIdInput<TStreamIdFields>
-  type Applied = ProjectionApplied<S, TEvent, StreamMetadata<TMetadata>, K, E>
-  type Outcome = ProjectionOutcome<S, TEvent, StreamMetadata<TMetadata>, Err, K, E>
+  type Applied = ProjectionApplied<S, TData, StreamMetadata<TMetadata>, K, E>
+  type Outcome = ProjectionOutcome<S, TData, StreamMetadata<TMetadata>, Err, K, E>
 
   const { stream, readModel } = config
   const label = `EventStore.projection("${stream.streamName}" → "${readModel.entityType}")`
@@ -1015,13 +1130,15 @@ export const projection = <
     throw new Error(`[EDD-9081] ${label}: the checkpoint offset ${offset} is not an integer.`)
   }
 
+  const offloaded = projectionReadMode(label, config.offloaded)
   const source: EngineSource = {
     name: "projection",
     stream: stream as unknown as EngineSource["stream"],
     key: config.key as EngineSource["key"],
-    evolve: (state, event) => config.evolve(state, event),
+    evolve: (state, event) => config.evolve(state, event as Ev),
     mode: "fold",
     terminal: config.terminal as EngineSource["terminal"],
+    offloaded,
   }
   const engine = makeEngine({
     label,
@@ -1090,7 +1207,7 @@ export const projection = <
     events: ReadonlyArray<Ev>,
     options?: ApplyBatchOptions | undefined,
   ): Effect.Effect<
-    ProjectionBatchResult<S, TEvent, StreamMetadata<TMetadata>, Err, K, E>,
+    ProjectionBatchResult<S, TData, StreamMetadata<TMetadata>, Err, K, E>,
     never,
     Req
   > =>
@@ -1225,14 +1342,17 @@ export const projection = <
 
   const catchUp = (
     streamId: Id,
-  ): Effect.Effect<ProjectionCaughtUp<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
+  ): Effect.Effect<ProjectionCaughtUp<S, TData, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
       yield* engine.preflight("catchUp")
       // The latest event that addresses a row — usually the head, one page.
       const pages = yield* Query.paginate(
-        stream.query
-          .events(streamId)
-          .pipe(Query.reverse, Query.pageSize(25), (q) => Query.consistentRead(q)),
+        stream.query.events(streamId).pipe(
+          Query.reverse,
+          Query.pageSize(25),
+          (q) => Query.consistentRead(q),
+          (q) => (offloaded === "lazy" ? Query.offloaded(q, "lazy") : q),
+        ),
       )
       const latest = yield* pages.pipe(
         Stream.flatMap((page) => Stream.fromIterable(page as Array<Ev>)),
@@ -1277,14 +1397,17 @@ export const projection = <
         version: applied.version,
         removed: applied.removed,
       }
-    }) as Effect.Effect<ProjectionCaughtUp<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req>
+    }) as Effect.Effect<ProjectionCaughtUp<S, TData, StreamMetadata<TMetadata>, K, E>, Err, Req>
 
   const rebuild = (
     streamId: Id,
-  ): Effect.Effect<ProjectionRebuilt<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
+  ): Effect.Effect<ProjectionRebuilt<S, TData, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
       yield* engine.preflight("rebuild")
-      const events = (yield* stream.read(streamId, { consistentRead: true })) as Array<Ev>
+      const events = (yield* stream.read(streamId, {
+        consistentRead: true,
+        offloaded,
+      })) as unknown as Array<Ev>
       const delivered = new Set(events.map((e) => e.version))
       const rows = new Map<string, { key: K; events: Array<Ev> }>()
       for (const event of events) {
@@ -1329,7 +1452,7 @@ export const projection = <
         { concurrency: 10 },
       )
       return { rows: rebuilt }
-    }) as Effect.Effect<ProjectionRebuilt<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req>
+    }) as Effect.Effect<ProjectionRebuilt<S, TData, StreamMetadata<TMetadata>, K, E>, Err, Req>
 
   const processBatch = <Rec>(
     records: ReadonlyArray<Rec>,
@@ -1339,7 +1462,8 @@ export const projection = <
       {
         name: "projection",
         stream: stream as unknown as DecodableStream,
-        decode: (image: StreamImage) => stream.decodeStreamImage(image),
+        offloaded,
+        decode: (image: StreamImage) => stream.decodeStreamImage(image, { offloaded }),
         applyBatch: (events, applyOptions) => applyBatch(events as ReadonlyArray<Ev>, applyOptions),
       },
     ]).pipe(
@@ -1348,7 +1472,7 @@ export const projection = <
           ({
             ...rest,
             outcomes: outcomes.projection as ReadonlyArray<Outcome>,
-          }) satisfies ProcessBatchResult<S, TEvent, StreamMetadata<TMetadata>, Err, Rec, K, E>,
+          }) satisfies ProcessBatchResult<S, TData, StreamMetadata<TMetadata>, Err, Rec, K, E>,
       ),
     )
 
@@ -1372,7 +1496,8 @@ export const projection = <
       {
         name,
         stream: stream as unknown as DecodableStream,
-        decode: (image: StreamImage) => stream.decodeStreamImage(image),
+        offloaded,
+        decode: (image: StreamImage) => stream.decodeStreamImage(image, { offloaded }),
         applyBatch: (events, applyOptions) => applyBatch(events as ReadonlyArray<Ev>, applyOptions),
       },
     ],
@@ -1395,7 +1520,7 @@ export const projection = <
     ),
   } as unknown as EventProjection<
     S,
-    TEvent,
+    TData,
     TStreamIdFields,
     StreamMetadata<TMetadata>,
     Err,
@@ -1471,9 +1596,14 @@ export interface ProcessBatchesResult<
   /** Records whose image failed to decode. */
   readonly decodeFailures: ReadonlyArray<{ readonly record: Rec; readonly error: ValidationError }>
   /**
+   * Records whose decode failed reading the blob store (#179): transient, so
+   * always reported — see {@link ProcessBatchOptions.onDecodeFailure}.
+   */
+  readonly storeFailures: ReadonlyArray<{ readonly record: Rec; readonly error: BlobStoreError }>
+  /**
    * The records the response reports, in delivery order: the earliest record
-   * of each failed row of every projection, and (with
-   * `onDecodeFailure: "report"`) every record that failed to decode.
+   * of each failed row of every projection, every record in `storeFailures`,
+   * and (with `onDecodeFailure: "report"`) every record that failed to decode.
    */
   readonly failedRecords: ReadonlyArray<Rec>
   /** The partial batch response for `failedRecords`. */
@@ -1490,10 +1620,19 @@ export interface Route {
   readonly tag?: string | undefined
   /** The (unbound) stream — its identity groups the projections that read it. */
   readonly stream: DecodableStream
-  /** How its images decode — under the bound context for a bound projection. */
+  /**
+   * The projection's `offloaded` mode (#179): `decode` reads in it. A batch
+   * decodes a record once per mode its projections read in.
+   */
+  readonly offloaded: StreamReadMode
+  /**
+   * How its images decode — under the bound context for a bound projection.
+   * An eager projection's decode reads offloaded `data` (#179), so it can
+   * fail with a `BlobStoreError`.
+   */
   readonly decode: (
     image: StreamImage,
-  ) => Effect.Effect<Option.Option<unknown>, ValidationError, any>
+  ) => Effect.Effect<Option.Option<unknown>, ValidationError | BlobStoreError, any>
   readonly applyBatch: (
     events: ReadonlyArray<any>,
     options?: ApplyBatchOptions | undefined,
@@ -1507,9 +1646,15 @@ const insertImage = (record: StreamRecord): StreamImage | undefined =>
     : record.dynamodb?.NewImage
 
 /**
- * @internal Decode a batch once, route each event to the projections of its
+ * @internal Decode a batch, route each event to the projections of its
  * stream, apply each projection's events, and build one partial batch
  * response — shared by {@link processBatch} and `projection.processBatch`.
+ *
+ * A record is decoded once per `offloaded` mode its readers take (#179,
+ * design §10.2): each projection receives its own mode's event, and the
+ * `streams` named without a projection the lazy one, so an eager and a lazy
+ * projection of one stream never share a decode. A record decodes in every
+ * mode or not at all: a failure in one is the record's.
  */
 export const runBatch = <Rec>(
   operation: string,
@@ -1533,6 +1678,10 @@ export const runBatch = <Rec>(
       readonly record: Rec
       readonly error: ValidationError
     }>
+    readonly storeFailures: ReadonlyArray<{
+      readonly record: Rec
+      readonly error: BlobStoreError
+    }>
     readonly failedRecords: ReadonlyArray<Rec>
     readonly response: BatchItemFailuresResponse
   },
@@ -1540,7 +1689,7 @@ export const runBatch = <Rec>(
   any
 > => {
   return Effect.gen(function* () {
-    // One decode per stream, however many projections read it.
+    // One decode per stream and mode, however many projections read it.
     const streams = new Map<DecodableStream, Array<Route>>()
     for (const route of routes) {
       const readers = streams.get(route.stream)
@@ -1569,8 +1718,9 @@ export const runBatch = <Rec>(
       ...[...streams.keys()].map((stream) => [stream.streamName, stream] as const),
       ...decodeOnlyStreams,
     ])
-    /** The names `streams` gives, by event marker. */
+    /** The names `streams` gives, and the streams, by event marker. */
     const unroutedNames = new Map(decodeOnly.map(([name, stream]) => [stream.eventMarker, name]))
+    const unroutedStreams = new Map(decodeOnly.map(([, stream]) => [stream.eventMarker, stream]))
     const unrouted: Array<{
       readonly position: number
       readonly stream: string
@@ -1583,7 +1733,13 @@ export const runBatch = <Rec>(
       routes.map((route) => [route.name, { events: [], recordOf: [] }]),
     )
     const decodeFailures: Array<{ readonly record: Rec; readonly error: ValidationError }> = []
+    const storeFailures: Array<{ readonly record: Rec; readonly error: BlobStoreError }> = []
     const failed = new Set<number>()
+    const identifyWith = (
+      "identifier" in options && options.identifier !== undefined
+        ? { identifier: options.identifier }
+        : { source: (options as IdentifyBySource).source }
+    ) as IdentifyWith<Rec>
     for (const [i, record] of records.entries()) {
       const recordImage = image(record)
       if (recordImage === undefined) continue
@@ -1593,29 +1749,78 @@ export const runBatch = <Rec>(
           : undefined
       // Not an event of any stream named: nothing to apply.
       if (entry === undefined) continue
-      const readers = streams.get(entry[1])
-      const decoded = yield* Effect.result(
-        readers === undefined
-          ? entry[1].decodeStreamImage(recordImage)
-          : readers[0]!.decode(recordImage),
-      )
-      if (Result.isFailure(decoded)) {
-        decodeFailures.push({ record, error: decoded.failure })
-        if (options.onDecodeFailure !== "skip") failed.add(i)
-      } else if (Option.isSome(decoded.success)) {
-        const name = unroutedNames.get(entry[1].eventMarker)
-        if (name !== undefined) {
-          unrouted.push({ position: i, stream: name, event: decoded.success.value })
+      const readers = streams.get(entry[1]) ?? []
+      const name = unroutedNames.get(entry[1].eventMarker)
+      // The decodes the record needs, one per mode (#179, design §10.2),
+      // lazy first (it reads nothing from the store): each projection's mode,
+      // under its own (bound) context, and lazily for `streams` — through a
+      // lazy projection's decode when there is one, else the stream named.
+      const lazyRoute = readers.find((route) => route.offloaded === "lazy")
+      const eagerRoute = readers.find((route) => route.offloaded === "eager")
+      const decodes: Array<
+        readonly [
+          StreamReadMode,
+          Effect.Effect<Option.Option<unknown>, ValidationError | BlobStoreError, any>,
+        ]
+      > = []
+      if (lazyRoute !== undefined) decodes.push(["lazy", lazyRoute.decode(recordImage)])
+      else if (name !== undefined) {
+        const named =
+          readers.length === 0 ? entry[1] : (unroutedStreams.get(entry[1].eventMarker) ?? entry[1])
+        decodes.push(["lazy", named.decodeStreamImage(recordImage)])
+      }
+      if (eagerRoute !== undefined) decodes.push(["eager", eagerRoute.decode(recordImage)])
+      const events = new Map<StreamReadMode, Option.Option<unknown>>()
+      let failure: ValidationError | BlobStoreError | undefined
+      for (const [mode, decode] of decodes) {
+        const decoded = yield* Effect.result(decode)
+        if (Result.isFailure(decoded)) {
+          failure = decoded.failure
+          break
         }
-        for (const route of readers ?? []) {
-          const target = routed.get(route.name)!
-          target.events.push(
-            route.tag === undefined
-              ? decoded.success.value
-              : { stream: route.tag, event: decoded.success.value },
+        events.set(mode, decoded.success)
+      }
+      if (failure !== undefined) {
+        const storeFailure = storeFailureOf(failure)
+        if (storeFailure !== undefined) {
+          // Transient, never poison (#179, design §10.5): the record is
+          // redelivered, whatever `onDecodeFailure` says — and said, so a
+          // store that keeps failing does not hold the shard silently.
+          failed.add(i)
+          storeFailures.push({ record, error: storeFailure })
+          const [identifier] = identifierOf(record, identifyWith)
+          yield* Effect.logWarning(
+            `${operation}: record ${i}${identifier === undefined ? "" : ` (${identifier})`} of ` +
+              `stream "${entry[1].streamName}" failed to read offloaded event data from the ` +
+              `blob store (${storeFailure.reason}); it is reported for redelivery.`,
+            storeFailure,
+          ).pipe(
+            Effect.annotateLogs({
+              operation,
+              stream: entry[1].streamName,
+              position: i,
+              ...(identifier === undefined ? {} : { record: identifier }),
+              reason: storeFailure.reason,
+            }),
           )
-          target.recordOf.push(i)
+          continue
         }
+        decodeFailures.push({ record, error: failure as ValidationError })
+        if (options.onDecodeFailure !== "skip") failed.add(i)
+        continue
+      }
+      const lazy = events.get("lazy")
+      if (name !== undefined && lazy !== undefined && Option.isSome(lazy)) {
+        unrouted.push({ position: i, stream: name, event: lazy.value })
+      }
+      for (const route of readers) {
+        const event = events.get(route.offloaded)
+        if (event === undefined || Option.isNone(event)) continue
+        const target = routed.get(route.name)!
+        target.events.push(
+          route.tag === undefined ? event.value : { stream: route.tag, event: event.value },
+        )
+        target.recordOf.push(i)
       }
     }
     const outcomes: Record<
@@ -1642,13 +1847,8 @@ export const runBatch = <Rec>(
       }))
     }
     const failedRecords = [...failed].sort((a, b) => a - b).map((i) => records[i]!)
-    const response = yield* batchResponse(
-      failedRecords,
-      ("identifier" in options && options.identifier !== undefined
-        ? { identifier: options.identifier }
-        : { source: (options as IdentifyBySource).source }) as IdentifyWith<Rec>,
-    )
-    return { unrouted, outcomes, decodeFailures, failedRecords, response }
+    const response = yield* batchResponse(failedRecords, identifyWith)
+    return { unrouted, outcomes, decodeFailures, storeFailures, failedRecords, response }
   })
 }
 

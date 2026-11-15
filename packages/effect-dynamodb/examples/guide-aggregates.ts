@@ -15,6 +15,7 @@
  *   - Aggregate type extractors
  *   - Aggregate error handling
  *   - Entity.cascade for propagating source changes to ref consumers
+ *   - Offloaded edge fields (a binary photo kept in a blob store)
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -25,6 +26,7 @@
 
 import { Config, Console, Effect, Layer, Option, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
+import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -202,6 +204,28 @@ const SquadSelections = Entity.make({
   },
 })
 // #endregion
+
+// An edge entity whose image is kept in the blob store (see "Offloaded edge fields")
+// #region offloaded-edge-entity
+class Photo extends Schema.Class<Photo>("Photo")({
+  id: Schema.String,
+  caption: Schema.String,
+  image: Schema.Uint8Array,
+}) {}
+
+const Photos = Entity.make({
+  model: DynamoModel.configure(Photo, {
+    id: { identifier: true },
+    image: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
+  }),
+  entityType: "Photo",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+// #endregion
+
 const MainTable = Table.make({
   schema: CricketSchema,
   entities: { Teams, Players, Coaches, Venues, Umpires, SquadSelections },
@@ -301,6 +325,30 @@ const AuditedMatchAggregate = Aggregate.make(Match, {
 // #endregion
 
 void AuditedMatchAggregate
+
+// #region offloaded-edges
+class MatchReport extends Schema.Class<MatchReport>("MatchReport")({
+  matchId: Schema.String,
+  headline: Schema.String,
+  photos: Schema.Array(Photo),
+}) {}
+
+// Offloading requires escaped key text: the reports live on a table whose schema sets it
+const ReportSchema = DynamoSchema.make({ name: "cricket", version: 1, escapeKeys: true })
+const ReportTable = Table.make({ schema: ReportSchema, entities: { Photos } })
+
+// Photos is configured to offload `image`: each photo's edge item holds a pointer
+const MatchReportAggregate = Aggregate.make(MatchReport, {
+  table: ReportTable,
+  schema: ReportSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "report" },
+  root: { entityType: "MatchReportItem" },
+  edges: {
+    photos: Aggregate.many("photos", { entityType: "ReportPhoto", entity: Photos }),
+  },
+})
+// #endregion
 
 // #region type-extractors
 type MatchDomain = Aggregate.Type<typeof MatchAggregate> // Match
@@ -579,6 +627,52 @@ const program = Effect.gen(function* () {
 
   yield* Console.log("Match deleted.")
 
+  // --- Offloaded edge fields ---
+  const jpeg = (size: number, fill: number) => new Uint8Array(size).fill(fill)
+  const { name: reportTable } = yield* ReportTable.Tag
+  yield* client
+    .deleteTable({ TableName: reportTable })
+    .pipe(Effect.catchTag("ResourceNotFoundError", () => Effect.void))
+  yield* client.createTable({
+    TableName: reportTable,
+    BillingMode: "PAY_PER_REQUEST",
+    KeySchema: [
+      { AttributeName: "pk", KeyType: "HASH" },
+      { AttributeName: "sk", KeyType: "RANGE" },
+    ],
+    AttributeDefinitions: [
+      { AttributeName: "pk", AttributeType: "S" },
+      { AttributeName: "sk", AttributeType: "S" },
+    ],
+  })
+
+  // #region offloaded-edges-usage
+  // Binary edge fields take Uint8Array; each one is uploaded before its group is written
+  yield* MatchReportAggregate.create({
+    matchId: "bgt-2025-test-1",
+    headline: "Cummins takes five",
+    photos: [
+      { id: "p-1", caption: "Day 1", image: jpeg(50_000, 1) },
+      { id: "p-2", caption: "Day 2", image: jpeg(40_000, 2) },
+    ],
+  })
+
+  // Aggregate reads are eager: image is the Uint8Array itself
+  const report = yield* MatchReportAggregate.get({ matchId: "bgt-2025-test-1" })
+  const firstImage: Uint8Array = report.photos[0]!.image
+
+  // An update writes only changed groups, and a changed group uploads its
+  // offloaded values again; an unchanged group uploads nothing
+  yield* MatchReportAggregate.update({ matchId: "bgt-2025-test-1" }, ({ cursor }) =>
+    cursor.key("headline").replace("Cummins takes five on day one"),
+  )
+  // #endregion
+
+  if (firstImage.length !== 50_000) throw new Error("expected the photo's bytes")
+  yield* Console.log(`Report photos: ${report.photos.length}, first ${firstImage.length} bytes`)
+  yield* MatchReportAggregate.delete({ matchId: "bgt-2025-test-1" })
+  yield* client.deleteTable({ TableName: reportTable })
+
   // =========================================================================
   // Part 3: Cascade Updates
   // =========================================================================
@@ -730,13 +824,16 @@ const program = Effect.gen(function* () {
 // ---------------------------------------------------------------------------
 
 // #region layer
-const AppLayer = Layer.merge(
+const AppLayer = Layer.mergeAll(
   DynamoClient.layerConfig({
     region: Config.succeed("us-east-1"),
     endpoint: Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
     credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MainTable.layer({ name: "guide-aggregates-table" }),
+  ReportTable.layer({ name: "guide-aggregates-reports" }),
+  // Where Photos' offloaded images live (S3 in production: effect-dynamodb/blob/s3)
+  BlobStore.layerMemory(),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

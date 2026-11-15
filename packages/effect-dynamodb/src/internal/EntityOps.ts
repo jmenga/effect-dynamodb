@@ -11,8 +11,13 @@ import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import { type DateTime, Effect, Pipeable, type Schema, Utils } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
+import type { NoOffloadState, OffloadState } from "../Offload.js"
 import type { TableConfig } from "../Table.js"
+import * as BlobLedger from "./BlobLedger.js"
+import type { Modes } from "./BlobResolver.js"
 import * as Capacity from "./Capacity.js"
+import { DEFAULT_MODES, withModes } from "./OffloadRead.js"
+import type { ReadPointers } from "./OffloadWrite.js"
 import type { RawCondition } from "./TransactableOps.js"
 
 // ---------------------------------------------------------------------------
@@ -197,6 +202,8 @@ export interface UpdateState {
    * write is conditioned on the row holding that ref (#263).
    */
   readonly keepRefs?: globalThis.Record<string, unknown> | undefined
+  /** `.offloaded(m)`: the read modes its result decodes under (#179); the defaults when unset. */
+  readonly offloadModes?: Modes | undefined
 }
 
 /** @internal Path-based SET operation */
@@ -283,7 +290,17 @@ export const emptyUpdateState: UpdateState = {
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */
-export interface EntityOp<A, Rec, E, R> extends Pipeable.Pipeable {
+/**
+ * @internal The phantom an op carries its offload state `O` in (#179): a
+ * method, so it is bivariant — an op over an offloading member still matches
+ * the type-erased (`any`) op types the multi-op entry points accept.
+ */
+export interface OffloadPhantom<O> {
+  _(state: O): void
+}
+
+export interface EntityOp<A, Rec, E, R, O extends OffloadState = NoOffloadState>
+  extends Pipeable.Pipeable {
   readonly [EntityOpTypeId]: EntityOpTypeId
   /** @internal The op's core, run without an operation scope (internal compositions). */
   readonly _run: (mode: DecodeMode) => Effect.Effect<any, E, R>
@@ -294,6 +311,8 @@ export interface EntityOp<A, Rec, E, R> extends Pipeable.Pipeable {
   /** Yield support for `Effect.gen`. */
   readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, R>, A>
   /** @internal */ readonly _Rec: (_: never) => Rec
+  /** @internal Phantom: the op's offload state (#179, design §9.2). */
+  readonly _O?: OffloadPhantom<O> | undefined
 }
 
 /**
@@ -305,7 +324,8 @@ export interface EntityOp<A, Rec, E, R> extends Pipeable.Pipeable {
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */
-export interface EntityGet<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {}
+export interface EntityGet<A, Rec, E, R, O extends OffloadState = NoOffloadState>
+  extends EntityOp<A, Rec, E, R, O> {}
 
 /**
  * Lazy intermediate returned by `Entity.put()`.
@@ -316,7 +336,8 @@ export interface EntityGet<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {}
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */
-export interface EntityPut<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
+export interface EntityPut<A, Rec, E, R, O extends OffloadState = NoOffloadState>
+  extends EntityOp<A, Rec, E, R, O> {
   /** @internal Never `"insert"`: an {@link EntityInsert} is not a put. */
   readonly _putKind?: Exclude<PutKind, "insert">
 }
@@ -335,7 +356,8 @@ export interface EntityPut<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */
-export interface EntityInsert<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
+export interface EntityInsert<A, Rec, E, R, O extends OffloadState = NoOffloadState>
+  extends EntityOp<A, Rec, E, R, O> {
   /** @internal */
   readonly _putKind: "insert"
 }
@@ -351,7 +373,8 @@ export interface EntityInsert<A, Rec, E, R> extends EntityOp<A, Rec, E, R> {
  * @typeParam E - Error channel
  * @typeParam R - Required services
  */
-export interface EntityUpdate<A, Rec, U, E, R> extends EntityOp<A, Rec, E, R> {
+export interface EntityUpdate<A, Rec, U, E, R, O extends OffloadState = NoOffloadState>
+  extends EntityOp<A, Rec, E, R, O> {
   readonly [EntityUpdateTypeId]: EntityUpdateTypeId
   /** @internal phantom */ readonly _U: (_: never) => U
   /** @internal */
@@ -375,7 +398,13 @@ export interface EntityUpdate<A, Rec, U, E, R> extends EntityOp<A, Rec, E, R> {
  * `returnValues("allOld")` the item it deleted (`Model`, `undefined` when there
  * was none).
  */
-export interface EntityDelete<E, R, A = void, Model = unknown> extends Pipeable.Pipeable {
+export interface EntityDelete<
+  E,
+  R,
+  A = void,
+  Model = unknown,
+  O extends OffloadState = NoOffloadState,
+> extends Pipeable.Pipeable {
   readonly [EntityDeleteTypeId]: EntityDeleteTypeId
   /** Convert this descriptor to an executable Effect. */
   readonly asEffect: () => Effect.Effect<A, E, R>
@@ -383,6 +412,8 @@ export interface EntityDelete<E, R, A = void, Model = unknown> extends Pipeable.
   readonly [Symbol.iterator]: () => Iterator<Effect.Effect<A, E, R>, A>
   /** @internal Phantom: the model an `"allOld"` delete returns. */
   readonly _deleteModel?: Model | undefined
+  /** @internal Phantom: the op's offload state (#179, design §9.2). */
+  readonly _O?: OffloadPhantom<O> | undefined
   /** @internal */ readonly _opType: "delete"
   /** @internal */ readonly _entity: EntityBase
   /** @internal */ readonly _key: globalThis.Record<string, unknown>
@@ -394,6 +425,28 @@ export interface EntityDelete<E, R, A = void, Model = unknown> extends Pipeable.
  */
 export interface EntityBase {
   readonly _tag: "Entity"
+}
+
+/**
+ * @internal Run an op of `entity` under its read modes (#179): those
+ * `.offloaded()` set, else the defaults — never another op's, so an op run
+ * inside another one decodes by its own. An entity that offloads nothing has
+ * no modes to provide.
+ */
+export const withReadModes = <A, E, R>(
+  entity: EntityBase,
+  modes: Modes | undefined,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  BlobLedger.offloads(entity) ? withModes(effect, modes ?? DEFAULT_MODES) : effect
+
+/** @internal Carry `from`'s read modes onto `to` (a combinator's new op). */
+export const carryModes = <T extends { _offloadModes: Modes | undefined }>(
+  from: unknown,
+  to: T,
+): T => {
+  to._offloadModes = (from as { readonly _offloadModes?: Modes | undefined })._offloadModes
+  return to
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +466,8 @@ export class EntityGetImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly _key: globalThis.Record<string, unknown>
   readonly _consistentRead: boolean
   readonly _projection: ReadonlyArray<string> | undefined
+  /** `.offloaded(m)`: the read modes (#179); the defaults when `undefined`. Combinators carry it. */
+  _offloadModes: Modes | undefined = undefined
   constructor(
     readonly _builder: (mode: DecodeMode, opts: EntityGetOpts) => Effect.Effect<any, E, R>,
     entity: EntityBase,
@@ -427,10 +482,14 @@ export class EntityGetImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
     return (mode) =>
-      this._builder(this._projection ? "raw" : mode, {
-        consistentRead: this._consistentRead,
-        projection: this._projection,
-      })
+      withReadModes(
+        this._entity,
+        this._offloadModes,
+        this._builder(this._projection ? "raw" : mode, {
+          consistentRead: this._consistentRead,
+          projection: this._projection,
+        }),
+      )
   }
   /** `getVersion`, `restore` and `deleted.get` are get-shaped; their builder carries the name. */
   get _exec(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
@@ -492,6 +551,13 @@ export interface EntityPutOpts {
         readonly returnOld?: boolean | undefined
       }
     | undefined
+  /**
+   * @internal The pointers the row being rewritten held when read (#179,
+   * design §6.11) — an EventStore projection's row rewrite: a value whose
+   * content one of them named keeps it, and the put is conditioned on the
+   * row still holding it.
+   */
+  readonly reuse?: ReadPointers | undefined
 }
 
 /**
@@ -517,6 +583,8 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   readonly _withVectors: WithVectors | undefined
   /** Which put-shaped op this is. Combinators MUST preserve it. */
   readonly _putKind: PutKind
+  /** `.offloaded(m)`: the read modes of its result (#179). Combinators carry it. */
+  _offloadModes: Modes | undefined = undefined
   constructor(
     readonly _builder: (mode: DecodeMode, opts: EntityPutOpts) => Effect.Effect<any, E, R>,
     entity: EntityBase,
@@ -533,12 +601,16 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
     return (mode) =>
-      refuseEmptyParts(this._entity, this._putKind, this._condition, () =>
-        this._builder(mode, {
-          condition: this._condition,
-          withVectors: this._withVectors,
-          putKind: this._putKind,
-        }),
+      withReadModes(
+        this._entity,
+        this._offloadModes,
+        refuseEmptyParts(this._entity, this._putKind, this._condition, () =>
+          this._builder(mode, {
+            condition: this._condition,
+            withVectors: this._withVectors,
+            putKind: this._putKind,
+          }),
+        ),
       )
   }
   get _exec(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
@@ -546,7 +618,7 @@ export class EntityPutImpl<A, Rec, E, R> implements Pipeable.Pipeable {
       Capacity.operation(
         `Entity.${this._putKind}`,
         Capacity.entityTarget(this._entity),
-        this._run(mode),
+        BlobLedger.rootIf(BlobLedger.offloads(this._entity), this._run(mode)),
       )
   }
   asEffect(): Effect.Effect<A, E, R> {
@@ -580,11 +652,15 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
   }
   get _run(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
     return (mode) =>
-      refuseEmptyParts(
+      withReadModes(
         this._entity,
-        this._updateState.patch ? "patch" : "update",
-        this._updateState.condition,
-        () => this._builder(mode, this._updateState),
+        this._updateState.offloadModes,
+        refuseEmptyParts(
+          this._entity,
+          this._updateState.patch ? "patch" : "update",
+          this._updateState.condition,
+          () => this._builder(mode, this._updateState),
+        ),
       )
   }
   get _exec(): (mode: DecodeMode) => Effect.Effect<any, E, R> {
@@ -592,7 +668,7 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
       Capacity.operation(
         this._updateState.patch ? "Entity.patch" : "Entity.update",
         Capacity.entityTarget(this._entity),
-        this._run(mode),
+        BlobLedger.rootIf(BlobLedger.offloads(this._entity), this._run(mode)),
       )
   }
   asEffect(): Effect.Effect<A, E, R> {
@@ -616,6 +692,8 @@ export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
   readonly _returnValues: ReturnValuesMode | undefined
   /** `deleteIfExists`: the item must exist — a guard no `.condition()` replaces. */
   readonly _mustExist: boolean
+  /** `.offloaded(m)`: the read modes of its `allOld` result (#179). Combinators carry it. */
+  _offloadModes: Modes | undefined = undefined
   constructor(
     readonly _builder: (opts: {
       readonly condition: Expr | ConditionInput | undefined
@@ -636,16 +714,20 @@ export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
   }
   /** @internal The op's core, run without an operation scope. */
   _core(): Effect.Effect<A, E, R> {
-    return refuseEmptyParts(
+    return withReadModes(
       this._entity,
-      this._mustExist ? "deleteIfExists" : "delete",
-      this._condition,
-      () =>
-        this._builder({
-          condition: this._condition,
-          returnValues: this._returnValues,
-          mustExist: this._mustExist,
-        }),
+      this._offloadModes,
+      refuseEmptyParts(
+        this._entity,
+        this._mustExist ? "deleteIfExists" : "delete",
+        this._condition,
+        () =>
+          this._builder({
+            condition: this._condition,
+            returnValues: this._returnValues,
+            mustExist: this._mustExist,
+          }),
+      ),
     )
   }
   /** `purge` is delete-shaped; its builder carries the name. */
@@ -655,7 +737,7 @@ export class EntityDeleteImpl<E, R, A = void> implements Pipeable.Pipeable {
         ? "Entity.deleteIfExists"
         : (Capacity.builderName(this._builder) ?? "Entity.delete"),
       Capacity.entityTarget(this._entity),
-      this._core(),
+      BlobLedger.rootIf(BlobLedger.offloads(this._entity), this._core()),
     )
   }
   [Symbol.iterator]() {

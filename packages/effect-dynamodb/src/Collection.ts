@@ -8,22 +8,31 @@
  * Collections are built from Entity index definitions that share a `collection` name.
  */
 
+import type { NoOffload, OffloadFields } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { type BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   compositeKeyFormKind,
   makeCompositeDomainKeyForm,
   refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
+import type {
+  DefaultOffloadModes,
+  EntityRecordType,
+  ReadBlobErrors,
+} from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, type Schema } from "effect"
+import type { Modes } from "./internal/OffloadRead.js"
+import type { MemberItem, StateOf } from "./internal/OffloadTypes.js"
 import {
   collectionPackedQueryOptions,
   entityPackedQueryOptions,
   type PackedAttributeGuard,
 } from "./internal/Packed.js"
+import type { NoOffloadState, OffloadState, View } from "./Offload.js"
 import * as Query from "./Query.js"
 import type { TableConfig } from "./Table.js"
 
@@ -45,10 +54,9 @@ interface CollectionEntity {
   }
   readonly _decodeRecord: (
     raw: globalThis.Record<string, unknown>,
-  ) => import("effect").Effect.Effect<
-    any,
-    import("@effect-dynamodb/schema/Errors.js").ValidationError
-  >
+    modes?: Modes,
+    operation?: string,
+  ) => import("effect").Effect.Effect<any, ValidationError | BlobStoreError>
   /** Packed attributes an expression may not look inside (EDD-9076, #147). */
   readonly _packedGuards?: ReadonlyArray<PackedAttributeGuard> | undefined
   /** Read packed attributes of a raw row by their stored form (#147). */
@@ -63,10 +71,101 @@ interface CollectionEntity {
 // Collection types
 // ---------------------------------------------------------------------------
 
-type EntityRecord<E extends CollectionEntity> = Schema.Schema.Type<E["schemas"]["recordSchema"]>
+/**
+ * The fields a member offloads (#179) — {@link NoOffload} when none, and for
+ * type-erased fields (`any`), which read as none.
+ */
+type MemberOffload<E> = E extends { readonly _offloadFields?: infer T }
+  ? Exclude<T, undefined> extends infer F extends OffloadFields
+    ? 0 extends 1 & F
+      ? NoOffload
+      : F
+    : NoOffload
+  : NoOffload
 
-type CollectionResult<TEntities extends Record<string, CollectionEntity>> = {
-  readonly [K in keyof TEntities]: Array<EntityRecord<TEntities[K]>>
+/**
+ * A member's record type (`Entity.Record`: model fields plus system fields) —
+ * what its record decoder yields. (Read off `recordSchema`, which entities
+ * type as `Codec<any>`, it was `any`.)
+ */
+type MemberRecord<E extends CollectionEntity> = E extends {
+  readonly model: Schema.Top
+  readonly timestamps: unknown
+  readonly versioned: unknown
+}
+  ? EntityRecordType<
+      E["model"],
+      E["timestamps"],
+      E["versioned"],
+      E extends { readonly timeSeries?: infer TS } ? TS : undefined
+    >
+  : Schema.Schema.Type<E["schemas"]["recordSchema"]>
+
+/** A member's records as a collection query reads them: offloaded fields in the default modes. */
+type EntityRecord<E extends CollectionEntity> = View<MemberRecord<E>, MemberOffload<E>>
+
+/** A member selector's query state: `Query.offloaded` re-types its records. */
+type MemberQueryState<E extends CollectionEntity> = StateOf<MemberOffload<E>, MemberRecord<E>>
+
+/** The blob errors reading the members raises under the default modes (#179). */
+type MemberBlobErrors<TEntities extends Record<string, CollectionEntity>> = {
+  readonly [K in keyof TEntities]: ReadBlobErrors<MemberOffload<TEntities[K]>, DefaultOffloadModes>
+}[keyof TEntities]
+
+/** Each member's offloaded fields, record and entity type. */
+type Members<TEntities extends Record<string, CollectionEntity>> = {
+  readonly [K in keyof TEntities & string]: {
+    readonly fields: MemberOffload<TEntities[K]>
+    readonly item: MemberRecord<TEntities[K]>
+    readonly entityType: TEntities[K]["entityType"]
+  }
+}
+
+/** Every member's offloaded fields together. */
+type AllMemberFields<TEntities extends Record<string, CollectionEntity>> = {
+  readonly overflow: {
+    readonly [K in keyof TEntities]: MemberOffload<TEntities[K]>["overflow"]
+  }[keyof TEntities]
+  readonly binary: {
+    readonly [K in keyof TEntities]: MemberOffload<TEntities[K]>["binary"]
+  }[keyof TEntities]
+}
+
+/**
+ * One item of a grouped collection query: the member it belongs to
+ * (`_entityKey`), its entity type and its record (`_decoded`), offloaded
+ * fields in the default modes.
+ */
+type CollectionItem<TEntities extends Record<string, CollectionEntity>> = MemberItem<
+  Members<TEntities>,
+  DefaultOffloadModes
+>
+
+/**
+ * A grouped collection query's state (§9.2): a per-member map, so
+ * `Query.offloaded` re-types each member's record — `NoOffloadState` when no
+ * member offloads.
+ */
+type CollectionState<TEntities extends Record<string, CollectionEntity>> = [
+  AllMemberFields<TEntities>["overflow"] | AllMemberFields<TEntities>["binary"],
+] extends [never]
+  ? NoOffloadState
+  : {
+      readonly fields: AllMemberFields<TEntities>
+      readonly modes: DefaultOffloadModes
+      readonly item: CollectionItem<TEntities>
+      readonly members: Members<TEntities>
+    }
+
+/** A member selector of a collection over `TEntities`. */
+type MemberSelectors<TEntities extends Record<string, CollectionEntity>> = {
+  readonly [K in keyof TEntities]: (
+    pkComposites: Record<string, unknown>,
+  ) => Query.Query<
+    EntityRecord<TEntities[K]>,
+    ReadBlobErrors<MemberOffload<TEntities[K]>, DefaultOffloadModes>,
+    MemberQueryState<TEntities[K]>
+  >
 }
 
 /**
@@ -83,10 +182,18 @@ export interface Collection<TEntities extends Record<string, CollectionEntity>> 
   readonly name: string
   readonly entities: TEntities
 
-  /** Query all entities in the collection. Returns grouped results keyed by entity name. */
+  /**
+   * Query all entities in the collection. Each item is tagged with its member:
+   * `{ _entityKey, _entityType, _decoded }`, `_decoded` the member's record.
+   * `Query.offloaded` re-types every member's record (#179).
+   */
   readonly query: (
     pkComposites: Record<string, unknown>,
-  ) => Query.Query<CollectionResult<TEntities>>
+  ) => Query.Query<
+    CollectionItem<TEntities>,
+    MemberBlobErrors<TEntities>,
+    CollectionState<TEntities>
+  >
 
   /** Entity selectors — narrow to a single entity type */
   readonly [K: string]: unknown
@@ -96,21 +203,6 @@ export interface Collection<TEntities extends Record<string, CollectionEntity>> 
 // Collection.make()
 // ---------------------------------------------------------------------------
 
-/**
- * Create a Collection from a set of entities that share an index with a common collection name.
- *
- * @param name - The collection name (must match a `collection` property in an entity's index definition)
- * @param entities - Map of entity names to Entity instances
- * @returns A Collection with a `.query()` method and per-entity selector methods
- */
-/**
- * The composite key form for one collection member — the same rule
- * (`internal/CompositeCodec.ts`) its own accessors and its write path apply.
- *
- * Without it, `Collections.make()`'s query builder composed the partition key
- * from the caller's raw Type-side record while the rows were written from the
- * key form, so a `DateEpochMs` or `BigIntFromString` composite matched nothing.
- */
 /** The schema a member's key form is derived from — `inputSchema` when the
  * member is a runtime entity, else its raw model. */
 const keyFormSourceOf = (entity: unknown): Schema.Top => {
@@ -121,16 +213,20 @@ const keyFormSourceOf = (entity: unknown): Schema.Top => {
   return (e.schemas?.inputSchema ?? e.model) as Schema.Top
 }
 
+/**
+ * The composite key form for one collection member — the same rule
+ * (`internal/CompositeCodec.ts`) its own accessors and its write path apply.
+ *
+ * Without it, `Collections.make()`'s query builder composed the partition key
+ * from the caller's raw Type-side record while the rows were written from the
+ * key form, so a `DateEpochMs` or `BigIntFromString` composite matched nothing.
+ */
 const collectionKeyForm = (
   entity: unknown,
   record: Record<string, unknown>,
   needs: ReadonlyArray<string>,
 ): Record<string, unknown> => {
-  const e = entity as {
-    readonly model?: unknown
-    readonly schemas?: { readonly inputSchema?: unknown }
-  }
-  const source = (e.schemas?.inputSchema ?? e.model) as Schema.Top | undefined
+  const source = keyFormSourceOf(entity) as Schema.Top | undefined
   if (source === undefined) return record
   // The caller's composites are DOMAIN values: the key `put` wrote for one is the
   // key form of the value it stores (`Entity._domainKeyForm`).
@@ -144,17 +240,21 @@ const collectionKeyForm = (
   return toCompositeKeyRecord(form, record, needs)
 }
 
+/**
+ * Create a Collection from a set of entities that share an index with a common collection name.
+ *
+ * @param name - The collection name (must match a `collection` property in an entity's index definition)
+ * @param entities - Map of entity names to Entity instances
+ * @returns A Collection with a `.query()` method (each item tagged with its
+ *   member) and per-entity selector methods
+ */
 export const make = <
   const TName extends string,
   const TEntities extends Record<string, CollectionEntity>,
 >(
   name: TName,
   entities: TEntities,
-): Collection<TEntities> & {
-  readonly [K in keyof TEntities]: (
-    pkComposites: Record<string, unknown>,
-  ) => Query.Query<EntityRecord<TEntities[K]>>
-} => {
+): Collection<TEntities> & MemberSelectors<TEntities> => {
   // Discover the shared index — find the first entity's index that has this collection name
   const entityEntries = Object.entries(entities)
   if (entityEntries.length === 0) {
@@ -278,7 +378,7 @@ export const make = <
   }
 
   // Collection decoder: decode and group items by entity type
-  const collectionDecoder = (raw: Record<string, unknown>) => {
+  const collectionDecoder = (raw: Record<string, unknown>, modes: Modes) => {
     const entityType = raw.__edd_e__ as string | undefined
     if (!entityType) {
       return Effect.fail(
@@ -301,7 +401,7 @@ export const make = <
       )
     }
 
-    return entry.entity._decodeRecord(raw).pipe(
+    return entry.entity._decodeRecord(raw, modes, "collection.decode").pipe(
       Effect.map((decoded) => ({
         _entityKey: entry.key,
         _entityType: entityType,
@@ -331,17 +431,23 @@ export const make = <
   }
   // A composite with no key text (`NaN`, an inexact number) refuses the query, as a bound
   // collection's does: its terminal fails with a `ValidationError` and sends nothing.
-  const refusable = <A>(build: () => Query.Query<A>): Query.Query<A> =>
+  const refusable = <A, E, O extends OffloadState>(
+    build: () => Query.Query<A, E, O>,
+  ): Query.Query<A, E, O> =>
     Query.orRefusal({ name: "Collection.query", target: name }, build, (refusal) =>
-      Query.refused<A>(sharedDynamoIndexName, refusal),
+      Query.refused<A, E, O>(sharedDynamoIndexName, refusal),
     )
 
-  // Main query: returns grouped results
+  // Main query: every member's items, each tagged with its member by
+  // `collectionDecoder` (`{ _entityKey, _entityType, _decoded }`) — the
+  // terminals return them as they come, ungrouped.
   const queryAll = (pkComposites: Record<string, unknown>) => {
-    // Each item is tagged with its member by `collectionDecoder`; the collect
-    // terminal groups them.
     const read = collectionPartitions(pkComposites)
-    let q = Query.make<CollectionResult<TEntities>>({
+    let q = Query.make<
+      CollectionItem<TEntities>,
+      MemberBlobErrors<TEntities>,
+      CollectionState<TEntities>
+    >({
       tableName: "",
       indexName: sharedDynamoIndexName,
       pkField: sharedPkField!,
@@ -355,11 +461,7 @@ export const make = <
         entityEntries[0]![1].indexes.primary?.pk.field,
         entityEntries[0]![1].indexes.primary?.sk.field,
       ],
-      decoder: (raw) => {
-        // This decoder gets called per-item, but Query.collect collects all items
-        // We need to tag each item with its entity key so the caller can group
-        return collectionDecoder(raw) as Effect.Effect<any, ValidationError>
-      },
+      decoder: (raw, modes) => collectionDecoder(raw, modes),
       ...collectionPackedQueryOptions(entityEntries.map(([, entity]) => entity)),
       keyConditionDiagnosis: { operation: "query", label: `collection "${name}"` },
     })
@@ -398,7 +500,7 @@ export const make = <
           pkValue,
           skField: sharedSkField,
           entityTypes: [entity.entityType],
-          decoder: (raw) => entity._decodeRecord(raw),
+          decoder: (raw, modes) => entity._decodeRecord(raw, modes, "collection.decode"),
           ...entityPackedQueryOptions(entity),
           resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
           keyFields: [
@@ -437,9 +539,5 @@ export const make = <
     entities,
     query: (pkComposites: Record<string, unknown>) => refusable(() => queryAll(pkComposites)),
     ...selectors,
-  } as Collection<TEntities> & {
-    readonly [K in keyof TEntities]: (
-      pkComposites: Record<string, unknown>,
-    ) => Query.Query<EntityRecord<TEntities[K]>>
-  }
+  } as Collection<TEntities> & MemberSelectors<TEntities>
 }

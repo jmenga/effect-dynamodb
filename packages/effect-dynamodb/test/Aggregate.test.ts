@@ -3420,6 +3420,21 @@ describe("Aggregate write path", () => {
       }).pipe(Effect.provide(WriteLayer)),
     )
 
+    it.effect("an empty inputField list (nothing to hydrate) still reaches its model field", () =>
+      Effect.gen(function* () {
+        mockTransactWrite.mockResolvedValue({})
+        // No ref id anywhere in the input: hydration fetches nothing, but the
+        // `inputField` key is still renamed to the model field, so the decode keeps the list.
+        const result = yield* MatchInputFieldAggregate.create({
+          id: "m-2",
+          name: "Empty Match",
+          umpires: { matchUmpireIds: [] },
+        } as never)
+        expect(result.umpires!.matchUmpire).toEqual([])
+        expect(mockBatchGetItem).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
     it("ManyEdge without inputField preserves original field name", () => {
       class SimpleMatch extends Schema.Class<SimpleMatch>("SimpleMatch")({
         id: Schema.String,

@@ -243,26 +243,6 @@ export const make = <
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Build the IndexDefinition for a member entity from collection config + member SK.
- * Used by DynamoClient.make() to inject GSI indexes into entities.
- *
- * @internal
- */
-export const buildMemberIndexDef = (
-  collection: Collection,
-  m: CollectionMember,
-): IndexDefinition => ({
-  index: collection.index.name,
-  collection: collection.name,
-  type: collection.type,
-  pk: { field: collection.index.pk, composite: [...collection.composite] },
-  sk: {
-    field: collection.index.sk,
-    composite: [...m.sk],
-  },
-})
-
 /** @internal Get model field names (including ref ID fields). */
 const getModelFieldNames = (model: Schema.Top): Set<string> => {
   try {

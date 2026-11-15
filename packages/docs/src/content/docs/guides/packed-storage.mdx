@@ -20,6 +20,8 @@ The same config is used in two places:
 
 The default stays the native map. Event metadata always stays a map.
 
+A packed value still counts toward DynamoDB's 400 KB item limit. For a value that can outgrow it, `Packed({ ..., external })` keeps the value inline below a threshold and moves it to a blob store such as S3 at or above it, the item holding a pointer: see [Offloaded Storage](/effect-dynamodb/guides/blob-offload/).
+
 ## When to use it
 
 A map is the most expensive shape DynamoDB returns. The AWS SDK parses a type-wrapped node for every value (`{"M":{…}}`, `{"N":"0"}`), and unmarshalling rebuilds the object graph a second time. A JSON string is one node: one string to parse, then `JSON.parse` in native code.
@@ -77,7 +79,8 @@ Each stored value says how it is encoded. A reader looks at **what is stored**, 
 | absent / `NULL` | absent / `null` |
 | `M`, `L` or another native type | the native value, as before packing (written before the field was packed) |
 | `S` | `JSON.parse` of the string |
-| `B` | header byte, then decompress, then `JSON.parse` |
+| `B`, layout `001` | header byte, then decompress, then `JSON.parse` |
+| `B`, layout `010` | a blob pointer: the value is fetched from the blob store, decompressed and parsed (eagerly by default). See [Offloaded Storage](/effect-dynamodb/guides/blob-offload/#what-the-item-holds). |
 
 So a field or stream can hold a mix of native, JSON and compressed values, and every one decodes. Turning packing on, off, or changing the codec needs no rewrite. No marker attribute is added to the item. This matters for EventStore stream indexes with the `"withoutMetadata"` projection: their `INCLUDE` list is fixed when the index is created and can't be changed in place.
 
@@ -87,11 +90,11 @@ Byte 0 of a `B` value is a header. The compressed UTF-8 JSON follows it.
 
 | Bits | Field | Values |
 |---|---|---|
-| 7–5 | layout version | `001` = v1. `000` is invalid. Other values are reserved for future layouts. |
-| 4–3 | format | `00` = JSON. `01` is reserved for a future binary format. `10` and `11` are reserved. |
+| 7–5 | layout version | `001` = v1. `010` = a blob pointer ([offloaded storage](/effect-dynamodb/guides/blob-offload/)). `000` is invalid. Other values are reserved for future layouts. |
+| 4–3 | format | `00` = JSON. `01` = bytes, used only by layout `010` (a binary field's pointer). `10` and `11` are reserved. |
 | 2–0 | codec | `000` none, `001` gzip, `010` brotli, `011` zstd. Other values are reserved. |
 
-Writers emit `0x21` (gzip), `0x22` (brotli) or `0x23` (zstd). Readers also accept `0x20` (uncompressed JSON in `B`). Any other header fails with a `ValidationError` that names the attribute and the byte, so a value written by a newer version is reported, not misread.
+Writers emit `0x21` (gzip), `0x22` (brotli) or `0x23` (zstd). Readers also accept `0x20` (uncompressed JSON in `B`). A pointer's header is `0x40`–`0x43` (its object is JSON, uncompressed or compressed with gzip, brotli or zstd) or `0x48` (a binary field's bytes, which store the pointer as `S` text instead). Any other header fails with a `ValidationError` that names the attribute and the byte, so a value written by a newer version is reported, not misread.
 
 ### Threshold, and only when smaller
 
@@ -330,10 +333,11 @@ Keep registering every codec your stored values were written with, for as long a
 A store whose `Packed` config names a codec meets values compressed with it on every read and write, so the codec is checked before anything runs, not when the first compressed value turns up:
 
 - **`DynamoClient.make`** checks every bound entity and aggregate (including each aggregate's edge entities) against the registry it binds with, whether that's from `compressors` or a `Compression` in context. A codec that isn't registered, or no registry at all, fails the bind with an `[EDD-9078]` configuration defect naming the member, the field and the codec. It isn't a typed error.
+- **`Entity.bind(entity)`** and **`Aggregate.bind(aggregate)`** do the same for the one entity (or the aggregate's edge entities), against the context they capture.
 - **`EventStore.bind(stream)`** does the same for the stream's `storedAs.data` and `snapshot.storedAs`, against the context it captures.
 - **An unbound stream** (`EventStore.makeStream(...)` used with the `DynamoClient` in context) checks the registry in context on its first operation, before anything is written or read, and dies with the same `[EDD-9078]` defect. Each registry is checked once per stream. This includes `stream.decodeStreamImage`: its type has no `Compression` requirement (`R = never`), but it reads the service from the running fiber, so a handler whose context lost `Compression` (for example behind `Layer.provide`, above) dies on its first image — even an image of another item. Provide `Compression` where the handler runs, or decode through `EventStore.bind(stream)`.
 
-All three checks are **defects**, not typed errors: a missing codec is a deployment mistake, so they fail fast at startup or on first use instead of surfacing per row.
+All of these checks are **defects**, not typed errors: a missing codec is a deployment mistake, so they fail fast at startup or on first use instead of surfacing per row.
 
 A bound stream's `query.events` / `query.index` builders are the exception to the captured context: run directly, they read the `Compression` registry of the caller's context. Run them through the bound stream's `provide` to use the one it captured.
 
@@ -574,7 +578,7 @@ if (Option.isSome(withRaw)) {
 }
 ```
 
-Both accept DynamoDB JSON (`B` as bytes or base64) or an already-unmarshalled item. In an unmarshalled item, a packed attribute's `B` value may still be base64 text. That text always starts with `I`–`P`, which JSON text never does, so the two can be told apart. `Entity.itemSchema(entity)` is a pure schema and **does not unpack**: use `decodeMarshalledItem` for entities with packed fields.
+Both accept DynamoDB JSON (`B` as bytes or base64) or an already-unmarshalled item. In an unmarshalled item, a packed attribute's `B` value may still be base64 text. That text always starts with `I`–`X` (`I`–`P` for a packed value, `Q`–`X` for a [blob pointer](/effect-dynamodb/guides/blob-offload/)), which JSON text never does, so the two can be told apart. `Entity.itemSchema(entity)` is a pure schema and **does not unpack**: use `decodeMarshalledItem` for entities with packed fields.
 
 Neither helper adds a requirement. Compressors come from a `Compression` service in context, or from the bound stream's context.
 
@@ -635,6 +639,7 @@ A packed value is decoded through the current schema, as a map is, so the same r
 
 ## What's next?
 
+- [Offloaded Storage](/effect-dynamodb/guides/blob-offload/): values that outgrow the item, and binary content, in a blob store such as S3
 - [Modeling](/effect-dynamodb/guides/modeling/): `DynamoModel.configure` and the other `storedAs` options
 - [Sparse Maps](/effect-dynamodb/guides/sparse-maps/): the other storage layout, for per-key access to a record
 - [Event Sourcing](/effect-dynamodb/tutorials/event-sourcing/): streams, snapshots and stream indexes

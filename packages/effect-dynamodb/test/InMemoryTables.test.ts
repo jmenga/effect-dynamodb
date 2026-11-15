@@ -1257,38 +1257,48 @@ describe("rows of one index key: a read is refused only when its own page depend
 describe("what the tables don't model fails by name", () => {
   for (const [name, table] of Object.entries(TABLES)) {
     it.effect(
-      `${name}: a transaction's ClientRequestToken is refused, and nothing is written`,
+      `${name}: a transaction's ClientRequestToken is answered as DynamoDB Local answers it`,
       () =>
         Effect.gen(function* () {
           const { layer, seed, read } = table()
           seed({ ...key("counter"), n: { N: "0" } })
-          const exit = yield* Effect.exit(
-            Effect.provide(
-              withClient((client) =>
-                client.transactWriteItems({
-                  ClientRequestToken: "token",
-                  TransactItems: [
-                    {
-                      Update: {
-                        TableName: "t",
-                        Key: key("counter"),
-                        UpdateExpression: "ADD #n :one",
-                        ExpressionAttributeNames: { "#n": "n" },
-                        ExpressionAttributeValues: { ":one": { N: "1" } },
+          const add = (amount: string, token: string) =>
+            Effect.exit(
+              Effect.provide(
+                withClient((client) =>
+                  client.transactWriteItems({
+                    ClientRequestToken: token,
+                    TransactItems: [
+                      {
+                        Update: {
+                          TableName: "t",
+                          Key: key("counter"),
+                          UpdateExpression: "ADD #n :one",
+                          ExpressionAttributeNames: { "#n": "n" },
+                          ExpressionAttributeValues: { ":one": { N: amount } },
+                        },
                       },
-                    },
-                  ],
-                }),
+                    ],
+                  }),
+                ),
+                layer,
               ),
-              layer,
-            ),
+            )
+          // Committed once; resent with its token: success, nothing written again.
+          expect(Exit.isSuccess(yield* add("1", "token"))).toBe(true)
+          expect(Exit.isSuccess(yield* add("1", "token"))).toBe(true)
+          expect(read(key("counter"))).toEqual({ ...key("counter"), n: { N: "1" } })
+          // Resent with other items: refused, nothing written.
+          const mismatch = yield* add("2", "token")
+          expect(Exit.isFailure(mismatch)).toBe(true)
+          const refusal = Exit.isFailure(mismatch) && Cause.squash(mismatch.cause)
+          expect((refusal as { readonly cause?: { readonly name?: string } }).cause?.name).toBe(
+            "IdempotentParameterMismatchException",
           )
-          const defect = Exit.isFailure(exit) && Cause.squash(exit.cause)
-          expect(defect).toBeInstanceOf(UnreadableRequest)
-          expect(String(defect)).toContain(
-            `doesn't read the ClientRequestToken "token": not modelled (DynamoDB Local answers a committed transaction resent with its token with success, writing nothing`,
-          )
-          expect(read(key("counter"))).toEqual({ ...key("counter"), n: { N: "0" } })
+          expect(read(key("counter"))).toEqual({ ...key("counter"), n: { N: "1" } })
+          // Another token is another transaction.
+          expect(Exit.isSuccess(yield* add("1", "other"))).toBe(true)
+          expect(read(key("counter"))).toEqual({ ...key("counter"), n: { N: "2" } })
         }),
     )
   }
@@ -1318,6 +1328,7 @@ describe("what the tables don't model fails by name", () => {
         "updateItem",
         "deleteItem",
         "query",
+        "batchWriteItem",
         "transactWriteItems",
         "executeStatement",
         "executeTransaction",

@@ -1400,8 +1400,8 @@ export interface RekeyOptions {
    */
   readonly streams?:
     | ReadonlyArray<
-        | EventStream<any, any, any, any, any, any, any>
-        | BoundEventStream<any, any, any, any, any, any, any>
+        | EventStream<any, any, any, any, any, any, any, any>
+        | BoundEventStream<any, any, any, any, any, any, any, any>
       >
     | undefined
   /**

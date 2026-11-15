@@ -720,6 +720,7 @@ the choke point (§4). "Unbound + bound" means the wrapper sits in the op itself
 | `EventStore.commandHandler` | the handler invocation | load (readLatest / read / loadState) + append (+ additional items) | nested children (§6.2) |
 | `Projection.apply` / `.applyBatch` / `.catchUp` / `.rebuild` / `.processBatch` / `.drain` / `.drainPending` | `EventProjection` / `MultiProjection` methods (`bindProjection` delegates) | GetItem, PutItem, UpdateItem, DeleteItem, Query, TransactWriteItems (ProjectionEngine) | target = projection entity type; multi-projection uses `MultiProjection.*` |
 | `CheckpointStore.load` / `.commit` / `.acquireLease` / `.renewLease` / `.releaseLease` | `CheckpointStore.makeDynamoDB` methods | GetItem, PutItem, UpdateItem, DeleteItem, Query | the change feed's DynamoDB Streams calls report no capacity (§9.3) |
+| `BlobGc.reap` / `.sweep` / `.sweepPartition` / `.sweepStore` | the `BlobGc.make` collector's methods (#179) | GetItem (confirm reads), Query (an item family's or partition's rows) | target = member name for `sweep` / `sweepPartition`; blob store calls report no capacity |
 
 Two operations are deliberately absent:
 

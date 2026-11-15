@@ -112,14 +112,15 @@ describe("header layout", () => {
   })
 
   it("refuses every other byte with a reason", () => {
-    const readable = new Set([0x20, 0x21, 0x22, 0x23])
+    // v1 values, and the blob pointer headers of layout 010 (#179, BlobPointer.test.ts).
+    const readable = new Set([0x20, 0x21, 0x22, 0x23, 0x40, 0x41, 0x42, 0x43, 0x48])
     for (let byte = 0; byte < 256; byte++) {
       if (readable.has(byte)) continue
       expect(typeof PackedCodec.parseHeader(byte)).toBe("string")
     }
     expect(PackedCodec.parseHeader(0x01)).toContain("layout version 0")
-    expect(PackedCodec.parseHeader(0x41)).toContain("layout version 2")
-    expect(PackedCodec.parseHeader(0x41)).toContain("newer effect-dynamodb")
+    expect(PackedCodec.parseHeader(0x61)).toContain("layout version 3")
+    expect(PackedCodec.parseHeader(0x61)).toContain("newer effect-dynamodb")
     expect(PackedCodec.parseHeader(0xe3)).toContain("layout version 7")
     expect(PackedCodec.parseHeader(0x28)).toContain('format "binary"')
     expect(PackedCodec.parseHeader(0x28)).toContain("reserved")
@@ -138,6 +139,7 @@ describe("header layout", () => {
         expect("IJKLMNOP").toContain(text[0])
       }
     }
+    // Widened to Q..X for blob pointers (#179): see BlobPointer.test.ts.
     for (const value of [{}, [], "x", 0, -1, 12.5, true, false, null, { I: 1 }, ["P"]]) {
       expect(PackedCodec.isBase64PackedText(JSON.stringify(value))).toBe(false)
     }
@@ -618,10 +620,51 @@ describe("unpackValue dispatch", () => {
     expect(notJson).toBeInstanceOf(ValidationError)
   })
 
+  it("unpackPayloadSync returns the content bytes a pointer's checksum covers, unparsed", () => {
+    const readOp = { entityType: "Order", operation: "decode" }
+    const value = payloadOfBytes(3000)
+    const content = encoder.encode(JSON.stringify(value))
+    // A v1 value of codec "none" (header 0x20) and a gzip one.
+    const gzipped = PackedCodec.packValueSync(withCodec("gzip", 0), value, all, ctx, "lines")
+    expect(gzipped).toBeInstanceOf(Uint8Array)
+    for (const stored of [new Uint8Array([0x20, ...content]), gzipped as Uint8Array]) {
+      const payload = PackedCodec.unpackPayloadSync(stored, all, readOp, "lines")
+      expect(payload).toBeInstanceOf(Uint8Array)
+      expect(Array.from(payload as Uint8Array)).toEqual(Array.from(content))
+    }
+    // Not JSON: the bytes are returned as stored — parsing is not this function's job.
+    const text = PackedCodec.unpackPayloadSync(
+      new Uint8Array([0x20, ...encoder.encode("{nope")]),
+      none,
+      readOp,
+      "lines",
+    )
+    expect(Array.from(text as Uint8Array)).toEqual(Array.from(encoder.encode("{nope")))
+    const missing = PackedCodec.unpackPayloadSync(gzipped as Uint8Array, none, readOp, "lines")
+    expect((missing as ValidationError).cause).toMatchObject({
+      _tag: "CompressorNotRegistered",
+      codec: "gzip",
+      direction: "decompress",
+    })
+    for (const [stored, message] of [
+      [new Uint8Array(0), "stored binary value is empty"],
+      [new Uint8Array([0x61, 1]), "newer effect-dynamodb"],
+      [new Uint8Array([0x41, 1]), "bad magic"],
+      [new Uint8Array([0x21, 1, 2, 3]), '"gzip" decompressor failed'],
+    ] as const) {
+      const result = PackedCodec.unpackPayloadSync(stored, all, readOp, "lines")
+      expect(result).toBeInstanceOf(ValidationError)
+      expect(causeMessage(result)).toContain(message)
+    }
+  })
+
   const invalidStored: ReadonlyArray<readonly [string, unknown, string]> = [
     ["empty B", new Uint8Array(0), "stored binary value is empty"],
     ["layout version 0", new Uint8Array([0x01, 1]), "layout version 0"],
-    ["unknown layout version", new Uint8Array([0x41, 1]), "newer effect-dynamodb"],
+    ["unknown layout version", new Uint8Array([0x61, 1]), "newer effect-dynamodb"],
+    ["a truncated blob pointer", new Uint8Array([0x41, 0x45, 0x44]), "truncated"],
+    ["a blob pointer with a bad magic", new Uint8Array([0x41, 1]), "bad magic"],
+    ["a reserved blob pointer kind", new Uint8Array([0x50, 1]), "reserved pointer kind 2"],
     ["reserved binary format", new Uint8Array([0x28, 1]), 'format "binary"'],
     ["unknown format code", new Uint8Array([0x30, 1]), "unknown format code"],
     ["unknown codec code", new Uint8Array([0x27, 1]), "unknown codec code 7"],

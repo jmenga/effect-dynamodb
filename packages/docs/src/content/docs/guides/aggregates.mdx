@@ -677,6 +677,83 @@ Existing rows need no migration step:
 
 For example, an optional `NumberFromString` holding `5` was stored as `{ "N": "5" }` and is now `{ "S": "5" }`. Rows of both kinds read back correctly. However, a `list` filter on such an attribute can match old and new rows differently until the old rows are rewritten: a `filter` expression compares against one DynamoDB type, and a `filterBy` predicate receives the stored value, a number on old rows and a string on new ones. DynamoDB Streams consumers also see the attribute change type. The same applies to an optional `Schema.BigIntFromString`. Rows 1.22.0 stored as `{ "N": "5" }` could not be read back at all; they now read back as `5n`.
 
+### Offloaded Edge Fields
+
+Edge items are entity items, so an edge entity's [offloaded fields](/effect-dynamodb/guides/blob-offload/) (`DynamoModel.Packed({ ..., external })` and `DynamoModel.External()`) are offloaded per its own config. `Aggregate.make` adds no option, but the aggregate's schema must set `escapeKeys: true` ([key text](/effect-dynamodb/guides/blob-offload/#key-text-escapekeys-true)); binding one on a schema without it fails with `[EDD-9146]`:
+
+```typescript region="offloaded-edge-entity" example="guide-aggregates.ts"
+class Photo extends Schema.Class<Photo>("Photo")({
+  id: Schema.String,
+  caption: Schema.String,
+  image: Schema.Uint8Array,
+}) {}
+
+const Photos = Entity.make({
+  model: DynamoModel.configure(Photo, {
+    id: { identifier: true },
+    image: { storedAs: DynamoModel.External({ contentType: "image/jpeg" }) },
+  }),
+  entityType: "Photo",
+  primaryKey: {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+```
+
+```typescript region="offloaded-edges" example="guide-aggregates.ts"
+class MatchReport extends Schema.Class<MatchReport>("MatchReport")({
+  matchId: Schema.String,
+  headline: Schema.String,
+  photos: Schema.Array(Photo),
+}) {}
+
+// Offloading requires escaped key text: the reports live on a table whose schema sets it
+const ReportSchema = DynamoSchema.make({ name: "cricket", version: 1, escapeKeys: true })
+const ReportTable = Table.make({ schema: ReportSchema, entities: { Photos } })
+
+// Photos is configured to offload `image`: each photo's edge item holds a pointer
+const MatchReportAggregate = Aggregate.make(MatchReport, {
+  table: ReportTable,
+  schema: ReportSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "report" },
+  root: { entityType: "MatchReportItem" },
+  edges: {
+    photos: Aggregate.many("photos", { entityType: "ReportPhoto", entity: Photos }),
+  },
+})
+```
+
+```typescript region="offloaded-edges-usage" example="guide-aggregates.ts"
+// Binary edge fields take Uint8Array; each one is uploaded before its group is written
+yield* MatchReportAggregate.create({
+  matchId: "bgt-2025-test-1",
+  headline: "Cummins takes five",
+  photos: [
+    { id: "p-1", caption: "Day 1", image: jpeg(50_000, 1) },
+    { id: "p-2", caption: "Day 2", image: jpeg(40_000, 2) },
+  ],
+})
+
+// Aggregate reads are eager: image is the Uint8Array itself
+const report = yield* MatchReportAggregate.get({ matchId: "bgt-2025-test-1" })
+const firstImage: Uint8Array = report.photos[0]!.image
+
+// An update writes only changed groups, and a changed group uploads its
+// offloaded values again; an unchanged group uploads nothing
+yield* MatchReportAggregate.update({ matchId: "bgt-2025-test-1" }, ({ cursor }) =>
+  cursor.key("headline").replace("Cummins takes five on day one"),
+)
+```
+
+- **Reads are eager for both kinds.** `get`, `list` and the state `update` hands you hold the values themselves (`Uint8Array` for a binary field), since the assembled value is your aggregate schema and `update` re-validates it.
+- **Binary edge inputs are `Uint8Array` only.** A `Stream`, `BlobHandle` or `Offload.source` (or an `OffloadedValue` for an overflow field) fails with a `ValidationError` naming `[EDD-9120]`.
+- **A changed group uploads again.** `update` diffs groups before writing (the root group, and each sub-aggregate), and writes only the changed ones. Within a changed group, every offloaded edge value is uploaded as a new version, even if its content didn't change: group writes carry no condition, so a pointer read from the partition is never written back. An unchanged group uploads nothing. Keep large binary content in a sub-aggregate of its own when other parts of the aggregate change often.
+- **Groups are separate transactions**, so uploads settle per group: a failed group's uploads are rolled back, and committed groups keep theirs.
+- **Refs never copy offloaded fields.** A ref schema that includes a field the referenced entity offloads is refused (`[EDD-9143]`): reference a subset model without it. An edge item hydrated from an id copies the target's offloaded values it holds into new versions under its own key.
+- **Errors.** Every aggregate write, and every read, of an aggregate with offloaded edge fields adds `BlobStoreError` to its error type. `delete` never reaches the store and keeps its error type; the [garbage collector](/effect-dynamodb/guides/blob-offload/#garbage-collection) frees the deleted edges' versions (`BlobGc.make({ aggregates })`, `sweepPartition`). An aggregate member collects only the rows in its own partitions: when its edge entity is also used standalone on the same table (with the same entity type), list that entity under `entities` too, or its standalone rows and their history are never collected by this collector.
+
 ### Aggregate Operations
 
 #### get — Read and Assemble
@@ -968,6 +1045,7 @@ type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 | `AggregateDecompositionError` | Write path: schema validation or structural error during decomposition | `aggregate`, `member`, `reason` |
 | `AggregateTransactionOverflow` | Write path: DynamoDB rejected a sub-aggregate group over its 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit`, `committed` (sub-aggregates already written), `operation` (`"create"` / `"update"`), `cause`; `message` states all of it |
 | `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |
+| `BlobStoreError` | An aggregate with [offloaded edge fields](#offloaded-edge-fields): an upload or an eager read failed (not on `delete`) | `entityType`, `attribute`, `operation`, `action`, `reason`, `committed` |
 
 ```typescript region="aggregate-error-handling" example="guide-aggregates.ts"
 const result = yield* MatchAggregate.get({ id: "nonexistent" }).pipe(

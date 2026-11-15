@@ -6,7 +6,9 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import { type DynamoEncoding, isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
+import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
@@ -14,8 +16,9 @@ import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySche
 import { given, ownValue } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { DateTime, Effect, Option, type Schema } from "effect"
+import { Context, DateTime, Effect, Option, type Schema } from "effect"
 import { SecureRandom } from "effect/crypto"
+import { BlobStore } from "../BlobStore.js"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
 import type { ConditionInput } from "../Expression.js"
@@ -23,7 +26,42 @@ import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshall
 import { resolveTtlAttributeName, type TableConfig, tableKeyAttributes } from "../Table.js"
 import { isRefusedValue } from "./Capacity.js"
 import type { PutKind, ReturnValuesMode, UpdateState } from "./EntityOps.js"
-import { encodeInput } from "./InputForm.js"
+import { DEFAULT_MODES, type Modes } from "./OffloadRead.js"
+
+/**
+ * @internal The blob store and compressor registry of a binding's context
+ * (#179, design §3.6) — whichever of the two it holds, `undefined` for
+ * neither. A bound builder carries them (`BoundCrudConfig.captured`), and the
+ * multi-item entry points build and read its item under them.
+ */
+export const capturedServices = (
+  context: Context.Context<never>,
+): Context.Context<never> | undefined => {
+  let captured: Context.Context<never> | undefined
+  const store = Context.getOrUndefined(context, BlobStore)
+  if (store !== undefined) captured = Context.make(BlobStore, store) as Context.Context<never>
+  const registry = Context.getOrUndefined(context, Compression)
+  if (registry !== undefined) {
+    captured = (
+      captured === undefined
+        ? Context.make(Compression, registry)
+        : Context.add(captured, Compression, registry)
+    ) as Context.Context<never>
+  }
+  return captured
+}
+
+/**
+ * @internal Run `effect` under an op's captured services (§3.6): they replace
+ * the caller's blob store and compressor registry for it, and nothing else —
+ * the caller's client, table, ledger and operation stay as they are. `effect`
+ * itself when the op captured none (an unbound op: the ambient ones apply).
+ */
+export const underCaptured = <A, E, R>(
+  captured: Context.Context<never> | undefined,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  captured === undefined ? effect : Effect.provideContext(effect, captured)
 
 /**
  * @internal Hidden per-incarnation token of a versioned entity (#133): set
@@ -975,6 +1013,64 @@ export const rejectUnsupportedOp = (
 }
 
 /**
+ * @internal Load, in place, the rows a multi-get (`Batch.get`,
+ * `Transaction.transactGet`) fetched (#179): grouped by entity, by the
+ * services the get captured (a bound get's blob store and compressor
+ * registry, §3.6) and by the value of its read modes, every group's offloaded
+ * values resolve together (one batched resolution per group, under the
+ * group's captured services) before any row is decoded — the decoder then
+ * finds each row prepared. Groups load one after another, so the reads in
+ * flight never exceed the store's `readConcurrency`. `rows[i]` is the
+ * unmarshalled item of `infos[i]`, `undefined` for none.
+ */
+export const loadGetRows = (
+  infos: ReadonlyArray<{
+    readonly entity: Entity
+    readonly offloadModes?: Modes | undefined
+    readonly captured?: Context.Context<never> | undefined
+  }>,
+  rows: ReadonlyArray<Record<string, unknown> | undefined>,
+  operation: string,
+): Effect.Effect<void, ValidationError | BlobStoreError> => {
+  interface Group {
+    readonly entity: Entity
+    readonly captured: Context.Context<never> | undefined
+    readonly modes: Modes
+    readonly rows: Array<Record<string, unknown>>
+  }
+  const groups: Array<Group> = []
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    const info = infos[i]
+    if (row === undefined || info === undefined || !info.entity._offloads) continue
+    const modes = info.offloadModes ?? DEFAULT_MODES
+    // Modes by value: an object-form mode is a fresh `Modes` per builder.
+    let group = groups.find(
+      (g) =>
+        g.entity === info.entity &&
+        g.captured === info.captured &&
+        g.modes.overflow === modes.overflow &&
+        g.modes.binary === modes.binary,
+    )
+    if (group === undefined) {
+      group = { entity: info.entity, captured: info.captured, modes, rows: [] }
+      groups.push(group)
+    }
+    group.rows.push(row)
+  }
+  if (groups.length === 0) return Effect.void
+  return Effect.forEach(
+    groups,
+    (group) =>
+      underCaptured(
+        group.captured,
+        group.entity._loadRows(group.rows, { operation, modes: group.modes }),
+      ),
+    { discard: true },
+  )
+}
+
+/**
  * Resolve table names for a set of entity infos, deduplicating by entity reference.
  */
 export const resolveTableNames = (infos: ReadonlyArray<{ readonly entity: Entity }>) =>
@@ -1044,6 +1140,20 @@ export const marshalOrFail = <A>(
     ),
   )
 
+/**
+ * Marshal a put item {@link validateAndBuildPutItem} built, once its offloaded
+ * fields are routed (#179): a value DynamoDB can't store fails as
+ * {@link marshalOrFail} says, naming the model field.
+ */
+export const marshalPutItem = (
+  entity: Entity,
+  item: Record<string, unknown>,
+  operation: string,
+): Effect.Effect<Record<string, AttributeValue>, ValidationError> =>
+  marshalOrFail(entity.entityType, operation, () => toAttributeMap(item), {
+    fieldOf: entity._fieldOfAttribute,
+  })
+
 /** An entity item's primary key, from a record already in the composite key form. */
 const primaryKeyOf = (
   entity: Entity,
@@ -1098,20 +1208,28 @@ export const composePrimaryKeyOrFail = (
   )
 
 /**
- * Validate input, compose all keys, and build a marshalled put item.
+ * Validate input, compose all keys, and build a put item — packed, under its
+ * stored names, not yet marshalled.
  *
  * Encodes the user-supplied domain payload to wire format via
  * `Schema.encode(inputSchema)`, then assembles the DynamoDB item with system
  * fields and composite keys. Substituted self-date schemas + RedactedFromValue
  * are handled in the encode pass — no per-field serialization needed.
  *
- * Returns the unmarshalled `item` alongside the marshalled one, plus the `now`
- * the timestamps were generated from, and whether the input supplied
- * `createdAt`. `Entity._planPut` needs them to derive uniqueness sentinels and
- * the retain snapshot from the same values that were written (#113), and to
- * keep a replaced item's `createdAt` (#133); re-deriving `now` there would risk
- * a skew between an item's `createdAt` and its snapshot's TTL. `options.createdAt`
- * is the `createdAt` of a row being rewritten, which no input supplies.
+ * Purely local: an item whose entity offloads a field still holds the field's
+ * inline stored value. The caller routes and uploads it
+ * (`entity._offloadItem`, #179, design §6.6) once every op of its request is
+ * built and its own reads are done — so a refused request uploads nothing —
+ * and marshals the routed item after (`marshalPutItem`); `marshalled` is the
+ * item as built, which an entity that offloads nothing stores as it is.
+ *
+ * Returns the unmarshalled `item` alongside the marshalled one, the `now` the
+ * timestamps were generated from, and whether the input supplied `createdAt`. `Entity._planPut` needs them to
+ * derive uniqueness sentinels and the retain snapshot from the same values
+ * that were written (#113), and to keep a replaced item's `createdAt` (#133);
+ * re-deriving `now` there would risk a skew between an item's `createdAt` and
+ * its snapshot's TTL. `options.createdAt` is the `createdAt` of a row being
+ * rewritten, which no input supplies.
  */
 export const validateAndBuildPutItem = (
   entity: Entity,
@@ -1121,7 +1239,8 @@ export const validateAndBuildPutItem = (
 ): Effect.Effect<
   {
     readonly item: Record<string, unknown>
-    readonly marshalled: Record<string, import("@aws-sdk/client-dynamodb").AttributeValue>
+    /** The item as built: an entity that offloads a field marshals it again once routed. */
+    readonly marshalled: Record<string, AttributeValue>
     readonly now: DateTime.Utc
     /** Whether the input supplied `createdAt` (a replacing put keeps the stored one otherwise). */
     readonly createdAtSupplied: boolean
@@ -1136,22 +1255,11 @@ export const validateAndBuildPutItem = (
     // Clock-backed time source resolved once per op; threaded into the sync
     // timestamp builder so the value is deterministic under `TestClock`.
     const now = yield* DateTime.now
-    const inputSchema = entity.schemas.inputSchema as Schema.Codec<any>
-    // The input's stored form, decided as `Entity.put` decides it (`InputForm`).
-    // Omitted decoding defaults are stored, exactly as `Entity.put` does.
+    // Omitted decoding defaults are stored, and the input encoded, exactly
+    // as `Entity.put` does (binary inputs included, #179).
     const filled = yield* entity._fillDecodingDefaults(input)
     const unsentineled = entity._unsentineledDefaults(input)
-    const encoded = yield* encodeInput(inputSchema, filled).pipe(
-      Effect.mapError(
-        ({ stored }) =>
-          new ValidationError({
-            entityType: entity.entityType,
-            operation,
-            cause: stored,
-          }),
-      ),
-    )
-    yield* entity._refuseNotReadBack(encoded, operation)
+    const encoded = yield* entity._encodeInput(filled, operation)
 
     const item: Record<string, unknown> = { ...(encoded as Record<string, unknown>) }
     item.__edd_e__ = entity.entityType
@@ -1237,6 +1345,10 @@ export const validateAndBuildPutItem = (
     // Pack `storedAs: DynamoModel.Packed` fields, as `Entity.put` does (#147).
     yield* entity._packFields(item, operation)
 
+    // Marshalled as built, so a value DynamoDB can't store is refused before
+    // anything is read or uploaded. An entity that offloads a field marshals
+    // its item again once routed (`marshalPutItem`): this one holds the
+    // offloaded values inline.
     const marshalled = yield* marshalOrFail(
       entity.entityType,
       operation,

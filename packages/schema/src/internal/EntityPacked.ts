@@ -12,9 +12,8 @@
  *   side is not object- or array-shaped (a scalar, a date — so never a TTL
  *   attribute — binary, a set, or a union with such a member).
  * - `[EDD-9072]` the packed field feeds a key or index attribute: a primary-key
- *   or secondary-index composite (collection-injected indexes are checked again
- *   when injected — {@link packedIndexRefusal}), `timeSeries.orderBy`, or a
- *   vector index partition / filter field.
+ *   or secondary-index composite ({@link packedIndexRefusal}),
+ *   `timeSeries.orderBy`, or a vector index partition / filter field.
  * - `[EDD-9074]` a unique constraint names the packed field.
  * - `[EDD-9075]` the packed field is a `DynamoModel.ref` field.
  *
@@ -22,7 +21,7 @@
  */
 
 import type { Schema } from "effect"
-import { isRefField, type PackedConfig } from "../DynamoModel.js"
+import { type ExternalPackedConfig, isRefField, type PackedConfig } from "../DynamoModel.js"
 import type { IndexDefinition } from "../KeyComposer.js"
 import type { VectorIndexConfig } from "../VectorIndex.js"
 import type { TimeSeriesConfig, UniqueConfig } from "./EntityConfig.js"
@@ -33,9 +32,9 @@ import { isDispatchEligible, packedShape } from "./PackedCodec.js"
 /** The storage plan of an entity's packed fields. */
 export interface PackedPlan {
   /** Domain field name → config, for every field configured packed. */
-  readonly packedFields: Readonly<Record<string, PackedConfig>>
+  readonly packedFields: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>
   /** Stored attribute name (after `field` renames) → config. */
-  readonly packedAttributes: Readonly<Record<string, PackedConfig>>
+  readonly packedAttributes: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>
   /**
    * Stored attribute names a reader dispatches on by stored form: every packed
    * attribute, plus every non-sparse model field whose encoded side is
@@ -50,12 +49,14 @@ const refusal = (code: string, entityType: string, field: string, message: strin
   new Error(`[${code}] Entity "${entityType}": packed field "${field}" ${message}`)
 
 /**
- * Why a (possibly injected) index cannot be added to an entity with these
- * packed fields, or `undefined`: one of its composites is packed (`[EDD-9072]`).
+ * Why an index cannot be declared on an entity with these packed fields, or
+ * `undefined`: one of its composites is packed (`[EDD-9072]`). Composites are
+ * matched by own key (`Object.hasOwn`): an `in` lookup would also match a name
+ * `Object.prototype` defines (`valueOf`, `constructor`, …).
  */
 export const packedIndexRefusal = (
   entityType: string,
-  packedFields: Readonly<Record<string, PackedConfig>>,
+  packedFields: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>,
   indexName: string,
   def: IndexDefinition,
 ): string | undefined => {
@@ -79,7 +80,7 @@ export const packedIndexRefusal = (
 export const resolvePackedPlan = (args: {
   readonly entityType: string
   readonly model: Schema.Top
-  readonly packedFields: Readonly<Record<string, PackedConfig>>
+  readonly packedFields: Readonly<Record<string, PackedConfig | ExternalPackedConfig>>
   readonly sparseFields: Readonly<Record<string, unknown>>
   readonly modelFields: Readonly<Record<string, Schema.Top>>
   readonly indexes: Readonly<Record<string, IndexDefinition>>
@@ -164,7 +165,7 @@ export const resolvePackedPlan = (args: {
     }
   }
 
-  const packedAttributes: Record<string, PackedConfig> = {}
+  const packedAttributes: Record<string, PackedConfig | ExternalPackedConfig> = {}
   for (const [field, config] of Object.entries(packedFields)) {
     setOwn(packedAttributes, args.resolveDbName(field), config)
   }

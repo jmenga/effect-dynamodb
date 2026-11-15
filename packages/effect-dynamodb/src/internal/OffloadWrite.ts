@@ -1,0 +1,1098 @@
+/**
+ * @internal The write side of offloaded fields (#179, design §6.1–§6.5,
+ * §6.8, §6.13): which values of a row go to the blob store (per-field
+ * thresholds, then the item budget), their uploads through the operation's
+ * ledger, and the pointers that replace them in the request. (A write's
+ * result reads what it stored through `OffloadRead`, its own uploads from the
+ * ledger's read cache.)
+ *
+ * Everything here works on **stored** attribute names, after renames, sparse
+ * flattening and packing: an overflow value arrives as its inline stored form
+ * (a JSON string, or a v1 header byte + compressed bytes) and leaves as a `B`
+ * pointer; a binary value arrives as its bytes and leaves as `~edbp:` text.
+ * A binary value given as a stream, a handle or `Offload.source(...)` arrives
+ * as its placeholder (`OffloadInput`), which uploads what it stands for.
+ *
+ * Not part of the public API.
+ */
+
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type { CompressionRegistry } from "@effect-dynamodb/schema/Compression.js"
+import type {
+  CompressionCodec,
+  ExternalConfig,
+  ExternalPackedConfig,
+} from "@effect-dynamodb/schema/DynamoModel.js"
+import { type BlobStoreError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import type { BlobChecksum } from "@effect-dynamodb/schema/internal/BlobPointer.js"
+import {
+  type BlobPointer,
+  type BlobPointerKind,
+  decode as decodePointer,
+  decodeText as decodePointerText,
+  encode as encodePointer,
+  encodeText as encodePointerText,
+  isPointerHeader,
+  isPointerText,
+  make as makePointer,
+} from "@effect-dynamodb/schema/internal/BlobPointer.js"
+import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
+import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
+import { parseHeader } from "@effect-dynamodb/schema/internal/PackedCodec.js"
+import { Cause, Context, Effect, Exit, Option } from "effect"
+import { BlobStore } from "../BlobStore.js"
+import { toAttributeMap, toAttributeValue } from "../Marshaller.js"
+import { blobError } from "./BlobCalls.js"
+import { type KeyAttributeValue, objectKey } from "./BlobKeys.js"
+import * as BlobLedger from "./BlobLedger.js"
+import * as BlobMetadata from "./BlobMetadata.js"
+import type { BlobStoreService } from "./BlobStoreContract.js"
+import { attributeBytes, itemBytes, utf8Bytes } from "./ItemSize.js"
+import * as OffloadInput from "./OffloadInput.js"
+import { currentRegistry } from "./Packed.js"
+
+// ---------------------------------------------------------------------------
+// Member info
+// ---------------------------------------------------------------------------
+
+/** How one member offloads, keyed by stored attribute name. */
+export interface OffloadInfo {
+  readonly entityType: string
+  /** Stored attribute → overflow config (`Packed({ external })`). */
+  readonly overflow: Readonly<Record<string, ExternalPackedConfig>>
+  /** Stored attribute → binary config (`External`). */
+  readonly binary: Readonly<Record<string, ExternalConfig>>
+  /** Stored attribute → domain field name. */
+  readonly fieldOf: Readonly<Record<string, string>>
+  /** `offload.itemBudget`: the whole-item size the router keeps an item under. */
+  readonly itemBudget: number | undefined
+  /** `offload.prefix`; the store's prefix when `undefined`. */
+  readonly prefix: string | undefined
+  /** The member's rows copy pointers (`retain`, `softDelete`, `timeSeries`). */
+  readonly copiesPointers: boolean
+}
+
+/** The stored attributes of a member that may hold a pointer. */
+export const offloadedAttributes = (info: OffloadInfo): ReadonlyArray<string> => [
+  ...Object.keys(info.overflow),
+  ...Object.keys(info.binary),
+]
+
+/** True iff `attribute` is one of the member's offloaded attributes. */
+export const isOffloaded = (info: OffloadInfo, attribute: string): boolean =>
+  Object.hasOwn(info.overflow, attribute) || Object.hasOwn(info.binary, attribute)
+
+// ---------------------------------------------------------------------------
+// The row
+// ---------------------------------------------------------------------------
+
+/** The row a write's uploads are for. */
+export interface OffloadRow {
+  /** The physical table name. */
+  readonly table: string
+  readonly pkAttribute: string
+  readonly pk: KeyAttributeValue
+  readonly skAttribute: string
+  /** The item family's sort key: the live SK. */
+  readonly sk: KeyAttributeValue
+  /** The row's own sort key, when not the live SK (a time-series event item's). */
+  readonly rowSk?: KeyAttributeValue | undefined
+  /** The library operation, e.g. `"Entity.put"`. */
+  readonly operation: string
+  /**
+   * The member's schema sets `escapeKeys: true`, which offloading requires
+   * (design §11.10): object keys are named from the row's key text, so a
+   * pointer row must be written only at its final text. {@link route} refuses
+   * a row without it (`[EDD-9146]`), before anything is uploaded.
+   */
+  readonly escapeKeys: boolean
+}
+
+/** A key attribute value of a stored-name item (its composed `S` value, as a rule). */
+export const keyValueOf = (value: unknown): KeyAttributeValue =>
+  toAttributeValue(value) as KeyAttributeValue
+
+const plainKeyValue = (value: KeyAttributeValue): unknown => {
+  const v = value as { readonly S?: string; readonly N?: string; readonly B?: Uint8Array }
+  return v.S ?? (v.N !== undefined ? Number(v.N) : v.B)
+}
+
+/** The row of a stored-name item whose key attributes are `pkAttribute` / `skAttribute`. */
+export const rowOf = (
+  item: Readonly<Record<string, unknown>>,
+  keys: {
+    readonly table: string
+    readonly pkAttribute: string
+    readonly skAttribute: string
+    readonly operation: string
+    /** The member's schema's `escapeKeys` (see {@link OffloadRow.escapeKeys}). */
+    readonly escapeKeys: boolean
+  },
+): OffloadRow => ({
+  table: keys.table,
+  pkAttribute: keys.pkAttribute,
+  pk: keyValueOf(item[keys.pkAttribute]),
+  skAttribute: keys.skAttribute,
+  sk: keyValueOf(item[keys.skAttribute]),
+  operation: keys.operation,
+  escapeKeys: keys.escapeKeys,
+})
+
+/**
+ * The `[EDD-9146]` text: a member offloads on a schema without `escapeKeys:
+ * true`. `what` names the member and its fields; `where` the bind site or the
+ * write.
+ */
+export const unescapedKeysText = (where: string, what: string): string =>
+  `[EDD-9146] ${where}: ${what}, but its table's schema doesn't set escapeKeys: true, which ` +
+  "offloading requires. An offloaded value's object key is named from its row's key text and " +
+  "S3 has no rename, so a row holding a pointer must be written only at its final key text and " +
+  "never moved by rekey. Set DynamoSchema.make({ ..., escapeKeys: true }) — over existing rows, " +
+  "run db.tables.<Table>.rekey() before serving traffic (see the offloaded storage guide)."
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+const notProvided = (info: OffloadInfo, attribute: string, operation: string): BlobStoreError =>
+  blobError(
+    { entityType: info.entityType, attribute, operation },
+    "put",
+    "NotProvided",
+    undefined,
+    "no BlobStore is in context: provide one (DynamoClient.make({ blobStore }), BlobStore.layer, " +
+      "or the S3 store's layer) where the operation runs or the client is bound",
+  )
+
+/** The store in context, if any (`Effect.serviceOption`: no requirement). */
+const currentStore: Effect.Effect<BlobStoreService | undefined> = Effect.map(
+  Effect.serviceOption(BlobStore),
+  (store) => Option.getOrUndefined(store),
+)
+
+// ---------------------------------------------------------------------------
+// Content
+// ---------------------------------------------------------------------------
+
+const JSON_CONTENT_TYPE = "application/json"
+const OCTET_STREAM = "application/octet-stream"
+
+const decoder = new TextDecoder("utf-8", { fatal: true })
+
+/** What one upload sends, derived from an attribute's inline stored value. */
+interface Upload {
+  readonly kind: BlobPointerKind
+  readonly content: BlobLedger.UploadContent
+  readonly codec: CompressionCodec | "none"
+  readonly body: Uint8Array | undefined
+  readonly contentType: string
+  readonly pointerContentType: string | undefined
+  /** Bytes of the stored object (the largest a pointer records, for a stream of unknown length). */
+  readonly objectSize: number
+  /** Bytes the checksum covers (`undefined`: not yet known). */
+  readonly contentSize: number | undefined
+}
+
+const invalid = (info: OffloadInfo, attribute: string, operation: string, message: string) =>
+  new ValidationError({
+    entityType: info.entityType,
+    operation,
+    cause: new Error(`Offloaded attribute "${attribute}": ${message}`),
+  })
+
+/**
+ * The upload of an overflow attribute's inline stored value: its JSON text
+ * (codec none, `application/json`), or the compressed payload after the
+ * header byte (`application/octet-stream`, the content its decompression).
+ * `contentSize` is left `undefined` for a compressed value when `measure`
+ * only (routing): the pointer bound then counts the largest content size.
+ */
+const overflowUpload = (
+  info: OffloadInfo,
+  attribute: string,
+  stored: string | Uint8Array,
+  registry: CompressionRegistry | undefined,
+  operation: string,
+): Upload | ValidationError => {
+  if (typeof stored === "string") {
+    const bytes = utf8Bytes(stored)
+    return {
+      kind: "json",
+      content: { kind: "json", text: stored },
+      codec: "none",
+      body: undefined,
+      contentType: JSON_CONTENT_TYPE,
+      pointerContentType: undefined,
+      objectSize: bytes,
+      contentSize: bytes,
+    }
+  }
+  const header = stored.length === 0 ? "the stored value is empty" : parseHeader(stored[0]!)
+  if (typeof header === "string") return invalid(info, attribute, operation, header)
+  if (header.version !== 1) {
+    return invalid(info, attribute, operation, "the value to upload is already a blob pointer")
+  }
+  const body = stored.slice(1)
+  if (registry === undefined) {
+    return {
+      kind: "json",
+      content: { kind: "json", text: "" },
+      codec: header.codec,
+      body,
+      contentType: header.codec === "none" ? JSON_CONTENT_TYPE : OCTET_STREAM,
+      pointerContentType: undefined,
+      objectSize: body.length,
+      contentSize: undefined,
+    }
+  }
+  let payload: Uint8Array = body
+  if (header.codec !== "none") {
+    const compressor = registry.get(header.codec)
+    if (compressor === undefined) {
+      return invalid(info, attribute, operation, `no "${header.codec}" compressor is registered`)
+    }
+    try {
+      payload = compressor.decompress(body)
+    } catch (cause) {
+      return new ValidationError({
+        entityType: info.entityType,
+        operation,
+        cause: new Error(
+          `Offloaded attribute "${attribute}": the "${header.codec}" decompressor failed`,
+          { cause },
+        ),
+      })
+    }
+  }
+  let text: string
+  try {
+    text = decoder.decode(payload)
+  } catch (cause) {
+    return new ValidationError({
+      entityType: info.entityType,
+      operation,
+      cause: new Error(`Offloaded attribute "${attribute}": the payload is not UTF-8`, { cause }),
+    })
+  }
+  return {
+    kind: "json",
+    content: { kind: "json", text },
+    codec: header.codec,
+    body: header.codec === "none" ? undefined : body,
+    contentType: header.codec === "none" ? JSON_CONTENT_TYPE : OCTET_STREAM,
+    pointerContentType: undefined,
+    objectSize: body.length,
+    contentSize: payload.length,
+  }
+}
+
+/** Largest LEB128 content size a pointer can record (8 groups, every safe integer). */
+const MAX_CONTENT_SIZE = Number.MAX_SAFE_INTEGER
+
+/**
+ * The upload of a binary attribute's value (design §3.8, §4.4): its bytes, or
+ * what its placeholder stands for — a stream (single-use), a handle's content
+ * to copy, or `Offload.source` bytes. The content type is the source's, else
+ * the field's `External({ contentType })`.
+ */
+const binaryUpload = (config: ExternalConfig, bytes: Uint8Array): Upload => {
+  const prepared = OffloadInput.preparedOf(bytes)
+  if (prepared?._tag === "Stream") {
+    const contentType = prepared.contentType ?? config.contentType
+    return {
+      kind: "bytes",
+      content: {
+        kind: "stream",
+        stream: prepared.stream,
+        identity: prepared.identity,
+        contentLength: prepared.contentLength,
+      },
+      codec: "none",
+      body: undefined,
+      contentType,
+      pointerContentType: contentType,
+      objectSize: prepared.contentLength ?? MAX_CONTENT_SIZE,
+      contentSize: prepared.contentLength,
+    }
+  }
+  if (prepared?._tag === "Handle") {
+    return {
+      kind: "bytes",
+      content: { kind: "copy", handle: prepared.handle },
+      codec: "none",
+      body: undefined,
+      contentType: config.contentType,
+      pointerContentType: config.contentType,
+      objectSize: prepared.handle.size,
+      contentSize: prepared.handle.size,
+    }
+  }
+  const contentType = prepared?.contentType ?? config.contentType
+  return {
+    kind: "bytes",
+    content: { kind: "bytes", bytes },
+    codec: "none",
+    body: undefined,
+    contentType,
+    pointerContentType: contentType,
+    objectSize: bytes.length,
+    contentSize: bytes.length,
+  }
+}
+
+/**
+ * The bytes the attribute's pointer can take at most (design §6.3): the real
+ * key extended by the store's `maxKeySuffixBytes`, a version of
+ * `maxVersionBytes`, the real sizes (the largest content size when not yet
+ * known) and the content type — in the attribute's stored form (`B` bytes for
+ * an overflow value, the `~edbp:` text's UTF-8 bytes for a binary one).
+ */
+const pointerBound = (store: BlobStoreService, key: string, upload: Upload): number => {
+  const pointer = makePointer({
+    kind: upload.kind,
+    codec: upload.codec,
+    ref: {
+      key: key + "k".repeat(store.limits.maxKeySuffixBytes),
+      version: "v".repeat(store.limits.maxVersionBytes),
+    },
+    objectSize: upload.objectSize,
+    contentSize: upload.contentSize ?? MAX_CONTENT_SIZE,
+    checksum: { algorithm: "crc64nvme", value: new Uint8Array(8) },
+    contentType: Option.fromNullishOr(upload.pointerContentType),
+  })
+  if (typeof pointer === "string") {
+    throw new Error(`OffloadWrite: no pointer bound for "${key}": ${pointer}`)
+  }
+  return upload.kind === "json"
+    ? encodePointer(pointer).length
+    : utf8Bytes(encodePointerText(pointer))
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+
+const keyOf = (info: OffloadInfo, store: BlobStoreService, row: OffloadRow, attribute: string) =>
+  objectKey(info.prefix ?? store.prefix, {
+    table: row.table,
+    pk: row.pk,
+    familySk: row.sk,
+    rowSk: row.rowSk ?? row.sk,
+    attribute,
+  })
+
+/** The stored form of `pointer` on the attribute: `B` (overflow) or `~edbp:` text (binary). */
+export const storedPointer = (pointer: BlobPointer): string | Uint8Array =>
+  pointer.kind === "json" ? encodePointer(pointer) : encodePointerText(pointer)
+
+const uploadOne = (
+  info: OffloadInfo,
+  store: BlobStoreService,
+  row: OffloadRow,
+  attribute: string,
+  upload: Upload,
+): Effect.Effect<BlobPointer, BlobStoreError | ValidationError> => {
+  const rowSk = row.rowSk ?? row.sk
+  return BlobLedger.upload({
+    store,
+    key: keyOf(info, store, row, attribute),
+    content: upload.content,
+    codec: upload.codec,
+    body: upload.body,
+    contentType: upload.contentType,
+    pointerContentType: upload.pointerContentType,
+    // Built from the ledger's own checksum of the content: computed once.
+    metadata: (checksum) =>
+      BlobMetadata.build({
+        table: row.table,
+        entity: info.entityType,
+        attribute,
+        pk: row.pk,
+        sk: rowSk,
+        kind: upload.kind,
+        codec: upload.codec,
+        checksum,
+      }),
+    target: {
+      table: row.table,
+      entityType: info.entityType,
+      attribute,
+      rowKey: {
+        [row.pkAttribute]: plainKeyValue(row.pk),
+        [row.skAttribute]: plainKeyValue(rowSk),
+      },
+      operation: row.operation,
+      copiesPointers: info.copiesPointers,
+    },
+  })
+}
+
+/** The inline stored value of an offloaded attribute that can be uploaded, if any. */
+const uploadable = (
+  info: OffloadInfo,
+  attribute: string,
+  value: unknown,
+): value is string | Uint8Array => {
+  if (Object.hasOwn(info.binary, attribute)) return value instanceof Uint8Array
+  if (!Object.hasOwn(info.overflow, attribute)) return false
+  if (typeof value === "string") return true
+  return value instanceof Uint8Array && value.length > 0 && !isPointerHeader(value[0]!)
+}
+
+const storedBytes = (value: string | Uint8Array): number =>
+  typeof value === "string" ? utf8Bytes(value) : value.length
+
+/** An overflow value at or above its threshold, or any binary value: offloaded whatever the item. */
+const overThreshold = (info: OffloadInfo, attribute: string, value: string | Uint8Array): boolean =>
+  Object.hasOwn(info.binary, attribute) ||
+  storedBytes(value) >= info.overflow[attribute]!.external.threshold
+
+/**
+ * Run `f` over `items` concurrently and fail only once every one has settled
+ * (design §6.2): an upload already sent is let finish rather than interrupted
+ * by a sibling's failure, so the version it writes is registered with the
+ * ledger and rolled back at exit — an interrupted one would leave a version no
+ * entry names. Fails with the first failure in `items` order, preferring a
+ * failure over an interruption.
+ */
+export const forEachSettled = <A, E>(
+  items: Iterable<A>,
+  f: (item: A) => Effect.Effect<void, E>,
+): Effect.Effect<void, E> =>
+  Effect.flatMap(
+    Effect.forEach(items, (item) => Effect.exit(f(item)), { concurrency: "unbounded" }),
+    (exits) => {
+      let interrupted: Cause.Cause<E> | undefined
+      for (const exit of exits) {
+        if (Exit.isSuccess(exit)) continue
+        if (!Cause.hasInterruptsOnly(exit.cause)) return Effect.failCause(exit.cause)
+        interrupted ??= exit.cause
+      }
+      return interrupted === undefined ? Effect.void : Effect.failCause(interrupted)
+    },
+  )
+
+/** What {@link route} decided. */
+export interface Routed {
+  /** The attributes it uploaded, now holding their pointers. */
+  readonly uploaded: ReadonlySet<string>
+}
+
+/**
+ * Route and upload a whole item (design §6.3), in place: every offloaded
+ * attribute of `only` (default: all of them) at or above its threshold, every
+ * binary one, then — when the member has an `itemBudget` and the item, with
+ * those as pointers at their upper bound, is still over it — the remaining
+ * overflow attributes by stored size, largest first (ties by name), until it
+ * fits. The item may still exceed the budget (DynamoDB's own limit is then
+ * diagnosed on failure). Each upload goes through the operation's ledger and
+ * its pointer replaces the value. Attributes outside `only` keep what they
+ * hold (a read-merge update's untouched pointers). Every upload is built
+ * before any starts (a value that cannot be uploaded sends nothing to the
+ * store), and a failed one fails the write only once the others have settled
+ * ({@link forEachSettled}).
+ *
+ * Fails with `BlobStoreError { reason: "NotProvided" }` when a value must go
+ * to the store and none is in context.
+ */
+export const route = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  row: OffloadRow,
+  only?: ReadonlySet<string>,
+): Effect.Effect<Routed, BlobStoreError | ValidationError> =>
+  Effect.gen(function* () {
+    const { out, store } = yield* decide(info, item, row, only)
+    if (out.size === 0) return { uploaded: out }
+    if (store === undefined) {
+      return yield* notProvided(info, [...out][0]!, row.operation)
+    }
+    // A measurement of the write (`measureAppend`'s additional items): each
+    // value takes its pointer's upper bound, and nothing is uploaded.
+    if (yield* Measuring) {
+      const placed = placeholders(info, item, row, out, store)
+      if (placed instanceof ValidationError) return yield* placed
+      return { uploaded: out }
+    }
+    const registry = yield* currentRegistry
+    const uploads: Array<readonly [attribute: string, upload: Upload]> = []
+    for (const attribute of out) {
+      const value = ownValue(item, attribute) as string | Uint8Array
+      const upload = Object.hasOwn(info.binary, attribute)
+        ? binaryUpload(info.binary[attribute]!, value as Uint8Array)
+        : overflowUpload(info, attribute, value, registry, row.operation)
+      if (upload instanceof ValidationError) return yield* upload
+      uploads.push([attribute, upload])
+    }
+    // Single-use streams (design §3.8): refused before any upload starts.
+    const ledger = yield* BlobLedger.current
+    const streams = new Set<object>()
+    for (const [attribute, upload] of uploads) {
+      if (upload.content.kind !== "stream") continue
+      const { identity } = upload.content
+      const why = streams.has(identity)
+        ? "it is also the content of another field of this item"
+        : BlobLedger.streamRefusal(ledger, identity, store, keyOf(info, store, row, attribute))
+      if (why !== undefined) {
+        return yield* BlobLedger.singleUseError(info.entityType, row.operation, attribute, why)
+      }
+      streams.add(identity)
+    }
+    yield* forEachSettled(uploads, ([attribute, upload]) =>
+      Effect.map(uploadOne(info, store, row, attribute, upload), (pointer) => {
+        setOwn(item, attribute, storedPointer(pointer))
+      }),
+    )
+    return { uploaded: out }
+  })
+
+/**
+ * Which attributes of `item` {@link route} sends to the store (design §6.3),
+ * and the store in context: the routing decision alone, shared by `route`
+ * and {@link measure} so a measurement routes exactly as the write would.
+ */
+const decide = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  row: OffloadRow,
+  only: ReadonlySet<string> | undefined,
+): Effect.Effect<
+  { readonly out: Set<string>; readonly store: BlobStoreService | undefined },
+  BlobStoreError | ValidationError
+> =>
+  Effect.gen(function* () {
+    // Offloading requires escaped key text (design §11.10, `[EDD-9146]`). A
+    // bound member was refused at bind; an unbound write is refused here,
+    // before anything is uploaded or sent (a measurement, before anything is
+    // measured).
+    if (!row.escapeKeys) {
+      return yield* new ValidationError({
+        entityType: info.entityType,
+        operation: row.operation,
+        cause: unescapedKeysText(
+          row.operation,
+          `${info.entityType} offloads ${offloadedAttributes(info)
+            .map((attribute) => `"${info.fieldOf[attribute] ?? attribute}"`)
+            .join(", ")}`,
+        ),
+      })
+    }
+    const candidates = offloadedAttributes(info).filter(
+      (attribute) =>
+        (only === undefined || only.has(attribute)) &&
+        uploadable(info, attribute, ownValue(item, attribute)),
+    )
+    if (candidates.length === 0) return { out: new Set<string>(), store: undefined }
+    const out = new Set(
+      candidates.filter((attribute) =>
+        overThreshold(info, attribute, ownValue(item, attribute) as string | Uint8Array),
+      ),
+    )
+    const store = yield* currentStore
+    const budget = info.itemBudget
+    if (budget !== undefined) {
+      const marshalled = toAttributeMap(item)
+      const measured = new Map<string, Upload>()
+      const measureOne = (attribute: string): Upload | ValidationError => {
+        const known = measured.get(attribute)
+        if (known !== undefined) return known
+        const value = ownValue(item, attribute) as string | Uint8Array
+        const upload = Object.hasOwn(info.binary, attribute)
+          ? binaryUpload(info.binary[attribute]!, value as Uint8Array)
+          : overflowUpload(info, attribute, value, undefined, row.operation)
+        if (!(upload instanceof ValidationError)) measured.set(attribute, upload)
+        return upload
+      }
+      const bound = (
+        attribute: string,
+      ): Effect.Effect<number, BlobStoreError | ValidationError> => {
+        if (store === undefined) return Effect.fail(notProvided(info, attribute, row.operation))
+        const upload = measureOne(attribute)
+        if (upload instanceof ValidationError) return Effect.fail(upload)
+        return Effect.succeed(pointerBound(store, keyOf(info, store, row, attribute), upload))
+      }
+      const inline = (attribute: string): number => {
+        const value = marshalled[attribute]
+        return value === undefined ? 0 : attributeBytes(value)
+      }
+      let size = itemBytes(marshalled)
+      for (const attribute of out) size += (yield* bound(attribute)) - inline(attribute)
+      const rest = candidates
+        .filter((attribute) => !out.has(attribute))
+        .sort((a, b) => inline(b) - inline(a) || (a < b ? -1 : a > b ? 1 : 0))
+      for (const attribute of rest) {
+        if (size <= budget) break
+        out.add(attribute)
+        size += (yield* bound(attribute)) - inline(attribute)
+      }
+    }
+    return { out, store }
+  })
+
+/** One attribute {@link measure} found the write would offload. */
+export interface MeasuredOffload {
+  /** The stored attribute name. */
+  readonly attribute: string
+  /** The object's bytes: the JSON text, or the compressed payload after its header. */
+  readonly objectBytes: number
+}
+
+/**
+ * Measure, in place, what {@link route} would do to `item` without uploading
+ * anything (design §6.10, `measureAppend` / `measureSnapshot`): each attribute
+ * the write would offload is replaced by a placeholder of its pointer's upper
+ * bound (§6.3) — so the item measures at most what the write would send — and
+ * reported with the bytes its object would hold. Fails as `route` does when a
+ * value must go to the store and none is in context (the bound needs its
+ * limits).
+ */
+export const measure = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  row: OffloadRow,
+): Effect.Effect<ReadonlyArray<MeasuredOffload>, BlobStoreError | ValidationError> =>
+  Effect.gen(function* () {
+    const { out, store } = yield* decide(info, item, row, undefined)
+    if (out.size === 0) return []
+    if (store === undefined) return yield* notProvided(info, [...out][0]!, row.operation)
+    const placed = placeholders(info, item, row, out, store)
+    if (placed instanceof ValidationError) return yield* placed
+    return placed
+  })
+
+/**
+ * Replace each of `out` in `item` by a placeholder of its pointer's upper
+ * bound (§6.3), uploading nothing: what {@link measure} and a measuring
+ * {@link route} ({@link Measuring}) leave for the item to be measured with.
+ */
+const placeholders = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  row: OffloadRow,
+  out: ReadonlySet<string>,
+  store: BlobStoreService,
+): ReadonlyArray<MeasuredOffload> | ValidationError => {
+  const measured: Array<MeasuredOffload> = []
+  for (const attribute of out) {
+    const value = ownValue(item, attribute) as string | Uint8Array
+    const upload = Object.hasOwn(info.binary, attribute)
+      ? binaryUpload(info.binary[attribute]!, value as Uint8Array)
+      : overflowUpload(info, attribute, value, undefined, row.operation)
+    if (upload instanceof ValidationError) return upload
+    const bound = pointerBound(store, keyOf(info, store, row, attribute), upload)
+    // `B` bytes for an overflow pointer, `~edbp:` text for a binary one.
+    setOwn(item, attribute, upload.kind === "json" ? new Uint8Array(bound) : "~".repeat(bound))
+    measured.push({ attribute, objectBytes: upload.objectSize })
+  }
+  return measured
+}
+
+/**
+ * @internal Set while a write is only being measured (`measureAppend` builds
+ * the transaction `append` would send, its `additionalItems` included):
+ * {@link route} then gives each value it would upload a placeholder of its
+ * pointer's upper bound, so the item measures at most what the write would
+ * send, and uploads nothing.
+ */
+export const Measuring = Context.Reference<boolean>(
+  "effect-dynamodb/internal/OffloadWrite/Measuring",
+  { defaultValue: () => false },
+)
+
+/** One offloaded attribute an `UpdateItem` `SET`s: its `:value` token and stored name. */
+export interface OffloadSet {
+  readonly valKey: string
+  readonly attr: string
+}
+
+/**
+ * Upload, in place, the offloaded values an `UpdateItem` `SET`s (thresholds
+ * only — the whole item is not in hand, §6.3): each binary value and each
+ * overflow value at or above its threshold becomes, in `values`, the pointer
+ * of a fresh upload; anything else stays as given. One {@link route} of all of
+ * them, so every upload is built before any starts and a failed one fails the
+ * write only once the others have settled.
+ */
+export const setValues = (
+  info: OffloadInfo,
+  sets: ReadonlyArray<OffloadSet>,
+  values: Record<string, AttributeValue>,
+  row: OffloadRow,
+): Effect.Effect<void, BlobStoreError | ValidationError> => {
+  const item: Record<string, unknown> = {}
+  const valKeys = new Map<string, string>()
+  for (const { valKey, attr } of sets) {
+    const stored = values[valKey]
+    if (stored === undefined || !isOffloaded(info, attr)) continue
+    setOwn(item, attr, stored.S ?? stored.B)
+    valKeys.set(attr, valKey)
+  }
+  if (valKeys.size === 0) return Effect.void
+  return Effect.map(
+    route({ ...info, itemBudget: undefined }, item, row, new Set(valKeys.keys())),
+    ({ uploaded }) => {
+      for (const attr of uploaded)
+        values[valKeys.get(attr)!] = toAttributeValue(ownValue(item, attr))
+    },
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Stored pointers
+// ---------------------------------------------------------------------------
+
+/** The pointer an offloaded attribute's stored value is, if it is a well-formed one. */
+export const pointerOf = (
+  info: OffloadInfo,
+  attribute: string,
+  value: unknown,
+): BlobPointer | undefined => {
+  if (Object.hasOwn(info.overflow, attribute)) {
+    if (!(value instanceof Uint8Array) || value.length === 0 || !isPointerHeader(value[0]!)) {
+      return undefined
+    }
+    const pointer = decodePointer(value)
+    return typeof pointer === "string" || pointer.kind !== "json" ? undefined : pointer
+  }
+  if (Object.hasOwn(info.binary, attribute)) {
+    if (typeof value !== "string" || !isPointerText(value)) return undefined
+    const pointer = decodePointerText(value)
+    return pointer === undefined || typeof pointer === "string" || pointer.kind !== "bytes"
+      ? undefined
+      : pointer
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// Read-pointer reuse (projection row rewrites, design §6.11)
+// ---------------------------------------------------------------------------
+
+/** A pointer a row held when read, and the content it named as fetched. */
+export interface ReadPointer {
+  readonly pointer: BlobPointer
+  /** Its stored form, as the row holds it (`B` bytes, or `~edbp:` text). */
+  readonly stored: string | Uint8Array
+  /**
+   * The content fetched, snapshotted when the row was read: the value's
+   * canonical JSON (overflow, {@link canonicalJson}), or a copy of its bytes
+   * (binary). A snapshot, so a fold that mutates the state it was given in
+   * place cannot make a changed value compare equal.
+   */
+  readonly content: string | Uint8Array
+}
+
+/** The pointers a read row held, by stored attribute name. */
+export type ReadPointers = ReadonlyMap<string, ReadPointer>
+
+/** A reused pointer the write must be conditioned on (`#f = :P`). */
+export interface Pin {
+  readonly attribute: string
+  readonly stored: string | Uint8Array
+}
+
+/** No reuse, no pins. */
+export const NO_PINS: ReadonlyArray<Pin> = []
+
+/** Sort an object's keys, recursively — key order does not change a JSON value. */
+const sortKeys = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map((element) => sortKeys(element))
+  if (value === null || typeof value !== "object") return value
+  // A null-prototype copy: on a plain object, assigning an own `__proto__`
+  // key (which `JSON.parse` creates) would set the prototype instead, and the
+  // key and its value would drop out of the text.
+  const out: Record<string, unknown> = Object.create(null)
+  for (const key of Object.keys(value).sort()) {
+    out[key] = sortKeys((value as Record<string, unknown>)[key])
+  }
+  return out
+}
+
+/** A JSON value's text with every object's keys sorted: equal iff the values are. */
+export const canonicalJson = (value: unknown): string => JSON.stringify(sortKeys(value)) ?? "null"
+
+/**
+ * The pointers a stored-name row holds on the member's offloaded attributes,
+ * before it is loaded (the load replaces them with their values).
+ */
+export const pointersIn = (
+  info: OffloadInfo,
+  row: Readonly<Record<string, unknown>>,
+): ReadonlyArray<{
+  readonly attribute: string
+  readonly pointer: BlobPointer
+  readonly stored: string | Uint8Array
+}> =>
+  offloadedAttributes(info).flatMap((attribute) => {
+    const stored = row[attribute]
+    const pointer = pointerOf(info, attribute, stored)
+    return pointer === undefined
+      ? []
+      : [{ attribute, pointer, stored: stored as string | Uint8Array }]
+  })
+
+/**
+ * The {@link ReadPointers} of a row whose `pointers` ({@link pointersIn}) were
+ * just loaded eagerly: each attribute holds its fetched value — the JSON wire
+ * form (overflow) or the bytes (binary) — which is snapshotted.
+ */
+export const snapshotPointers = (
+  info: OffloadInfo,
+  pointers: ReturnType<typeof pointersIn>,
+  loaded: Readonly<Record<string, unknown>>,
+): ReadPointers => {
+  const out = new Map<string, ReadPointer>()
+  for (const { attribute, pointer, stored } of pointers) {
+    const value = loaded[attribute]
+    if (Object.hasOwn(info.binary, attribute)) {
+      if (value instanceof Uint8Array) {
+        out.set(attribute, { pointer, stored, content: new Uint8Array(value) })
+      }
+    } else if (value !== undefined) {
+      out.set(attribute, { pointer, stored, content: canonicalJson(value) })
+    }
+  }
+  return out
+}
+
+/**
+ * Keep, in place, the read pointer of every offloaded attribute of a packed,
+ * stored-name item whose new value has the content that pointer named when
+ * the row was read (design §6.11) — content, not checksum: a CRC is no proof
+ * of equality. The attribute then holds the pointer, which {@link route}
+ * leaves as is, and the returned {@link Pin}s must condition the write on the
+ * row still holding each one ({@link withPins}), so a concurrent write of the
+ * row fails it. Each reused value goes into the ledger's read cache, so the
+ * write's result decodes it without a fetch. A value that differs, or an
+ * attribute the item no longer holds, is left to {@link route}.
+ */
+export const reuse = (
+  info: OffloadInfo,
+  item: Record<string, unknown>,
+  read: ReadPointers,
+  operation: string,
+): Effect.Effect<ReadonlyArray<Pin>, ValidationError> =>
+  read.size === 0
+    ? Effect.succeed(NO_PINS)
+    : Effect.gen(function* () {
+        const registry = yield* currentRegistry
+        const ledger = yield* BlobLedger.current
+        const pins: Array<Pin> = []
+        for (const [attribute, previous] of read) {
+          const value = ownValue(item, attribute)
+          if (!uploadable(info, attribute, value)) continue
+          let content: BlobLedger.LedgerContent
+          if (Object.hasOwn(info.binary, attribute)) {
+            // A stream's or a handle's placeholder holds no content to compare;
+            // a source naming another content type is a new object.
+            const prepared = OffloadInput.preparedOf(value)
+            if (
+              (prepared !== undefined && prepared._tag !== "Bytes") ||
+              (prepared?.contentType !== undefined &&
+                prepared.contentType !== Option.getOrUndefined(previous.pointer.contentType)) ||
+              !(previous.content instanceof Uint8Array) ||
+              !sameBytes(value as Uint8Array, previous.content)
+            ) {
+              continue
+            }
+            content = { kind: "bytes", bytes: previous.content }
+          } else {
+            const upload = overflowUpload(info, attribute, value, registry, operation)
+            if (upload instanceof ValidationError) return yield* upload
+            const text = (upload.content as { readonly text: string }).text
+            let parsed: unknown
+            try {
+              parsed = JSON.parse(text)
+            } catch {
+              continue
+            }
+            if (previous.content !== canonicalJson(parsed)) continue
+            content = { kind: "json", text }
+          }
+          setOwn(item, attribute, previous.stored)
+          pins.push({ attribute, stored: previous.stored })
+          BlobLedger.remember(ledger, previous.pointer.ref, content)
+        }
+        return pins
+      })
+
+/** A compiled condition: expression, names and values. */
+export interface RawCondition {
+  readonly expression: string
+  readonly names: Record<string, string>
+  readonly values: Record<string, AttributeValue>
+}
+
+/**
+ * `condition` ANDed with `#f = :P` for every pin (design §6.11): the write
+ * succeeds only while the row still holds each reused pointer. `condition`
+ * itself when there are none.
+ */
+export const withPins = <C extends RawCondition | undefined>(
+  condition: C,
+  pins: ReadonlyArray<Pin>,
+): C | RawCondition => {
+  if (pins.length === 0) return condition
+  const names: Record<string, string> = { ...condition?.names }
+  const values: Record<string, AttributeValue> = { ...condition?.values }
+  const parts: Array<string> = []
+  pins.forEach((pin, i) => {
+    names[`#eddPin${i}`] = pin.attribute
+    values[`:eddPin${i}`] = toAttributeValue(pin.stored)
+    parts.push(`#eddPin${i} = :eddPin${i}`)
+  })
+  const pinned = parts.join(" AND ")
+  return {
+    expression: condition === undefined ? pinned : `(${condition.expression}) AND ${pinned}`,
+    names,
+    values,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Immutables
+// ---------------------------------------------------------------------------
+
+const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
+  a.length === b.length && a.every((byte, i) => byte === b[i])
+
+/**
+ * Whether `content` (a restated value's JSON text, or its bytes) has the
+ * pointer's content checksum and size — the fast path of an immutable
+ * assertion (design §6.5): a match passes; a mismatch is confirmed by
+ * fetching the stored value.
+ */
+export const matchesPointer = (pointer: BlobPointer, content: string | Uint8Array): boolean => {
+  const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content
+  return matchesChecksum(pointer, { algorithm: "crc64nvme", value: crc64nvme(bytes) }, bytes.length)
+}
+
+/** Whether `bytes` (a value stored natively) have `checksum` and `size` (a `BlobHandle`'s). */
+export const bytesMatch = (bytes: Uint8Array, checksum: BlobChecksum, size: number): boolean =>
+  bytes.length === size &&
+  checksum.algorithm === "crc64nvme" &&
+  sameBytes(crc64nvme(bytes), checksum.value)
+
+/**
+ * Whether content of `size` bytes with `checksum` (a `BlobHandle`'s,
+ * restating an immutable binary field) has the pointer's content checksum
+ * and size.
+ */
+export const matchesChecksum = (
+  pointer: BlobPointer,
+  checksum: BlobChecksum,
+  size: number,
+): boolean =>
+  size === pointer.contentSize &&
+  pointer.checksum.algorithm === "crc64nvme" &&
+  checksum.algorithm === "crc64nvme" &&
+  sameBytes(checksum.value, pointer.checksum.value)
+
+// ---------------------------------------------------------------------------
+// Bind-time check ([EDD-9115])
+// ---------------------------------------------------------------------------
+
+/** A bound member's offloaded fields, which need a store where it is bound. */
+export interface StoreRequirement {
+  /** The member, for the message: `entity "Documents"`, `aggregate "Order" (edge "Line")`. */
+  readonly owner: string
+  /** Its offloaded fields (domain names). */
+  readonly fields: ReadonlyArray<string>
+  /**
+   * Its table's schema sets `escapeKeys: true`, which offloading requires
+   * (`[EDD-9146]`); `undefined` when no schema is known yet (a definition on
+   * no table), which the binding refuses on its own.
+   */
+  readonly escapeKeys: boolean | undefined
+}
+
+/** Whether a member's schema (`_schema`, configured by `Table.make`) sets `escapeKeys: true`. */
+const escapeKeysOf = (schema: unknown): boolean | undefined =>
+  typeof schema === "object" && schema !== null
+    ? (schema as { readonly escapeKeys?: boolean }).escapeKeys === true
+    : undefined
+
+/** The store requirement of an entity (`entity.offload`), if it offloads anything. */
+export const entityStoreRequirements = (
+  owner: string,
+  entity: unknown,
+): ReadonlyArray<StoreRequirement> => {
+  const member = entity as {
+    readonly offload?:
+      | { readonly overflow: ReadonlyArray<string>; readonly binary: ReadonlyArray<string> }
+      | undefined
+    readonly _schema?: unknown
+  } | null
+  const offload = member?.offload
+  if (offload === undefined) return []
+  return [
+    {
+      owner,
+      fields: [...offload.overflow, ...offload.binary],
+      escapeKeys: escapeKeysOf(member?._schema),
+    },
+  ]
+}
+
+/** The store requirements of an aggregate's edge entities (`_offloadByType`). */
+export const aggregateStoreRequirements = (
+  owner: string,
+  aggregate: unknown,
+): ReadonlyArray<StoreRequirement> => {
+  const member = aggregate as {
+    readonly _offloadByType?: ReadonlyMap<string, ReadonlyArray<string>> | undefined
+    readonly _keySchema?: unknown
+  } | null
+  const byType = member?._offloadByType
+  if (byType === undefined) return []
+  return [...byType].map(([edgeType, fields]) => ({
+    owner: `${owner} (edge "${edgeType}")`,
+    fields,
+    escapeKeys: escapeKeysOf(member?._keySchema),
+  }))
+}
+
+/**
+ * The `[EDD-9146]` configuration error for members that offload on a schema
+ * without `escapeKeys: true` (design §11.10), or `undefined` when none does.
+ * Checked before the store ({@link missingStoreError}): a store doesn't make
+ * the key text right. `where` names the binding.
+ */
+export const unescapedKeysError = (
+  where: string,
+  requirements: ReadonlyArray<StoreRequirement>,
+): Error | undefined => {
+  const unescaped = requirements.filter((r) => r.escapeKeys === false)
+  if (unescaped.length === 0) return undefined
+  return new Error(
+    unescapedKeysText(
+      where,
+      unescaped
+        .map((r) => `${r.owner} offloads ${r.fields.map((field) => `"${field}"`).join(", ")}`)
+        .join("; "),
+    ),
+  )
+}
+
+/**
+ * The `[EDD-9115]` configuration error for members bound with no store
+ * resolvable (`store` undefined), or `undefined` when there is one or nothing
+ * offloads. `where` names the binding — `DynamoClient.make`, `Entity.bind`, ….
+ */
+export const missingStoreError = (
+  where: string,
+  requirements: ReadonlyArray<StoreRequirement>,
+  store: BlobStoreService | undefined,
+): Error | undefined => {
+  if (store !== undefined || requirements.length === 0) return undefined
+  const what = requirements
+    .map((r) => `${r.owner} offloads ${r.fields.map((field) => `"${field}"`).join(", ")}`)
+    .join("; ")
+  return new Error(
+    `[EDD-9115] ${where}: ${what}, but no BlobStore is resolvable. Every write of an ` +
+      "offloaded field uploads it to the blob store and every read resolves its pointer there, " +
+      "so provide one where the client is bound: DynamoClient.make({ blobStore }), or " +
+      "BlobStore.layer(...) / the S3 store's layer merged into the application layer (see the " +
+      "offloaded storage guide).",
+  )
+}

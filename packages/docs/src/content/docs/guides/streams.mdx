@@ -93,7 +93,7 @@ const MainTable = Table.make({
 
 ## Decoding from AttributeValue Format
 
-For Lambda functions consuming DynamoDB Stream events directly, use `Entity.decodeMarshalledItem`. It unmarshalls the `AttributeValue` map and decodes it as a table read does, in a single step: `field:` renames are reversed, [sparse maps](/effect-dynamodb/guides/sparse-maps/) are rebuilt, and [packed fields](/effect-dynamodb/guides/packed-storage/) are decoded by their stored form. It returns an `Effect` that fails with `ValidationError` on schema mismatch, or when a compressed value's codec isn't registered (the error's `cause` is then a `CompressorNotRegistered`):
+For Lambda functions consuming DynamoDB Stream events directly, use `Entity.decodeMarshalledItem`. It unmarshalls the `AttributeValue` map and decodes it as a table read does, in a single step: `field:` renames are reversed, [sparse maps](/effect-dynamodb/guides/sparse-maps/) are rebuilt, and [packed fields](/effect-dynamodb/guides/packed-storage/) are decoded by their stored form. It returns an `Effect` that fails with `ValidationError` on schema mismatch, or when a compressed value's codec isn't registered (the error's `cause` is then a `CompressorNotRegistered`). [Offloaded fields](#offloaded-fields-in-stream-records) come back as lazy handles:
 
 ```typescript region="decode-marshalled" example="guide-streams.ts"
 const handleEmployeeStream = (event: DynamoDBStreamEvent) =>
@@ -112,7 +112,7 @@ const handleEmployeeStream = (event: DynamoDBStreamEvent) =>
 
 ## Decoding from Unmarshalled Format
 
-If you've already unmarshalled the item (e.g., using `Marshaller.fromAttributeMap` or `@aws-sdk/util-dynamodb`), use `Entity.itemSchema` to get a Schema codec for direct decoding. It's a pure schema: it doesn't map `field:` renamed attributes back to their domain names, rebuild sparse maps or decode packed fields. For an entity that uses any of those, pass the unmarshalled item to `Entity.decodeMarshalledItem` instead, which accepts both forms:
+If you've already unmarshalled the item (e.g., using `Marshaller.fromAttributeMap` or `@aws-sdk/util-dynamodb`), use `Entity.itemSchema` to get a Schema codec for direct decoding. It's a pure schema: it doesn't map `field:` renamed attributes back to their domain names, rebuild sparse maps, decode packed fields or resolve offloaded ones. For an entity that uses any of those, pass the unmarshalled item to `Entity.decodeMarshalledItem` instead, which accepts both forms:
 
 ```typescript region="decode-unmarshalled" example="guide-streams.ts"
 const employeeFromItem = Entity.itemSchema(EmployeeEntity)
@@ -199,9 +199,109 @@ const decodeImage = (image: EventStore.StreamImage) =>
 
 Compressors come from a `Compression` service in context (for example `Compression.layer([...])` merged into the application layer), as for table reads. See [DynamoDB Streams images](/effect-dynamodb/guides/packed-storage/#dynamodb-streams-images) in the Packed Storage guide.
 
+## Offloaded Fields in Stream Records
+
+A field [offloaded to a blob store](/effect-dynamodb/guides/blob-offload/) is stored in the item as a pointer. Stream decoding is **lazy** by default, so a consumer pays a store `GET` only for the values it reads:
+
+```typescript region="offloaded-entity" example="guide-streams.ts"
+class Contract extends Schema.Class<Contract>("Contract")({
+  contractId: Schema.String,
+  terms: Schema.Struct({ clauses: Schema.Array(Schema.String) }),
+  signed: Schema.Uint8Array,
+}) {}
+
+const ContractEntity = Entity.make({
+  model: DynamoModel.configure(Contract, {
+    // In the blob store at or over 32 KiB stored, inline below
+    terms: { storedAs: DynamoModel.Packed({ format: "json", external: { threshold: 32_768 } }) },
+    // Always in the blob store
+    signed: { storedAs: DynamoModel.External({ contentType: "application/pdf" }) },
+  }),
+  entityType: "Contract",
+  primaryKey: {
+    pk: { field: "pk", composite: ["contractId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+```
+
+```typescript region="decode-lazy" example="guide-streams.ts"
+const handleContractImage = (image: Record<string, AttributeValue>) =>
+  Effect.gen(function* () {
+    // Typed for an entity that offloads: its offloaded fields come back lazy
+    const contract = yield* Entity.decodeMarshalledItem(ContractEntity, image)
+    const terms = yield* contract.terms.read() // OffloadedValue: one GET, on read()
+    const header = yield* contract.signed.read({ range: { offset: 0, length: 4 } }) // BlobHandle
+
+    // { offloaded: "eager" } resolves both kinds while decoding
+    const eager = yield* Entity.decodeMarshalledItem(ContractEntity, image, {
+      offloaded: "eager",
+    })
+    const pdf: Uint8Array = eager.signed
+    return { clauses: terms.clauses.length, header, bytes: pdf.length }
+  })
+```
+
+- **`decodeMarshalledItem`** is typed for an entity that offloads: its record, with each offloaded field an `OffloadedValue` (overflow, `read()`) or a `BlobHandle` (binary, `read`, `stream`, `presignedUrl`), inline values included. For an entity that offloads nothing it still returns `unknown`. `{ offloaded: "eager" }` (or `{ overflow, binary }`) resolves while decoding, and a store failure is then a `BlobStoreError`.
+- **The store** comes from the `BlobStore` in context where the decode runs (a handle captures it, so its `read()` needs nothing). Without one, an eager decode or a handle's `read()` fails with `BlobStoreError { reason: "NotProvided" }`.
+- **Adding `external` changes what lazy decoders return** for that field, even for values still inline. Code that casts an `unknown` result only sees the change at run time: decode through the typed overload.
+
+### Change detection
+
+`Entity.decodeStreamRecord` decodes both images of a record and classifies what the change did to each offloaded field, from the two pointers alone, with no store I/O:
+
+```typescript region="decode-stream-record" example="guide-streams.ts"
+// A record of a NEW_AND_OLD_IMAGES stream: both images, and what the change
+// did to each offloaded field, read from the two pointers alone
+const handleContractRecord = (record: Entity.StreamRecordLike) =>
+  Effect.gen(function* () {
+    const change = yield* Entity.decodeStreamRecord(ContractEntity, record)
+    if (Option.isNone(change)) return "not a contract"
+    const { offloaded, newItem } = change.value
+    // "rewritten" is probably the same content: a consumer that must never
+    // miss a change treats it as "changed"
+    const signed = offloaded.signed
+    if (signed === "unchanged" || Option.isNone(newItem)) return "signature unchanged"
+    const bytes = yield* newItem.value.signed.read() // fetched only here
+    return `signature ${signed}: ${bytes.length} bytes to re-index`
+  })
+```
+
+It returns `Option.none()` for a record of another entity type, and otherwise an `EntityChange`: `eventName`, `oldItem` and `newItem` (each an `Option`, decoded in the call's read modes, lazy by default) and `offloaded`, one of these per offloaded field present in either image:
+
+| Value | Meaning |
+|---|---|
+| `unchanged` | the same object version, or inline values with the same content |
+| `rewritten` | another version (or stored form) with the same checksum algorithm, checksum and content size: **probably** the same content |
+| `changed` | different content |
+| `added` / `removed` | only in the new / old image |
+
+`rewritten` is probable, not proven: a CRC can be matched by crafted content, so a consumer that must never miss a change (an indexer, a malware scanner) treats it as `changed`, or compares the content. The stream must use `NEW_AND_OLD_IMAGES`: a record of another view type, or one missing an image its event needs, fails with a `ValidationError` naming `[EDD-9119]`. `decodeStreamRecord` accepts the SDK's records, Lambda's and EventBridge Pipes' (`B` as base64 text), and Kinesis Data Streams' (`Entity.StreamRecordLike` is structural).
+
+For a consumer that decodes no entity, `Offload.compareStored(old, new, kind)` is the same classification over two raw attribute values, and `StorageEncoding.pointer` reads the pointer a stored value holds:
+
+```typescript region="compare-stored" example="guide-streams.ts"
+// Without an entity: classify one attribute of the two images, and read a pointer
+const compareSigned = (record: Entity.StreamRecordLike) =>
+  Effect.gen(function* () {
+    const oldImage = record.dynamodb?.OldImage as Record<string, AttributeValue> | undefined
+    const newImage = record.dynamodb?.NewImage as Record<string, AttributeValue> | undefined
+    const change = yield* Offload.compareStored(oldImage?.signed, newImage?.signed, "binary")
+    const pointer =
+      newImage?.signed === undefined ? Option.none() : StorageEncoding.pointer(newImage.signed)
+    // pointer.value → { kind: "bytes", ref: { key, version }, objectSize, contentType, … }
+    return { change, pointer }
+  })
+```
+
+### A lagging consumer can read `NotFound`
+
+A handle decoded from an old record names a version that may since have been superseded and freed by the [reaper](/effect-dynamodb/guides/blob-offload/#the-reaper), once its grace has passed. The newer record carries the newer pointer, so catch `BlobStoreError` with `reason: "NotFound"` and skip the field rather than failing the batch, which would wedge the shard. Choose a reaper grace at least as long as the slowest consumer's tolerated lag.
+
 ## What's Next?
 
 - [Projections from DynamoDB Streams](/effect-dynamodb/guides/projections/) — Fold `EventStore` events from the change feed into read models in version order
 - [Testing](/effect-dynamodb/guides/testing/) — Testing patterns with mocked DynamoClient
 - [Modeling](/effect-dynamodb/guides/modeling/) — Model, schema, table, entity definitions
 - [Packed Storage](/effect-dynamodb/guides/packed-storage/) — JSON and compressed storage, and decoding it from stream records
+- [Offloaded Storage](/effect-dynamodb/guides/blob-offload/) — large and binary values in a blob store, and garbage collection from the stream

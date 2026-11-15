@@ -1,4 +1,4 @@
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
 import { Entity } from "effect-dynamodb"
 import * as h3 from "h3-js"
 import { describe, expect, it } from "vitest"
@@ -20,10 +20,14 @@ const mockEntity: GeoIndex.GeoEntity<any, any> = {
       sk: { field: "gsi1sk", composite: ["cell"] },
     },
   },
-  schemas: { recordSchema: {} as any },
-  // Identity normaliser — no test in this file drives the search path that
-  // consults it (#111); `enrich` and `make` validation are what is exercised.
+  // Identity normaliser and stub decoders — no test in this file drives the
+  // search path that consults them (#111, #179); `enrich` and `make`
+  // validation are what is exercised.
   _domainKeyForm: (record) => record,
+  _decodeRecord: (raw) => Effect.succeed(raw),
+  _loadRows: () => Effect.void,
+  _readAttributes: [],
+  _bindContext: (_where, context) => context,
   put: () => undefined as any,
 }
 
