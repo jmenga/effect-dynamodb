@@ -59,6 +59,7 @@ import {
   SHAPES,
   UNHELD_POSITIONS,
 } from "./helpers/PayloadShapes.js"
+import { expectRequestsSince132 } from "./helpers/Since132.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -137,7 +138,7 @@ describeConnected("a key or a payload in every shape (#239)", () => {
         expect(recorded!.requests).toBeDefined()
         expect(outcome.steps).not.toEqual(control.steps)
         expect(outcome.steps).toEqual(recorded!.steps)
-        expect(outcome.requests).toEqual(recorded!.requests)
+        expectRequestsSince132(outcome, recorded!)
         expect(outcome.rows).toEqual(recorded!.rows)
         return
       }
@@ -149,7 +150,7 @@ describeConnected("a key or a payload in every shape (#239)", () => {
       // What 1.40.0 handled as it handles a plain object stays exactly as it was.
       if (shape === CONTROL_SHAPE) expect(recorded!.requests).toBeDefined()
       if (recorded!.requests !== undefined) {
-        expect(outcome.requests).toEqual(recorded!.requests)
+        expectRequestsSince132(outcome, recorded!)
         expect(outcome.steps).toEqual(recorded!.steps)
         expect(outcome.rows).toEqual(recorded!.rows)
       }
@@ -167,7 +168,7 @@ describeConnected("a record argument in every shape, read as 1.40.0 read it (#23
       expect(outcome.refused).toBeUndefined()
       // Its own entries, as 1.40.0 read them: exactly 1.40.0's results, requests and rows.
       expect(outcome.steps).toEqual(recorded!.steps)
-      expect(outcome.requests).toEqual(recorded!.requests)
+      expectRequestsSince132(outcome, recorded!)
       expect(outcome.rows).toEqual(recorded!.rows)
     })
   }
@@ -206,7 +207,7 @@ describeConnected(
         if (shape !== "throwing getter") expect(outcome.requests).toEqual(control.requests)
         // An object throwing from a getter it inherits is read as 1.40.0 read it, step for step.
         if (shape === "throwing getter") expect(outcome.steps).toEqual(recorded!.steps)
-        if (recorded!.requests !== undefined) expect(outcome.requests).toEqual(recorded!.requests)
+        if (recorded!.requests !== undefined) expectRequestsSince132(outcome, recorded!)
         if (shape === CONTROL_SHAPE) expect(recorded!.requests).toBeDefined()
       })
     }

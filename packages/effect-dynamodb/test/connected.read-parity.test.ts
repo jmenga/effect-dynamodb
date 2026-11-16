@@ -34,6 +34,7 @@ import * as Zlib from "../src/compression/zlib.js"
 import * as Lib from "../src/index.js"
 import { type Api, CONTROL, capture, type Outcome, trapsBeside } from "./helpers/InheritedNames.js"
 import { NAME_SETS, type Names, parityPositions } from "./helpers/ReadParity.js"
+import { expectRequestsSince132 } from "./helpers/Since132.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -109,7 +110,7 @@ describeConnected("each caller's object read as 1.40.0 read it, trap for trap (#
       if (set === ORDINARY) {
         // Each step returns, sends and leaves what it did on 1.40.0.
         expect(outcome.steps).toEqual(recorded.steps)
-        expect(outcome.requests).toEqual(recorded.requests)
+        expectRequestsSince132(outcome, recorded)
         expect(outcome.rows).toEqual(recorded.rows)
         return
       }

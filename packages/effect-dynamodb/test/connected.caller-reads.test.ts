@@ -44,6 +44,7 @@ import {
   requestsByStep,
   withoutReads,
 } from "./helpers/InheritedNames.js"
+import { expectRequestsSince132, readsHeldByStep } from "./helpers/Since132.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -103,10 +104,10 @@ describeConnected("what the library reads of a caller's object (#239)", () => {
         const { pathRemove: _was, ...recordedSteps } = recorded!.steps
         expect(steps).toEqual(recordedSteps)
         expect(JSON.parse(pathRemove!.value!)).toHaveProperty("failed")
-        expect({ ...requestsByStep(outcome), pathRemove: [] }).toEqual({
-          ...requestsByStep(recorded!),
+        expect({
+          ...readsHeldByStep(requestsByStep(outcome), requestsByStep(recorded!)),
           pathRemove: [],
-        })
+        }).toEqual({ ...requestsByStep(recorded!), pathRemove: [] })
         expect(outcome.rows).toEqual(recorded!.rows)
         return
       }
@@ -116,7 +117,7 @@ describeConnected("what the library reads of a caller's object (#239)", () => {
         expect(outcome.steps).toEqual(recorded!.steps)
       }
       expect(outcome.sentBy).toEqual(recorded!.sentBy)
-      expect(outcome.requests).toEqual(recorded!.requests)
+      expectRequestsSince132(outcome, recorded!)
       expect(outcome.rows).toEqual(recorded!.rows)
     })
   }

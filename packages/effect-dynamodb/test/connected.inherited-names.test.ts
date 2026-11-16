@@ -53,6 +53,7 @@ import {
   POSITIONS,
   type Position,
 } from "./helpers/InheritedNames.js"
+import { expectRequestsSince132 } from "./helpers/Since132.js"
 
 /** The names each position runs under: the ordinary one, `__proto__` and three inherited functions. */
 const RUN = [CONTROL, "__proto__", "constructor", "hasOwnProperty", "toString"] as const
@@ -179,7 +180,7 @@ describeConnected("names every object inherits (#239)", () => {
           expect(recordedControl).toBeDefined()
           if (asOrdinary(recorded!, recordedControl!)) {
             expect(recorded!.requests).toBeDefined()
-            expect(outcome.requests).toEqual(recorded!.requests)
+            expectRequestsSince132(outcome, recorded!)
             expect(outcome.rows).toEqual(recorded!.rows)
             expect(outcome.steps).toEqual(recorded!.steps)
           }
