@@ -227,6 +227,29 @@ Erasing an item that is still being written is the caller's to sequence.
 | **a. Condition each cascade update on its target still being the source's (recommended)** | Each cascade `Update` carries `attribute_exists(#pk) AND #rid = :sourceId`. `#rid` is the target's stored attribute for the ref's id (`matchingRef.idFieldName`, through the target's `field:` rename). `:sourceId` is the id in the target's stored form, the value the cascade query was keyed on. Eventual mode: a refusal means the target was deleted or re-pointed since the query. It is not the source's any more, so it is skipped and counted in neither `succeeded` nor `failed`. Transactional mode: a refused item cancels the transaction. Its cancellation reasons name the refused items, which are dropped, and the rest is sent again, up to `GUARDED_PUT_ATTEMPTS` sends. After the last send it is `CascadePartialFailure` as today. | A condition per update: nothing when it holds. Transactional mode: one more `TransactWriteItems` per round that has a refusal. | No partial item is created at a deleted target's key, and no re-pointed target is overwritten. `CascadePartialFailure` is unchanged, so no error union changes. |
 | b. Named limit | Document that a cascade can write to a target that changed in the index's propagation delay. | None. | Partial items that block a later `create` at their key, and denormalised data that disagrees with its reference. |
 
+**As built: the guard holds the index key, not the ref's id.** The condition D12 accepted
+names the target's stored id attribute (`#rid = :sourceId`). The implementation holds the
+same fact through a different attribute: each update carries `#held = :held`, the target's
+cascade-index partition-key attribute, and the value the cascade's query found the target
+under (per shard partition of a sharded index). It is the source's id as the target indexes
+it, so it fails exactly when the target was deleted (the attribute is absent, which also
+covers `attribute_exists(#pk)`) or re-pointed (the attribute holds another source's key). The
+reasons for the change:
+
+- The ref's id is not a top-level attribute: hydration stores the ref whole, so the id sits
+  inside the ref value, which a `field:` rename moves and `Packed` storage can compress into a
+  binary. A condition on it would need a document path that a packed ref has no form for
+  (EDD-9076), and a per-storage path builder for the rest.
+- The index key attribute is top-level, always written by every write that sets the ref
+  (#241, "Every write keys an index keyed by `${field}Id`"), and is the exact text the query
+  matched, so no key form is recomputed: the condition compares the value the query sent.
+
+One more interaction follows from holding the index key. A target whose shard moved between
+the query and its update (a concurrent change of a sharded index's `by` attribute, #183) is
+refused too, though it still names the source, so it keeps its copy until a later write
+hydrates it. That is a named limit: it needs a concurrent write to the target inside the
+cascade's window, and the next write that sets the ref repairs it.
+
 ### 3.6, 3.7 R6, R7: aggregates
 
 Moved to #168.
@@ -250,9 +273,13 @@ branch (`Entity.ts:13581`) runs these steps:
    false), so a missing row is `ItemNotFound` (`ConditionalCheckFailed` for `patch`), never
    `MissingForCreate`. Second, `.cascade()` does not run, because nothing changed. The
    item-returning modes decode the item returned in the same response.
-2. **Otherwise:** it reads the row with `readCurrent`, consistently (§3.2(a)). The
-   item-returning modes decode it. A missing row (or a projection tombstone) is `ItemNotFound`,
-   or `ConditionalCheckFailed` for `patch` (§3.3).
+2. **Otherwise:** it reads the row with `readCurrent`, consistently (§3.2(a)), or takes the
+   row the update already read (a packed or offloaded immutable's check reads it), so there is
+   one read. The item-returning modes decode it. A missing row (or a projection tombstone) is
+   `ItemNotFound`, or `ConditionalCheckFailed` for `patch` (§3.3). A restated immutable value
+   is compared with the row read (`immutableMismatch`, the function the refusal of the same
+   update with a payload uses): a different value is `ValidationError`, the same value is the
+   no-op it was. Nothing is sent for it (§8, F3).
 
 In a transaction, `planWrite` records step 1's request as a `ConditionCheck`
 (`asConditionCheck`, beside `asPut` / `asUpdate` / `asDelete`, for an `UpdateItem` with no
@@ -275,6 +302,8 @@ both `composite: []`) whose fields are all optional.
 | Feature | Interaction |
 |---|---|
 | unique sentinels | A no-op rotates no sentinel. Nothing changes. |
+| projection tombstones (#154) | The existence term is `rowExists`: on a read model a projection with `removal` writes, it also requires `__edd_e__` not to be the tombstone marker, in the request with no `UpdateExpression` and in the plan's `ConditionCheck`. A tombstone read or returned is a missing row (`liveRow`). See §8, F1. |
+| immutable fields | A restated value is compared with the row read (step 2), or sent in the condition (step 1). In a transaction, the plan's read refuses a mismatch before sending (§8, F2). |
 | versioned / retain | A versioned update always `SET`s the version (`Entity.ts:13168-13177`), so it is never a no-op. Not affected. |
 | timestamps | A stamped entity always `SET`s `updatedAt` (`Entity.ts:13159`), so it is never a no-op. Only an entity with neither timestamps nor versioning reaches the branch. |
 | softDelete | A soft-deleted item has no live row, so it is `ItemNotFound` as today. |
@@ -291,7 +320,9 @@ both `composite: []`) whose fields are all optional.
 ### 4.2 `purge` (R5)
 
 The live row and its sentinels are written as `delete` writes them for a unique entity. The
-item-building functions are shared, not copied. The retry loop is `GUARDED_PUT_ATTEMPTS`, and
+item-building functions are shared, not copied. The live row is read before the partition
+query (§8, F5), and a batch failure after the transaction counts the live row among the
+items deleted (§8, F4). The retry loop is `GUARDED_PUT_ATTEMPTS`, and
 each attempt starts again from the partition query. The partition query is consistent for
 every entity (D13).
 
@@ -416,7 +447,8 @@ The canonical GSI-composite shapes are not affected: no composer or index-policy
 - R4: a no-op update's condition is evaluated (D5).
 - R5: `purge` deletes the live row and its sentinels in one guarded transaction (D4), and
   queries the partition consistently (D13).
-- R8: cascade updates are conditioned on the target still naming the source (D12).
+- R8: cascade updates are conditioned on the target still naming the source (D12), through
+  its cascade-index key attribute (§3.5a, "As built").
 - Regression tests for every §2.1 claim (D9).
 - The raced connected suite in both passes.
 - Doc updates: CLAUDE.md's `patch` / no-op wording, purge and cascade bullets, DESIGN.md, the
@@ -458,3 +490,31 @@ tests and docs. `Aggregate.ts` is not changed on this branch.
 - The change feed's checkpoint commit (`change-feed/CheckpointStore.ts`) is not fenced by the
   lease. A former holder can commit an older sequence, which replays records, and the feed is
   documented at-least-once. That is not a read-then-write of an item, so not this issue.
+- A cascade target whose shard moved between the cascade's query and its update (a
+  concurrent change of a sharded index's `by` attribute) is skipped although it still names
+  the source: a named limit (§3.5a, "As built"). The next write that sets the ref repairs it.
+- A cascade target that stopped matching the cascade's `filter` after its query is still
+  updated: a named limit (§8, L2).
+- A transaction's delete of a retained row its plan read missing holds nothing to the commit:
+  a named limit (§8, L1).
+
+---
+
+## 8. Review findings
+
+Two reviews of the implementation found the following. Each was reproduced with a test
+before it was fixed, or is recorded as a named limit (§7, and DESIGN.md's "Reads Held to
+Their Writes").
+
+| ID | Finding | Resolution |
+|---|---|---|
+| F1 | A no-op's existence checks (the plan's `ConditionCheck`, the conditioned request with no `UpdateExpression`, a `"held"` answer) proved only `attribute_exists(#pk)`, which a projection tombstone (#154) satisfies. A removal landing after the plan's read committed the siblings, and a conditioned no-op on a row already removed succeeded, standalone with `returnValues("none")` and in a transaction (on 1.43.0 the conditioned no-op answered from `get`, so that was a regression). The same hole was older on updates with a payload: on 1.43.0 they wrote their attributes onto the tombstone and reported success (or failed decoding the tombstone they returned), with siblings committed. | Fixed. One existence term, `rowExists`: `attribute_exists(#pk)`, plus `#eddLive <> :eddTomb` on a read model whose rows may be tombstones (`hasProjectionTombstones`), in every update's request, a no-op's request and the plan's check. `<>` holds on a row with no `__edd_e__` (checked on DynamoDB Local), so rows written outside the library are judged as before, and no ownership check is added. Every row read or returned goes through `liveRow`: the refusal mapping, the read-first updates, the plan's read (a tombstone → `rowMissing`) and its verdict (a tombstone → absent, a lost race, planned again, then `ItemNotFound`). An update whose payload is a whole row creates the row over the tombstone through `create`'s `overTombstone`. Entities without such a projection send exactly what they did. Cost: none when the term holds. |
+| F2 | A transaction's update restating an immutable with a different value was sent, refused on the unchanged row, and taken for a lost race: three transactions, then `ConcurrentModification`. Standalone it is `ValidationError`. On 1.43.0 for updates with a payload; this branch extended it to no-ops. | Fixed. `planUpdate`'s `refuse` hook, which the plan already runs on its read of the row, compares the immutables (`immutableMismatch`) and fails `ValidationError` before anything is sent. A race that changed the value after the read is a lost race, planned again, and the next read refuses it. |
+| F3 | A no-op restating an unpacked immutable sent an `UpdateItem` with no `UpdateExpression` (1 WCU per KB) where the docs said one `GetItem`, and the `ok` → `ValidationError` change was unlisted. | Fixed in code, not in the docs: the no-op compares restated immutables with the row it reads (step 2 of §4.1), so it sends one consistent `GetItem` as documented. The outcome change is listed in the upgrading guide and the changeset. A conditioned no-op still sends its request, and the immutables ride in its condition at no extra cost. |
+| F4 | A unique `purge` whose batch runs out of retries after its transaction committed said it "had deleted none of the partition's items", though the live row was gone. | Fixed. The transaction's live-row delete is counted in the progress and the denominator, and the message says its reservations went with it (they are in other partitions, so not counted). |
+| F5 | `purge` of a unique entity read the live row after the partition query. A write between the two left its new rows (a retain snapshot) behind, while the guard read the newer row and passed. | Fixed: the live row is read before the query, the same requests in the other order. On a versioned entity, any write after the read moves the version and refuses the transaction, and the next attempt's query sees its rows. A non-versioned unique entity's guard holds its unique values only, so the writer-during-purge limit (§3.5) still applies there. |
+| F6 | A no-op restating a packed or offloaded immutable read its row twice: once for the immutable check, once for the no-op. | Fixed with F3: the no-op takes the row the update already read. |
+| F7 | The published-version parity helper dropped `ConsistentRead` from every `GetItem` on both sides. | Fixed: a `GetItem` counts as the recording's only where the run sends `ConsistentRead: true` in place of a recorded read without it, the rest of the input equal. Any other change still fails. |
+| F8 | `data-integrity.mdx` said `purge` releases the live item's sentinels one at a time; CLAUDE.md called `conditionCheckItem` the one `ConditionCheck` builder. | Fixed in both. |
+| L1 | A transaction's delete of a retained row its plan read missing writes nothing and holds nothing: a row created before the commit survives. | Named limit. The standalone delete of a missing retained row writes nothing either: both decide at the read. Holding it would add an `attribute_not_exists` `ConditionCheck`, billed at 2 WCU per KB, to every such delete. |
+| L2 | A cascade's `filter` runs in its query only; a target that stopped matching after the query is still updated. | Named limit. Holding it would mean ANDing the filter into each update's condition, and only its equality terms translate. |

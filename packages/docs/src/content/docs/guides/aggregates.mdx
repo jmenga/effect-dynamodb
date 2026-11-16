@@ -1143,7 +1143,18 @@ yield* db.entities.Players.update(
 | `failed` | Number of failed updates |
 | `errors` | Array of individual error details |
 
-In transactional mode, a failure rolls back the entire cascade (but not the source update — the source entity is already updated). You get `TransactionCancelled` instead of `CascadePartialFailure`.
+In transactional mode, a failure rolls back the entire cascade (but not the source update — the source entity is already updated). A transaction DynamoDB cancels for another reason fails with the `DynamoError` it produced; one over a DynamoDB limit fails with `CascadePartialFailure` (`succeeded: 0`).
+
+### Targets That Change During the Cascade
+
+The cascade finds its targets with a query, then updates each one. A target can change in between: another writer deletes it, or points its ref at another source. Each update is conditioned on the target still being indexed under the source (its cascade index key holds what the query found), so such a target is left alone instead of being re-created as a partial item or overwritten with the wrong source's data:
+
+- **Eventual mode** skips it. It counts as neither succeeded nor failed.
+- **Transactional mode** drops it from the transaction and sends the rest again, up to three sends; if targets are still being refused after that, the update fails with `CascadePartialFailure`.
+
+The condition costs nothing when it holds; a transactional round with a refused target costs one more `TransactWriteItems`.
+
+The condition holds the target's link to the source, not the cascade's `filter`: the filter runs in the query only, so a target that stopped matching it after the query is still updated.
 
 ### Multiple Targets
 

@@ -4808,15 +4808,18 @@ an update or a delete with a `.condition()` (an unconditioned delete is retried
 too). (`releaseRaced` marks those errors, `releaseRaces`, so
 `guardedUpsert` can tell them from a change of the item itself, which fails an
 upsert as it fails an update.) Each sentinel a write would release costs one consistent
-`GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` releases them
-one by one with a conditional `DeleteItem`, since a batch delete cannot carry
-the condition, collects them from the live item and every tombstone, and skips
-a release whose reservation changed hands in between. It then batch-deletes the
-item's rows in `BatchWriteItem` chunks of 25 (by count alone: 25 stored keys can't
+`GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` collects them
+from the live item and every tombstone. Those the live item owns go in one
+transaction with the live row's `Delete`, guarded on the row as read, exactly as
+`delete` sends them (#132, see "Reads Held to Their Writes"). Those a tombstone
+keeps (`preserveUnique`) are released one by one with a conditional
+`DeleteItem`, since a batch delete cannot carry the condition, skipping a
+release whose reservation changed hands in between. It then batch-deletes the
+item's other rows in `BatchWriteItem` chunks of 25 (by count alone: 25 stored keys can't
 reach the 16 MB request limit), resending `UnprocessedItems` with
 `Batch.write`'s backoff (5 retries); when they run out it fails with a
-`DynamoError` stating how many rows remain and exactly how many it had deleted
-(#144). A sentinel an update
+`DynamoError` stating how many rows remain and exactly how many it had deleted,
+the live row its transaction deleted included (#144, #132). A sentinel an update
 writes for a changed value carries its constraint's `ttl`, as a put's does.
 A reservation no row holds any more (a release that never happened, as a delete
 of a `Schema.BigInt` unique value on 1.39 and earlier left it, or a write outside
@@ -5007,6 +5010,111 @@ db.Users.update(key, changes, { expectedVersion: 5 })
 // Adds ConditionExpression: version = :expected
 // Fails with OptimisticLockError if version doesn't match
 ```
+
+#### Reads Held to Their Writes (#132)
+
+Full design: [`docs/designs/standalone-read-guards.md`](docs/designs/standalone-read-guards.md).
+An op that reads a row and then writes from what it read holds the read to the write: the
+write carries a condition on the row as read, and a refusal is a lost race, answered by a
+fresh read (bounded by `GUARDED_PUT_ATTEMPTS`, the budget of every guarded write) or by
+the op's own error. Read-first deletes, soft deletes, unique and retain updates, guarded
+puts, `upsert` and `restore` have held their reads since earlier releases. #132 closes the
+three paths that did not; the aggregate paths are #168's.
+
+- **An update that sets nothing.** It writes nothing, so what its write would have
+  established is established otherwise. Only an entity with no timestamps, no version and
+  no index half recomposed on every write reaches it: those always `SET` something.
+  - With no `.condition()` or `.keepRefs()`, it reads the row with one consistent `GetItem`
+    in every return mode. The item modes decode it, `none` returns nothing and `updated*`
+    an empty object; a missing row is `ItemNotFound` (`ConditionalCheckFailed` for
+    `patch`, as `patch`'s contract says). Cost: one consistent read (1 RCU per 4 KB),
+    where `none` / `updated*` sent nothing before and the item modes read eventually
+    (half the cost). An eventually consistent read could miss the row the caller just
+    wrote. A row the update already read (a packed or offloaded immutable's check) is
+    that read: no second one. A restated immutable value is compared with the row read,
+    as the refusal of the same update with a payload compares it: a different value is
+    `ValidationError` (1.43.0 returned the row). Nothing is sent for it: the value is in
+    hand, and a request would cost a write (1 WCU per KB) where the read costs 1 RCU
+    per 4 KB.
+  - With one, the update's own `UpdateItem` is sent with no `UpdateExpression`, which
+    DynamoDB accepts and which changes nothing. Its condition is ANDed with
+    `attribute_exists(#exists)` whatever it asserts, because an `UpdateItem` with no
+    `UpdateExpression` creates a key-only item at a missing key. The item modes ask for
+    `ALL_NEW`, so the item comes back in the response. Cost: one write (1 WCU per KB of
+    the row) that stores nothing. A no-op never takes the create fallback and never
+    cascades.
+  - In `transactWrite`, `planWrite` records that conditioned request as a `ConditionCheck`,
+    and an op whose plan read the row but wrote nothing gains an existence
+    `ConditionCheck` (the existence term below, `ALL_OLD`) on its key. Each is judged by the
+    plan's verdict like any planned item: a row gone at the commit is a lost race, planned
+    again, and then `ItemNotFound`; a caller's condition failing on an unchanged row is
+    `TransactionCancelled`. Each check is a billed item of the caller's transaction (2 WCU
+    per KB of the row): it counts toward the 100 items and can repeat a key, both diagnosed
+    after DynamoDB refuses them (#144), never pre-checked.
+  - A restated immutable value a transaction's update doesn't match is refused on the
+    plan's read of the row, with the `ValidationError` standalone reports, whether or not
+    the update sets anything else. It was sent, refused on the unchanged row, taken for a
+    lost race and retried until `ConcurrentModification`.
+- **A projection tombstone is a missing row to every update (#154).** A projection with
+  `removal` leaves a tombstone (`__edd_e__ = <entity>#tombstone`) at the removed row's
+  key, which every read by key reports as absent. An update's existence term
+  (`rowExists`), in its own request, a no-op's request and the plan's `ConditionCheck`,
+  is `attribute_exists(#pk) AND #eddLive <> :eddTomb` on such a read model, and
+  `attribute_exists(#pk)` on every other entity, which sends what it did. `<>` holds on a
+  row with no `__edd_e__`, so rows written outside the library are judged as before. A
+  returned or read row that is a tombstone (`liveRow`) is a missing row on every path: the
+  refusal mapping, the read-first updates, the plan's read and its verdict, where a
+  tombstone in place of the row read is a lost race, planned again, then `ItemNotFound`.
+  So an update of a removed row is `ItemNotFound` (`ConditionalCheckFailed` for `patch`)
+  and writes nothing; one whose payload is a whole row creates it over the tombstone,
+  through `create`'s own path (`overTombstone`, which carries the checkpoints). Up to
+  1.43.0, an update with a payload wrote its attributes onto the tombstone and reported
+  success (or a decode failure of the tombstone it returned), and siblings in a
+  transaction committed. The term costs nothing when it holds.
+- **`purge`.** Its queries are consistent (twice the read cost of an eventual query: 1 RCU
+  per 4 KB of the item's rows), so a purge straight after a write deletes that write's
+  rows. For a `unique` entity each attempt reads the live row consistently, before the
+  partition query, and deletes it with the sentinels it owns in one transaction guarded on
+  the row as read, sharing
+  `delete`'s parts (`hardDeleteParts`); a concurrent change of a unique value refuses the
+  transaction instead of orphaning the new value's sentinel. A lost race restarts from the
+  partition query; once every attempt has lost, `purge` fails as `delete` does
+  (`OptimisticLockError` when versioned, `ConcurrentModification` otherwise) with nothing
+  deleted. The transaction is billed at the transactional rate (2 WCU per KB) for the live
+  row and its sentinels; every other row is batch-deleted as before. Reading the live row
+  first costs nothing more (the same two reads, in the other order) and makes a versioned
+  entity's guard cover every row the query can see: a write landing after the read moves
+  the version and refuses the transaction, so the rows it added (a snapshot) are seen by
+  the next attempt's query. Read after the query, such a write was guarded against while
+  its snapshot was left behind. When the batch fails after the transaction committed, the
+  error counts the live row among the partition's items it had deleted, and says its
+  reservations went with it.
+- **Cascade updates.** Each target's update is conditioned on the target's cascade-index
+  partition-key attribute still holding what the query found (`#held = :held`): the
+  source's id as the target indexes it. A target deleted after the query (which an
+  unconditioned `UpdateItem` would re-create as an item with no entity type) or re-pointed
+  to another source is refused. Eventual mode skips it, counting it neither succeeded nor
+  failed; transactional mode drops the refused items and resends the rest, for at most
+  `GUARDED_PUT_ATTEMPTS` sends, then `CascadePartialFailure`. A condition that holds costs
+  nothing; a transactional round with a refusal costs one more `TransactWriteItems`. The
+  guard names the index key attribute, never the ref's id inside the ref value (which may
+  be renamed or packed).
+
+Named limits: a no-op update never creates a row (only a keyless singleton entity whose
+fields are all optional could otherwise count as complete); a writer still writing while
+`purge` runs can leave rows behind (a sweep can't tell them from a re-created item's), and
+a `restore` racing `purge` is not ordered; a cascade target whose shard moved between the
+query and its update (a concurrent change of a `by` attribute) is skipped and keeps its
+copy until a later write hydrates it; a cascade's `filter` runs in its query only, so a
+target that stopped matching it after the query is still updated (holding it would mean
+ANDing the filter into each update's condition, which only equality terms translate to);
+a transaction's delete of a retained (`retain`, no `unique` or soft delete) row its plan
+read missing writes nothing and holds nothing, as the standalone delete of a missing
+retained row writes nothing, so a row created between the plan's read and the commit
+survives (holding it would add an `attribute_not_exists`
+`ConditionCheck`, a billed item, to every such delete); on a non-versioned `unique`
+entity, `purge`'s guard holds the unique values only, so a write in its window that
+changes nothing unique can leave the rows it added (the writer-during-purge limit).
 
 #### Write Limits and Request Rules — Diagnosed, Not Pre-checked (#144)
 
@@ -6994,6 +7102,8 @@ yield* Players.provide(
 **Explicit targets required.** No implicit discovery. Default mode is eventual consistency (batch writes). Transactional mode available for small datasets.
 
 Each target item found through the target's `_cascade_<field>` GSI is updated under the **target entity's own primary-key fields** (`primaryKey.pk.field` / `sk.field`), and a rejected update is diagnosed under those fields, so one transactional cascade may span targets keyed differently. Before 1.25.0 the cascade read the hard-coded `pk` / `sk` attributes, so on a table keyed otherwise (e.g. `PK` / `SK`) every eventual-mode update failed (`CascadePartialFailure` with `succeeded: 0`) and a transactional cascade was rejected whole.
+
+**Held to the entry the query found (#132).** Each target's update is conditioned on its cascade-index partition-key attribute holding the value the query found it under, so a target deleted or re-pointed since is refused rather than re-created or overwritten: skipped in eventual mode, dropped and the rest resent in transactional mode (see "Reads Held to Their Writes").
 
 ### Aggregate vs Collection
 
@@ -9006,7 +9116,7 @@ pre-#179 unions.
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
 | `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
-| `purge` | `ValidationError` (plus `BlobStoreError` for an entity that offloads: it needs the store up front and deletes the purged rows' versions) |
+| `purge` | `ValidationError`, `OptimisticLockError`, `ConcurrentModification` (a `unique` entity's live row changed under every attempt, #132), plus `BlobStoreError` for an entity that offloads: it needs the store up front and deletes the purged rows' versions |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
