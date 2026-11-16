@@ -118,7 +118,13 @@ export type {
   PrefixPart,
   StringDimension,
 } from "@effect-dynamodb/schema/ZOrder.js"
-export type { AggregateCreateError, AggregateWriteError, BoundAggregate } from "./Aggregate.js"
+export type {
+  AggregateCreateError,
+  AggregateUpdateError,
+  AggregateUpdateOptions,
+  AggregateWriteError,
+  BoundAggregate,
+} from "./Aggregate.js"
 export * as Aggregate from "./Aggregate.js"
 export type { BatchRetryConfig } from "./Batch.js"
 export * as Batch from "./Batch.js"

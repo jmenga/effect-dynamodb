@@ -245,7 +245,7 @@ export type GcError = DynamoClientError | BlobStoreError | ValidationError
 
 /** The members `BlobGc.make` takes. */
 export type EntityMember = { readonly _tag: "Entity" }
-export type AggregateMember = Aggregate<any, any, any, any, any>
+export type AggregateMember = Aggregate<any, any, any, any, any, any>
 export type StreamMember = EventStream<any, any, any, any, any, any, any, any>
 
 /** The key `gc.sweep` takes for an entity member. */
@@ -255,7 +255,7 @@ export type SweepKey<E> = E extends { readonly model: Schema.Top; readonly index
 
 /** The key `gc.sweepPartition` takes for an aggregate (its key) or a stream (its id). */
 export type PartitionKey<M> =
-  M extends Aggregate<any, infer K, any, any, any>
+  M extends Aggregate<any, infer K, any, any, any, any>
     ? K
     : M extends EventStream<any, infer F, any, any, any, any, any, any>
       ? StreamIdInput<F>
