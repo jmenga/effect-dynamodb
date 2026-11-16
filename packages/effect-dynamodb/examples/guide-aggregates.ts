@@ -14,6 +14,7 @@
  *   - Aggregate CRUD: create, get, update (cursor + spread), delete
  *   - Aggregate type extractors
  *   - Aggregate error handling
+ *   - Concurrent writers: a bounded, jittered retry; `versioned` and `expectedVersion`
  *   - Entity.cascade for propagating source changes to ref consumers
  *   - Offloaded edge fields (a binary photo kept in a blob store)
  *
@@ -24,7 +25,7 @@
  *   npx tsx examples/guide-aggregates.ts
  */
 
-import { Config, Console, Effect, Layer, Option, Schema } from "effect"
+import { Config, Console, Effect, Layer, Option, Schedule, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -326,6 +327,19 @@ const AuditedMatchAggregate = Aggregate.make(Match, {
 
 void AuditedMatchAggregate
 
+// A versioned aggregate: a version on its root, moved by every write that sends anything.
+// #region aggregate-versioned
+const ScoredMatchAggregate = Aggregate.make(TournamentMatch, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "smatch" },
+  root: { entityType: "ScoredMatchItem" },
+  edges: {},
+  versioned: true,
+})
+// #endregion
+
 // #region offloaded-edges
 class MatchReport extends Schema.Class<MatchReport>("MatchReport")({
   matchId: Schema.String,
@@ -612,6 +626,58 @@ const program = Effect.gen(function* () {
   )
   // #endregion
 
+  // #region aggregate-update-retry
+  // Another writer's change since the read fails the update; read again and re-apply.
+  const renamed = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ state }) => ({
+    ...state,
+    name: "AUS vs IND, 1st Test (Perth)",
+  })).pipe(
+    Effect.retry({
+      while: (error) =>
+        error._tag === "ConcurrentModification" ||
+        // Two transactions over one row can cancel each other: retryable too.
+        (error._tag === "TransactionCancelled" &&
+          error.reasons.some((reason) => reason.code === "TransactionConflict")),
+      schedule: Schedule.exponential("20 millis").pipe(Schedule.jittered),
+      times: 4,
+    }),
+  )
+  // #endregion
+
+  yield* Console.log(`Renamed: ${renamed.name}`)
+
+  // #region aggregate-expected-version
+  yield* ScoredMatchAggregate.create({
+    matchId: "bgt-2025-final",
+    tournament: "bgt-2025",
+    name: "Final",
+    status: "scheduled",
+  })
+  // The caller saw version 1: the update applies only if nothing has changed since.
+  yield* ScoredMatchAggregate.update(
+    { matchId: "bgt-2025-final" },
+    ({ state }) => ({ ...state, status: "completed" }),
+    { expectedVersion: 1 },
+  )
+  // A second caller that also saw version 1 is refused before its mutation runs.
+  const stale = yield* ScoredMatchAggregate.update(
+    { matchId: "bgt-2025-final" },
+    ({ state }) => ({ ...state, name: "Final (abandoned)" }),
+    { expectedVersion: 1 },
+  ).pipe(
+    Effect.map(() => "applied"),
+    Effect.catchTag("OptimisticLockError", (e) =>
+      Effect.succeed(`refused: version ${e.actualVersion}, expected ${e.expectedVersion}`),
+    ),
+  )
+  // #endregion
+
+  yield* Console.log(`Stale update: ${stale}`)
+  if (stale !== "refused: version 2, expected 1") {
+    return yield* Effect.die(new Error(`expectedVersion: ${stale}`))
+  }
+  yield* ScoredMatchAggregate.delete({ matchId: "bgt-2025-final" })
+
   // #region aggregate-error-handling
   const result = yield* MatchAggregate.get({ id: "nonexistent" }).pipe(
     Effect.catchTag("AggregateAssemblyError", (e) =>
@@ -661,8 +727,8 @@ const program = Effect.gen(function* () {
   const report = yield* MatchReportAggregate.get({ matchId: "bgt-2025-test-1" })
   const firstImage: Uint8Array = report.photos[0]!.image
 
-  // An update writes only changed groups, and a changed group uploads its
-  // offloaded values again; an unchanged group uploads nothing
+  // An update writes only changed rows, and a changed row uploads its
+  // offloaded values again; an unchanged row uploads nothing
   yield* MatchReportAggregate.update({ matchId: "bgt-2025-test-1" }, ({ cursor }) =>
     cursor.key("headline").replace("Cummins takes five on day one"),
   )

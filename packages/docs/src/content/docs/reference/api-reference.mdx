@@ -1292,7 +1292,7 @@ const TeamSheetAggregate = Aggregate.make(TeamSheet, {
 })
 ```
 
-**Top-level form** — `Aggregate.make(Schema, { table, schema, pk, collection, root, refs?, edges })`:
+**Top-level form** — `Aggregate.make(Schema, { table, schema, pk, collection, root, refs?, edges, timestamps?, consistentRead?, versioned?, fence? })`. `versioned` (`true` or `{ field }`, default field `version`) keeps a version and an incarnation token on the root row; an entity's snapshot options are refused (`EDD-9177`). `fence: true` makes every update check the root and `delete` remove the root first; `versioned` implies it, and `versioned` with `fence: false` is `EDD-9179`:
 
 Returns an `Aggregate<TSchema, TKey>` with `get`, `create`, `update`, `delete` operations.
 
@@ -1317,9 +1317,9 @@ const MatchAggregate = Aggregate.make(Match, {
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
 | `aggregate.get(key)` | `Effect<Domain, AggregateAssemblyError \| DynamoError \| ValidationError>` | Fetch and assemble by partition key |
-| `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated, sub-aggregate transactions). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
-| `aggregate.update(key, fn)` | `Effect<Domain, AggregateWriteError>` | Fetch → mutate → diff → write changed groups. `fn` receives `UpdateContext` with `{ state, cursor, optic, current }` |
-| `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove the rows of the aggregate's entity types from its partition |
+| `aggregate.create(input)` | `Effect<Domain, AggregateWriteError \| ConditionalCheckFailed>` | Create from input (ref IDs hydrated; one transaction when it fits, else whole sub-aggregate groups packed into several, root first). Fails with `ConditionalCheckFailed`, writing nothing, when the aggregate's root item already exists |
+| `aggregate.update(key, fn, options?)` | `Effect<Domain, AggregateUpdateError>` | Read (strongly consistent on a base-table collection) → mutate → diff → write only the changed rows, each guarded on the row as read, in one transaction when they fit. `fn` receives `UpdateContext` with `{ state, cursor, optic, current, version }`. `AggregateUpdateError` is `AggregateWriteError \| ConcurrentModification \| OptimisticLockError`: another writer changed a row since the read (`ConcurrentModification`, `attributes` as member paths), or, on a `versioned` aggregate, the version moved (`OptimisticLockError`). `options.expectedVersion` (a `versioned` aggregate only; `EDD-9178` for an untyped caller) applies the update only at that version, compared before `fn` runs. The mutation is never re-run: retry the update |
+| `aggregate.delete(key)` | `Effect<void, AggregateAssemblyError \| DynamoError>` | Remove the rows of the aggregate's entity types from its partition. With `fence` (or `versioned`), the root first, then one consistent read and the rest; without, a consistent second read deletes what a concurrent writer added, unless it finds a root |
 | `aggregate.list(key, options?)` | `Effect<ListResult<Domain>, AggregateAssemblyError \| DynamoError \| ValidationError>` | Page aggregates off the list index. `options`: `limit` (at most _n_ aggregates), `pageSize` (rows examined per request), `filter` (server-side `FilterExpression`, callback or shorthand; an empty part under `or()` / `not()` or an `or()` with no parts fails with a `ValidationError` before sending; an `isIn` with no values is sent, and DynamoDB's rejection named), `reverse`, `cursor` (one that can't be decoded fails with a `ValidationError`, `EDD-9094`, `operation: "list"`), `prefix` (match the last list sort key value given as a prefix of its value, not the whole value; a numeric composite stays whole). Returns `{ data, cursor }`; `cursor` is an `Option<string>`, `None` only when exhausted, and always `None` on a sharded (`cardinality`) list, which rejects a passed cursor with `EDD-9051` |
 
 ### Edge Types
@@ -1338,7 +1338,7 @@ const MatchAggregate = Aggregate.make(Match, {
 | `SubAggregate<TSchema>` | Composable sub-aggregate with `.with(config)` for discriminator binding |
 | `BoundSubAggregate<TSchema>` | Discriminator-bound sub-aggregate, ready to embed in a parent |
 | `Aggregate<TSchema, TKey>` | Top-level aggregate with CRUD operations |
-| `UpdateContext<TIso, TClass>` | Context provided to `update` mutation: `{ state: TIso, cursor: Cursor<TIso>, optic: Optic.Iso<TIso, TIso>, current: TClass }` |
+| `UpdateContext<TIso, TClass>` | Context provided to `update` mutation: `{ state: TIso, cursor: Cursor<TIso>, optic: Optic.Iso<TIso, TIso>, current: TClass, version?: number }` (`version` on a `versioned` aggregate) |
 
 ### Type Extractors
 

@@ -363,7 +363,9 @@ const MatchAggregate = Aggregate.make(Match, {
 | `schema` | DynamoSchema namespace for key prefixing |
 | `pk` | Partition key definition (field + composite attributes from the schema) |
 | `collection` | Collection naming for the read path. `name` is required; `index` + `sk` only when assembling through a secondary index (see below) |
-| `consistentRead` | Use strongly consistent reads when assembling. Defaults to `false` |
+| `consistentRead` | Use strongly consistent reads when assembling (`get`, `list`). Defaults to `false`. `update`'s read is consistent on a base-table collection whatever this says; on a collection index it follows this setting, so set it on an LSI (see [Concurrent writers](#concurrent-writers)) |
+| `versioned` | Optional. `true` or `{ field }`: a version on the root row, moved by every write, and `update`'s `expectedVersion` (see [Concurrent writers](#concurrent-writers)) |
+| `fence` | Optional, `false` by default. `true` makes every update check the root and `delete` remove the root first, so no update lands on a deleted aggregate. Implied by `versioned` |
 | `root` | Entity type for the root item |
 | `context` | Optional array of schema field names to propagate to all member items |
 | `timestamps` | Optional auto-managed `created` / `updated` attributes on every row the aggregate writes (see below) |
@@ -397,7 +399,7 @@ Every row the aggregate writes is stamped — the root item, `one` and `many` ed
 every row inside a sub-aggregate's transaction group.
 
 **`updated` is per row.** It records when *that row* last changed. `update` diffs the
-decomposition and rewrites only the sub-aggregate groups whose content actually changed,
+decomposition and rewrites only the rows whose content actually changed,
 so rows a mutation leaves alone keep their stored value. That is what a downstream sync
 guarding its writes with `attribute_exists(updated) and updated < :updated` wants: rows
 that did not change do not need a new stamp.
@@ -466,7 +468,12 @@ missing while the root is visible, which for optional or empty-able edges assemb
 aggregate that is quietly incomplete.
 
 Set `consistentRead: true` to close that window. It doubles the RCU cost of every assembly
-read, so it is opt-in. It requires an aggregate collection that can be read strongly
+read, so it is opt-in. `update` doesn't wait for it: on a base-table collection its read is
+always strongly consistent, because it guards each row it writes on the row it read, and a stale
+read would fail as a conflict. `delete`'s second read is too. On a collection index they follow
+`consistentRead`: a GSI can be keyed on the table's own partition key (one added after the table
+was created, since an LSI can't be), and DynamoDB refuses a consistent read of a GSI, so the library
+takes only `consistentRead: true` as saying the index is an LSI. `consistentRead` requires an aggregate collection that can be read strongly
 consistently — on the base table, or on an LSI (an aggregate's collection index whose
 partition key is the table's is created as one). DynamoDB reads a GSI only eventually
 consistently: with a GSI-shaped collection index, `make()` accepts it, and every assembly
@@ -740,8 +747,8 @@ yield* MatchReportAggregate.create({
 const report = yield* MatchReportAggregate.get({ matchId: "bgt-2025-test-1" })
 const firstImage: Uint8Array = report.photos[0]!.image
 
-// An update writes only changed groups, and a changed group uploads its
-// offloaded values again; an unchanged group uploads nothing
+// An update writes only changed rows, and a changed row uploads its
+// offloaded values again; an unchanged row uploads nothing
 yield* MatchReportAggregate.update({ matchId: "bgt-2025-test-1" }, ({ cursor }) =>
   cursor.key("headline").replace("Cummins takes five on day one"),
 )
@@ -749,8 +756,8 @@ yield* MatchReportAggregate.update({ matchId: "bgt-2025-test-1" }, ({ cursor }) 
 
 - **Reads are eager for both kinds.** `get`, `list` and the state `update` hands you hold the values themselves (`Uint8Array` for a binary field), since the assembled value is your aggregate schema and `update` re-validates it.
 - **Binary edge inputs are `Uint8Array` only.** A `Stream`, `BlobHandle` or `Offload.source` (or an `OffloadedValue` for an overflow field) fails with a `ValidationError` naming `[EDD-9120]`.
-- **A changed group uploads again.** `update` diffs groups before writing (the root group, and each sub-aggregate), and writes only the changed ones. Within a changed group, every offloaded edge value is uploaded as a new version, even if its content didn't change: group writes carry no condition, so a pointer read from the partition is never written back. An unchanged group uploads nothing. Keep large binary content in a sub-aggregate of its own when other parts of the aggregate change often.
-- **Groups are separate transactions**, so uploads settle per group: a failed group's uploads are rolled back, and committed groups keep theirs.
+- **A changed row uploads again.** `update` diffs rows before writing and writes only the changed ones. A changed row's offloaded edge values are uploaded as new versions, even if their content didn't change, so a pointer read from the partition is never written back. An unchanged row uploads nothing. Keep large binary content in an edge of its own when other parts of the aggregate change often.
+- **Uploads settle with the write.** A write that fits one transaction keeps its uploads when it commits and deletes them when it is cancelled (a conflict included), leaving the stored pointers and their objects as they were. Past one transaction, the committed requests keep theirs.
 - **Refs never copy offloaded fields.** A ref schema that includes a field the referenced entity offloads is refused (`[EDD-9143]`): reference a subset model without it. An edge item hydrated from an id copies the target's offloaded values it holds into new versions under its own key.
 - **Errors.** Every aggregate write, and every read, of an aggregate with offloaded edge fields adds `BlobStoreError` to its error type. `delete` never reaches the store and keeps its error type; the [garbage collector](/effect-dynamodb/guides/blob-offload/#garbage-collection) frees the deleted edges' versions (`BlobGc.make({ aggregates })`, `sweepPartition`). An aggregate member collects only the rows in its own partitions: when its edge entity is also used standalone on the same table (with the same entity type), list that entity under `entities` too, or its standalone rows and their history are never collected by this collector.
 
@@ -804,7 +811,7 @@ The create operation:
 2. Hydrates all ref fields (fetches entities by ID, embeds domain data)
 3. Decomposes the domain object into individual DynamoDB items following the graph structure, with every value in its wire form (see [How Values Are Stored](#how-values-are-stored))
 4. Adds partition keys, sort keys, entity type discriminators, and context fields
-5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`). The root item goes first, in the first transaction, conditioned on `attribute_not_exists`
+5. Writes every item in one `transactWriteItems` when they fit (100 items, 4 MB). The root item goes first, conditioned on `attribute_not_exists`. Past one transaction, whole sub-aggregate groups are packed into several, the root's first
 
 Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`, including the `Option` a `Schema.OptionFromOptional` makes. These are kept intact while ref IDs are replaced with hydrated data.
 
@@ -824,15 +831,15 @@ A `many` edge whose element is the entity takes an ID or the entity whole. One w
 
 A `one` or `ref` edge's `${field}Id` follows the same rule as a `many` element's. A string ID is fetched, as in earlier versions, whatever the model or the element declares. An ID of another type (a number, a `bigint`, a `Date`) is fetched only where the model's field is the entity's own model, the model doesn't declare `${field}Id` itself (a declared `${field}Id` is the model's own data), and the entity isn't given whole: given whole, it is stored as given. A string ID given beside the entity is still fetched, and replaces it, as in earlier versions.
 
-Returns `RefNotFound` if a ref ID doesn't resolve. Each sub-aggregate group is its own transaction, written in turn, so a multi-group write is not atomic. DynamoDB's limits are not checked before sending: a group over 100 items (DynamoDB's transaction limit) is rejected by DynamoDB and fails with `AggregateTransactionOverflow`; an item over 400 KB, a group over 4 MB, or a key over its size limit (2048 bytes for a partition key, 1024 for a sort key) fails with a `ValidationError` naming the item and its key. Nothing from the rejected group is written, DynamoDB's error is the `cause`, and the error says which groups were already committed (`AggregateTransactionOverflow.committed` and its `message`, or the `ValidationError`'s message). A `create` whose root group committed fails on the existing root if retried: `update` or `delete` the partial aggregate instead.
+Returns `RefNotFound` if a ref ID doesn't resolve. A write that fits one transaction is atomic: if DynamoDB rejects it, nothing is written. Past one transaction, the groups go in several, in turn, and a later one's failure leaves the earlier ones written. DynamoDB's limits are not checked before sending: a group over 100 items (DynamoDB's transaction limit) is rejected by DynamoDB and fails with `AggregateTransactionOverflow`; an item over 400 KB, a request over 4 MB, or a key over its size limit (2048 bytes for a partition key, 1024 for a sort key) fails with a `ValidationError` naming the item and its key. Nothing from the rejected request is written, DynamoDB's error is the `cause`, and the error says which groups earlier requests committed (`AggregateTransactionOverflow.committed` and its `message`, or the `ValidationError`'s message). A `create` whose first request committed fails on the existing root if retried: `update` or `delete` the partial aggregate instead.
 
-Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first. Each sub-aggregate is still its own transaction, so if a later one fails, the ones before it stay written.
+Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first.
 
 The guard is on the root item only. Edge and sub-aggregate rows left without a root, for example by an earlier write that failed partway, don't stop `create`. `get` then reads them back together with the new aggregate's rows, merging stale edges into it. Before creating an aggregate where an earlier write may have failed partway, `delete` its key: `delete` removes every row of the aggregate's entity types in the partition, orphans included. The library doesn't check for orphan rows on `create`, because that would add a partition read to every create.
 
 #### update — Diff and Write
 
-Fetch the current state, apply a mutation function, diff, and write only changed sub-aggregate groups:
+Fetch the current state, apply a mutation function, diff, and write only the rows that changed, each guarded on the row as it was read (see [Concurrent writers](#concurrent-writers)):
 
 ```typescript region="aggregate-update-spread" example="guide-aggregates.ts"
 const updated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, (current) => ({
@@ -848,13 +855,13 @@ const updated = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, (current
 ```
 
 The update operation:
-1. Fetches the current aggregate via `get`
+1. Reads the partition (strongly consistent on a base-table collection) and assembles the current aggregate
 2. Applies the mutation function to produce the updated domain object
 3. Decomposes both old and new into DynamoDB items
-4. Diffs at sub-aggregate group boundaries
-5. Writes only the groups that changed
+4. Diffs them row by row
+5. Writes only the rows that changed, each guarded on the row as read, in one transaction when they fit
 
-**Context field propagation:** If the mutation changes a context field (a root-level field propagated to all members), all sub-aggregate groups are rewritten with the new context values.
+**Context field propagation:** If the mutation changes a context field (a root-level field propagated to all members), every row is rewritten with the new context values.
 
 #### UpdateContext
 
@@ -916,6 +923,8 @@ yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
 ```
 
 Queries the partition and batch-deletes every row whose entity type (`__edd_e__`) is one of the aggregate's own: its root's, each edge's and each sub-aggregate's, whoever wrote them. Any other row in the partition, an entity's or another aggregate's, stays. A partition holding none of the aggregate's rows fails with `AggregateAssemblyError`, as an empty one does. Up to 1.40.0, `delete` removed every row in the partition.
+
+A row another writer adds between `delete`'s read and its batches would be left behind, so `delete` reads the partition once more afterwards and deletes what it finds of the aggregate's, unless it finds a root: then a `create` has reused the key, and its aggregate is left alone. With `fence: true` (or `versioned`) the order changes: `delete` removes the root first, then reads and deletes the rest. Every update checks the root, so none can commit after the root is gone, and no second read is needed. A `create` can: if that read finds a root, a `create` reused the key after the root went, and `delete` leaves it alone.
 
 #### list — Page Through Aggregates
 
@@ -1024,6 +1033,123 @@ An object nothing gives other text to (a struct, a `Data` class, an instance of 
 
 A write composing one of these keys from such an object is a `ValidationError` naming the field or the discriminator (`EDD-9162`), with nothing written: `create` for the partition key, the `collection` sort key, the `list` keys and every row's discriminators, and `update` for all of them but the partition key, which `update` composes from the key it's given. An `update` that leaves the value as it read it writes the row where it is, so an aggregate an earlier release wrote can still be updated, and `get`, `list` and `delete` compose the text as before. A `many` edge's sort key already refused every object, and still does. A value with a key form, such as a number, text or a `Duration`, is untouched.
 
+### Concurrent writers
+
+Two writers can `update` one aggregate at the same time. Each update guards every row it writes on
+the row as it read it: a `Put` of a row it read is conditioned on that row being unchanged, a new
+row on nothing being there, a dropped row is deleted only as read. If another writer, through the
+library or not, changed a row in between, DynamoDB cancels the write and `update` fails with
+`ConcurrentModification`, nothing written. Its `attributes` name what changed by member path, such
+as `"team1.players[smith-01].isCaptain"`. Guards cost no write capacity; they count towards the
+4 MB transaction limit, so a write of very large rows compares their largest attributes by size
+instead. Only ASCII text is compared by size, because DynamoDB doesn't document how `size()` counts
+other characters. A sub-aggregate group that must be sent whole with more than about 2 MB of
+non-ASCII text stays over 4 MB with its guards, and DynamoDB refuses it with a `ValidationError`
+naming the request. To stay under the limit, split such text across smaller groups or offload it
+(see Offloaded Storage).
+
+The update writes only the rows that changed, in one transaction when they fit (100 items, 4 MB),
+so a change to several sub-aggregates lands whole or not at all. Its partition read is strongly
+consistent on a base-table collection, so a conflict means another writer really did write;
+on a collection index the read follows `consistentRead` (set it on an LSI), and read eventually
+consistently an update made just after a write can see the index lag as a conflict.
+
+The library never re-runs your mutation: it decided on state that no longer holds. Read again and
+re-apply by retrying the update, with a bounded, jittered schedule. Two updates of one aggregate
+overlapping at DynamoDB can also cancel each other's transactions without either condition failing:
+that is `TransactionCancelled` with a `TransactionConflict` reason, and retrying it is as safe. On a
+`versioned` aggregate the conflict is `OptimisticLockError` instead of `ConcurrentModification`; retry
+it too, unless you passed `expectedVersion`, whose mismatch a fresh read can't cure:
+
+```typescript region="aggregate-update-retry" example="guide-aggregates.ts"
+// Another writer's change since the read fails the update; read again and re-apply.
+const renamed = yield* MatchAggregate.update({ id: "bgt-2025-test-1" }, ({ state }) => ({
+  ...state,
+  name: "AUS vs IND, 1st Test (Perth)",
+})).pipe(
+  Effect.retry({
+    while: (error) =>
+      error._tag === "ConcurrentModification" ||
+      // Two transactions over one row can cancel each other: retryable too.
+      (error._tag === "TransactionCancelled" &&
+        error.reasons.some((reason) => reason.code === "TransactionConflict")),
+    schedule: Schedule.exponential("20 millis").pipe(Schedule.jittered),
+    times: 4,
+  }),
+)
+```
+
+#### Versioned aggregates
+
+`versioned: true` (or `{ field: "rev" }`) keeps a version on the root row: `create` writes 1, and
+every update that writes anything moves it by one. The mutation sees it as `context.version`, and a
+root model that declares the field reads it. A conflict on a versioned aggregate is an
+`OptimisticLockError` carrying `expectedVersion` and `actualVersion`. A root written before the
+option was turned on reads as version 0, and its first update starts the count.
+
+```typescript region="aggregate-versioned" example="guide-aggregates.ts"
+const ScoredMatchAggregate = Aggregate.make(TournamentMatch, {
+  table: MainTable,
+  schema: CricketSchema,
+  pk: { field: "pk", composite: ["matchId"] },
+  collection: { name: "smatch" },
+  root: { entityType: "ScoredMatchItem" },
+  edges: {},
+  versioned: true,
+})
+```
+
+Pass `expectedVersion` to apply an update only if the aggregate is still at the version the caller
+saw, as an HTTP `If-Match` does. It is compared before the mutation runs:
+
+```typescript region="aggregate-expected-version" example="guide-aggregates.ts"
+yield* ScoredMatchAggregate.create({
+  matchId: "bgt-2025-final",
+  tournament: "bgt-2025",
+  name: "Final",
+  status: "scheduled",
+})
+// The caller saw version 1: the update applies only if nothing has changed since.
+yield* ScoredMatchAggregate.update(
+  { matchId: "bgt-2025-final" },
+  ({ state }) => ({ ...state, status: "completed" }),
+  { expectedVersion: 1 },
+)
+// A second caller that also saw version 1 is refused before its mutation runs.
+const stale = yield* ScoredMatchAggregate.update(
+  { matchId: "bgt-2025-final" },
+  ({ state }) => ({ ...state, name: "Final (abandoned)" }),
+  { expectedVersion: 1 },
+).pipe(
+  Effect.map(() => "applied"),
+  Effect.catchTag("OptimisticLockError", (e) =>
+    Effect.succeed(`refused: version ${e.actualVersion}, expected ${e.expectedVersion}`),
+  ),
+)
+```
+
+`versioned` also stores a random incarnation token beside the version, so an update that read an
+aggregate which was then deleted and created again fails, even though the new one is at version 1
+too. Turn `versioned` on once every writer of the aggregate runs a release that has it: an older
+release rewrites the root without the version, and the count starts again.
+
+#### What the guards don't see
+
+- **Without `versioned`, write skew.** A mutation that decides on rows it doesn't write (a total on
+  the root from lines another writer adds) can commit over that writer. `versioned` closes this
+  between the library's writers.
+- **Without `fence`, an update racing a delete** that only adds rows can leave rows without a root,
+  which `get` refuses and a later `delete` removes. Every update that rewrites or deletes an
+  existing row fails instead. `fence: true` closes it: each update then checks the root.
+- **With `fence`, a group sent alone holds at most 99 items**: the fence takes the 100th place.
+- **Past one transaction** a write isn't atomic: the error's `committed` names what landed.
+- **Wide rows.** A row too wide for one condition expression (about 150 attributes) is guarded on
+  its `updatedAt` and as many attributes as fit.
+- **A `create` of a key while it is being deleted** keeps its aggregate (`delete` leaves a root it
+  finds after its own work began), and rows of the old aggregate it didn't overwrite stay beside it.
+- **The collection index must project every attribute.** A row read without one can never match
+  its guard.
+
 ### Type Extractors
 
 | Type | Description |
@@ -1043,6 +1169,8 @@ type MatchKey = Aggregate.Key<typeof MatchAggregate> // { id: string }
 | `AggregateAssemblyError` | Read path: no items for the key, a missing root item, or duplicate root / sub-aggregate items | `aggregate`, `reason`, `key` |
 | `ValidationError` | Read path: the assembled items fail schema decode (`operation: "aggregate.assemble"`) | `entityType`, `operation`, `cause` |
 | `AggregateDecompositionError` | Write path: schema validation or structural error during decomposition | `aggregate`, `member`, `reason` |
+| `ConcurrentModification` | `update`: a row changed since the update read it (another writer); nothing written | `entityType`, `key`, `attributes` (member paths), `committed` (past one transaction) |
+| `OptimisticLockError` | `update` of a `versioned` aggregate: the version moved since the read, the `expectedVersion` didn't match, or a row changed | `expectedVersion`, `actualVersion`, `attributes`, `committed` |
 | `AggregateTransactionOverflow` | Write path: DynamoDB rejected a sub-aggregate group over its 100-item transaction limit | `aggregate`, `subgraph`, `itemCount`, `limit`, `committed` (sub-aggregates already written), `operation` (`"create"` / `"update"`), `cause`; `message` states all of it |
 | `RefNotFound` | Ref hydration: referenced entity not found | `entity`, `field`, `refEntity`, `refId` |
 | `BlobStoreError` | An aggregate with [offloaded edge fields](#offloaded-edge-fields): an upload or an eager read failed (not on `delete`) | `entityType`, `attribute`, `operation`, `action`, `reason`, `committed` |
