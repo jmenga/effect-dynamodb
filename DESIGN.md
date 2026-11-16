@@ -9295,6 +9295,7 @@ for unrelated errors and the collision was caught only at review.
 | 9161–9164 | Effect value types: what DynamoDB doesn't store at an untyped position, object key composites (#242) |
 | 9173–9176 | Reads held to their writes (#132): reserved, none allocated (every outcome is an existing tagged error) |
 | 9177–9180 | Aggregate concurrency: `versioned`, `expectedVersion` (#168) |
+| 9180–9181 | Per-value shard layouts: tables supplied at run time (#287) |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -9451,11 +9452,13 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9177` | `Aggregate.ts` (`make`, pure and operational; #168, `docs/designs/aggregate-concurrency.md` §3.5) | An aggregate's `versioned` option the root version can't be kept under: `retain` or `ttl` (an aggregate keeps no snapshots), or a `field` that is a context field, a partition, collection or list key composite, a timestamp field, a root model field whose type isn't a number (on a root of members, a union or a suspended schema, any member declaring it), or the attribute a root model field is stored under (`Schema.encodeKeys`). Refused at load, naming the option and the field. |
 | `EDD-9178` | `Aggregate.ts` (`update`; #168, `docs/designs/aggregate-concurrency.md` §3.5) | `update(key, fn, { expectedVersion })` on an aggregate without `versioned`: there is no version to compare. A `ValidationError`, nothing read or sent; a typed caller can't write it. |
 | `EDD-9179` | `Aggregate.ts` (`make`, pure and operational; #168, `docs/designs/aggregate-concurrency.md` §0) | An aggregate's `fence` setting it can't be kept under: `fence: false` beside `versioned` (the version `Update` on the root is itself the fence, so a versioned aggregate is always fenced), or a `fence` that isn't a boolean. Refused at load. |
+| `EDD-9180` | Allocated for #287 (`docs/designs/shard-layouts.md` §10.4): the `ShardLayouts` attach step (`_indexesNow`), `KeyComposer.ts` (`composedShardMarker`, `composeReadPartitions`, from an index definition whose `layouts` is `"provided"` with no table attached), through `DynamoClient.make` (bind), every unbound operation, a deferred query's terminal, `explain` and `asParams`, and `rekey` (a defect; nothing is sent) | An index declares `shards: { layouts: "provided" }` and no `ShardLayouts` service in context supplies its table: no layer, or no `ShardLayouts.of` for the entity. Never a fallback to a default |
+| `EDD-9181` | Allocated for #287 (`docs/designs/shard-layouts.md` §10.3, §10.5): `ShardLayouts.of` / `ShardLayouts.layer` / `ShardLayouts.layerEffect`, when the layer is built (a defect), and the types of `of` | `ShardLayouts.of` misused: an index not declared `layouts: "provided"`, an unknown index, a provided index of the entity left out, the same entity given twice in one layer, or an entity registered on no table |
 
 `EDD-9076` and `EDD-9077` also cover `DynamoModel.External` binary fields from #179 (the same
 condition — an attribute DynamoDB sees as one opaque value — raised by the same walker).
 
-Next free code: `9181` (`9173`–`9176` and `9180` are reserved for #132 and #168 and left unallocated; `9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: `9182` (`9173`–`9176` and `9180` are reserved for #132 and #168 and left unallocated; `9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 
