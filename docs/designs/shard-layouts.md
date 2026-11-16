@@ -5,7 +5,8 @@ posted on it, which records the owner's decisions (D1 to D14 below). Where the t
 review comment wins: it replaces the issue's function with a **table of values**, and the issue's
 `DynamoClient.make({ shards })` override with a **layer**.
 **Status:** Design, commit 1 of the feature branch (single-PR workflow). D1 to D14 are the owner's;
-D15 onwards are scoping calls made here, awaiting review.
+D15 onwards are scoping calls made here. Revised after the design review: findings F1 to F11 and
+what was done with each are D30 to D40 (§19).
 **On top of:** `main` at `9ec9bb63` (1.43.0).
 **Builds on:** `gsi-write-sharding.md` (#183): the marker (§2), the shard function (§3), structural
 composition (§4), the update gate (§5), reads, merge and cursors (§6), pruning (§7), adoption and
@@ -61,10 +62,12 @@ The design has four load-bearing parts:
    marker (#183 §2.1), so layouts in one index can't collide, and the existing cursor checks refuse
    a cursor across a layout change (§6.5).
 3. **The composer resolves; the call sites don't change** (§5, §6). `composePk`, the truncating
-   composer and `composeReadPartitions` resolve the layout from the index definition they're given,
-   as they add the marker today. A `"provided"` index carries no table until a path attaches the
-   one `ShardLayouts` supplies, and composing from a definition without one throws `[EDD-9180]`, so
-   a path that forgets can't fall back to a default.
+   composer and `composeReadPartitions` resolve the layout from the index definition and the
+   schema they're given, as they add the marker today. A `"provided"` index's table travels on the
+   schema an operation composes under (`DynamoSchema.shardTables`, internal, as `objectKeys` does),
+   attached from what `ShardLayouts` supplies; composing under a schema without it throws
+   `[EDD-9180]`, so a path that forgets can't fall back to a default. Index definitions never change
+   identity (D36).
 4. **Rules stay per index** (§7, D4). `.within()`, skip-scan, `.zorder()`, `GeoIndex`, `by`, the
    update gate and `rekey`'s rule follow the index, not the value's count. Byte-identical holds for
    key text and requests; the rule set is the sharded one for every value of an index with a table.
@@ -92,7 +95,9 @@ shards?:
   nothing to fall back to (D11).
 - **`by`** stays beside `layouts`, one per index, as today. It never varies by value (D4).
 - **`previous`** lives only inside a layout, the default's included (D7). `{ layouts, previous }` and
-  `{ layouts, count }` are refused (`EDD-9099`).
+  `{ layouts, count }` are refused (`EDD-9099`), and are compile errors: the static member of the
+  union declares `layouts?: never` and the table members `count?: never; previous?: never`, so a
+  fresh literal mixing them doesn't pass the union's excess-property check (D37).
 
 A layout is `count` in 1..256, or `{ count, previous? }` with `previous` in 1..256 and not equal to
 `count`. Count `1` means unsharded (§4). `{ count: 1, previous: N }` is allowed, as the default or for
@@ -122,7 +127,14 @@ definition-time attribute name (owner rule, CLAUDE.md). The guard joins `EntityI
 - `layout` is `Layout`; `default` is required.
 
 `layouts: "provided"` is a literal type, so `ShardLayouts.of` can find the provided indexes of an
-entity from its type (§10.3).
+entity from its type (§10.3). That needs the entity's type to keep the declaration: `Entity.make`
+returns `NormalizedIndexes<TPrimaryKey, TGsiIndexes>`, and `NormalizedGsi`
+(`packages/schema/src/Entity.ts:247`) keeps only `collection` and the composites, so the raw
+`shards` is gone by then. `NormalizedGsi` therefore carries the declaration as a phantom, as it
+carries `zorder` and `prefix`: `shards: IndexShards & { readonly declared: G["shards"] }` for an
+index declaring `shards`. Both the operational `Entity` and the pure definition use
+`NormalizedIndexes`, so `of()` reads the provided indexes and each one's partition key composites
+from either (D30).
 
 `ShardsConfig` (`KeyComposer.ts:158`) gains the two table forms as a union beside the existing
 interface; `GsiConfig.shards` (`KeyComposer.ts:242`) takes the union.
@@ -155,38 +167,53 @@ apply to an index with a table exactly as to any sharded index (D4).
 
 ### 2.4 The normalised form
 
-`IndexShards` (`KeyComposer.ts:175`) loses `count` and `previous`, and gains the layouts:
+`IndexShards` (`KeyComposer.ts:175`) gains the layouts, and keeps `count` and `previous`, which are
+public (`KeyComposer` is exported, and the API reference documents them), as the default layout's
+(D33):
 
 ```ts
 interface IndexShards {
+  /** The default layout's count (the only one of a static declaration); 0 on a provided index. */
+  readonly count: number
+  /** The default layout's previous. */
+  readonly previous: number | undefined
   readonly by: ReadonlyArray<string> | undefined
   readonly source: ReadonlyArray<string> | undefined
-  /** As declared: a table, or "provided". */
+  /** As declared, compiled: a table, or "provided". */
   readonly layouts: ShardTable | "provided"
 }
 
 interface ShardTable {
   readonly default: ShardLayout             // { count, previous: number | undefined }
-  readonly values: ReadonlyArray<{ readonly match: Record<string, unknown>; readonly layout: ShardLayout }>
-  /** The text index, built per key text settings (§3.3). */
-  readonly layoutOf: (schema: DynamoSchema, entityType: string, index: IndexDefinition, unsharded: string) => ShardLayout
+  /** Each entry as declared, with its match in key form (§3.1). */
+  readonly values: ReadonlyArray<{ readonly match: Record<string, unknown>; readonly keyRecord: Record<string, unknown>; readonly layout: ShardLayout }>
 }
 ```
 
-A provided index carries `"provided"` until a path attaches a table (§10.4): attaching returns a view
-of the definition with `layouts` set to the supplied `ShardTable`, as `unshardedView`
-(`KeyComposer.ts:826`) returns a view today. The definition held by the entity never changes.
+The text index (§3.3) is a function of a `ShardTable` and the key text settings, memoised beside the
+table, not a field of it.
 
-Every reader of `count` / `previous` moves to the resolved layout or to the table:
+**Where a provided table lives (D36).** The definition held by the entity never changes, and neither
+does its identity: no path composes from a view of it. The supplied tables travel on the schema an
+operation composes under, as an internal `DynamoSchema.shardTables` (a map from an index's
+`IndexShards` to its `ShardTable`), the way `objectKeys` already travels on a write's own schema
+(`ownSchema`, `effect-dynamodb/src/Entity.ts:4699`). Every composer already takes a schema, so one
+resolver, `KeyComposer.shardTableOf(schema, index)`, returns the declared table, or the provided
+one from `schema.shardTables`, or throws `[EDD-9180]`. Lookups by definition identity
+(`objectKeySiteName`, `Entity.ts:4660`, which names the index in `EDD-9162`, and the `ownSchemaFor`
+cache keyed by `allIndexes`, `:4708`) keep working, and a schema derived by spreading (rekey's
+older-format schemas, `{ ...schema, numericKeyText: true }`) keeps the tables.
+
+Every reader of `count` / `previous` inside the library moves to the resolved layout or to the table:
 
 | Reader | Today | With tables |
 |---|---|---|
 | `composedShardMarker` (`KeyComposer.ts:793`) | `shards.count` | the value's resolved layout (§4) |
 | `composeReadPartitions` (`KeyComposer.ts:964`) | `shards.count`, `shards.previous` | the pinned value's resolved layout (§6.1) |
 | `isCurrentShardLayout` (`KeyComposer.ts:891`) | `shards.count` | the row's resolved layout (§9.2) |
-| `assertCollectionShardsAgreement` (`KeyComposer.ts:281`) | `count`/`previous` | the tables, by content (§11) |
+| `assertCollectionShardsAgreement` (`KeyComposer.ts:281`) | `count`/`previous` | the tables, by content (§11); same name, its members gain an optional `schema` |
 | `shardForm` (`internal/SharedKeyAttribute.ts:47`) | `[count, source]` | `[canonical table, source]`; a provided half has no provable form (§12) |
-| Aggregate `exactOf` (`effect-dynamodb/src/Aggregate.ts:9094`) | `shards !== undefined` | unchanged: any table may hold a marker, since a provided table and `previous` aren't known from the definition. It continues the head after `#`, which is right for a marker and harmless for text that has none |
+| Aggregate `exactOf` (`effect-dynamodb/src/Aggregate.ts:9094`) | `shards !== undefined` | `false` when the half has composites; **`undefined` (either) on an empty half**, sharded or not (D35). A table may resolve a value to 1, whose key on an empty half is exactly the head, so "continues after `#`" would miss a writer whose text equals the aggregate's partition head |
 | Language service `shardMarkerText`, `shardsInfo` (`language-service/src/core/ParamsBuilder.ts:563`, `:567`) | `count`, `previous` | the table (§13) |
 
 ## 3. Lookup by unsharded key text
@@ -199,6 +226,12 @@ accessor's pins take; it accepts the domain value or its stored form, as an acce
 `composePkText(schema, entityType, index, composites, names, undefined)` (`KeyComposer.ts:765`) with
 the index's effective casing (`effectiveCasing`, `KeyComposer.ts:246`). The text index maps that text
 to the entry's layout.
+
+The key form needs the entity and the text needs the schema, so the work is split in two. When a
+table is compiled (at `Entity.make` for a declared one, by the definition's own compile function for
+a supplied one), each entry's match is checked and put into key form once (`keyRecord`), and a value
+with no key text is refused there. The text index is then built from those records per key text
+settings (§3.3).
 
 So the key is the text itself: the schema prefix, the entity type or collection name, the composite
 labels and values, under the casing and the escaping setting the keys are composed with. Nothing is
@@ -239,9 +272,13 @@ memoised build never fails later (D16).
   every composite. It resolves the default. Writes and `rekey` compose the same truncated text, so
   they agree. No accessor can query a truncated partition key (an accessor requires every partition
   key composite), so no read depends on it.
-- **A row whose partition key composites can't compose any text** (a hole, or no leading value) is
-  judged by `rekey` against the default layout (§9.2). A named limit: such a row lost a partition key
-  composite under `preserve`, which is already the accepted limit of #183 §9.2.
+- **A row whose partition key composites can't compose any text** (a hole, or no leading value) has
+  no value to look up. `rekey` leaves it alone when its stored text lies in the layout of the default
+  **or of any entry whose match agrees with the composites the row still holds**, and reports it
+  `uncomposable` otherwise (§9.2, D34). Judging it against the default alone would report a hot
+  value's hole rows (`!20.07#…` under `{ default: 1 }`) on every run, though a read finds them where
+  they are, and §15's "a dry run with no conflicts" could never be met for that index. Such a row
+  lost a partition key composite under `preserve`, which is already the accepted limit of #183 §9.2.
 
 ## 4. Key text per layout
 
@@ -277,34 +314,42 @@ truncating composer (`composePkPrefixUpTo`, `KeyComposer.ts:1300`) or the update
 `KeyComposer.ts:1739`), all of which reach `composedShardMarker`. Resolution lives there (§4), so for
 a **declared** table no call site changes: the definition carries the table.
 
-A **provided** table has to reach the definition the composer is given. Each operation of an entity
-with a provided index reads `ShardLayouts` once, at its start, and composes from a view of its indexes
-with the tables attached (§10.4). The view replaces `allIndexes` (`Entity.ts:3671`) at each composing
-site below; an entity with no provided index reads nothing and passes `allIndexes` as today, so its
-code path and its requests are unchanged. A site that composes from the plain definition of a provided
-index throws `[EDD-9180]` from `composedShardMarker`, a defect that `composeKeysOrFail` does not turn
-into a `ValidationError` (`Capacity.isRefusedValue` doesn't recognise it), so nothing is sent.
+A **provided** table has to reach the schema the composer is given (D36). Each operation of an entity
+with a provided index reads `ShardLayouts` once, at its start, and composes under a copy of its schema
+carrying the tables (`_schemaNow`, §10.4). The copy replaces the schema at each composing site below
+(and `ownSchema` copies it again, keeping the tables); `allIndexes` is unchanged everywhere. An entity
+with no provided index reads nothing and composes under its schema as today, so its code path and its
+requests are unchanged. A site that composes a provided index under a schema without its table throws
+`[EDD-9180]` from `shardTableOf`, a defect that `composeKeysOrFail` does not turn into a
+`ValidationError` (`Capacity.isRefusedValue` doesn't recognise it), so nothing is sent.
+
+**Cascade targets (D31).** An update's `.cascade({ targets })` reads each target's index after the
+source row is written (`executeCascade`, `Entity.ts:10381`, run at `:12761` and `:13714`), and the
+targets are given per call, so `DynamoClient.make` never checked their tables. The cascading update
+therefore resolves the tables of every target with a provided index **before** its own write,
+alongside its own `_schemaNow`, and a missing one dies with `[EDD-9180]` with nothing written. The
+cascade then reads each target under the schema resolved then.
 
 All `file:line` references are to `9ec9bb63`.
 
 | Path | Composing site | How it gets the table |
 |---|---|---|
-| `put`, `create` | `composeAllKeys` helper (`effect-dynamodb/src/Entity.ts:6949`, body `:6959`, `KeyComposer.composeAllKeys` at `:6965`), called at `:10861` | the op's index view |
-| Guarded put (unique, retain), carried keys | `:11031` (`composeKeys` of the plan) | the op's index view |
-| `upsert` | pre-check `:15004`, keys `:15264`, and `upsertKeys` → `KeyComposer.composeKnownHalves` (`:7192`, `:7212`; `KeyComposer.ts:1224`) | the op's index view |
-| `update`, `patch` (standard) | `composeGsiKeysForUpdatePolicyAware` at `:13250` | the op's index view |
-| `update` pre-check before the retain / computed branch | `:11606` | the op's index view |
-| Retain and computed branches | `:12074` | the op's index view |
-| `append` (time series) | `composeAppendKeys` → `:16044` | the op's index view |
-| `restore` | `composeAllKeys` at `:17169` | the op's index view |
-| `Batch.write` put | `Batch.ts:441` → `validateAndBuildPutItem` (`internal/TransactableOps.ts:1234`) → `KeyComposer.composeAllKeys` (`:1305`) | `entity._indexesNow` (§10.4), under the op's captured services (`underCaptured`, `TransactableOps.ts:60`) for a bound builder |
+| `put`, `create` | `composeAllKeys` helper (`effect-dynamodb/src/Entity.ts:6949`, body `:6959`, `KeyComposer.composeAllKeys` at `:6965`), called at `:10861` | the op's schema (`_schemaNow`) |
+| Guarded put (unique, retain), carried keys | `:11031` (`composeKeys` of the plan) | the op's schema (`_schemaNow`) |
+| `upsert` | pre-check `:15004`, keys `:15264`, and `upsertKeys` → `KeyComposer.composeKnownHalves` (`:7192`, `:7212`; `KeyComposer.ts:1224`) | the op's schema (`_schemaNow`) |
+| `update`, `patch` (standard) | `composeGsiKeysForUpdatePolicyAware` at `:13250` | the op's schema (`_schemaNow`) |
+| `update` pre-check before the retain / computed branch | `:11606` | the op's schema (`_schemaNow`) |
+| Retain and computed branches | `:12074` | the op's schema (`_schemaNow`) |
+| `append` (time series) | `composeAppendKeys` → `:16044` | the op's schema (`_schemaNow`) |
+| `restore` | `composeAllKeys` at `:17169` | the op's schema (`_schemaNow`) |
+| `Batch.write` put | `Batch.ts:441` → `validateAndBuildPutItem` (`internal/TransactableOps.ts:1234`) → `KeyComposer.composeAllKeys` (`:1305`) | `entity._schemaNow` (§10.4), under the op's captured services (`underCaptured`, `TransactableOps.ts:60`) for a bound builder |
 | `Transaction.transactWrite` put | `internal/TransactWriteOps.ts:568` → the same `validateAndBuildPutItem` | as `Batch.write` |
-| `transactWrite` update / delete (planned) | `TransactWriteOps.ts:519` (`_planUpdate`), `:543` (`_planDelete`): the entity's own op, recorded (`internal/TransactPlan.ts`) | the entity's op view, under the op's captured services |
+| `transactWrite` update / delete (planned) | `TransactWriteOps.ts:519` (`_planUpdate`), `:543` (`_planDelete`): the entity's own op, recorded (`internal/TransactPlan.ts`) | the entity's op schema, under the op's captured services |
 | `EventStore.append({ additionalItems })` | `buildTransactWriteItems` → `TransactWriteOps.ts:568` (put) | as `transactWrite`, inside the append's context (a bound stream's is its bind context, `EventStore.ts:7238`) |
-| Projection rows (read-model `put`) | `internal/ProjectionEngine.ts:1883`, `:2705` → `validateAndBuildPutItem` | `entity._indexesNow`, in the context the projection runs in |
-| `rekey`: a missing index key | `KeyComposer.judgeIndexHalf` (`Entity.ts:18499`; `KeyComposer.ts:1629`) | the run's index view (§9) |
-| `rekey`: the sharded partition key | `composeStoredPk` / `isCurrentShardLayout` (`Entity.ts:19011`, `:19014`) | the run's index view |
-| `rekey`: a moved row recomposed (`rekeyAfterMove`, dry run's `movedRowOf`) | `composeGsiKeysForUpdatePolicyAware` at `:18690` | the run's index view |
+| Projection rows (read-model `put`) | `internal/ProjectionEngine.ts:1883`, `:2705` → `validateAndBuildPutItem` | `entity._schemaNow`, in the context the projection runs in |
+| `rekey`: a missing index key | `KeyComposer.judgeIndexHalf` (`Entity.ts:18499`; `KeyComposer.ts:1629`) | the run's schema (§9) |
+| `rekey`: the sharded partition key | `composeStoredPk` / `isCurrentShardLayout` (`Entity.ts:19011`, `:19014`) | the run's schema |
+| `rekey`: a moved row recomposed (`rekeyAfterMove`, dry run's `movedRowOf`) | `composeGsiKeysForUpdatePolicyAware` at `:18690` | the run's schema |
 
 Paths that compose no sharded partition key, unchanged (#183 §4): soft delete, version snapshots and
 time-series events strip index keys; unique sentinels hold none; aggregate writes compose only their
@@ -344,10 +389,10 @@ Call sites, all at `9ec9bb63`:
 
 | Site | Path | How it gets the table |
 |---|---|---|
-| `DynamoClient.ts:2943` | bound entity accessors, `db.entities.X.byIndex(...)` | the view `DynamoClient.make` attached at bind (§10.4); resolved when the query is built |
-| `DynamoClient.ts:3387` | bound collection accessors | the members' views attached at bind; resolved when built |
+| `DynamoClient.ts:2943` | bound entity accessors, `db.entities.X.byIndex(...)` | the schema `DynamoClient.make` resolved at bind, carrying the tables (§10.4); resolved when the query is built |
+| `DynamoClient.ts:3387` | bound collection accessors | the schema resolved at bind; resolved when built |
 | `Entity.ts:16764` | unbound `Entity.query.<index>` | a provided index defers: resolved at the terminal (§6.2) |
-| `Entity.ts:10475` | cascade read of the target's index | the target's view, read at run in the cascading op (it is an Effect) |
+| `Entity.ts:10475` | cascade read of the target's index | the schema the cascading update resolved for its targets before its own write (§5, D31) |
 | `Collection.ts:420` | unbound collection query (`Collections.make`) | deferred, if any member's index is provided (§6.2) |
 | `Collection.ts:487` | unbound collection entity selectors | deferred, likewise |
 | `docs/src/lib/playground-engine.ts:185` | docs playground | a declared table resolves; `"provided"` shows the placeholder marker (§13) |
@@ -363,13 +408,28 @@ it. A missing table dies with `[EDD-9180]`. An unbound `Query.where()` that repl
 (`withoutPruning`, `:751`) is recorded on the state, and the deferred resolution then reads every
 current shard, as `withoutPruning` would have.
 
+**A key-text refusal stays a `ValidationError` (D40).** Built eagerly, the composition runs inside
+`Query.orRefusal` (`Entity.ts:16739`, `Collection.ts:409`): a composite with no key text
+(`EDD-9096`) or an object composing `[object Object]` (`EDD-9162`) makes a refused query, whose
+terminals fail with a `ValidationError`. The deferred resolution runs inside the same wrapper
+(`Query.refusalOf`), so the same input fails the same way on a provided index: `prepared` and
+`asParams` fail with the `ValidationError`, and `explain` (no error channel) reports the refused
+query's `empty` plan with the refusal as its reason, as it does for a query refused at build.
+`[EDD-9180]` is not a refused value, so it stays a defect.
+
 ### 6.3 Rules per index, on reads
 
 `refuseShardedPlan` (`Query.ts:1202`) and `plan` (`:1182`) test `state.fanOut !== undefined` today. A
-value at 1 has no fan-out, so they test a new `state.sharded` flag instead, set by every builder of a
-query on an index with `shards` (static, table or provided), before resolution. So `.within()`,
-skip-scan and `.zorder()` stay refused for every value (`EDD-9104`, D4), including on a deferred
-query. `BoundQuery`'s calls (`internal/BoundQuery.ts:1397`, `:1421`) are unchanged.
+value at 1 has no fan-out, so they test a new `state.sharded` flag instead (the resolved layout, or
+the deferred resolution's marker), set by every builder of a query on an index with `shards`
+(static, table or provided), before resolution. So `.within()`, skip-scan and `.zorder()` stay
+refused for every value (`EDD-9104`, D4), including on a deferred query. `BoundQuery`'s calls
+(`internal/BoundQuery.ts:1397`, `:1421`) are unchanged.
+
+`planEmpty` (`:1212`) installs its empty plan through `plan`, after clearing `fanOut`: nothing is
+read, so no partition is. It clears `sharded` too (D32), or every provably empty query on a sharded
+index, static ones included, would throw `EDD-9104` instead of returning nothing
+(`ShardedMembers.test.ts:329`).
 
 `isFanOutState` (`Query.ts:2111`) keeps meaning "a fan-out": a plain query at 1 sizes requests and
 treats `.maxPages()` as an unsharded query does, which is what byte-identical requests need.
@@ -473,8 +533,13 @@ takes the row's **resolved** layout instead:
   `!`, the unsharded layout.
 
 The row's layout is resolved from its unsharded text, which needs only the partition key composites
-(present: it's `by` that's missing). A row with no partition key text is judged against the default
-(§3.4).
+(present: it's `by` that's missing). A row with no partition key text (a hole) is left alone when its
+stored text lies in the layout of the default or of any entry whose match agrees with the
+composites it still holds, compared as key text (D34, §3.4).
+
+So `isCurrentShardLayout` needs the row's key-form record as well as its stored text, which its
+signature (`stored` only) doesn't take: it gains an optional `record` parameter. Without one (an
+existing caller), it tests the default layout, which for a static declaration is today's test.
 
 ### 9.3 Dry run, malformed and missing tables
 
@@ -553,6 +618,11 @@ accessor's pin does (§3.1).
 - At run time (for untyped callers, and for decoded tables): an index that isn't declared
   `"provided"`, an unknown index, or a provided index left out is `[EDD-9181]`; a malformed table is
   `[EDD-9099]` (§2.3).
+- **A literal is checked as `Entity.make` checks one (D37).** The branded `ShardLayouts.Table`
+  member's `match: Record<string, …>` would make every key known to the union's excess-property
+  check, so a literal holding the right composite and a typo (`{ tenantId, tenantID }`) would pass.
+  `of()` puts the same `never`-mapping guard on its parameter that §2.2 puts on `Entity.make`'s, so
+  an unbranded literal is checked key by key.
 - Entries are keyed by the entity's definition identity (the `EntityDefinitionData` a pure definition
   and the runtime entity promoted from it share), so `DynamoClient.make`'s promotion of a pure
   definition (#265) finds the same table.
@@ -567,19 +637,21 @@ followed exactly:
 
 | Path | Reads `ShardLayouts` | Missing table |
 |---|---|---|
-| `DynamoClient.make` | **at bind**, from the bind context (`baseCtx`, `DynamoClient.ts:2704`), added to the captured context of every bound member (as `Compression` at `:2755`), and attached to the index views its accessors and collections use | `[EDD-9180]` defect at bind, naming every bound member and provided index without a table, as `[EDD-9078]` names missing codecs |
+| `DynamoClient.make` | **at bind**, from the bind context (`baseCtx`, `DynamoClient.ts:2704`), added to the captured context of every bound member (as `Compression` at `:2755`), and carried on the schema its accessors and collections compose under (D36) | `[EDD-9180]` defect at bind, naming every bound member and provided index without a table, as `[EDD-9078]` names missing codecs |
 | Bound CRUD ops, bound builders | at run, from the captured context: the bind's table | can't happen: checked at bind |
-| Bound accessors and collections | at build, from the views attached at bind | can't happen |
-| Unbound entity ops (`Entity.put(...)` etc. run through `Transaction`, `Batch`, `EventStore.append({ additionalItems })`) | at run, `Effect.serviceOption(ShardLayouts)` once per op (`_indexesNow`), under the op's captured services when it is a bound builder | `[EDD-9180]` defect before anything is sent |
+| A cascade's targets (given per call, never bound) | at run, by the cascading update **before its own write** (D31) | `[EDD-9180]` defect, nothing written |
+| Bound accessors and collections | at build, from the schema resolved at bind | can't happen |
+| Unbound entity ops (`Entity.put(...)` etc. run through `Transaction`, `Batch`, `EventStore.append({ additionalItems })`) | at run, `Effect.serviceOption(ShardLayouts)` once per op (`_schemaNow`), under the op's captured services when it is a bound builder | `[EDD-9180]` defect before anything is sent |
 | Projection rows | at run, in the projection's context | as above |
 | Unbound queries (`Entity.query.<index>`, `Collections.make`) | at the terminal (§6.2) | as above |
 | `rekey` | at the start of the run, from the bind context (§9.3) | the run fails before the scan |
 
-`_indexesNow` (new, on the runtime entity) is `Effect.succeed(allIndexes)` for an entity with no
+`_schemaNow` (new, on the runtime entity) is `Effect.succeed(schema)` for an entity with no
 provided index, so such an entity reads no service and its operations are unchanged. With one, it
-reads the service, attaches each provided index's table (`ShardTable` for this entity and index), and
-dies with `[EDD-9180]` when the service or the entry is missing. Every composing site in §5 takes the
-view from one `_indexesNow` at the start of its operation.
+reads the service and returns a copy of the schema whose `shardTables` maps each provided index's
+`IndexShards` to the supplied `ShardTable` (compiled for this entity and index), and dies with
+`[EDD-9180]` when the service or the entry is missing. Every composing site in §5 takes the schema
+from one `_schemaNow` at the start of its operation. Index definitions are never copied (D36).
 
 **Missing is always an error, never a fallback** (D11). The message, per the review:
 
@@ -627,6 +699,15 @@ differently but meaning the same (an entry in domain form on one member and stor
 or `T-BIG` and `t-big` under `lowercase`) are equal. A static member compares as a table with only a
 default, so existing collections compare as today. `by` may still differ.
 
+**A member without `shards` never agrees with a member that has them (D39)**, `{ layouts: { default:
+1 } }` included. Their reads agree today, but their rules don't (D4: `.within()`, `by`, the update
+gate), and the day the table member's value moves, the unsharded member can't follow it. So
+`EDD-9103` stays strict: a collection is sharded on every member or on none.
+
+The function keeps its name and its `(collectionName, members)` signature; each member gains an
+optional `schema` (the member's configured schema, as `assertCollectionCasingAgreement` already takes
+it). Without one, tables are compared under the default casing; both call sites pass it.
+
 Where it runs, after runtime tables are applied:
 
 - `Collections.make` (`Collection.ts:339`): members with declared tables are compared at once. If any
@@ -666,7 +747,9 @@ in one attribute is the inverted-index case #183 D68 already discourages.
   plain query; for a value at N, the marker shape.
 - **Playground** (`docs/src/lib/playground-engine.ts:185`): composes through `composeReadPartitions`,
   so a declared table renders the pinned value's real key. A provided index renders the placeholder
-  marker, as the language service does.
+  marker, as the language service does. The playground's write-key preview composes through
+  `KeyComposer.composeIndexKeys` (`playground-engine.ts:38`), which would throw `[EDD-9180]` for a
+  provided index: it renders the same placeholder there (D38), on both paths, rather than crash.
 
 ## 14. Docs and examples
 
@@ -840,8 +923,9 @@ entry doesn't change is accepted at every step, both for a value at 1 (legacy) a
   type; `default` required; `layouts: "provided"` accepted.
 - `packages/effect-dynamodb/test/ShardLayouts.types.test.ts`: `of()` accepts exactly the provided
   indexes and requires each (`@ts-expect-error` on a non-provided index, an unknown index, a missing
-  one); `match` typed per index; a decoded `ShardLayouts.Table` accepted; a `Config` of a typed table
-  accepted.
+  one); `match` typed per index, with `@ts-expect-error` on an extra key and on a typo beside the
+  correct key (D37); a decoded `ShardLayouts.Table` accepted; a `Config` of a typed table accepted.
+- `shards: { count: 20, layouts: { … } }` and `{ layouts, previous }` are `@ts-expect-error` (D37).
 - Language service: hover text for a table, a provided index and a static one (`tooltip.test.ts`);
   `KeyParity` table case; a completion check on `match` keys.
 
@@ -1010,6 +1094,17 @@ design, for review.
 | D27 | An unbound query on a provided index resolves its partitions at the terminal (`prepared`, `explain`, `asParams`); `state.sharded`, set at build, keeps `EDD-9104` refusals at the call | proposed |
 | D28 | A row with no partition key text resolves the default layout, for writes (truncated text matches no entry) and `rekey`; named limit | proposed |
 | D29 | New codes start at `EDD-9180`: `9173`–`9179` are held by the #168 branch | proposed |
+| D30 | Review F1, **accepted**: `NormalizedGsi` carries the `shards` declaration as a phantom (`shards.declared`), so `of()` can find the provided indexes and type `match` from either entity type (§2.2) | review |
+| D31 | Review F2, **accepted**: a cascading update resolves the provided tables of every cascade target before its own write; a missing one dies with `EDD-9180` with nothing written (§5, §10.4) | review |
+| D32 | Review F3, **accepted**: `planEmpty` clears `sharded` as it clears `fanOut`, so an empty plan on a sharded index still returns nothing (§6.3) | review |
+| D33 | Review F4, **accepted**: `IndexShards` keeps `count` and `previous` as the default layout's (`count` 0 on a provided index, which no existing reader can hold); `assertCollectionShardsAgreement` keeps its name and signature, members gain an optional `schema` (§2.4, §11). No type-level break | review |
+| D34 | Review F5, **accepted**: a row with a hole in its partition key is left alone when its stored text is in the layout of the default or of an entry agreeing with the composites it holds; `isCurrentShardLayout` gains an optional key-form `record` (§3.4, §9.2) | review |
+| D35 | Review F6, **accepted**: Aggregate `exactOf` returns `undefined` (either) on an empty partition key half, sharded or not (§2.4) | review |
+| D36 | Review F7, **accepted, by changing the seam**: no path composes from a view of an index definition. A provided table travels on the schema an operation composes under (`DynamoSchema.shardTables`, internal, keyed by the index's `IndexShards`), read through one resolver, `KeyComposer.shardTableOf`; definition identity and every lookup by it are unchanged (§2.4, §5, §10.4) | review |
+| D37 | Review F8, **accepted**: `layouts?: never` / `count?: never; previous?: never` make the mixed forms compile errors; `of()` puts `Entity.make`'s `never`-mapping guard on its parameter, with typo and extra-key `@ts-expect-error` cases (§2.1, §10.3, §16.9) | review |
+| D38 | Review F10, **accepted**: the playground renders the placeholder marker for a provided index on its write-key preview too (§13) | review |
+| D39 | Review F9, **accepted, strict**: a member without `shards` and a member with a table never agree (`EDD-9103`), `{ default: 1 }` included: their rules differ, and the unsharded one can't follow a value that moves (§11) | review |
+| D40 | Review F11, **accepted**: a deferred query's resolution runs inside the `orRefusal` wrapper, so a key-text refusal is a `ValidationError` at the terminal, and `explain` reports the refused `empty` plan; `EDD-9180` stays a defect (§6.2) | review |
 
 ## 20. Implementation order
 
@@ -1018,7 +1113,7 @@ design, for review.
    text index, `composedShardMarker` / `composeReadPartitions` / `composeStoredPk` /
    `isCurrentShardLayout`, `assertCollectionShardsAgreement`, `shardForm`, `ShardLayouts`; unit, golden
    and type tests.
-3. Runtime: `_indexesNow` and the sites of §5, `capturedServices`, `DynamoClient.make` at bind, deferred
+3. Runtime: `_schemaNow` and the sites of §5 (cascade targets before the write), `capturedServices`, `DynamoClient.make` at bind, deferred
    queries, `state.sharded`, `explain().shards`, collections, `rekey`; request-capture fixture from
    `9ec9bb63`; unit and connected tests.
 4. Language service and playground.
