@@ -71,6 +71,7 @@ import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
+import { asBefore168 } from "./Before168.js"
 
 export type Row = Record<string, AttributeValue>
 interface Request {
@@ -174,6 +175,13 @@ const batchInKeyOrder = (requests: ReadonlyArray<Request>): ReadonlyArray<Reques
           },
         },
   )
+
+/**
+ * 1.39.0's requests as #168 changed them (`Before168.ts`), from the rows stored before the step:
+ * the step's own requests are recorded the same way.
+ */
+const as168 = (requests: unknown, before: ReadonlyArray<Row>): ReadonlyArray<Request> =>
+  asBefore168(named(requests) as ReadonlyArray<Request>, { stored: before })
 
 /** Requests with the table's name taken out: the fixture's tables were named for their run. */
 const named = (value: unknown, tables = false): unknown =>
@@ -287,12 +295,14 @@ const world = (
       }).pipe(Effect.provide(layer as never), Effect.exit) as Effect.Effect<Exit.Exit<A, unknown>>
     const step = <A>(body: (db: any) => Effect.Effect<A, unknown, never>) =>
       Effect.gen(function* () {
+        const before = byKey(yield* opened.rows)
         log.length = 0
         const exit = yield* run(body)
         return {
           exit,
           result: resultOf(exit),
-          requests: named(log) as ReadonlyArray<Request>,
+          before,
+          requests: asBefore168(named(log) as ReadonlyArray<Request>, { stored: before }),
           commands: log.map((request) => request.command),
           rows: byKey(yield* opened.rows),
         }
@@ -968,7 +978,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
           )
           const expected = at(scenario, "update")
           expect(done.result).toEqual(expected.result)
-          expect(done.requests).toEqual(named(expected.requests))
+          expect(done.requests).toEqual(as168(expected.requests, done.before))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(others(done.rows, ownedBy("a"))).toEqual(others(created, ownedBy("a")))
           expect(resultOf(yield* w.run((db) => db.aggregates.A.get({ id: "p q" })))).toEqual(
@@ -987,7 +997,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
           const done = yield* w.step((db) =>
             db.aggregates.A.update({ id: "p q" }, ({ state }: any) => state),
           )
-          expect(done.requests).toEqual(named(at(scenario, "noop update").requests))
+          expect(done.requests).toEqual(as168(at(scenario, "noop update").requests, done.before))
           expect(done.commands).toEqual(["Query"])
           expect(done.rows).toEqual(byKey(created))
           yield* w.opened.close
@@ -1148,7 +1158,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
             )
             const expected = at(kind, name)
             expect(done.result).toEqual(expected.result)
-            expect(done.requests).toEqual(named(expected.requests))
+            expect(done.requests).toEqual(as168(expected.requests, done.before))
             expect(done.rows).toEqual(byKey(expected.rows))
             expect(entityRows(done.rows)).toEqual(entityRows(seeded))
           }
@@ -1184,7 +1194,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
           )
           const expected = at("two edges", name)
           expect(done.result).toEqual(expected.result)
-          expect(done.requests).toEqual(named(expected.requests))
+          expect(done.requests).toEqual(as168(expected.requests, done.before))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(bRow(done.rows)).toEqual(bRow(created))
         }
@@ -1249,8 +1259,8 @@ export const sharedPartitionSuite = (backend: Backend) => {
             expect(done.result, op).toEqual(expected.result)
             expect(backend.local ? done.requests : batchInKeyOrder(done.requests), op).toEqual(
               backend.local
-                ? named(expected.requests)
-                : batchInKeyOrder(named(expected.requests) as ReadonlyArray<Request>),
+                ? as168(expected.requests, done.before)
+                : batchInKeyOrder(as168(expected.requests, done.before)),
             )
             expect(done.rows, op).toEqual(byKey(expected.rows))
           }
@@ -1286,9 +1296,11 @@ export const sharedPartitionSuite = (backend: Backend) => {
             gsi: true,
             seed: seeded,
           })
+          // 1.39.0 sent each group in a transaction of its own, and failed the sub-aggregate's,
+          // the second. The groups now fit one transaction (#168, D3): it fails whole.
           let transactions = 0
           w.hooks.before = (command) =>
-            command === "TransactWriteItems" && ++transactions === 2
+            command === "TransactWriteItems" && ++transactions === 1
               ? Effect.fail(
                   new DynamoError({
                     operation: "TransactWriteItems",
@@ -1305,8 +1317,10 @@ export const sharedPartitionSuite = (backend: Backend) => {
           )
           const expected = at(scenario, "sub failure")
           expect(done.result).toEqual(expected.result)
-          expect(done.requests).toEqual(named(expected.requests))
-          expect(done.rows).toEqual(byKey(expected.rows))
+          expect(done.requests).toEqual(as168(expected.requests, done.before))
+          // 1.39.0 kept the root group's rows it had written: nothing is written now.
+          expect(done.rows).not.toEqual(byKey(expected.rows))
+          expect(done.rows).toEqual(byKey(seeded))
           const leftOfA = (rows: ReadonlyArray<Row>) =>
             byKey(rows.filter((row) => row.team?.S === "a" && row.section?.S === "left"))
           expect(leftOfA(done.rows)).toEqual(leftOfA(seeded))
@@ -1348,7 +1362,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
         )
         const expected = atOwnership(scenario, "remove a")
         expect(done.result).toEqual(expected.result)
-        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.requests).toEqual(as168(expected.requests, done.before))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(byKey(done.rows.filter(lineOf("b")))).toEqual(byKey(created.filter(lineOf("b"))))
         expect(resultOf(yield* w.run((db) => db.aggregates.B.get({ id: "p q" })))).toEqual(
@@ -1375,7 +1389,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
         )
         const expected = atOwnership(scenario, "race remove a")
         expect(done.result).toEqual(expected.result)
-        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.requests).toEqual(as168(expected.requests, done.before))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(done.rows).toContainEqual({ ...foreign, note: { S: "concurrent b edit" } })
         yield* w.opened.close
@@ -1438,7 +1452,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
         )
         const expected = atOwnership(scenario, "remove")
         expect(done.result).toEqual(expected.result)
-        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.requests).toEqual(as168(expected.requests, done.before))
         expect(done.rows).toEqual(byKey(expected.rows))
         const entityRows = (rows: ReadonlyArray<Row>) =>
           byKey(rows.filter((row) => row.owner?.S === "entity"))
@@ -1618,7 +1632,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
                 )
                 const expected = atRenamed(scenario, name)
                 expect(done.exit._tag).toBe("Success")
-                expect(done.requests).toEqual(named(expected.requests))
+                expect(done.requests).toEqual(as168(expected.requests, done.before))
                 expect(done.rows).toEqual(byKey(expected.rows))
                 expect(yield* read(w)).toEqual(atRenamed(scenario, `${name} get`))
               }
@@ -1711,7 +1725,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
           )
           const expected = atForeign(scenario, "remove a")
           expect(done.result).toEqual(expected.result)
-          expect(done.requests).toEqual(named(expected.requests))
+          expect(done.requests).toEqual(as168(expected.requests, done.before))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(others(done.rows, (row) => !ofB(row))).toEqual(others(created, (row) => !ofB(row)))
           expect(yield* readB(done.rows)).toEqual(atForeign(scenario, "remove a get b"))
@@ -1762,7 +1776,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
         )
         const expected = atForeign(scenario, "b takes the key")
         expect(done.result).toEqual(expected.result)
-        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.requests).toEqual(as168(expected.requests, done.before))
         expect(done.rows).toEqual(byKey(expected.rows))
         yield* w.opened.close
       }),
@@ -1779,7 +1793,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
         )
         const expected = atForeign(scenario, "remove a")
         expect(done.result).toEqual(expected.result)
-        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.requests).toEqual(as168(expected.requests, done.before))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(done.rows).toContainEqual(created.find(lineOf("a")))
         // The update returns the state as mutated, as 1.39.0 and 1.40.0 did; a get after it reads
@@ -1795,19 +1809,18 @@ export const sharedPartitionSuite = (backend: Backend) => {
       Effect.gen(function* () {
         const w = yield* world(backend, concurrentDefine, { name: "concurrent", seed: created })
         const taken = atForeign(scenario, "b takes the key").rows.find(lineOf("b"))!
-        w.hooks.before = (command) => {
-          if (command !== "TransactWriteItems") return undefined
-          w.hooks.before = undefined
-          return w.opened.put(taken)
-        }
+        // 1.39.0 sent a `Delete` of the key as read (5), where no row is, and B's row was put
+        // before it. #168 deletes only the rows it read (§3.2), so A's update sends its read alone
+        // and B's row, put after it, is kept as it was.
         const done = yield* w.step((db) =>
           db.aggregates.A.update({ id: "p" }, ({ state }: any) => ({ ...state, lines: [] })),
         )
+        yield* w.opened.put(taken)
         const expected = atForeign(scenario, "race remove a")
         expect(done.result).toEqual(expected.result)
-        expect(done.requests).toEqual(named(expected.requests))
-        expect(done.rows).toEqual(byKey(expected.rows))
-        expect(done.rows).toContainEqual(taken)
+        expect(done.commands).toEqual(["Query"])
+        expect(byKey(yield* w.opened.rows)).toEqual(byKey(expected.rows))
+        expect(yield* w.opened.rows).toContainEqual(taken)
         yield* w.opened.close
       }),
     )
@@ -1887,7 +1900,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
           )
           const expected = atClaimed(scenario, "remove a")
           expect(done.result).toEqual(expected.result)
-          expect(done.requests).toEqual(named(expected.requests))
+          expect(done.requests).toEqual(as168(expected.requests, done.before))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(others(done.rows, (row) => !ofB(row))).toEqual(others(created, (row) => !ofB(row)))
           expect(resultOf(yield* w.run((db) => db.aggregates.B.get({ id: "p q" })))).toEqual(
@@ -1976,7 +1989,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
           )
           const expected = atClaimed(scenario, "remove a")
           expect(done.result).toEqual(expected.result)
-          expect(done.requests).toEqual(named(expected.requests))
+          expect(done.requests).toEqual(as168(expected.requests, done.before))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(done.rows.map((row) => row.sk?.S)).toContain(lineKey)
           // The update returns the state as mutated, as 1.39.0 and 1.40.0 did; a get after it
@@ -1996,19 +2009,18 @@ export const sharedPartitionSuite = (backend: Backend) => {
               name: "guard",
               seed: created,
             })
-            w.hooks.before = (command) => {
-              if (command !== "TransactWriteItems") return undefined
-              w.hooks.before = undefined
-              return w.opened.put(taken)
-            }
+            // 1.39.0 sent a `Delete` of the key as read, where no row is, and B's line was put
+            // before it. #168 deletes only the rows it read (§3.2), so A's update sends its read
+            // alone and B's line, put after it, is kept as it was.
             const done = yield* w.step((db) =>
               db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
             )
+            yield* w.opened.put(taken)
             const expected = atClaimed(scenario, "race remove a")
             expect(done.result).toEqual(expected.result)
-            expect(done.requests).toEqual(named(expected.requests))
-            expect(done.rows).toEqual(byKey(expected.rows))
-            expect(done.rows).toContainEqual(taken)
+            expect(done.commands).toEqual(["Query"])
+            expect(byKey(yield* w.opened.rows)).toEqual(byKey(expected.rows))
+            expect(yield* w.opened.rows).toContainEqual(taken)
             yield* w.opened.close
           }),
       )

@@ -269,10 +269,11 @@ describe("Aggregate timestamps", () => {
         name: "Grand Final",
       }))
 
-      // The flat fixture keeps every edge in the root transaction group, so a
-      // root change rewrites all four rows.
+      // The flat fixture keeps every edge in the root transaction group, but a
+      // write sends only the rows whose value changed (#168, D2): the root alone.
+      // Its edges keep their stored `updated`.
       const rewritten = writtenItems()
-      expect(rewritten).toHaveLength(4)
+      expect(rewritten.map((item) => item.__edd_e__.S)).toEqual(["MatchItem"])
       for (const item of rewritten) {
         expect(item.created.N).toBe(String(FROZEN_MS))
         expect(item.updated.N).toBe(String(FROZEN_MS + 5_000))

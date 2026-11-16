@@ -35,6 +35,7 @@ import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
+import { asBefore168 } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
 type Request = { readonly command: string; readonly input: any }
@@ -452,6 +453,24 @@ const transaction = (requests: ReadonlyArray<Request>) => {
   }
 }
 
+/** A row without its `updatedAt`, which a write stamps. */
+const unstamped = (row: Row): Row => {
+  const { updatedAt: _, ...rest } = row
+  return rest
+}
+
+/** `rows`, each one that is a `stored` row but for its `updatedAt` as stored (#168, D2). */
+const keptStamps = (rows: ReadonlyArray<Row>, stored: ReadonlyArray<Row>): ReadonlyArray<Row> =>
+  rows.map(
+    (row) =>
+      stored.find(
+        (was) =>
+          was.pk?.S === row.pk?.S &&
+          was.sk?.S === row.sk?.S &&
+          canonical(unstamped(was)) === canonical(unstamped(row)),
+      ) ?? row,
+  )
+
 /** A rekey report's moved aggregate rows and conflicts, for `member`. */
 const rekeyed = (outcome: any, member: string) => ({
   moved: outcome.ok.byMember?.[member]?.moved?.aggregate ?? 0,
@@ -558,9 +577,15 @@ export const suite = (
           )
           expect(actual.map((s) => s.step)).toEqual(published.off.map((s) => s.step))
           for (const [i, s] of actual.entries()) {
+            // As #168 changed them (`Before168.ts`), from the rows stored before the step: a row
+            // 1.40.0 rewrote unchanged but for its `updatedAt` isn't sent, and keeps its stamp.
+            const stored = i === 0 ? [] : actual[i - 1]!.rows
+            const options = { stored, same: unstamped }
             expect(s.outcome, s.step).toEqual(published.off[i]!.outcome)
-            expect(s.requests, s.step).toEqual(published.off[i]!.requests)
-            expect(s.rows, s.step).toEqual(published.off[i]!.rows)
+            expect(asBefore168(s.requests, options), s.step).toEqual(
+              asBefore168(published.off[i]!.requests, options),
+            )
+            expect(s.rows, s.step).toEqual(keptStamps(published.off[i]!.rows, stored))
           }
         }),
     )
@@ -644,7 +669,7 @@ export const suite = (
               }),
             )
             expect(get.outcome, name).toEqual(then[name][1].outcome)
-            expect(get.requests, name).toEqual(then[name][1].requests)
+            expect(asBefore168(get.requests), name).toEqual(asBefore168(then[name][1].requests))
             expect(noop.outcome, name).toEqual(then[name][1].outcome)
             expect(
               noop.requests.map((request) => request.command),
@@ -682,9 +707,18 @@ export const suite = (
               }),
           )
           expect(title.outcome).toHaveProperty("ok")
-          // The group as this release writes it from scratch: every key, `created` kept as stored.
-          expect(title.rows).toEqual(fresh.after.rows)
           const before = sks(then.sheet[0].rows)
+          // The group as this release writes it from scratch: every key, `created` kept as stored.
+          // A row moved off 1.40.0's text is written, so stamped; one whose key didn't move is
+          // unchanged, so not sent, and keeps its stamp (#168, D2), as the root's title alone is
+          // written from scratch.
+          expect(title.rows).toEqual(
+            fresh.after.rows.map((row) =>
+              before.includes(row.sk!.S!)
+                ? row
+                : { ...row, updatedAt: { S: new Date(published.clock + 5000).toISOString() } },
+            ),
+          )
           const moved = before.filter((sk) => !sks(fresh.create.rows).includes(sk))
           expect(moved).toHaveLength(18)
           // One transaction: this release's Puts, then a Delete of each row read under 1.40.0's text.
@@ -694,7 +728,12 @@ export const suite = (
           ])
           const sent = transaction(title.requests)
           // The elements in the order they were read: 1.40.0's text sorted `12` before `5`.
-          expect([...sent.puts].sort()).toEqual([...transaction(fresh.after.requests).puts].sort())
+          // The root, whose title changed, and each moved row under its new key; a row whose key
+          // didn't move is unchanged, so not sent (#168, D2).
+          expect([...sent.puts].sort()).toEqual(
+            sks(title.rows).filter((sk) => sk === "$edges#v1#sheet" || !before.includes(sk)),
+          )
+          expect(sent.puts).toHaveLength(1 + 18)
           expect([...sent.deletes].sort()).toEqual([...moved].sort())
           // The wrapper's own `n`, which 1.40.0 ran through the entity's `NumberFromString`: moved,
           // its `created` carried.
@@ -738,9 +777,11 @@ export const suite = (
           )
           expect(removed.outcome).toEqual({ ok: null })
           expect(removed.rows).toEqual([])
+          // The read, its batches, then the sweep (#168, design §3.8): one more read, empty.
           expect(removed.requests[0]!.command).toBe("Query")
+          expect(removed.requests.at(-1)!.command).toBe("Query")
           expect(
-            removed.requests.slice(1).every((request) => request.command === "BatchWriteItem"),
+            removed.requests.slice(1, -1).every((request) => request.command === "BatchWriteItem"),
           ).toBe(true)
         }
       }),
@@ -837,7 +878,14 @@ export const suite = (
           // Removing one of each pair: one row each, under this release's key, the survivor's
           // `created` carried; then nothing for `rekey`.
           expect(repair.outcome).toHaveProperty("ok")
-          expect(repair.rows).toEqual(fresh.after.rows)
+          // Every survivor moved, so written and stamped; written from scratch, the title alone
+          // was (#168, D2).
+          expect(repair.rows).toEqual(
+            fresh.after.rows.map((row) => ({
+              ...row,
+              updatedAt: { S: new Date(published.clock + 5000).toISOString() },
+            })),
+          )
           const sent = transaction(repair.requests)
           expect([...sent.deletes].sort()).toEqual(
             sks(seeded)
@@ -1038,12 +1086,14 @@ export const suite = (
           expect(title.rows).toEqual(sorted(seeded))
           // Read as before.
           expect(get.outcome).toEqual(then.bulk51[1].outcome)
-          // A group too large without its moves: an ordinary overflow, which names no `rekey`.
+          // 50 moves (a put and a delete each) and 50 new rows: the root is unchanged, so it isn't
+          // sent (#168). Without the moves' deletes it is 100 items and fits, so this overflow
+          // names `rekey` too (up to 1.43.0 the root and 151 items, too large either way).
           expect(adding.outcome.fail).toBe("AggregateTransactionOverflow")
-          expect(adding.outcome.error.itemCount).toBe(151)
-          expect(adding.outcome.error.previousKeyText).toBeUndefined()
+          expect(adding.outcome.error.itemCount).toBe(150)
+          expect(adding.outcome.error.previousKeyText).toBe(50)
           expect(adding.outcome.error.committed).toEqual([])
-          expect(adding.outcome.error.message).not.toContain("rekey")
+          expect(adding.outcome.error.message).toContain("rekey")
           expect(adding.rows).toEqual(sorted(seeded))
           // `rekey` reports the 50 rows, moves them, and the update then fits.
           expect(rekeyed(dry.outcome, "Bulk")).toEqual({ moved: 50, conflicts: [] })
@@ -1062,21 +1112,25 @@ export const suite = (
         }),
     )
 
+    // An update sends only the rows that changed (#168, D2): of a group read under 1.40.0's text,
+    // the rows whose key moves (a `Put` under the new key and a `Delete` of the old) and the root,
+    // never the rows whose key doesn't move (the notes).
     it.effect(
-      "under escapeKeys: true, a group holding rows that don't move counts them too: its rows plus its rows under 1.40.0's text, 100 items written, 101 refused naming rekey",
+      "under escapeKeys: true, a group's moved rows count twice and its unmoved rows not at all: 99 items written, 101 refused naming rekey",
       () =>
         Effect.gen(function* () {
           // `escapeKeys: false` stores 1.40.0's text byte for byte (pinned above), so it writes the
           // rows 1.40.0 would have: here a number's text, which escaping leaves as it is.
-          for (const [notes, items] of [
-            [9, 100],
-            [10, 101],
+          const notes = 9
+          for (const [tallies, items] of [
+            [49, 99],
+            [50, 101],
           ] as const) {
             if (items > 100 && !harness.enforcesLimits) continue
-            const id = `m${notes}`
+            const id = `m${tallies}`
             const pk = `$edges#v1#mix#${id}`
             const created = yield* session(harness, OFF, [], ({ db, step }) =>
-              step("create", () => db.aggregates.Mixes.create(mix(id, notes, 45)), pk),
+              step("create", () => db.aggregates.Mixes.create(mix(id, notes, tallies)), pk),
             )
             expect(created.outcome).toHaveProperty("ok")
             const title = yield* session(harness, ON, created.rows, ({ db, step }) =>
@@ -1085,14 +1139,14 @@ export const suite = (
             if (items <= 100) {
               expect(title.outcome.ok.title).toBe("t2")
               const sent = transaction(title.requests)
-              // The root, 9 notes and 45 tallies, and the 45 tallies' rows under 1.40.0's text.
-              expect([sent.puts.length, sent.deletes.length]).toEqual([1 + notes + 45, 45])
+              // The root and the tallies, and the tallies' rows under 1.40.0's text.
+              expect([sent.puts.length, sent.deletes.length]).toEqual([1 + tallies, tallies])
               expect(sent.puts.length + sent.deletes.length).toBe(items)
               expect(sks(title.rows)).toEqual(
                 [
                   "$edges#v1#mix",
                   ...Array.from(
-                    { length: 45 },
+                    { length: tallies },
                     (_, i) => `$edges#v1#mixtally#${String(i + 1).padStart(16, "0")}`,
                   ),
                   ...Array.from({ length: notes }, (_, i) => `$edges#v1#note#n${i}`),
@@ -1101,10 +1155,10 @@ export const suite = (
             } else {
               expect(title.outcome.fail).toBe("AggregateTransactionOverflow")
               expect(title.outcome.error.itemCount).toBe(items)
-              expect(title.outcome.error.previousKeyText).toBe(45)
+              expect(title.outcome.error.previousKeyText).toBe(tallies)
               expect(title.outcome.error.committed).toEqual([])
               expect(title.outcome.error.message).toContain(
-                "so 45 of these 101 items are those deletes",
+                `so ${tallies} of these ${items} items are those deletes`,
               )
               expect(title.rows).toEqual(sorted(created.rows))
             }
@@ -1118,11 +1172,15 @@ export const suite = (
         Effect.gen(function* () {
           const id = "x2"
           const pk = `$edges#v1#split#${id}`
-          const cased = (count: number) =>
-            Array.from({ length: count }, (_, i) => line(1, { lineId: `c${i}`, hex: `h${i}` }))
+          const cased = (count: number, prefix = "c") =>
+            Array.from({ length: count }, (_, i) =>
+              line(1, { lineId: `${prefix}${i}`, hex: `${prefix}h${i}` }),
+            )
+          // The part's row (its name changed), its new elements and the `Delete` of the one the
+          // create wrote: only changed rows are sent (#168, D2).
           for (const [count, items] of [
-            [99, 100],
-            [100, 101],
+            [98, 100],
+            [99, 101],
           ] as const) {
             const [created, update] = yield* session(harness, OFF, [], ({ db, step }) =>
               Effect.gen(function* () {
@@ -1144,7 +1202,7 @@ export const suite = (
                         db.aggregates.Splits.update({ id }, ({ state }: any) => ({
                           ...state,
                           title: "t2",
-                          part: { ...state.part, cased: cased(count) },
+                          part: { ...state.part, partName: "p2", cased: cased(count, "d") },
                         })),
                       ),
                     pk,
@@ -1156,7 +1214,7 @@ export const suite = (
             const writes = update.requests.filter(
               (request) => request.command === "TransactWriteItems",
             )
-            // The root's group, then the part's: its row and one per element.
+            // The root's group, then the part's, which don't fit one transaction together.
             expect(writes.map((request) => request.input.TransactItems.length)).toEqual([1, items])
             const root = (rows: ReadonlyArray<Row>) =>
               rows.find((row) => row.sk?.S === "$edges#v1#split")!
@@ -1168,6 +1226,7 @@ export const suite = (
               expect(part(update.rows)).toHaveLength(1 + count)
               continue
             }
+            expect(items).toBe(1 + count + 1)
             expect(update.outcome.fail).toBe("AggregateTransactionOverflow")
             expect(update.outcome.error.subgraph).toBe("part")
             expect(update.outcome.error.itemCount).toBe(items)

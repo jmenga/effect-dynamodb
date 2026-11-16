@@ -9,8 +9,9 @@
  *   holds the root's form). Key text is what 1.40.0 composed, byte for byte, whatever the stored
  *   form: a key over such a date, passed or stamped, reads it as ISO text.
  * - Rows stored as ISO text read as before, and a no-op `update` over them sends only its read.
- * - A group's rows are written in the declared form when the group is written for another reason:
- *   every row of that group, its kept `created` too (the same instant), and no other group's.
+ * - A row is written in the declared form when it is written for another reason, its kept `created`
+ *   too (the same instant). Since #168 a write sends only the rows whose value changed (D2): a row
+ *   beside it whose value didn't change keeps the form 1.40.0 stored it in, which reads as before.
  *
  * `fixtures/aggregate-optional-dates-1.40.0.json` holds what published 1.39.0 and 1.40.0 did, at a
  * fixed clock. One suite, run on a recording table (`AggregateOptionalDates.test.ts`) and against
@@ -28,6 +29,7 @@ import { describe, expect } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
+import { asBefore168, keptStamps } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
 type Request = { readonly command: string; readonly input: any }
@@ -156,7 +158,11 @@ const requestsInDeclared = (requests: ReadonlyArray<Request>): ReadonlyArray<Req
         },
   )
 
-const isSubGroup = (row: Row) => (row.__edd_e__?.S ?? "").startsWith("DocSub")
+/** A row without its `updatedAt`, which a write stamps. */
+const withoutUpdated = (row: Row): Row => {
+  const { updatedAt: _, ...rest } = row
+  return rest
+}
 
 const keyOf = (row: Row) => `${row.pk?.S}|${row.sk?.S}`
 const sorted = (rows: ReadonlyArray<Row>): ReadonlyArray<Row> =>
@@ -301,7 +307,10 @@ export const suite = (
             const actual = yield* run(harness, over, 0)
             const [create, get, noop] = [actual[0]!, actual[1]!, actual[2]!]
             expect(create.outcome).toEqual(then[0]!.outcome)
-            expect(create.requests).toEqual(requestsInDeclared(then[0]!.requests))
+            // One transaction where 1.40.0 sent one per group (#168, D3).
+            expect(asBefore168(create.requests)).toEqual(
+              asBefore168(requestsInDeclared(then[0]!.requests)),
+            )
             expect(create.rows).toEqual(sorted(then[0]!.rows.map(inDeclared)))
             // Every key attribute is 1.40.0's, byte for byte.
             for (const [i, row] of create.rows.entries()) {
@@ -312,16 +321,22 @@ export const suite = (
             expect(get.outcome).toEqual(then[1]!.outcome)
             expect(get.requests).toEqual(then[1]!.requests)
             // A no-op update reads and writes nothing.
-            expect(noop.requests).toEqual(then[2]!.requests)
+            expect(asBefore168(noop.requests)).toEqual(asBefore168(then[2]!.requests))
             expect(noop.requests.map((request) => request.command)).toEqual(["Query"])
             expect(noop.rows).toEqual(create.rows)
             // Each later step: what 1.40.0 sent and stored, in the declared encoding.
+            // As #168 changed them (`Before168.ts`): only the rows that changed are sent, and the
+            // rows that didn't keep their `updatedAt`.
             for (const i of [3, 4, 5]) {
+              const stored = actual[i - 1]!.rows
+              const options = { stored, same: (row: Row) => withoutUpdated(row) }
               expect(actual[i]!.outcome, then[i]!.step).toEqual(then[i]!.outcome)
-              expect(actual[i]!.requests, then[i]!.step).toEqual(
-                requestsInDeclared(then[i]!.requests),
+              expect(asBefore168(actual[i]!.requests, options), then[i]!.step).toEqual(
+                asBefore168(requestsInDeclared(then[i]!.requests), options),
               )
-              expect(actual[i]!.rows, then[i]!.step).toEqual(sorted(then[i]!.rows.map(inDeclared)))
+              expect(actual[i]!.rows, then[i]!.step).toEqual(
+                keptStamps(sorted(then[i]!.rows.map(inDeclared)), stored),
+              )
             }
           }),
       )
@@ -340,7 +355,7 @@ export const suite = (
               expect(get!.outcome).toEqual(then[1]!.outcome)
               expect(get!.requests).toEqual(then[1]!.requests)
               expect(noop!.outcome).toEqual(then[2]!.outcome)
-              expect(noop!.requests).toEqual(then[2]!.requests)
+              expect(asBefore168(noop!.requests)).toEqual(asBefore168(then[2]!.requests))
               expect(noop!.requests.map((request) => request.command)).toEqual(["Query"])
               expect(noop!.rows).toEqual(sorted(seeded))
             }),
@@ -351,23 +366,39 @@ export const suite = (
     for (const over of ["passed", "stamp"] as const) {
       const then = published["1.40.0"][over]
       it.effect(
-        `keys over ${over === "stamp" ? "the stamps" : "a date passed"}, over the rows 1.40.0 stored: a group written for another reason is written in the declared encoding, every row of it and no other group's`,
+        `keys over ${over === "stamp" ? "the stamps" : "a date passed"}, over the rows 1.40.0 stored: a write sends only the rows that changed, in the declared encoding, and leaves every other row as 1.40.0 stored it`,
         () =>
           Effect.gen(function* () {
-            const actual = yield* run(harness, over, 1, then[0]!.rows)
+            const seeded = then[0]!.rows
+            const actual = yield* run(harness, over, 1, seeded)
             const [title, sub, get] = [actual[2]!, actual[3]!, actual[4]!]
-            // The title's group: the root, its `one` edge and its `many` rows, `created` kept as
-            // the same instant. The sub-aggregate's rows stay as 1.40.0 stored them.
+            /** A row in its declared encoding, its `updatedAt` left out: what a row's value is. */
+            const valueOf = (row: Row) => withoutUpdated(inDeclared(row))
+            /** `rows`, the row of `entityType` replaced by `after`'s, in the declared encoding. */
+            const replaced = (rows: ReadonlyArray<Row>, after: ReadonlyArray<Row>, type: string) =>
+              sorted(
+                rows.map((row) =>
+                  row.__edd_e__?.S === type
+                    ? inDeclared(after.find((was) => was.__edd_e__?.S === type)!)
+                    : row,
+                ),
+              )
+            // The title's row alone is sent (#168, D2), in the declared encoding, `created` kept as
+            // the same instant. 1.40.0 rewrote its whole group; a row whose value didn't change
+            // keeps the form 1.40.0 stored it in (DESIGN.md §11: read by its stored form).
             expect(title.outcome).toEqual(then[3]!.outcome)
-            expect(title.requests).toEqual(requestsInDeclared(then[3]!.requests))
-            expect(title.rows).toEqual(
-              sorted(then[3]!.rows.map((row) => (isSubGroup(row) ? row : inDeclared(row)))),
+            const stored = { stored: seeded, same: valueOf }
+            expect(asBefore168(title.requests, stored)).toEqual(
+              asBefore168(requestsInDeclared(then[3]!.requests), stored),
             )
-            expect(title.rows.filter(isSubGroup)).toEqual(sorted(then[0]!.rows.filter(isSubGroup)))
-            // Then the sub-aggregate's group.
+            expect(title.rows).toEqual(replaced(seeded, then[3]!.rows, "Doc"))
+            // Then the sub-aggregate's root row, alone.
             expect(sub.outcome).toEqual(then[4]!.outcome)
-            expect(sub.requests).toEqual(requestsInDeclared(then[4]!.requests))
-            expect(sub.rows).toEqual(sorted(then[4]!.rows.map(inDeclared)))
+            const storedSub = { stored: title.rows, same: valueOf }
+            expect(asBefore168(sub.requests, storedSub)).toEqual(
+              asBefore168(requestsInDeclared(then[4]!.requests), storedSub),
+            )
+            expect(sub.rows).toEqual(replaced(title.rows, then[4]!.rows, "DocSub"))
             expect(get.outcome).toEqual(then[5]!.outcome)
             // No key attribute moved.
             for (const [i, row] of sub.rows.entries()) {

@@ -9,6 +9,12 @@
  * value its row now stores, the copy a `get` right after reads. Apart from that, the changes the
  * changeset names, per shape ({@link NAMED}).
  *
+ * Since #168 (`docs/designs/aggregate-concurrency.md`): requests are compared as #168 changed them
+ * (`Before168.ts`); a row an update leaves as it is isn't sent, and keeps what it held; the failing
+ * update is one transaction, refused whole, so nothing of it is written; and from there on this
+ * release is compared with itself running the same steps with nothing refused (the change applied
+ * once), since 1.40.0's rows from there on hold what its partial write left.
+ *
  * Run on a recording table (`AggregateUpgradeSweep.test.ts`) and against DynamoDB Local
  * (`connected.aggregate-upgrade-sweep.test.ts`).
  */
@@ -47,6 +53,7 @@ import {
   TYPE,
   valueCopiesAsRoot,
 } from "./AggregateUpgradeSweep.js"
+import { asBefore168 } from "./Before168.js"
 
 const published: {
   readonly generatedFrom: ReadonlyArray<string>
@@ -69,6 +76,8 @@ const lib: SweepLib = {
   Exit,
   Cause,
   Layer,
+  // Since #168 the failing update's groups are one transaction: refusing it refuses the write.
+  failingTransaction: 1,
 }
 
 /** A timestamp the library stamps, as compared: its text differs on every run. */
@@ -267,34 +276,6 @@ const NAMED: Readonly<Record<string, Named>> = {
 }
 
 /**
- * The shapes whose failing step (its second transaction refused) leaves rows holding a context
- * attribute's old value behind the root, by the context attributes (#241). From the retry on, this
- * release writes their groups too, the rows a group already holding the root's value stays
- * unwritten, and every read hands back the root's value on every row. 1.40.0 wrote only what the
- * diff found changed, so those rows kept the old value, and each read handed it back, until their
- * group next changed. Compared with 1.40.0 with every row's copy set to the root's on both sides,
- * and the transactions putting only those rows taken out of this release's requests.
- */
-const STALE_AFTER_FAILING: Readonly<Record<string, ReadonlyArray<string>>> = {
-  "held: context: a sub-aggregate with an edge, both declaring tenantId": ["tenantId"],
-  "repro: context over a Schema.optional date beside an Unknown value under a sub-aggregate": [
-    "since",
-  ],
-  "repro: context changed while a later group's transaction fails": ["tenantId"],
-}
-
-/** `rows` with each row's copy of a context attribute (`names`) the root row's. */
-const copiesAsRoot = (rows: ReadonlyArray<Row>, names: ReadonlyArray<string>) => {
-  const root = rows.find((row) => typeOf(row) === "Root")
-  return rows.map((row) => {
-    if (root === undefined || row === root) return row
-    const next: Row = { ...row }
-    for (const name of names) if (Object.hasOwn(next, name)) next[name] = root[name]!
-    return next
-  })
-}
-
-/**
  * The shapes whose edge has a custom `decompose` and `assemble` (#241): an `update` can't tell
  * which of its rows an element's copy of a context attribute came from, so it hands the copy back
  * as 1.40.0 did, the value before the write.
@@ -302,35 +283,6 @@ const copiesAsRoot = (rows: ReadonlyArray<Row>, names: ReadonlyArray<string>) =>
 const CUSTOM_EDGE: Readonly<Record<string, string>> = {
   "held: context: a custom decompose and assemble": "lines",
   "context: an Unknown element with a custom assemble holding another tenantId": "lines",
-}
-
-/** The sort keys of the rows holding a copy of a context attribute other than the root row's. */
-const staleKeysIn = (rows: ReadonlyArray<Row>, names: ReadonlyArray<string>) => {
-  const root = rows.find((row) => typeOf(row) === "Root")!
-  return new Set(
-    rows
-      .filter(
-        (row) =>
-          row !== root &&
-          names.some(
-            (name) =>
-              Object.hasOwn(row, name) && JSON.stringify(row[name]) !== JSON.stringify(root[name]),
-          ),
-      )
-      .map((row) => row.sk!.S!),
-  )
-}
-
-/** Whether a request is a transaction putting only rows at `keys`. */
-const putsOnly = (request: Request, keys: ReadonlySet<string>) => {
-  if (request.command !== "TransactWriteItems") return false
-  const items = putsOf([request])
-  const all = (request.input as { TransactItems?: ReadonlyArray<unknown> }).TransactItems ?? []
-  return (
-    items.length > 0 &&
-    items.length === all.length &&
-    items.every((item) => keys.has((item.sk as { S?: string } | undefined)?.S ?? ""))
-  )
 }
 
 /** A `create` refused by `EDD-9159`: `givenOverRow`'s arguments, the member first. */
@@ -505,6 +457,52 @@ const requestsAs = (requests: ReadonlyArray<Request>, row: (row: Row) => Row): u
   return walk(requests)
 }
 
+/**
+ * The keys of the rows stored before an update (`stored`) that it neither puts nor deletes (#168,
+ * D2): rows it leaves as they are.
+ */
+const keptAt = (
+  stored: ReadonlyArray<Row>,
+  sent: ReadonlyArray<Request>,
+  keyOf: (row: Row) => string,
+): ReadonlySet<string> => {
+  const touched = new Set<string>()
+  for (const request of sent) {
+    if (request.command !== "TransactWriteItems") continue
+    for (const item of (request.input as { TransactItems: ReadonlyArray<any> }).TransactItems) {
+      const at = item.Put?.Item ?? item.Delete?.Key
+      if (at !== undefined) touched.add(keyOf(at))
+    }
+  }
+  return new Set(stored.map(keyOf).filter((key) => !touched.has(key)))
+}
+
+/** `requests` without the transaction `Put`s of rows at `kept` (a row 1.40.0 rewrote unchanged). */
+const withoutPutsAt = (
+  requests: ReadonlyArray<Request>,
+  kept: ReadonlySet<string> | undefined,
+  pk: string,
+): ReadonlyArray<Request> =>
+  kept === undefined
+    ? requests
+    : requests.map((request) =>
+        request.command !== "TransactWriteItems"
+          ? request
+          : {
+              ...request,
+              input: {
+                ...(request.input as object),
+                TransactItems: (
+                  request.input as { TransactItems: ReadonlyArray<any> }
+                ).TransactItems.filter(
+                  (item) =>
+                    item.Put === undefined ||
+                    !kept.has(`${item.Put.Item[pk]?.S} ${item.Put.Item.sk?.S}`),
+                ),
+              },
+            },
+      )
+
 export interface SweepHarness {
   /**
    * Run `body` on a fresh table keyed by `pk` and `sk`, with the local index `lsi1` on `csk`: its
@@ -544,17 +542,37 @@ export const sweepSuite = (
           const asRow = named?.row ?? ((row: Row) => row)
           const asValue = named?.value ?? ((value: unknown) => value)
           const rows = (all: ReadonlyArray<Row>) => stamped(all.map(asRow))
-          const requests = (sent: ReadonlyArray<Request>) => stamped(requestsAs(sent, asRow))
+          // Compared as #168 changed them (`asBefore168`): a `Put` of a row as `stored` held it,
+          // a stamp aside, is one this release doesn't send.
+          const requests = (
+            sent: ReadonlyArray<Request>,
+            stored?: ReadonlyArray<Row>,
+            kept?: ReadonlySet<string>,
+          ) =>
+            stamped(
+              requestsAs(
+                asBefore168(withoutPutsAt(sent, kept, shape.pk ?? "pk"), {
+                  stored,
+                  same: (row: Row) => stamped(asRow(row)),
+                }),
+                asRow,
+              ),
+            )
           const outcome = (result: Outcome) => {
             const judgedAs = judged(result)
             return stamped("ok" in judgedAs ? { ok: asValue(judgedAs.ok) } : judgedAs)
           }
-          const now = yield* harness.onTable(shape.pk ?? "pk", (io, seed) =>
-            Effect.gen(function* () {
-              if (from === "seeded") yield* seed(then.rows)
-              return yield* runSweep(lib, shape, io, from === "seeded")
-            }),
-          )
+          const runOn = (with168: SweepLib) =>
+            harness.onTable(shape.pk ?? "pk", (io, seed) =>
+              Effect.gen(function* () {
+                if (from === "seeded") yield* seed(then.rows)
+                return yield* runSweep(with168, shape, io, from === "seeded")
+              }),
+            )
+          const now = yield* runOn(lib)
+          // The same steps with nothing refused (#168): the failing update's change applied once,
+          // which is what this release's retry of it must do, from the same rows.
+          const control = yield* runOn({ ...lib, failingTransaction: 0 })
           const refused = REFUSED_AT_CREATE[label]
           if (from === "created" && refused !== undefined) {
             // 1.40.0 created it, and its read handed back the library's value, not the one given.
@@ -573,26 +591,46 @@ export const sweepSuite = (
           }
           named?.head(now, from === "seeded" ? then.rows : now.rows!)
           expect(outcome(now.get)).toEqual(outcome(then.get))
-          const stale = STALE_AFTER_FAILING[label]
           const failingAt = now.steps.findIndex((step) => step.step.startsWith("failing"))
-          const staleKeys =
-            stale === undefined ? new Set<string>() : staleKeysIn(now.steps[failingAt]!.rows, stale)
-          if (stale !== undefined) expect(staleKeys.size).toBeGreaterThan(0)
+          const before = (
+            steps: ReadonlyArray<{ readonly rows: ReadonlyArray<Row> }>,
+            i: number,
+          ) => (i === 0 ? undefined : steps[i - 1]!.rows)
+          const nowBefore = (i: number) =>
+            before(now.steps, i) ?? (from === "seeded" ? then.rows : now.rows!)
+          const wasBefore = (i: number) => before(then.steps, i) ?? then.rows
+          const pkOf = shape.pk ?? "pk"
+          const keyOf = (row: Row) => `${row[pkOf]?.S} ${row.sk?.S}`
+          const inOrder = (all: ReadonlyArray<Row>) =>
+            [...all].sort((x, y) => (keyOf(x) < keyOf(y) ? -1 : keyOf(x) > keyOf(y) ? 1 : 0))
           for (const [i, step] of now.steps.entries()) {
             const was = then.steps[i]!
             expect(step.step).toBe(was.step)
             const id = { step: step.step }
-            const repaired = stale !== undefined && i > failingAt
-            const copies = (value: Outcome) =>
-              repaired && value.ok !== undefined
-                ? { ...value, ok: valueCopiesAsRoot(asValue(value.ok), stale) }
-                : value
-            const rowsOf = (all: ReadonlyArray<Row>) =>
-              repaired ? stamped(copiesAsRoot(all.map(asRow), stale)) : rows(all)
-            expect({ ...id, get: outcome(copies(step.get)) }).toEqual({
-              ...id,
-              get: outcome(copies(was.get)),
-            })
+            // Past the failing update, this release is compared with itself, the change applied
+            // once (`control`): its retry is the control's failing update, and 1.40.0's rows from
+            // there on hold what its partial write left.
+            if (i > failingAt) {
+              const twin = control.steps[i === failingAt + 1 ? failingAt : i]!
+              const twinBefore = i === failingAt + 1 ? before(control.steps, failingAt) : twin
+              expect({ ...id, update: outcome(step.update) }).toEqual({
+                ...id,
+                update: outcome(twin.update),
+              })
+              expect({ ...id, requests: requests(step.requests, nowBefore(i)) }).toEqual({
+                ...id,
+                requests: requests(
+                  twin.requests,
+                  i === failingAt + 1
+                    ? (twinBefore as ReadonlyArray<Row>)
+                    : before(control.steps, i),
+                ),
+              })
+              expect({ ...id, refused: step.refused }).toEqual({ ...id, refused: [] })
+              expect({ ...id, rows: rows(step.rows) }).toEqual({ ...id, rows: rows(twin.rows) })
+              expect({ ...id, get: outcome(step.get) }).toEqual({ ...id, get: outcome(twin.get) })
+              continue
+            }
             // 1.40.0's result (#241), each copy of a context attribute a value holds as its row
             // holds it after the write: the root's value.
             const returned = (value: Outcome) =>
@@ -606,50 +644,48 @@ export const sweepSuite = (
               ...id,
               update: outcome(returned(was.update)),
             })
-            // The transactions writing the rows left behind that 1.40.0 didn't send: only at the
-            // retry, and every such row's group.
-            const sent140 = (was.requests as ReadonlyArray<Request>).map((r) =>
-              JSON.stringify(requests([r])),
-            )
-            const repairs = repaired
-              ? step.requests.filter((r) => {
-                  if (!putsOnly(r, staleKeys)) return false
-                  const at = sent140.indexOf(JSON.stringify(requests([r])))
-                  if (at === -1) return true
-                  sent140.splice(at, 1)
-                  return false
-                })
-              : []
-            if (repaired) {
-              const put = new Set(putsOf(repairs).map((row) => row.sk!.S!))
-              expect({ ...id, repairs: put.size > 0 }).toEqual({
+            if (i === failingAt) {
+              // Refused whole (#168): what it sent and was refused is the whole change in one
+              // transaction, as the control sent it (1.40.0 sent its groups one transaction each, and
+              // stopped at the refused one), nothing is written, and a read hands back the aggregate
+              // as it was.
+              expect({
                 ...id,
-                repairs: step.step === "retry",
+                requests: requests([...step.requests, ...step.refused], nowBefore(i)),
+              }).toEqual({
+                ...id,
+                requests: requests(control.steps[i]!.requests, before(control.steps, i)),
               })
-              if (step.step === "retry") {
-                const written = new Set(putsOf(step.requests).map((row) => row.sk!.S!))
-                expect([...staleKeys].filter((k) => !written.has(k))).toEqual([])
-              }
-              // Every row's copy is the root's once the retry is written.
-              const root = step.rows.find((row) => typeOf(row) === "Root")!
-              for (const row of step.rows) {
-                for (const name of stale!) {
-                  if (Object.hasOwn(row, name)) expect(row[name]).toEqual(root[name])
-                }
-              }
+              expect({ ...id, rows: rows(step.rows) }).toEqual({ ...id, rows: rows(nowBefore(i)) })
+              expect({ ...id, get: outcome(step.get) }).toEqual({
+                ...id,
+                get: outcome(i === 0 ? now.get : now.steps[i - 1]!.get),
+              })
+              continue
             }
-            expect({
+            // A row the update leaves as it is isn't sent (#168, D2), and keeps what it held, where
+            // 1.40.0 rewrote its group: in a form 1.40.0 stored otherwise (a held attribute it
+            // dropped), it holds what it held before.
+            const kept = keptAt(nowBefore(i), step.requests, keyOf)
+            expect({ ...id, requests: requests(step.requests, nowBefore(i), kept) }).toEqual({
               ...id,
-              requests: requests(step.requests.filter((r) => !repairs.includes(r))),
-            }).toEqual({
-              ...id,
-              requests: requests(was.requests),
+              requests: requests(was.requests, wasBefore(i), kept),
             })
             expect({ ...id, refused: requests(step.refused) }).toEqual({
               ...id,
               refused: requests(was.refused),
             })
-            expect({ ...id, rows: rowsOf(step.rows) }).toEqual({ ...id, rows: rowsOf(was.rows) })
+            const beforeRows = new Map(nowBefore(i).map((row) => [keyOf(row), row]))
+            const expected = inOrder(
+              was.rows.map((row) =>
+                kept.has(keyOf(row)) ? (beforeRows.get(keyOf(row)) ?? row) : row,
+              ),
+            )
+            expect({ ...id, rows: rows(inOrder(step.rows)) }).toEqual({
+              ...id,
+              rows: rows(expected),
+            })
+            expect({ ...id, get: outcome(step.get) }).toEqual({ ...id, get: outcome(was.get) })
           }
         })
       it(`${label}: on 1.40.0's rows, never refused; sends, stores, reads and returns what 1.40.0 did`, () =>

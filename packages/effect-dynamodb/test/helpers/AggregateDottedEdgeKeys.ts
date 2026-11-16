@@ -32,6 +32,7 @@ import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
 import type { Harness } from "./AggregateEntityEdgeKeys.js"
+import { asBefore168 } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
 type Request = { readonly command: string; readonly input: any }
@@ -279,9 +280,14 @@ export const dottedSuite = (
             step: then.step,
             outcome: then.outcome,
           })
-          expect({ step: now.step, requests: stamped(now.requests) }).toEqual({
+          // As #168 changed them (`Before168.ts`), from the rows stored before the step.
+          const stored = i === 0 ? [] : published.off[i - 1]!.rows
+          expect({
+            step: now.step,
+            requests: asBefore168(stamped(now.requests), { stored }),
+          }).toEqual({
             step: then.step,
-            requests: then.requests,
+            requests: asBefore168(then.requests, { stored }),
           })
           expect({ step: now.step, rows: stamped(now.rows) }).toEqual({
             step: then.step,

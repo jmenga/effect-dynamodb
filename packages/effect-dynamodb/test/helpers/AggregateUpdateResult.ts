@@ -92,7 +92,7 @@ export const rich = (value: unknown): unknown => {
 
 /** A timestamp the library stamps, as compared: its text differs on every run. */
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
-export const stamped = (value: unknown): unknown =>
+export const stamped = <A>(value: A): A =>
   value === undefined
     ? value
     : JSON.parse(

@@ -144,10 +144,30 @@ const orderPk = (() => {
   ])
 })()
 const hiddenKey = { pk: { S: orderPk }, sk: { S: "$ex#v1#line#h" } }
-const guard = (type: string) => ({
-  ConditionExpression: "attribute_not_exists(#pk) OR #e = :e",
-  ExpressionAttributeNames: { "#pk": "pk", "#e": "__edd_e__" },
-  ExpressionAttributeValues: { ":e": { S: type } },
+/**
+ * A cleanup `Delete`'s guard (#168, design §2.7): the row gone, or exactly as the update read it,
+ * each attribute named and valued in the row's own order.
+ */
+const guard = (row: Record<string, unknown>) => {
+  const names = Object.keys(row).filter((name) => name !== "pk" && name !== "sk")
+  return {
+    ConditionExpression: `attribute_not_exists(#cpk) OR (attribute_exists(#gpk) AND ${names
+      .map((_, i) => `#g${i} = :g${i}`)
+      .join(" AND ")})`,
+    ExpressionAttributeNames: {
+      "#cpk": "pk",
+      "#gpk": "pk",
+      ...Object.fromEntries(names.map((name, i) => [`#g${i}`, name])),
+    },
+    ExpressionAttributeValues: Object.fromEntries(names.map((name, i) => [`:g${i}`, row[name]])),
+    ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+  }
+}
+/** A hidden line as `create` stores it. */
+const hiddenRow = (lid: string) => ({
+  __edd_e__: { S: "Line" },
+  lid: { S: lid },
+  note: { S: "hidden" },
 })
 
 // ---------------------------------------------------------------------------
@@ -1088,35 +1108,35 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
       request.command === "TransactWriteItems" ? request.input : request.command,
     )
 
-  it.effect("a hidden line goes after the groups, in its own request, when its node changes", () =>
-    Effect.gen(function* () {
-      const { table, run, rows } = world()
-      succeed(yield* run((db) => db.aggregates.Orders.create(created())))
-      expect(rows().map((row) => row.sk?.S)).toContain("$ex#v1#line#h")
-      table.requests.length = 0
-      succeed(
-        yield* run((db) =>
-          db.aggregates.Orders.update({ id: "p q" }, ({ state }: any) => ({
-            ...state,
-            sub: { lines: [...state.sub.lines, { lid: "y", note: "shown" }] },
-          })),
-        ),
-      )
-      expect(table.requests.map((request) => request.command)).toEqual([
-        "Query",
-        "TransactWriteItems",
-        "TransactWriteItems",
-      ])
-      // The group's transaction holds no Delete; the cleanup's holds the hidden line's, guarded.
-      expect(table.requests[2]!.input).toEqual({
-        TransactItems: [{ Delete: { TableName: "ex", Key: hiddenKey, ...guard("Line") } }],
-      })
-      expect(deletes(table)).toHaveLength(1)
-      expect(rows().map((row) => row.sk?.S)).not.toContain("$ex#v1#line#h")
-    }),
+  // #168 (design §2.7): the cleanup joins the update's transaction, each `Delete` guarded as read.
+  it.effect(
+    "a hidden line's Delete joins the update's transaction, guarded as read, when its node changes",
+    () =>
+      Effect.gen(function* () {
+        const { table, run, rows } = world()
+        succeed(yield* run((db) => db.aggregates.Orders.create(created())))
+        expect(rows().map((row) => row.sk?.S)).toContain("$ex#v1#line#h")
+        table.requests.length = 0
+        succeed(
+          yield* run((db) =>
+            db.aggregates.Orders.update({ id: "p q" }, ({ state }: any) => ({
+              ...state,
+              sub: { lines: [...state.sub.lines, { lid: "y", note: "shown" }] },
+            })),
+          ),
+        )
+        expect(table.requests.map((request) => request.command)).toEqual([
+          "Query",
+          "TransactWriteItems",
+        ])
+        expect(deletes(table)).toEqual([
+          { TableName: "ex", Key: hiddenKey, ...guard(hiddenRow("h")) },
+        ])
+        expect(rows().map((row) => row.sk?.S)).not.toContain("$ex#v1#line#h")
+      }),
   )
 
-  it.effect("its group's transactions are exactly the ones sent without the option", () =>
+  it.effect("its group's transaction is the one sent without the option, and the cleanup", () =>
     Effect.gen(function* () {
       const sent = (ownsRows: boolean) =>
         Effect.gen(function* () {
@@ -1136,11 +1156,13 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
         })
       const owned = yield* sent(true)
       const plain = yield* sent(false)
-      // The cleanup comes after them, and is the only request added.
-      expect(owned.slice(0, plain.length)).toEqual(plain)
-      expect(owned.slice(plain.length)).toEqual([
-        { TransactItems: [{ Delete: { TableName: "ex", Key: hiddenKey, ...guard("Line") } }] },
-      ])
+      // The same requests; the cleanup's `Delete` is the only item added, after the group's.
+      expect(owned.length).toBe(plain.length)
+      const [ownedWrite, plainWrite] = [owned[1] as any, plain[1] as any]
+      expect(ownedWrite.TransactItems.slice(0, -1)).toEqual(plainWrite.TransactItems)
+      expect(ownedWrite.TransactItems.at(-1)).toEqual({
+        Delete: { TableName: "ex", Key: hiddenKey, ...guard(hiddenRow("h")) },
+      })
     }),
   )
 
@@ -1200,10 +1222,10 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
   )
 
   /**
-   * Hidden lines `h1` and `h2`; `land` runs before each cleanup request, as another writer's write
-   * landing just before it. The mutation counts its calls.
+   * Hidden lines `h1` and `h2`; `land` runs before the update's transaction, as another writer's
+   * write landing between its read and its write. The mutation counts its calls.
    */
-  const raced = (land: (table: ReturnType<typeof makeRecordingTable>, request: number) => void) =>
+  const raced = (land: (table: ReturnType<typeof makeRecordingTable>) => void) =>
     Effect.gen(function* () {
       const { table, run, rows } = world()
       succeed(
@@ -1217,11 +1239,9 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
           ),
         ),
       )
-      let writes = 0
+      const before = rows()
       table.hooks.onRequest = (request) => {
-        if (request.command !== "TransactWriteItems") return
-        writes++
-        if (writes > 1) land(table, writes - 1)
+        if (request.command === "TransactWriteItems") land(table)
       }
       table.requests.length = 0
       let mutations = 0
@@ -1232,18 +1252,9 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
         }),
       )
       table.hooks.onRequest = undefined
-      return { exit, table, rows: rows(), mutations }
+      return { exit, table, before, rows: rows(), mutations }
     })
   const keyOf = (lid: string) => `${hiddenKey.pk.S}|$ex#v1#line#${lid}`
-  const cleanupOf = (...lids: ReadonlyArray<string>) => ({
-    TransactItems: lids.map((lid) => ({
-      Delete: {
-        TableName: "ex",
-        Key: { pk: hiddenKey.pk, sk: { S: `$ex#v1#line#${lid}` } },
-        ...guard("Line"),
-      },
-    })),
-  })
 
   it.effect("a row another write removed in between is fine", () =>
     Effect.gen(function* () {
@@ -1252,55 +1263,49 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
       })
       succeed(exit)
       expect(mutations).toBe(1)
-      expect(sentBy(table).slice(2)).toEqual([cleanupOf("h1", "h2")])
+      expect(table.requests.map((request) => request.command)).toEqual([
+        "Query",
+        "TransactWriteItems",
+      ])
+      expect(deletes(table).map((del) => del.Key.sk.S)).toEqual([
+        "$ex#v1#line#h1",
+        "$ex#v1#line#h2",
+      ])
       expect(rows.map((row) => row.sk?.S)).not.toContain("$ex#v1#line#h2")
     }),
   )
 
-  it.effect("a row replaced with another type is left, and the rest are sent once more", () =>
-    Effect.gen(function* () {
-      const { exit, table, rows, mutations } = yield* raced((table, request) => {
-        const row = table.items.get(keyOf("h1"))!
-        if (request === 1) table.items.set(keyOf("h1"), { ...row, __edd_e__: { S: "Note" } })
-      })
-      succeed(exit)
-      expect(mutations).toBe(1)
-      expect(table.requests.map((request) => request.command)).toEqual([
-        "Query",
-        "TransactWriteItems",
-        "TransactWriteItems",
-        "TransactWriteItems",
-      ])
-      expect(sentBy(table).slice(2)).toEqual([cleanupOf("h1", "h2"), cleanupOf("h2")])
-      expect(rows.find((row) => row.sk?.S === "$ex#v1#line#h1")?.__edd_e__).toEqual({ S: "Note" })
-      expect(rows.map((row) => row.sk?.S)).not.toContain("$ex#v1#line#h2")
-    }),
-  )
+  // 1.40.0 matched the cleanup on the entity type alone, left a row changed to another type and sent
+  // the rest once more, and deleted a row changed otherwise (R9). A row changed after the read now
+  // cancels the update, nothing written, never run again: the decision was made on a stale read.
+  for (const [what, change] of [
+    ["replaced with another type", { __edd_e__: { S: "Note" } }],
+    ["changed, its type kept", { note: { S: "edited" } }],
+  ] as const) {
+    it.effect(`a row ${what} after the read: ConcurrentModification, nothing written`, () =>
+      Effect.gen(function* () {
+        let changed: Record<string, unknown> | undefined
+        const { exit, table, before, rows, mutations } = yield* raced((table) => {
+          changed = { ...table.items.get(keyOf("h1"))!, ...change }
+          table.items.set(keyOf("h1"), changed as never)
+        })
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "ConcurrentModification" })
+        }
+        expect(mutations).toBe(1)
+        expect(table.requests.map((request) => request.command)).toEqual([
+          "Query",
+          "TransactWriteItems",
+        ])
+        expect(rows).toEqual(before.map((row) => (row.sk?.S === "$ex#v1#line#h1" ? changed : row)))
+      }),
+    )
+  }
 
-  it.effect("a cleanup that fails again is reported, with the update's groups committed", () =>
-    Effect.gen(function* () {
-      const { exit, table, rows, mutations } = yield* raced((table, request) => {
-        const lid = request === 1 ? "h1" : "h2"
-        const row = table.items.get(keyOf(lid))!
-        table.items.set(keyOf(lid), { ...row, __edd_e__: { S: "Note" } })
-      })
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) {
-        expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "TransactionCancelled" })
-      }
-      // Never run again, never read again.
-      expect(mutations).toBe(1)
-      expect(table.requests.map((request) => request.command)).toEqual([
-        "Query",
-        "TransactWriteItems",
-        "TransactWriteItems",
-        "TransactWriteItems",
-      ])
-      expect(rows.map((row) => row.sk?.S)).toContain("$ex#v1#line#y")
-    }),
-  )
-
-  it.effect("cleanup goes up to 100 Deletes to a request", () =>
+  // The new line's `Put` (the unchanged `x y` isn't sent, #168 D2) and 150 `Delete`s: packed into
+  // transactions of up to 100 items, the update's own first (design §3.5).
+  it.effect("cleanup Deletes pack with the update's items, up to 100 to a request", () =>
     Effect.gen(function* () {
       const { table, run, rows, seed } = world()
       succeed(
@@ -1337,7 +1342,7 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
         table.requests
           .filter((request) => request.command === "TransactWriteItems")
           .map((request) => request.input.TransactItems.length),
-      ).toEqual([3, 100, 50])
+      ).toEqual([100, 51])
       expect(rows().filter((row) => row.note?.S === "hidden")).toEqual([])
     }),
   )
@@ -1853,19 +1858,16 @@ describe("deciding which rows are the aggregate's reads and decomposes nothing m
           return { update, rekey: { ...calls, reads: reads(mover.table) } }
         })
       const owned = yield* count(true, true)
-      // A hidden row, which the update deletes and `rekey` reports, costs neither a read nor a call:
-      // only the cleanup's own request.
+      // A hidden row, which the update deletes and `rekey` reports, costs neither a read, a call
+      // nor a request: its `Delete` joins the update's transaction (#168).
       const plain = yield* count(true, false)
-      expect({
-        ...owned,
-        update: { ...owned.update, requests: owned.update.requests - 1 },
-      }).toEqual(plain)
+      expect(owned).toEqual(plain)
       // The update reads the partition, assembles the old state, decomposes it and the new state,
       // and reads the value written once more for its stamps (as 1.39.0 did), then writes its
       // group and its cleanup; `rekey` reads what it reads without one (the scan, the old and new
       // partitions, the roots it checks), and assembles and decomposes the aggregate once.
       expect(owned).toEqual({
-        update: { assemble: 1, decompose: 3, reads: 1, requests: 3 },
+        update: { assemble: 1, decompose: 3, reads: 1, requests: 2 },
         rekey: { assemble: 1, decompose: 1, reads: 5 },
       })
       // Without `ownsRows`, the same but the cleanup.

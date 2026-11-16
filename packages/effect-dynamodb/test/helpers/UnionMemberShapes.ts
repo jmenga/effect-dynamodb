@@ -8,6 +8,7 @@
  * `fixtures/aggregate-create-result-1.39.0.json` holds, compared by `compareCreateResult`. Shared by
  * `AggregateUnionMembers.test.ts` (a recording table) and its connected twin.
  */
+
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -18,6 +19,7 @@ import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
 import { renamedAttribute, storedAsNow } from "./AggregateWholeElements.js"
+import { asBefore168 } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
 
@@ -524,9 +526,15 @@ export const compareCreateResult = (
   as139("create")
   if (group === "renames" && label.endsWith("given its stored form")) {
     const now = storedAsNow("Sheet", renamedAttribute("text", "line"))
-    expect(actual.requests).toEqual(now.requests(expected.requests as never))
+    expect(asBefore168(actual.requests as never)).toEqual(
+      asBefore168(now.requests(expected.requests as never) as never),
+    )
     expect(actual.rows).toEqual((expected.rows as ReadonlyArray<never>).map(now.row))
-    expect(actual.updateRequests).toEqual(expected.updateRequests)
+    expect(asBefore168(actual.updateRequests as never, { stored: actual.rows as never })).toEqual(
+      asBefore168(expected.updateRequests as never, {
+        stored: (expected.rows as ReadonlyArray<never>).map(now.row),
+      }),
+    )
     expect(actual.updateRows).toEqual((expected.updateRows as ReadonlyArray<never>).map(now.row))
     const element = { kind: "own", qty: 3, text: "KEEP" }
     const read = label.startsWith("sub-aggregate, ")
@@ -538,13 +546,16 @@ export const compareCreateResult = (
     }
     return
   }
-  expect(actual.requests).toEqual(expected.requests)
+  // Compared as #168 changed them (`asBefore168`).
+  expect(asBefore168(actual.requests as never)).toEqual(asBefore168(expected.requests as never))
   expect(actual.rows).toEqual(expected.rows)
   as139("get")
   if (expected.update.ok !== undefined) {
     as139("update")
     as139("getAfterUpdate")
-    expect(actual.updateRequests).toEqual(expected.updateRequests)
+    expect(asBefore168(actual.updateRequests as never, { stored: actual.rows as never })).toEqual(
+      asBefore168(expected.updateRequests as never, { stored: expected.rows as never }),
+    )
     expect(actual.updateRows).toEqual(expected.updateRows)
     return
   }
@@ -552,8 +563,8 @@ export const compareCreateResult = (
   for (const step of ["update", "getAfterUpdate"] as const) {
     expect({ step, ...judged(actual[step]) }).toEqual({ step, ...judged(after) })
   }
-  expect(actual.updateRequests.slice(0, expected.updateRequests.length)).toEqual(
-    expected.updateRequests,
-  )
+  expect(
+    asBefore168(actual.updateRequests as never).slice(0, expected.updateRequests.length),
+  ).toEqual(asBefore168(expected.updateRequests as never))
   expect(actual.updateRows).toEqual(retitled(expected.rows))
 }

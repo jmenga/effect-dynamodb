@@ -2,7 +2,8 @@
  * Aggregates published 1.40.0 wrote, continued by this release (#241): the upgrade every shape of
  * the aggregate fixtures takes. Each shape is written by 1.40.0 (`create`), then read, updated with
  * no change, updated three times, updated while its second transaction fails (an earlier group has
- * committed, a later one hasn't), read, the failed update retried, and updated with no change again,
+ * committed, a later one hasn't; since #168, its one transaction), read, the failed update retried,
+ * and updated with no change again,
  * a read after each update. `fixtures/aggregate-upgrade-sweep-1.40.0.json` holds what published
  * 1.40.0 did for every step on DynamoDB Local; `AggregateUpgradeSweepSuite.ts` runs the same steps
  * with this release on the rows 1.40.0 wrote and asserts it never refuses one, and sends, stores,
@@ -33,6 +34,12 @@ export type SweepLib = {
   readonly Exit: typeof Exit
   readonly Cause: typeof Cause
   readonly Layer: typeof Layer
+  /**
+   * Which of the failing update's transactions the injected failure refuses: the second, as the
+   * capture ran 1.40.0 (an earlier group had committed), unless given. Since #168 an update sends
+   * its groups in one transaction when they fit, so the suite refuses the first: the whole write.
+   */
+  readonly failingTransaction?: number
 }
 
 export type Change = { readonly label: string; readonly change: (state: any) => any }
@@ -1200,7 +1207,9 @@ export const runSweep = (
         target = yield* bind({
           ...io.client,
           transactWriteItems: (input: unknown) => {
-            if (++transactions !== 2) return io.client.transactWriteItems(input)
+            if (++transactions !== (lib.failingTransaction ?? 2)) {
+              return io.client.transactWriteItems(input)
+            }
             refused.push({
               command: "TransactWriteItems",
               input: JSON.parse(JSON.stringify(input).replaceAll(io.tableName, "<table>")),

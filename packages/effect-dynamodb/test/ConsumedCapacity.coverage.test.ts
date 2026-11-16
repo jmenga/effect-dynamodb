@@ -371,6 +371,51 @@ const PurchaseOrders = Aggregate.make(PurchaseOrder, {
   },
 })
 
+/**
+ * Two sub-aggregate groups and the root's, `versioned` (so fenced): an update changing them all is
+ * one transaction, and `delete` deletes the root first (#168).
+ */
+const ShipmentLine = Schema.Struct({ lineId: Schema.String, sku: Schema.String })
+const ShipmentPartModel = Schema.Struct({ label: Schema.String, lines: Schema.Array(ShipmentLine) })
+const ShipmentPart = Aggregate.make(ShipmentPartModel, {
+  root: { entityType: "ShipmentPart" },
+  edges: { lines: Aggregate.many({ entityType: "ShipmentLine", sk: { composite: ["lineId"] } }) },
+} as any)
+const Shipments = Aggregate.make(
+  Schema.Struct({
+    shipmentId: Schema.String,
+    note: Schema.String,
+    part1: ShipmentPartModel,
+    part2: ShipmentPartModel,
+  }),
+  {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["shipmentId"] },
+    collection: { index: "lsi1", name: "shipment", sk: { field: "lsi1sk", composite: [] } },
+    root: { entityType: "ShipmentItem" },
+    versioned: true,
+    edges: {
+      part1: (ShipmentPart as any).with({ discriminator: { part: 1 } }),
+      part2: (ShipmentPart as any).with({ discriminator: { part: 2 } }),
+    },
+  } as any,
+) as any
+const seedShipment = () =>
+  Shipments.create({
+    shipmentId: "s-1",
+    note: "n",
+    part1: { label: "a", lines: [{ lineId: "l-1", sku: "A" }] },
+    part2: { label: "b", lines: [{ lineId: "l-2", sku: "B" }] },
+  }) as Effect.Effect<unknown, unknown, any>
+const relabelShipment = () =>
+  Shipments.update({ shipmentId: "s-1" }, ({ state }: any) => ({
+    ...state,
+    note: "m",
+    part1: { ...state.part1, label: "a2" },
+    part2: { ...state.part2, label: "b2" },
+  })) as Effect.Effect<unknown, unknown, any>
+
 const feed = { streamArn: "arn:aws:dynamodb:local:stream/1", consumer: "ledger-reader" }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +749,10 @@ const cases: ReadonlyArray<Case> = [
   ["Aggregate.get", ({ purchaseOrders }) => purchaseOrders.get({ purchaseOrderId: "po-1" })],
   ["Aggregate.delete", () => PurchaseOrders.delete({ purchaseOrderId: "po-1" })],
   ["Aggregate.list", () => (PurchaseOrders as any).list({ purchaseOrderId: "po-1" })],
+  // A versioned aggregate (#168): a multi-group update, and a fenced delete (its root first).
+  ["Aggregate.create", () => seedShipment()],
+  ["Aggregate.update", () => relabelShipment(), seedShipment],
+  ["Aggregate.delete", () => Shipments.delete({ shipmentId: "s-1" }), seedShipment],
   // Event streams
   [
     "EventStream.append",
@@ -876,6 +925,25 @@ describe("consumed-capacity targets", () => {
       ])
       expect(reports[0]!.requestsByCommand).toEqual({ GetItem: 1 })
       expect(reports[1]!.requestsByCommand).toEqual({ UpdateItem: 1 })
+    }),
+  )
+
+  it.effect("an aggregate's multi-group update and fenced delete are one report each (#168)", () =>
+    Effect.gen(function* () {
+      const layer = baseLayer()
+      yield* seedShipment().pipe(Effect.provide(layer), Effect.orDie)
+      const { reports, onOperation } = collectReports()
+      yield* Effect.andThen(relabelShipment(), Shipments.delete({ shipmentId: "s-1" })).pipe(
+        Effect.provide(ConsumedCapacity.layer({ onOperation })),
+        Effect.provide(layer),
+      )
+      expect(reports.map((report) => report.operation)).toEqual([
+        "Aggregate.update",
+        "Aggregate.delete",
+      ])
+      // Three groups changed, one transaction; the root first, then one read, then the batch.
+      expect(reports[0]!.requestsByCommand).toEqual({ Query: 1, TransactWriteItems: 1 })
+      expect(reports[1]!.requestsByCommand).toEqual({ DeleteItem: 1, Query: 1, BatchWriteItem: 1 })
     }),
   )
 

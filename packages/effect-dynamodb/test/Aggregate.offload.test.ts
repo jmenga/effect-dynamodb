@@ -160,6 +160,18 @@ const album = (albumId = "a-1") => ({
   page2: { label: "Hills", scans: [scan("s-2", 3), scan("s-3", 4)] },
 })
 
+/**
+ * An album whose groups don't fit one transaction (#168, D3): the root's (root and cover, 2 items),
+ * page 1's (99) and page 2's (3), each a request of its own.
+ */
+const bigAlbum = () => ({
+  ...album(),
+  page1: {
+    label: "Beach",
+    scans: Array.from({ length: 98 }, (_, i) => scan(`s-1-${String(i).padStart(2, "0")}`, 2)),
+  },
+})
+
 // ---------------------------------------------------------------------------
 // The client: the in-memory tables, a scripted TransactWriteItems, batch reads
 // ---------------------------------------------------------------------------
@@ -366,8 +378,8 @@ describe("Aggregate.create — offloaded edge fields", () => {
         expect(calls().put).toBe(8)
         expect(versions()).toHaveLength(8)
         expect(reports).toEqual([])
-        // Three groups, each its own transaction; every upload before the first.
-        expect(commands().filter((c) => c === "TransactWriteItems")).toHaveLength(3)
+        // Three groups, in one transaction when they fit (#168, D3); every upload before it.
+        expect(commands().filter((c) => c === "TransactWriteItems")).toHaveLength(1)
 
         for (const [type, id] of [
           ["AlbumCover", "c-1"],
@@ -458,36 +470,43 @@ describe("Aggregate.create — offloaded edge fields", () => {
     ),
   )
 
-  it.effect("per-group settlement: a cancelled group's uploads are deleted, others kept", () => {
-    // The root group commits, page 1's is cancelled; page 2 is never sent.
-    transactScript.push({}, { cancel: true })
-    return withStore(
-      Effect.gen(function* () {
-        const error = yield* Effect.flip(Albums.create(album() as never))
-        expect(error._tag).toBe("TransactionCancelled")
-        expect(commands().filter((c) => c === "TransactWriteItems")).toHaveLength(2)
-        // Every value was uploaded before the first transaction.
-        expect(calls().put).toBe(8)
-        // The cover's two committed; page 1's (rejected) and page 2's (never
-        // carried) six deleted.
-        const cover = rowOf("AlbumCover", "c-1")
-        expect(
-          versions()
-            .map((v) => v.ref.key)
-            .sort(),
-        ).toEqual([pointerOf(cover.image).ref.key, pointerOf(cover.notes).ref.key].sort())
-        expect(reports).toEqual([])
-      }),
-    )
-  })
+  it.effect(
+    "per-request settlement: a cancelled request's uploads are deleted, others kept",
+    () => {
+      // The root group's request commits, page 1's is cancelled; page 2's is never sent.
+      transactScript.push({}, { cancel: true })
+      return withStore(
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(Albums.create(bigAlbum() as never))
+          expect(error._tag).toBe("TransactionCancelled")
+          expect(
+            sent
+              .filter((s) => s.command === "TransactWriteItems")
+              .map((s) => s.input.TransactItems.length),
+          ).toEqual([2, 99])
+          // Every value was uploaded before the first transaction.
+          expect(calls().put).toBe(2 + 98 * 2 + 4)
+          // The cover's two committed; page 1's (rejected) and page 2's (never
+          // carried) deleted.
+          const cover = rowOf("AlbumCover", "c-1")
+          expect(
+            versions()
+              .map((v) => v.ref.key)
+              .sort(),
+          ).toEqual([pointerOf(cover.image).ref.key, pointerOf(cover.notes).ref.key].sort())
+          expect(reports).toEqual([])
+        }),
+      )
+    },
+  )
 
-  it.effect("an upload expired by a later group: refused, naming the committed groups", () => {
+  it.effect("an upload expired by a later request: refused, naming the committed groups", () => {
     blobs = BlobStore.memory({ maxUploadAge: "5 minutes" })
-    // The root group takes ten minutes to answer; page 1's carries expired uploads.
+    // The root group's request takes ten minutes to answer; page 1's carries expired uploads.
     transactScript.push({ before: TestClock.adjust("10 minutes") })
     return withStore(
       Effect.gen(function* () {
-        const error = yield* Effect.flip(Albums.create(album() as never))
+        const error = yield* Effect.flip(Albums.create(bigAlbum() as never))
         expect(error).toBeInstanceOf(BlobStoreError)
         const expired = error as BlobStoreError
         expect(expired.reason).toBe("Expired")
@@ -633,23 +652,23 @@ describe("Aggregate.update — offloaded edge fields", () => {
         yield* Albums.create(album() as never)
         const put = calls().put
         sent.length = 0
-        // A root-only change rewrites the root group (album + cover) only.
+        // A root-only change rewrites the root alone: the cover in its group is unchanged, so
+        // neither sent nor re-uploaded (#168, D2; 1.43.0 rewrote and re-uploaded it).
         yield* Albums.update({ albumId: "a-1" }, ({ state }) => ({ ...state, title: "Trip" }))
         expect(transactPuts().map((puts) => puts.map((item) => item.__edd_e__?.S))).toEqual([
-          ["AlbumItem", "AlbumCover"],
+          ["AlbumItem"],
         ])
-        // The cover's two values were re-uploaded; the pages' six were not.
-        expect(calls().put - put).toBe(2)
+        expect(calls().put - put).toBe(0)
         // Nothing changed at all: no transaction, no upload.
         sent.length = 0
         yield* Albums.update({ albumId: "a-1" }, ({ state }) => state)
         expect(commands().filter((c) => c === "TransactWriteItems")).toEqual([])
-        expect(calls().put - put).toBe(2)
+        expect(calls().put - put).toBe(0)
       }),
     ),
   )
 
-  it.effect("a changed group re-uploads every offloaded value: no read pointer is reused", () =>
+  it.effect("a changed row re-uploads its offloaded values: no read pointer is reused", () =>
     withStore(
       Effect.gen(function* () {
         yield* Albums.create(album() as never)
@@ -659,7 +678,7 @@ describe("Aggregate.update — offloaded edge fields", () => {
           pointerOf(row.notes).ref,
         ])
         const put = calls().put
-        // Change one scan's label in page 2: the whole group is rewritten.
+        // Change one scan's label in page 2: that row alone is rewritten (#168, D2).
         yield* Albums.update({ albumId: "a-1" }, ({ state }) => ({
           ...state,
           page2: {
@@ -667,11 +686,11 @@ describe("Aggregate.update — offloaded edge fields", () => {
             scans: state.page2.scans.map((s) => (s.id === "s-2" ? { ...s, label: "renamed" } : s)),
           },
         }))
-        // Page 2's two scans: four values uploaded afresh, unchanged content too.
-        expect(calls().put - put).toBe(4)
+        // The scan's two values uploaded afresh, unchanged content too.
+        expect(calls().put - put).toBe(2)
         for (const [id, image, notes] of before as Array<[string, any, any]>) {
           const row = rowOf("AlbumScan", id)
-          if (id === "s-1") {
+          if (id !== "s-2") {
             expect(pointerOf(row.image).ref).toEqual(image)
             expect(pointerOf(row.notes).ref).toEqual(notes)
           } else {
@@ -756,8 +775,8 @@ describe("Aggregate.update — offloaded edge fields", () => {
           transactScript.push({ cancel: true })
           const error = yield* Effect.flip(Albums.update({ albumId: "a-1" }, relabel()))
           expect(error._tag).toBe("TransactionCancelled")
-          // Page 2's two scans were uploaded afresh — new versions of the same keys…
-          expect(calls().put - put).toBe(4)
+          // The renamed scan's two values were uploaded afresh — new versions of the same keys…
+          expect(calls().put - put).toBe(2)
           // …and every one of them was deleted; the live versions are all kept.
           expect(versions().map((v) => v.ref)).toEqual(live)
           expect(pointers()).toEqual(stored)
@@ -772,40 +791,54 @@ describe("Aggregate.update — offloaded edge fields", () => {
   )
 
   it.effect(
-    "an upload expired by a later group of an update: the committed groups keep theirs",
+    "an upload expired by a later request of an update: the committed groups keep theirs",
     () => {
       blobs = BlobStore.memory({ maxUploadAge: "5 minutes" })
       return withStore(
         Effect.gen(function* () {
-          yield* Albums.create(album() as never)
+          yield* Albums.create(bigAlbum() as never)
           const refId = (ref: { readonly key: string; readonly version: string }) =>
             `${ref.key}@${ref.version}`
           const live = new Set(versions().map((v) => refId(v.ref)))
           const put = calls().put
           sent.length = 0
-          // Page 1's transaction takes ten minutes; page 2's carries expired uploads.
+          // Every scan relabelled: page 1's 98 and its own row (99 items) don't fit one
+          // transaction with page 2's two (#168, D3). Page 1's request takes ten minutes; page 2's
+          // carries expired uploads.
           transactScript.push({ before: TestClock.adjust("10 minutes") })
-          const error = yield* Effect.flip(Albums.update({ albumId: "a-1" }, relabel(true)))
+          const error = yield* Effect.flip(
+            Albums.update({ albumId: "a-1" }, ({ state }) => ({
+              ...state,
+              page1: {
+                label: "Shore",
+                scans: state.page1.scans.map((s) => ({ ...s, label: "shore" })),
+              },
+              page2: {
+                ...state.page2,
+                scans: state.page2.scans.map((s) => ({ ...s, label: "hills" })),
+              },
+            })),
+          )
           expect(error).toBeInstanceOf(BlobStoreError)
           const expired = error as BlobStoreError
           expect(expired.reason).toBe("Expired")
           expect(String(expired.cause)).toMatch(
             /earlier transactions of this write already committed sub-aggregates "page1"$/,
           )
-          expect(commands().filter((c) => c === "TransactWriteItems")).toHaveLength(1)
-          // Page 1's one scan (2 values) and page 2's two scans (4) were uploaded;
-          // page 1's committed, page 2's were deleted, and every live version kept.
-          expect(calls().put - put).toBe(6)
+          expect(
+            sent
+              .filter((s) => s.command === "TransactWriteItems")
+              .map((s) => s.input.TransactItems.length),
+          ).toEqual([99])
+          // Page 1's scans (196 values) and page 2's (4) were uploaded; page 1's committed,
+          // page 2's were deleted, and every live version kept.
+          expect(calls().put - put).toBe(98 * 2 + 4)
           const now = new Set(versions().map((v) => refId(v.ref)))
           expect([...live].every((ref) => now.has(ref))).toBe(true)
-          expect(now.size - live.size).toBe(2)
-          // Page 1's row names its committed versions, page 2's still its live ones.
-          for (const [id, isNew] of [
-            ["s-1", true],
-            ["s-2", false],
-            ["s-3", false],
-          ] as const) {
-            const row = rowOf("AlbumScan", id)
+          expect(now.size - live.size).toBe(98 * 2)
+          // Page 1's rows name their committed versions, page 2's still their live ones.
+          for (const row of rowsOf("AlbumScan")) {
+            const isNew = row.id!.S!.startsWith("s-1-")
             for (const value of [row.image, row.notes]) {
               const ref = refId(pointerOf(value).ref)
               expect(now.has(ref)).toBe(true)
@@ -814,6 +847,7 @@ describe("Aggregate.update — offloaded edge fields", () => {
           }
           const read = yield* Albums.get({ albumId: "a-1" })
           expect(read.page1.label).toBe("Shore")
+          expect(new Set(read.page1.scans.map((s) => s.label))).toEqual(new Set(["shore"]))
           expect(read.page1.scans[0]!.image).toEqual(bytes(5, 2))
           expect(read.page2.scans.map((s) => [s.label, s.image])).toEqual([
             ["scan s-2", bytes(5, 3)],

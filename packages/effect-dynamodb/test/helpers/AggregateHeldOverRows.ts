@@ -38,6 +38,7 @@ import {
   TYPE,
   valueCopiesAsRoot,
 } from "./AggregateUpgradeSweep.js"
+import { asBefore168 } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
 type Request = { readonly command: string; readonly input: unknown }
@@ -509,7 +510,9 @@ export const suite = (
                 expect(judged(outcome(yield* Effect.exit(A.create(shape.input))))).toEqual(
                   judged(then.create),
                 )
-                expect(plain(yield* harness.requests(tableName))).toEqual(then.requests)
+                expect(asBefore168(plain(yield* harness.requests(tableName)))).toEqual(
+                  asBefore168(then.requests),
+                )
                 expect(sorted(yield* harness.rows(tableName))).toEqual(sorted(then.rows))
                 expect(judged(outcome(yield* Effect.exit(A.get({ id: "a" }))))).toEqual(
                   judged(then.get),
@@ -518,11 +521,16 @@ export const suite = (
                 for (const [i, { label: step, change }] of (shape.steps ?? [noop]).entries()) {
                   const was = then.steps[i]!
                   expect(was.step).toBe(step)
+                  const before = yield* harness.rows(tableName)
                   const update = outcome(
                     yield* Effect.exit(A.update({ id: "a" }, ({ state }: any) => change(state))),
                   )
                   const sent = plain(yield* harness.requests(tableName))
-                  expect({ step, requests: sent }).toEqual({ step, requests: was.requests })
+                  // As #168 changed them (`Before168.ts`), from the rows stored before the step.
+                  expect({ step, requests: asBefore168(sent, { stored: before }) }).toEqual({
+                    step,
+                    requests: asBefore168(was.requests, { stored: before }),
+                  })
                   expect({ step, rows: sorted(yield* harness.rows(tableName)) }).toEqual({
                     step,
                     rows: sorted(was.rows),

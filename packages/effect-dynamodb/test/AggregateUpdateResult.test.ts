@@ -5,7 +5,8 @@
  * member's value holds is set to what its row holds after the write. Against what published 1.40.0
  * returned, sent and stored for each step (`fixtures/aggregate-update-result-1.40.0.json`), from the
  * rows its `create` wrote. A `get` right after may read otherwise (element order, a custom
- * `assemble`, a row's key text), as on 1.40.0.
+ * `assemble`, a row's key text), as on 1.40.0. Requests are compared as #168 changed them
+ * (`helpers/Before168.ts`).
  */
 
 import { readFileSync } from "node:fs"
@@ -26,6 +27,7 @@ import {
   type UpdateLib,
   withCopiesAsRoot,
 } from "./helpers/AggregateUpdateResult.js"
+import { asBefore168 } from "./helpers/Before168.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const published: {
@@ -67,6 +69,50 @@ const run = (c: (typeof cases)[number], step: string, created: ReadonlyArray<Row
   )
 }
 
+/**
+ * Cases whose update 1.40.0 sent rows of unchanged decomposed value in another form than stored:
+ * a custom `assemble` rewriting its elements' text, and a root field read back as its list key's
+ * text (1.40.0 stored the key text prefixed twice). #168 sends only the rows that changed (D2).
+ */
+const REWROTE_UNCHANGED = [
+  "a custom assemble rewriting its elements",
+  "a root field that is the list key attribute",
+]
+
+const keyOf = (row: any): string => `${row?.pk?.S}|${row?.sk?.S}`
+
+const putsOf = (requests: ReadonlyArray<any>): Array<any> =>
+  requests.flatMap((request) =>
+    ((request.input?.TransactItems ?? []) as Array<any>).flatMap((item) =>
+      item.Put === undefined ? [] : [item.Put.Item],
+    ),
+  )
+
+/** Keys of stored rows 1.40.0 put and this release doesn't. */
+const unsentStoredKeys = (
+  was: ReadonlyArray<any>,
+  now: ReadonlyArray<any>,
+  stored: ReadonlyArray<Row>,
+): Set<string> => {
+  const storedKeys = new Set(stored.map(keyOf))
+  const sentKeys = new Set(putsOf(now).map(keyOf))
+  return new Set(
+    putsOf(was)
+      .map(keyOf)
+      .filter((key) => storedKeys.has(key) && !sentKeys.has(key)),
+  )
+}
+
+const withoutPutsAt = (requests: ReadonlyArray<any>, keys: ReadonlySet<string>) =>
+  requests.flatMap((request) => {
+    const items = request.input?.TransactItems as Array<any> | undefined
+    if (items === undefined) return [request]
+    const left = items.filter((item) => item.Put === undefined || !keys.has(keyOf(item.Put.Item)))
+    return left.length === 0
+      ? []
+      : [{ ...request, input: { ...request.input, TransactItems: left } }]
+  })
+
 /** As text, so key order, element order and every tag count. */
 const text = (value: unknown) => JSON.stringify(stamped(value))
 
@@ -88,8 +134,29 @@ describe("an aggregate's update returns 1.40.0's object, context copies as their
       const was = then.steps[step]!
       it(`${c.name}, ${step}: sends and stores what 1.40.0 did, and returns its object`, async () => {
         const now = await run(c, step, then.created)
-        expect(stamped(now.step.requests)).toEqual(stamped(was.requests))
-        expect(stamped(now.step.rows)).toEqual(stamped(was.rows))
+        // Compared as #168 changed them (`asBefore168`): a row as it was stored, stamps aside,
+        // is one this release doesn't send.
+        const as168 = (requests: ReadonlyArray<any>) =>
+          stamped(asBefore168(requests, { stored: then.created, same: stamped }))
+        const sent = as168(now.step.requests)
+        // A row 1.40.0 rewrote though its decomposed value didn't change (`REWROTE_UNCHANGED`):
+        // this release leaves it as stored (§3.3, D2), so its `Put` is left out of 1.40.0's
+        // requests and its stored row is the one `create` wrote.
+        const kept = REWROTE_UNCHANGED.some((name) => c.name.startsWith(name))
+          ? unsentStoredKeys(as168(was.requests), sent, then.created)
+          : new Set<string>()
+        expect(sent).toEqual(withoutPutsAt(as168(was.requests), kept))
+        expect(stamped(now.step.rows)).toEqual(
+          stamped(
+            sortRows(
+              was.rows.map((row) =>
+                kept.has(keyOf(row))
+                  ? then.created.find((stored) => keyOf(stored) === keyOf(row))!
+                  : row,
+              ),
+            ),
+          ),
+        )
         expect(text(now.step.update)).toBe(text({ ok: withCopiesAsRoot(c, was.update.ok) }))
       })
     }

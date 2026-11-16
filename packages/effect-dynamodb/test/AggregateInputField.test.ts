@@ -32,6 +32,7 @@ import {
   runInputField,
 } from "./helpers/AggregateInputField.js"
 import { CONTEXT, givenOverRow } from "./helpers/AggregateUpgradeSweep.js"
+import { asBefore168 } from "./helpers/Before168.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const published: {
@@ -92,7 +93,8 @@ describe("a many edge's value given under its inputField (EDD-9159)", () => {
         expect(pinned.create.ok).toBeDefined()
         const now = await run(c)
         expect(now.create).toEqual(pinned.create)
-        expect(now.requests).toEqual(pinned.requests)
+        // As #168 changed them (`helpers/Before168.ts`): its groups in one transaction.
+        expect(asBefore168(now.requests)).toEqual(asBefore168(pinned.requests))
         expect(now.rows).toEqual(pinned.rows)
         expect(now.get).toEqual(pinned.get)
       })
