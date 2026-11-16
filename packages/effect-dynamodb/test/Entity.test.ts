@@ -6380,17 +6380,24 @@ describe("Entity", () => {
           LastEvaluatedKey: undefined,
         })
         mockGetItem.mockResolvedValueOnce({ Item: renamedUniqueRow("RenamedUniqHard") })
+        mockTransactWriteItems.mockResolvedValueOnce({})
         mockBatchWriteItem.mockResolvedValueOnce({})
 
         yield* RenamedUniqHard.purge({ id: "u-1" }).asEffect()
 
-        // Released on its own, under the ownership condition (#133).
+        // Released with the live row, in `delete`'s guarded transaction, under the ownership
+        // condition (#133, #132).
         const expected = sentinelKeyFor("RenamedUniqHard")
-        const released = mockDeleteItem.mock.calls.map(([input]) => input)
-        expect(released.map((d: any) => ({ pk: d.Key.pk.S, sk: d.Key.sk.S }))).toEqual([
-          { pk: expected.pk, sk: expected.sk },
-        ])
-        expect(released[0].ConditionExpression).toBe("#epk = :epk AND #esk = :esk")
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toHaveLength(2)
+        expect(call.TransactItems[0].Delete.Key.sk.S).toBe("$myapp#v1#renameduniqhard")
+        expect(call.TransactItems[0].Delete.ConditionExpression).toContain("#dg")
+        expect(call.TransactItems[1].Delete.Key.pk.S).toBe(expected.pk)
+        expect(call.TransactItems[1].Delete.Key.sk.S).toBe(expected.sk)
+        expect(call.TransactItems[1].Delete.ConditionExpression).toBe("#epk = :epk AND #esk = :esk")
+        // Nothing released on its own, and the live row is not batch-deleted again.
+        expect(mockDeleteItem).not.toHaveBeenCalled()
+        expect(mockBatchWriteItem).not.toHaveBeenCalled()
       }).pipe(Effect.provide(RenamedTestLayer)),
     )
 

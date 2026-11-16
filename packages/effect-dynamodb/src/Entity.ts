@@ -1909,12 +1909,20 @@ export interface Entity<
    * Permanently remove an item plus all version history and sentinels. Deletes
    * in `BatchWriteItem` chunks of 25, retrying `UnprocessedItems` with
    * backoff; not atomic, so a failure says exactly how many items it had
-   * already deleted.
+   * already deleted. With `unique`, the live row and the sentinels it owns are
+   * deleted first, in one transaction guarded on the row as read (as `delete`
+   * sends it); a race with a concurrent write is retried from a fresh read, and
+   * once every attempt has lost it fails `OptimisticLockError` (versioned) or
+   * `ConcurrentModification`, having deleted nothing (#132).
    */
   readonly purge: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityDelete<
-    DynamoClientError | ValidationError | WriteBlobErrors<TOffload>,
+    | DynamoClientError
+    | ValidationError
+    | OptimisticLockError
+    | ConcurrentModification
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -2622,11 +2630,23 @@ export interface BoundEntity<
    * Permanently remove an item plus all version history and sentinels. Deletes
    * in `BatchWriteItem` chunks of 25, retrying `UnprocessedItems` with
    * backoff; not atomic, so a failure says exactly how many items it had
-   * already deleted.
+   * already deleted. With `unique`, the live row and the sentinels it owns are
+   * deleted first, in one transaction guarded on the row as read (as `delete`
+   * sends it); a race with a concurrent write is retried from a fresh read, and
+   * once every attempt has lost it fails `OptimisticLockError` (versioned) or
+   * `ConcurrentModification`, having deleted nothing (#132).
    */
   readonly purge: (
     key: TKey,
-  ) => Effect.Effect<void, DynamoClientError | ValidationError | WriteBlobErrors<TOffload>, never>
+  ) => Effect.Effect<
+    void,
+    | DynamoClientError
+    | ValidationError
+    | OptimisticLockError
+    | ConcurrentModification
+    | WriteBlobErrors<TOffload>,
+    never
+  >
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
@@ -14455,6 +14475,137 @@ const makeImpl = <
   // delete operation
   // ---------------------------------------------------------------------------
 
+  /**
+   * The parts of the transaction a read-first delete sends (#133), for the item at `primaryKey`:
+   * the main `Delete`'s condition (its guard on the row as read, ANDed with the caller's), the
+   * owned sentinels' releases, and how a cancellation of it reads. `delete` sends them for an
+   * entity with `unique`, retain or soft delete, and `purge` for a unique entity's live row
+   * (#132), so the two can't drift.
+   */
+  const hardDeleteParts = ({
+    encodedKey,
+    primaryKey,
+    userCondition,
+  }: {
+    readonly encodedKey: globalThis.Record<string, unknown>
+    readonly primaryKey: globalThis.Record<string, unknown>
+    readonly userCondition: ReturnType<typeof compileOwnCondition>
+  }) => {
+    const primary = config.indexes.primary
+    /** The guard ANDed with the user's condition, for the main Delete. */
+    const guardedDeleteCondition = (guard: {
+      readonly expression: string
+      readonly names: globalThis.Record<string, string>
+      readonly values: globalThis.Record<string, AttributeValue>
+    }) => {
+      const values = { ...guard.values, ...userCondition?.values }
+      return {
+        ConditionExpression: userCondition
+          ? `${guard.expression} AND (${userCondition.expression})`
+          : guard.expression,
+        ExpressionAttributeNames: { ...guard.names, ...userCondition?.names },
+        ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+      }
+    }
+    /**
+     * Run a guarded delete transaction: index 0 is the main Delete, the
+     * only conditioned item, so its rejection is read from the stored
+     * item (ALL_OLD) — gone, raced, or the user's condition.
+     */
+    const guardedDelete = <A>(
+      write: Effect.Effect<A, DynamoClientError>,
+      read: globalThis.Record<string, AttributeValue>,
+      inputs: ReadonlyArray<string>,
+      snapshotAt: { readonly index: number; readonly version: number } | undefined,
+      releases: ReadonlyArray<{ readonly index: number; readonly constraintName: string }>,
+    ) => {
+      let rejected: globalThis.Record<string, AttributeValue> | undefined
+      const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
+        rejected = stored as globalThis.Record<string, AttributeValue> | undefined
+        // Deleted since the read: with nothing asserted, read it again —
+        // a delete of a missing item reports what such a delete does.
+        if (stored === undefined && userCondition === undefined) {
+          return new DeletedConcurrently()
+        }
+        return deleteRejection(
+          encodedKey as globalThis.Record<string, unknown>,
+          read,
+          inputs,
+          stored,
+          userCondition !== undefined,
+        )
+      }
+      return withCurrentItem(
+        write.pipe(
+          Effect.mapError((err) => {
+            if (isAwsTransactionCancelled(err.cause)) {
+              const main = err.cause.CancellationReasons?.[0]
+              if (main?.Code === "ConditionalCheckFailed") return reject(main.Item)
+              if (
+                snapshotAt !== undefined &&
+                err.cause.CancellationReasons?.[snapshotAt.index]?.Code === "ConditionalCheckFailed"
+              ) {
+                return historyConflict(snapshotAt.version, "delete")
+              }
+              for (const { index, constraintName } of releases) {
+                if (err.cause.CancellationReasons?.[index]?.Code === "ConditionalCheckFailed") {
+                  return releaseRaced(
+                    encodedKey as globalThis.Record<string, unknown>,
+                    constraintName,
+                  )
+                }
+              }
+            }
+            if (isAwsConditionalCheckFailed(err.cause)) return reject(err.cause.Item)
+            return err
+          }),
+        ),
+        () => rejected,
+      )
+    }
+
+    /**
+     * Append a release for each sentinel the stored item `raw` holds AND
+     * owns (#133) — composed from its domain view, since the stored row is
+     * attribute-keyed and the constraint is not (#127) — returning where
+     * each landed, so a release that lost a race can be reported.
+     */
+    const ownedReleases = (
+      table: string,
+      raw: globalThis.Record<string, unknown>,
+      into: Array<unknown>,
+    ) =>
+      Effect.gen(function* () {
+        const rawDomain = toDomainView(raw)
+        const held: Array<{
+          readonly pk: string
+          readonly sk: string
+          readonly constraintName: string
+        }> = []
+        for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
+          const sentinel = composeUniqueSentinel(
+            schema,
+            entityType,
+            constraintName,
+            constraintDef,
+            rawDomain,
+            readSentinelValue,
+          )
+          if (!sentinel) continue
+          held.push({ ...sentinel.key, constraintName })
+        }
+        const owner = { pk: primaryKey[primary.pk.field], sk: primaryKey[primary.sk.field] }
+        const releases: Array<{ index: number; constraintName: string }> = []
+        for (const sentinel of yield* ownedSentinels(table, held, owner)) {
+          releases.push({ index: into.length, constraintName: sentinel.constraintName })
+          into.push(sentinelRelease(table, sentinel, owner))
+        }
+        return releases
+      })
+    return { guardedDeleteCondition, guardedDelete, ownedReleases }
+  }
+
   const del = (key: unknown) =>
     new EntityDeleteImpl(
       (opts: {
@@ -14566,120 +14717,11 @@ const makeImpl = <
             return err
           }
 
-          /** The guard ANDed with the user's condition, for the main Delete. */
-          const guardedDeleteCondition = (guard: {
-            readonly expression: string
-            readonly names: globalThis.Record<string, string>
-            readonly values: globalThis.Record<string, AttributeValue>
-          }) => {
-            const values = { ...guard.values, ...userCondition?.values }
-            return {
-              ConditionExpression: userCondition
-                ? `${guard.expression} AND (${userCondition.expression})`
-                : guard.expression,
-              ExpressionAttributeNames: { ...guard.names, ...userCondition?.names },
-              ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
-              ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
-            }
-          }
-          /**
-           * Run a guarded delete transaction: index 0 is the main Delete, the
-           * only conditioned item, so its rejection is read from the stored
-           * item (ALL_OLD) — gone, raced, or the user's condition.
-           */
-          const guardedDelete = <A>(
-            write: Effect.Effect<A, DynamoClientError>,
-            read: globalThis.Record<string, AttributeValue>,
-            inputs: ReadonlyArray<string>,
-            snapshotAt: { readonly index: number; readonly version: number } | undefined,
-            releases: ReadonlyArray<{ readonly index: number; readonly constraintName: string }>,
-          ) => {
-            let rejected: globalThis.Record<string, AttributeValue> | undefined
-            const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
-              rejected = stored as globalThis.Record<string, AttributeValue> | undefined
-              // Deleted since the read: with nothing asserted, read it again —
-              // a delete of a missing item reports what such a delete does.
-              if (stored === undefined && userCondition === undefined) {
-                return new DeletedConcurrently()
-              }
-              return deleteRejection(
-                encodedKey as globalThis.Record<string, unknown>,
-                read,
-                inputs,
-                stored,
-                userCondition !== undefined,
-              )
-            }
-            return withCurrentItem(
-              write.pipe(
-                Effect.mapError((err) => {
-                  if (isAwsTransactionCancelled(err.cause)) {
-                    const main = err.cause.CancellationReasons?.[0]
-                    if (main?.Code === "ConditionalCheckFailed") return reject(main.Item)
-                    if (
-                      snapshotAt !== undefined &&
-                      err.cause.CancellationReasons?.[snapshotAt.index]?.Code ===
-                        "ConditionalCheckFailed"
-                    ) {
-                      return historyConflict(snapshotAt.version, "delete")
-                    }
-                    for (const { index, constraintName } of releases) {
-                      if (
-                        err.cause.CancellationReasons?.[index]?.Code === "ConditionalCheckFailed"
-                      ) {
-                        return releaseRaced(
-                          encodedKey as globalThis.Record<string, unknown>,
-                          constraintName,
-                        )
-                      }
-                    }
-                  }
-                  if (isAwsConditionalCheckFailed(err.cause)) return reject(err.cause.Item)
-                  return err
-                }),
-              ),
-              () => rejected,
-            )
-          }
-
-          /**
-           * Append a release for each sentinel the stored item `raw` holds AND
-           * owns (#133) — composed from its domain view, since the stored row is
-           * attribute-keyed and the constraint is not (#127) — returning where
-           * each landed, so a release that lost a race can be reported.
-           */
-          const ownedReleases = (
-            table: string,
-            raw: globalThis.Record<string, unknown>,
-            into: Array<unknown>,
-          ) =>
-            Effect.gen(function* () {
-              const rawDomain = toDomainView(raw)
-              const held: Array<{
-                readonly pk: string
-                readonly sk: string
-                readonly constraintName: string
-              }> = []
-              for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                const sentinel = composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  rawDomain,
-                  readSentinelValue,
-                )
-                if (!sentinel) continue
-                held.push({ ...sentinel.key, constraintName })
-              }
-              const owner = { pk: primaryKey[primary.pk.field], sk: primaryKey[primary.sk.field] }
-              const releases: Array<{ index: number; constraintName: string }> = []
-              for (const sentinel of yield* ownedSentinels(table, held, owner)) {
-                releases.push({ index: into.length, constraintName: sentinel.constraintName })
-                into.push(sentinelRelease(table, sentinel, owner))
-              }
-              return releases
-            })
+          const { guardedDeleteCondition, guardedDelete, ownedReleases } = hardDeleteParts({
+            encodedKey: encodedKey as globalThis.Record<string, unknown>,
+            primaryKey,
+            userCondition,
+          })
 
           if (isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()) {
             const readFirst = Effect.gen(function* () {
@@ -17505,7 +17547,6 @@ const makeImpl = <
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const liveSk = liveSkOf(encodedKey)
-          const allItems: Array<globalThis.Record<string, AttributeValue>> = []
           const history = historyKeyOptions(liveSk)
 
           /**
@@ -17568,110 +17609,241 @@ const makeImpl = <
           offloadedAttributeNames.forEach((attr, i) => {
             projected[`#o${i}`] = attr
           })
-          let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
+          const hasUniqueConstraints =
+            config.unique !== undefined && Object.keys(config.unique).length > 0
+          const owner = { pk: pkValue, sk: liveSk }
+          const liveKey = toAttributeMap({
+            [primary.pk.field]: owner.pk,
+            [primary.sk.field]: owner.sk,
+          })
+          const isLiveRow = (row: globalThis.Record<string, AttributeValue>) =>
+            row[primary.pk.field]?.S === pkValue && row[primary.sk.field]?.S === liveSk
 
-          do {
-            const result = yield* client.query({
-              TableName: tableName,
-              KeyConditionExpression: "#pk = :pk",
-              ExpressionAttributeNames: {
-                "#pk": primary.pk.field,
-                "#sk": primary.sk.field,
-                ...projected,
-              },
-              ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
-              ProjectionExpression: ["#pk", "#sk", ...Object.keys(projected)].join(", "),
-              ExclusiveStartKey: exclusiveStartKey,
-            })
-
-            allItems.push(...(result.Items ?? []).filter(belongsToItem))
-            exclusiveStartKey = result.LastEvaluatedKey as
-              | globalThis.Record<string, AttributeValue>
-              | undefined
-          } while (exclusiveStartKey)
-
-          // The unique sentinels the item holds — live, or soft-deleted with
-          // `preserveUnique` — and owns (#133): a sentinel of a value the item
-          // holds without owning its reservation belongs to another item.
-          if (config.unique && Object.keys(config.unique).length > 0) {
-            const owner = { pk: pkValue, sk: liveSk }
-            const holders: Array<globalThis.Record<string, AttributeValue>> = []
-            const mainResult = yield* client.getItem({
-              TableName: tableName,
-              Key: toAttributeMap({ [primary.pk.field]: owner.pk, [primary.sk.field]: owner.sk }),
-              ConsistentRead: true,
-            })
-            if (mainResult.Item) holders.push(mainResult.Item)
-            // Every soft-deleted incarnation (each kept its reservations).
-            const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
-            let deletedStart: globalThis.Record<string, AttributeValue> | undefined
+          /**
+           * One attempt: read the item's rows, and with `unique`, delete the live row and the
+           * sentinels it owns in one transaction guarded on the row as read — the one `delete`
+           * sends (#132). A batch delete carries no condition, so a concurrent update moving a
+           * unique value after the read would otherwise leave the new value's sentinel reserving
+           * for a row the batch then deletes. A lost race fails the attempt, and the purge starts
+           * again from the query. Returns every row read, and whether the transaction deleted the
+           * live row.
+           *
+           * The live row is read before the partition query: on a versioned entity its guard then
+           * covers every row the query can see, since a write landing after the read moves the
+           * version and refuses the transaction. Read after the query, a write in between was
+           * guarded against while the rows it added (its snapshot) were missed.
+           */
+          const attempt = Effect.gen(function* () {
+            const mainResult = hasUniqueConstraints
+              ? yield* client.getItem({ TableName: tableName, Key: liveKey, ConsistentRead: true })
+              : undefined
+            let liveDeleted = false
+            const allItems: Array<globalThis.Record<string, AttributeValue>> = []
+            let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
             do {
-              const deletedResult = yield* client.query({
+              // Consistent (#132): a purge straight after the item's last write sees every row
+              // that write left — a new live row, a fresh snapshot — and deletes it.
+              const result = yield* client.query({
                 TableName: tableName,
-                KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+                KeyConditionExpression: "#pk = :pk",
                 ExpressionAttributeNames: {
                   "#pk": primary.pk.field,
                   "#sk": primary.sk.field,
+                  ...projected,
                 },
-                ExpressionAttributeValues: {
-                  ":pk": toAttributeValue(pkValue),
-                  ":skPrefix": toAttributeValue(deletedPrefix),
-                },
+                ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
+                ProjectionExpression: ["#pk", "#sk", ...Object.keys(projected)].join(", "),
                 ConsistentRead: true,
-                ExclusiveStartKey: deletedStart,
+                ExclusiveStartKey: exclusiveStartKey,
               })
-              holders.push(...(deletedResult.Items ?? []).filter(belongsToItem))
-              deletedStart = deletedResult.LastEvaluatedKey as
+
+              allItems.push(...(result.Items ?? []).filter(belongsToItem))
+              exclusiveStartKey = result.LastEvaluatedKey as
                 | globalThis.Record<string, AttributeValue>
                 | undefined
-            } while (deletedStart !== undefined)
+            } while (exclusiveStartKey)
 
-            // Sparse — fields that were unset never had a sentinel. The stored
-            // row is attribute-keyed, the constraint is not (#127).
-            const held = new Map<string, { readonly pk: string; readonly sk: string }>()
-            for (const holder of holders) {
-              const holderDomain = toDomainView(fromAttributeMap(holder))
-              for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-                const sentinel = composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  holderDomain,
-                  readSentinelValue,
+            // The unique sentinels the item holds — live, or soft-deleted with
+            // `preserveUnique` — and owns (#133): a sentinel of a value the item
+            // holds without owning its reservation belongs to another item.
+            if (hasUniqueConstraints) {
+              // The live row, with the sentinels it owns, in `delete`'s guarded transaction.
+              if (mainResult?.Item) {
+                const live = mainResult.Item
+                const parts = hardDeleteParts({
+                  encodedKey: encodedKey as globalThis.Record<string, unknown>,
+                  primaryKey: { [primary.pk.field]: owner.pk, [primary.sk.field]: owner.sk },
+                  userCondition: undefined,
+                })
+                const hardGuard = deleteGuard(
+                  live,
+                  [
+                    ...new Set(
+                      Object.values(config.unique!).flatMap((def) =>
+                        resolveUniqueFields(def).map(compositeAttribute),
+                      ),
+                    ),
+                  ],
+                  undefined,
                 )
-                if (!sentinel) continue
-                held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
+                const transactItems: Array<TransactWriteItem> = [
+                  {
+                    Delete: {
+                      TableName: tableName,
+                      Key: liveKey,
+                      ...parts.guardedDeleteCondition(hardGuard),
+                    },
+                  },
+                ]
+                const releases = yield* parts.ownedReleases(
+                  tableName,
+                  fromAttributeMap(live) as globalThis.Record<string, unknown>,
+                  transactItems,
+                )
+                yield* parts
+                  .guardedDelete(
+                    client.transactWriteItems({ TransactItems: transactItems }),
+                    live,
+                    hardGuard.inputs,
+                    undefined,
+                    releases,
+                  )
+                  .pipe(
+                    // A delete of stored keys meets no size limit; wrapped for uniformity (#144).
+                    diagnoseFailure({
+                      sent: () => ({
+                        _tag: "Transaction",
+                        items: transactItems,
+                        targets: () =>
+                          targetsFor(transactItems, entityKeyFields(), entityType, (index) =>
+                            index === 0 ? "the item" : `item ${index} of the purge transaction`,
+                          ),
+                      }),
+                      keys: entityKeys,
+                      rewrite: (diagnosis, original) =>
+                        diagnosedValidationError(diagnosis, original, {
+                          operation: "purge",
+                          entityType,
+                        }),
+                    }),
+                  )
+                liveDeleted = true
+              }
+              // Every soft-deleted incarnation (each kept its reservations).
+              const holders: Array<globalThis.Record<string, AttributeValue>> = []
+              const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+              let deletedStart: globalThis.Record<string, AttributeValue> | undefined
+              do {
+                const deletedResult = yield* client.query({
+                  TableName: tableName,
+                  KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+                  ExpressionAttributeNames: {
+                    "#pk": primary.pk.field,
+                    "#sk": primary.sk.field,
+                  },
+                  ExpressionAttributeValues: {
+                    ":pk": toAttributeValue(pkValue),
+                    ":skPrefix": toAttributeValue(deletedPrefix),
+                  },
+                  ConsistentRead: true,
+                  ExclusiveStartKey: deletedStart,
+                })
+                holders.push(...(deletedResult.Items ?? []).filter(belongsToItem))
+                deletedStart = deletedResult.LastEvaluatedKey as
+                  | globalThis.Record<string, AttributeValue>
+                  | undefined
+              } while (deletedStart !== undefined)
+
+              // Sparse — fields that were unset never had a sentinel. The stored
+              // row is attribute-keyed, the constraint is not (#127).
+              const held = new Map<string, { readonly pk: string; readonly sk: string }>()
+              for (const holder of holders) {
+                const holderDomain = toDomainView(fromAttributeMap(holder))
+                for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
+                  const sentinel = composeUniqueSentinel(
+                    schema,
+                    entityType,
+                    constraintName,
+                    constraintDef,
+                    holderDomain,
+                    readSentinelValue,
+                  )
+                  if (!sentinel) continue
+                  held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
+                }
+              }
+              // Released one by one, each only while still this item's: a batch
+              // delete cannot carry the ownership condition. A tombstone's
+              // reservation that the live row shared went with it above.
+              for (const sentinel of yield* ownedSentinels(tableName, [...held.values()], owner)) {
+                const release = sentinelRelease(tableName, sentinel, owner)
+                yield* client.deleteItem(release.Delete).pipe(
+                  Effect.catchIf(
+                    (err) => isAwsConditionalCheckFailed(err.cause),
+                    () => Effect.void,
+                  ),
+                  // A delete of a stored key cannot meet a size limit; wrapped
+                  // for uniformity (#144), so it passes through in practice.
+                  diagnoseItemWrite("purge", release),
+                )
               }
             }
-            // Released one by one, each only while still this item's: a batch
-            // delete cannot carry the ownership condition.
-            for (const sentinel of yield* ownedSentinels(tableName, [...held.values()], owner)) {
-              const release = sentinelRelease(tableName, sentinel, owner)
-              yield* client.deleteItem(release.Delete).pipe(
-                Effect.catchIf(
-                  (err) => isAwsConditionalCheckFailed(err.cause),
-                  () => Effect.void,
+            return { allItems, liveDeleted }
+          })
+
+          // A lost race on the live row is retried from the query, as a read-first delete is;
+          // purge refuses a `.condition()`, so it always is. Once every attempt has lost, it is
+          // what such a delete reports — a row deleted concurrently each time, a change.
+          const { allItems, liveDeleted } = yield* attempt.pipe(
+            Effect.retry({
+              times: GUARDED_PUT_ATTEMPTS - 1,
+              while: (e) =>
+                e instanceof OptimisticLockError ||
+                e instanceof ConcurrentModification ||
+                e instanceof DeletedConcurrently,
+            }),
+            Effect.catchIf(
+              (e): e is DeletedConcurrently | ItemNotFound | ConditionalCheckFailed =>
+                e instanceof DeletedConcurrently ||
+                e instanceof ItemNotFound ||
+                e instanceof ConditionalCheckFailed,
+              () =>
+                Effect.fail(
+                  new ConcurrentModification({
+                    entityType,
+                    key: encodedKey as globalThis.Record<string, unknown>,
+                    attributes: [],
+                    current: Option.none(),
+                  }),
                 ),
-                // A delete of a stored key cannot meet a size limit; wrapped
-                // for uniformity (#144), so it passes through in practice.
-                diagnoseItemWrite("purge", release),
-              )
-            }
-          }
+            ),
+          )
+          // With `unique`, the live row went in the transaction: the batch never deletes it, so a
+          // row created after the attempt's read keeps its sentinels with it.
+          const batchItems = hasUniqueConstraints
+            ? allItems.filter((row) => !isLiveRow(row))
+            : allItems
 
           // Batch delete in chunks of 25. `UnprocessedItems` are retried with
           // `Batch.write`'s backoff; what the purge had deleted is always
           // stated exactly, whether a request is rejected or retries run out. By count alone: 25
           // stored keys (at most 2048 + 1024 bytes each, so at most about 0.5 MB as JSON) can't
           // reach the 16 MB request limit.
+          // The live row the transaction deleted is one of the partition's items, and counted;
+          // the reservations it released are in other partitions, and named.
+          const inTransaction = liveDeleted ? 1 : 0
+          const partitionItems = batchItems.length + inTransaction
           let deleted = 0
           const deletedSoFar = () =>
-            deleted === 0
+            deleted + inTransaction === 0
               ? "the purge had deleted none of the partition's items"
-              : `the purge had already deleted ${deleted} of the partition's ${allItems.length} items`
-          for (let i = 0; i < allItems.length; i += 25) {
-            const chunk = allItems.slice(i, i + 25)
+              : `the purge had already deleted ${deleted + inTransaction} of the partition's ` +
+                `${partitionItems} items` +
+                (liveDeleted
+                  ? ", the live item among them, with the reservations of its unique values"
+                  : "")
+          for (let i = 0; i < batchItems.length; i += 25) {
+            const chunk = batchItems.slice(i, i + 25)
             let requestItems: globalThis.Record<string, Array<WriteRequest>> = {
               [tableName]: chunk.map((item) => ({
                 DeleteRequest: {
@@ -17729,7 +17901,7 @@ const makeImpl = <
                 return yield* new DynamoError({
                   operation: "BatchWriteItem",
                   cause: new Error(
-                    `purge: ${remaining} of the partition's ${allItems.length} items were still ` +
+                    `purge: ${remaining} of the partition's ${partitionItems} items were still ` +
                       `unprocessed after ${MAX_RETRIES} retries; ${deletedSoFar()}. The rest ` +
                       "were not deleted: purge again to finish.",
                   ),
