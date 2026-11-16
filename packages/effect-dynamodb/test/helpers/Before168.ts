@@ -21,6 +21,9 @@
  * Applied to both sides of a comparison, so what's left is everything else a request holds.
  */
 
+import type { Outcome, Sent } from "./InheritedNames.js"
+import { expectRequestsSince132 } from "./Since132.js"
+
 /** A recorded request: `{ op, input }` (`op` in lower camel case) or `{ command, input }`. */
 type Recorded = { readonly op?: string; readonly command?: string; readonly input?: any }
 
@@ -255,7 +258,45 @@ type Run = {
 export const runsAsBefore168 = <N extends Run, W extends Run>(now: N, was: W): readonly [N, W] =>
   now.sentBy !== undefined && was.sentBy !== undefined
     ? [runAsBefore168(now), runAsBefore168(was)]
-    : [
-        { ...now, requests: asBefore168Run(now.requests) },
-        { ...was, requests: asBefore168Run(was.requests) },
-      ]
+    : [wholeAsBefore168(now), wholeAsBefore168(was)]
+
+/**
+ * A run as {@link asBefore168Run} has it whole, its `sentBy` (where it says what each step sent)
+ * kept in step with its requests: each step holds what the run up to its end gives past what the
+ * run up to the step before gave (a transaction joined across a step boundary is the earlier step's).
+ */
+const wholeAsBefore168 = <R extends Run>(run: R): R => {
+  const requests = asBefore168Run(run.requests)
+  if (run.sentBy === undefined) return { ...run, requests }
+  const sentBy: Record<string, ReadonlyArray<string>> = {}
+  let end = 0
+  let given = 0
+  for (const [label, commands] of Object.entries(run.sentBy)) {
+    end += commands.length
+    const upTo = asBefore168Run(run.requests.slice(0, end)).length
+    sentBy[label] = requests
+      .slice(given, upTo)
+      .map((request) => request.command ?? request.op ?? "")
+    given = upTo
+  }
+  return { ...run, requests, sentBy }
+}
+
+/**
+ * Assert what a run sent is what a published release recorded, but for #132's changes
+ * (`expectRequestsSince132`) and #168's (`runsAsBefore168`): #168's are taken out of both sides
+ * first, then #132's are compared as `expectRequestsSince132` compares them.
+ */
+export const expectRequestsSince168 = (
+  received: Outcome,
+  recorded: {
+    readonly requests?: ReadonlyArray<Sent> | undefined
+    readonly sentBy?: Run["sentBy"]
+  },
+): void => {
+  const [now, was] = runsAsBefore168(received, {
+    requests: recorded.requests ?? [],
+    sentBy: recorded.sentBy,
+  })
+  expectRequestsSince132(now, was)
+}

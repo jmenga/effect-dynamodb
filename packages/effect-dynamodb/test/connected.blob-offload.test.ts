@@ -13,7 +13,9 @@
  *   restore; a handle read before an update presigning a GET of the version
  *   it read.
  * - **Aggregates and EventStore.** An aggregate's offloaded edge field (the
- *   changed group re-uploaded, the superseded version swept by partition); a
+ *   changed group re-uploaded, the superseded version swept by partition), an
+ *   update whose edge another writer changed after its read refused (#168), its
+ *   upload deleted and a retry committing; a
  *   stream with offloaded event `data` and an offloaded inline snapshot, read
  *   through `read`, `readLatest`, `readIndex` and raw rows, its superseded
  *   snapshot state reaped.
@@ -76,7 +78,7 @@ import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { composeCollectionKey } from "@effect-dynamodb/schema/DynamoSchema.js"
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ConcurrentModification, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { BlobRef } from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import * as BlobPointer from "@effect-dynamodb/schema/internal/BlobPointer.js"
 import { crc64nvme } from "@effect-dynamodb/schema/internal/Crc64Nvme.js"
@@ -426,6 +428,8 @@ const probed = (service: BlobStoreService): { readonly store: BlobStoreService; 
 
 /** What runs right after each `BatchWriteItem` lands (a writer racing a purge). */
 const afterBatchWrite: Array<Effect.Effect<void>> = []
+/** What runs right after the next `Query` is answered (a writer between a read and its write). */
+const afterQuery: Array<Effect.Effect<void>> = []
 
 const credentials = { accessKeyId: "local", secretAccessKey: "local" }
 const ClientLayer = Layer.effect(
@@ -437,6 +441,10 @@ const ClientLayer = Layer.effect(
       batchWriteItem: (input) =>
         Effect.tap(inner.batchWriteItem(input), () =>
           Effect.forEach(afterBatchWrite.splice(0), (effect) => effect, { discard: true }),
+        ),
+      query: (input) =>
+        Effect.tap(inner.query(input), () =>
+          Effect.forEach(afterQuery.splice(0), (effect) => effect, { discard: true }),
         ),
     }),
   ),
@@ -1140,6 +1148,66 @@ describeConnected("Offloaded storage end to end over S3 (#179)", () => {
         }),
       )
     })
+
+    it.effect(
+      "an aggregate update whose edge changed after its read is refused (#168): its upload deleted, a retry commits",
+      () => {
+        const { store, probe } = probed(s3Store("aggregate-conflict/"))
+        return using(store)(
+          Effect.gen(function* () {
+            yield* Matches.create({
+              matchId: "m-race",
+              name: "Final",
+              venue: { venueId: "v-race", name: "Arena", plan: bytes(2_000, 1) },
+            })
+            const pk = composeCollectionKey(AppSchema, "match", ["m-race"])
+            const edge = () =>
+              Effect.map(rowsOf(mainTable, pk), (rows) =>
+                rows.find((row) => row.__edd_e__?.S === "MatchVenue"),
+              )
+            const first = yield* refOf((yield* edge())!.plan)
+            // Another writer renames the venue between the update's read and its write.
+            const venue = (yield* edge())!
+            const raw = yield* DynamoClient
+            afterQuery.push(
+              Effect.orDie(
+                raw.updateItem({
+                  TableName: mainTable,
+                  Key: { pk: venue.pk!, sk: venue.sk! },
+                  UpdateExpression: "SET #n = :n",
+                  ExpressionAttributeNames: { "#n": "name" },
+                  ExpressionAttributeValues: { ":n": { S: "Stadium" } },
+                }),
+              ).pipe(Effect.asVoid),
+            )
+            const uploads = probe.calls.put
+            const deletes = probe.calls.delete
+            const refused = yield* Effect.flip(
+              Matches.update({ matchId: "m-race" }, ({ state }) => ({
+                ...state,
+                venue: { ...state.venue, plan: bytes(2_000, 2) },
+              })),
+            )
+            expect(afterQuery).toHaveLength(0)
+            expect(refused).toBeInstanceOf(ConcurrentModification)
+            expect((refused as ConcurrentModification).attributes).toEqual(["venue.name"])
+            // The cancelled write's upload landed, then was deleted; the stored version is the first.
+            expect(probe.calls.put).toBe(uploads + 1)
+            expect(probe.calls.delete).toBe(deletes + 1)
+            const kept = yield* refOf((yield* edge())!.plan)
+            expect(kept.version).toBe(first.version)
+            expect(yield* exists(first)).toBe(true)
+            expect((yield* edge())!.name?.S).toBe("Stadium")
+            // A retry reads the rename and commits its plan over it.
+            const match = yield* Matches.update({ matchId: "m-race" }, ({ state }) => ({
+              ...state,
+              venue: { ...state.venue, plan: bytes(2_000, 2) },
+            }))
+            expect(match.venue).toMatchObject({ name: "Stadium", plan: bytes(2_000, 2) })
+          }),
+        )
+      },
+    )
 
     it.effect(
       "a stream with offloaded data and snapshot: read, readLatest, readIndex, raw rows; a superseded snapshot reaped",

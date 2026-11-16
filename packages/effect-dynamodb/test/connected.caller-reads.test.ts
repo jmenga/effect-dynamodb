@@ -33,6 +33,7 @@ import { Cause, Clock, Config, Effect, Exit, Layer, Option, Schema } from "effec
 import { describe, expect, it } from "vitest"
 import * as Zlib from "../src/compression/zlib.js"
 import * as Lib from "../src/index.js"
+import { runAsBefore168 } from "./helpers/Before168.js"
 import { CALLER_READ_POSITIONS } from "./helpers/CallerReads.js"
 import {
   type Api,
@@ -116,8 +117,12 @@ describeConnected("what the library reads of a caller's object (#239)", () => {
       } else {
         expect(outcome.steps).toEqual(recorded!.steps)
       }
-      expect(outcome.sentBy).toEqual(recorded!.sentBy)
-      expectRequestsSince132(outcome, recorded!)
+      // But for what #168 changed of an aggregate's writes (`runAsBefore168`), and #132's
+      // reads held to their writes (`expectRequestsSince132`).
+      const now = runAsBefore168(outcome)
+      const was = runAsBefore168(recorded!)
+      expect(now.sentBy).toEqual(was.sentBy)
+      expectRequestsSince132(now, was)
       expect(outcome.rows).toEqual(recorded!.rows)
     })
   }

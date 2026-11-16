@@ -4049,7 +4049,11 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
           // PUT-based rewrites must not clobber the original create instant.
           expect(row.created!.N).toBe(prior.created!.N)
           expect(row.created!.N).toBe(String(T1))
-          expect(row.updated!.N).toBe(String(T2))
+          // Only the root changed, so only the root is rewritten (#168): every other row keeps
+          // its own `updated`.
+          expect(row.updated!.N).toBe(
+            row.__edd_e__?.S === "TsPostRoot" ? String(T2) : prior.updated!.N,
+          )
         }
       }).pipe(provideAgg),
     )
@@ -4488,40 +4492,31 @@ describeConnected("Entity refs and Aggregate integration tests", () => {
         }).pipe(provideAgg),
     )
 
-    it.effect(
-      "#144 a later group rejected for size: the error names the groups already committed",
-      () =>
-        Effect.gen(function* () {
-          // team2's one player is over 400 KB: DynamoDB rejects that group
-          // after the root and team1 were committed.
-          const error = yield* MatchCardAggregate.create({
-            id: "mc-big",
-            title: "Big",
-            team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
-            team2: { coach: { name: "C2" }, players: [{ id: "q1", name: "x".repeat(410_000) }] },
-          }).pipe(Effect.flip)
-          expect(error._tag).toBe("ValidationError")
-          const text = String((error as ValidationError).cause)
-          expect(text).toContain('sub-aggregate "team2"')
-          expect(text).toContain(
-            'earlier transactions of this write already committed sub-aggregates "root", "team1"',
-          )
-          expect(text).toContain(
-            "a retried create fails on the existing root: update or delete the partial aggregate",
-          )
+    it.effect("#144 a group rejected for size: one transaction, nothing written", () =>
+      Effect.gen(function* () {
+        // team2's one player is over 400 KB: DynamoDB rejects the create's one
+        // transaction (#168), so neither the root nor team1 is written.
+        const error = yield* MatchCardAggregate.create({
+          id: "mc-big",
+          title: "Big",
+          team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
+          team2: { coach: { name: "C2" }, players: [{ id: "q1", name: "x".repeat(410_000) }] },
+        }).pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        const text = String((error as ValidationError).cause)
+        expect(text).toContain('sub-aggregate "team2"')
+        expect(text).toContain("Nothing was written.")
 
-          const sks = yield* rawSks(matchPk("mc-big"))
-          expect(playerSks(sks)).toHaveLength(1)
-          expect(coachSks(sks)).toHaveLength(1)
-          // As the error says: the partial aggregate is updated, not created again.
-          const retried = yield* MatchCardAggregate.create({
-            id: "mc-big",
-            title: "Big",
-            team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
-            team2: { coach: { name: "C2" }, players: [{ id: "q1", name: "Q" }] },
-          }).pipe(Effect.flip)
-          expect(retried._tag).toBe("ConditionalCheckFailed")
-        }).pipe(provideAgg),
+        expect(yield* rawSks(matchPk("mc-big"))).toHaveLength(0)
+        // Nothing to clean up: a create with values that fit succeeds.
+        const retried = yield* MatchCardAggregate.create({
+          id: "mc-big",
+          title: "Big",
+          team1: { coach: { name: "C1" }, players: [{ id: "p1", name: "A" }] },
+          team2: { coach: { name: "C2" }, players: [{ id: "q1", name: "Q" }] },
+        })
+        expect(retried.team2.players.map((p) => p.id)).toEqual(["q1"])
+      }).pipe(provideAgg),
     )
 
     it.effect("#144 an update whose later group DynamoDB rejects: earlier groups stay, named", () =>

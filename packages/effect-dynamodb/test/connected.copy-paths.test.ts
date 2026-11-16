@@ -35,6 +35,7 @@ import { Cause, Clock, Config, Effect, Exit, Layer, Option, Schema } from "effec
 import { describe, expect, it } from "vitest"
 import * as Zlib from "../src/compression/zlib.js"
 import * as Lib from "../src/index.js"
+import { runAsBefore168 } from "./helpers/Before168.js"
 import { COPY_PATH_POSITIONS, PATHS, PROBES } from "./helpers/CopyPaths.js"
 import {
   type Api,
@@ -130,9 +131,12 @@ describeConnected("the copies made of a caller's object, as 1.40.0 made them (#2
       expect(outcome.refused).toEqual(recorded.refused)
       expect(Object.keys(outcome.steps)).toEqual(Object.keys(recorded.steps))
       const known = KNOWN[position.key]
+      // Requests compared but for what #168 changed of an aggregate's writes (`runAsBefore168`).
+      const now = runAsBefore168(outcome)
+      const was = runAsBefore168(recorded)
       if (known === "line read") {
-        const sent = requestsByStep(outcome)
-        const wasSent = requestsByStep(recorded)
+        const sent = requestsByStep(now)
+        const wasSent = requestsByStep(was)
         const notMade = new Set<string>()
         for (const [label, step] of Object.entries(outcome.steps)) {
           const was = recorded.steps[label]!
@@ -177,8 +181,8 @@ describeConnected("the copies made of a caller's object, as 1.40.0 made them (#2
           ...recorded.steps[label],
         })
       }
-      expect(outcome.sentBy).toEqual(recorded.sentBy)
-      expect(outcome.requests).toEqual(recorded.requests)
+      expect(now.sentBy).toEqual(was.sentBy)
+      expect(now.requests).toEqual(was.requests)
       expect(outcome.rows).toEqual(recorded.rows)
     })
   }

@@ -32,9 +32,9 @@ import { Cause, Clock, Config, Effect, Exit, Layer, Option, Schema } from "effec
 import { describe, expect, it } from "vitest"
 import * as Zlib from "../src/compression/zlib.js"
 import * as Lib from "../src/index.js"
+import { expectRequestsSince168 } from "./helpers/Before168.js"
 import { type Api, CONTROL, capture, type Outcome, trapsBeside } from "./helpers/InheritedNames.js"
 import { NAME_SETS, type Names, parityPositions } from "./helpers/ReadParity.js"
-import { expectRequestsSince132 } from "./helpers/Since132.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -110,7 +110,9 @@ describeConnected("each caller's object read as 1.40.0 read it, trap for trap (#
       if (set === ORDINARY) {
         // Each step returns, sends and leaves what it did on 1.40.0.
         expect(outcome.steps).toEqual(recorded.steps)
-        expectRequestsSince132(outcome, recorded)
+        // But for #132's reads held to their writes and what #168 changed of an aggregate's
+        // writes (`expectRequestsSince168`).
+        expectRequestsSince168(outcome, recorded)
         expect(outcome.rows).toEqual(recorded.rows)
         return
       }

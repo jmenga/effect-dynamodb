@@ -43,6 +43,7 @@ import { Cause, Clock, Config, Effect, Exit, Layer, Option, Schema } from "effec
 import { describe, expect, it } from "vitest"
 import * as Zlib from "../src/compression/zlib.js"
 import * as Lib from "../src/index.js"
+import { expectRequestsSince168 } from "./helpers/Before168.js"
 import {
   type Api,
   CONTROL,
@@ -53,7 +54,6 @@ import {
   POSITIONS,
   type Position,
 } from "./helpers/InheritedNames.js"
-import { expectRequestsSince132 } from "./helpers/Since132.js"
 
 /** The names each position runs under: the ordinary one, `__proto__` and three inherited functions. */
 const RUN = [CONTROL, "__proto__", "constructor", "hasOwnProperty", "toString"] as const
@@ -180,7 +180,9 @@ describeConnected("names every object inherits (#239)", () => {
           expect(recordedControl).toBeDefined()
           if (asOrdinary(recorded!, recordedControl!)) {
             expect(recorded!.requests).toBeDefined()
-            expectRequestsSince132(outcome, recorded!)
+            // But for #132's reads held to their writes and what #168 changed of an
+            // aggregate's writes (`expectRequestsSince168`).
+            expectRequestsSince168(outcome, recorded!)
             expect(outcome.rows).toEqual(recorded!.rows)
             expect(outcome.steps).toEqual(recorded!.steps)
           }
