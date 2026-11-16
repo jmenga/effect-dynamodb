@@ -24,6 +24,7 @@ import {
   composeSk,
   type IndexDefinition,
   isZOrderHalf,
+  shardLayoutsOf,
   unshardedView,
 } from "../KeyComposer.js"
 import { setOwn } from "./OwnNames.js"
@@ -43,11 +44,28 @@ const describe = ({ owner, half }: KeyHalf): string =>
 
 const isZOrder = ({ half, index }: KeyHalf): boolean => half === "sk" && isZOrderHalf(index.sk)
 
-/** The hash a sharded partition key's marker depends on; nothing on any other half. */
-const shardForm = ({ half, index }: KeyHalf): string | undefined =>
-  half === "pk" && index.shards !== undefined
-    ? JSON.stringify([index.shards.count, index.shards.source])
-    : undefined
+/**
+ * What a sharded partition key's marker depends on: its layouts and source; nothing on
+ * any other half. A table is its canonical declaration: the default, then each entry's
+ * key-form match (sorted) with its layout (#287). A table supplied at run time has no
+ * form known here, so it is its own: a half holding one shares its attribute with no
+ * other half.
+ */
+const shardForm = ({ owner, half, index }: KeyHalf): string | undefined => {
+  if (half !== "pk" || index.shards === undefined) return undefined
+  const { source } = index.shards
+  const layouts = shardLayoutsOf(index.shards)
+  if (layouts === "provided") return `provided:${owner}`
+  const json = (value: unknown) =>
+    JSON.stringify(value, (_, v) => (typeof v === "bigint" ? `${v}n` : v))
+  // What a write composes: each value's count (`previous` is read, never written).
+  const entries = layouts.values.map((entry) => json([entry.keyRecord, entry.layout.count])).sort()
+  return json([
+    // A static declaration's form is unchanged: its count, then its source.
+    entries.length === 0 ? layouts.default.count : [layouts.default.count, entries],
+    source,
+  ])
+}
 
 /**
  * A half's fields in order, and the label a collection or its absence gives the key. The

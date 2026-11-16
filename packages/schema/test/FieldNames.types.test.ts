@@ -1080,3 +1080,231 @@ describe("timeSeries.appendInput against a sharded index", () => {
     })
   })
 })
+
+describe("shards.layouts match (#287)", () => {
+  const byRegion = {
+    name: "gsi7",
+    pk: { field: "gsi7pk", composite: ["region", "agencyId"] },
+    sk: { field: "gsi7sk", composite: ["status", "listedAt"] },
+  } as const
+
+  it("names every partition key composite of its own index, typed as an accessor's pin", () => {
+    const made = Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: byListingId,
+      indexes: {
+        byRegion: {
+          ...byRegion,
+          shards: {
+            by: ["status"],
+            layouts: {
+              default: 1,
+              values: [
+                { match: { region: "EU", agencyId: "a-1" }, layout: 20 },
+                { match: { region: "us", agencyId: "a-2" }, layout: { count: 4, previous: 1 } },
+              ],
+            },
+          },
+        },
+      },
+    })
+    expect(made.indexes.byRegion.shards?.source).toEqual(["status"])
+  })
+
+  it("accepts a table with only a default, and a provided table", () => {
+    Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: byListingId,
+      indexes: {
+        byRegion: { ...byRegion, shards: { layouts: { default: 20 } } },
+        byOther: {
+          name: "gsi8",
+          pk: { field: "gsi8pk", composite: ["region"] },
+          sk: { field: "gsi8sk", composite: ["listedAt"] },
+          shards: { layouts: "provided" },
+        },
+      },
+    })
+  })
+
+  it("keeps the declaration on the entity's type, for ShardLayouts.of", () => {
+    const made = Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: byListingId,
+      indexes: {
+        byRegion: { ...byRegion, shards: { layouts: "provided" } },
+        byOther: {
+          name: "gsi8",
+          pk: { field: "gsi8pk", composite: ["region"] },
+          sk: { field: "gsi8sk", composite: ["listedAt"] },
+          shards: { layouts: { default: 1 } },
+        },
+      },
+    })
+    type ByRegion = NonNullable<(typeof made.indexes)["byRegion"]["shards"]>["declared"]
+    type ByOther = NonNullable<(typeof made.indexes)["byOther"]["shards"]>["declared"]
+    expectTypeOf<ByRegion>().toEqualTypeOf<{ readonly layouts: "provided" }>()
+    expectTypeOf<ByOther["layouts"]>().toEqualTypeOf<{ readonly default: 1 }>()
+  })
+
+  const refused = (shards: unknown) => () =>
+    Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: byListingId,
+      indexes: { byRegion: { ...byRegion, shards } as never },
+    })
+
+  it("a typo is an error on that entry", () => {
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: {
+            ...byRegion,
+            shards: {
+              layouts: {
+                default: 1,
+                values: [
+                  {
+                    match: {
+                      region: "eu",
+                      agencyId: "a",
+                      // @ts-expect-error not a partition key composite (a typo of agencyId)
+                      agencyID: "a",
+                    },
+                    layout: 20,
+                  },
+                ],
+              },
+            },
+          },
+        },
+      }),
+    ).toThrow("[EDD-9099]")
+    expect(
+      refused({
+        layouts: { default: 1, values: [{ match: { region: "eu", agencyID: "a" }, layout: 2 }] },
+      }),
+    ).toThrow("[EDD-9099]")
+  })
+
+  it("another attribute, another index's composite, a missing composite and a wrong type are errors", () => {
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: {
+            ...byRegion,
+            shards: {
+              layouts: {
+                default: 1,
+                values: [
+                  {
+                    match: {
+                      region: "eu",
+                      agencyId: "a",
+                      // @ts-expect-error a sort key composite of this index, not a partition key one
+                      status: "live",
+                    },
+                    layout: 20,
+                  },
+                ],
+              },
+            },
+          },
+        },
+      }),
+    ).toThrow("[EDD-9099]")
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: {
+            ...byRegion,
+            shards: {
+              layouts: {
+                default: 1,
+                // @ts-expect-error agencyId missing
+                values: [{ match: { region: "eu" }, layout: 20 }],
+              },
+            },
+          },
+        },
+      }),
+    ).toThrow("[EDD-9099]")
+    Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: byListingId,
+      indexes: {
+        byRegion: {
+          ...byRegion,
+          shards: {
+            layouts: {
+              default: 1,
+              values: [
+                // @ts-expect-error agencyId is a string
+                { match: { region: "eu", agencyId: 5 }, layout: 20 },
+              ],
+            },
+          },
+        },
+      },
+    })
+  })
+
+  it("count and previous beside layouts, and no default, are errors", () => {
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: {
+            ...byRegion,
+            // @ts-expect-error a table's layouts carry their own counts
+            shards: { count: 20, layouts: { default: 1 } },
+          },
+        },
+      }),
+    ).toThrow("[EDD-9099]")
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: {
+            ...byRegion,
+            // @ts-expect-error previous lives inside a layout
+            shards: { previous: 1, layouts: { default: 20 } },
+          },
+        },
+      }),
+    ).toThrow("[EDD-9099]")
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: {
+            ...byRegion,
+            // @ts-expect-error default is required
+            shards: { layouts: { values: [] } },
+          },
+        },
+      }),
+    ).toThrow("[EDD-9099]")
+  })
+})

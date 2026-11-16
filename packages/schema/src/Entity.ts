@@ -44,7 +44,12 @@ import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
 import { refIdAttribute, refIdField } from "./internal/AggregateSchemas.js"
-import { bothKindsKeyRefusal, keyFormValueKind } from "./internal/CompositeCodec.js"
+import {
+  bothKindsKeyRefusal,
+  keyFormValueKind,
+  makeCompositeDomainKeyForm,
+  toCompositeKeyRecord,
+} from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -79,6 +84,7 @@ import {
   validateNoTransformOverride,
 } from "./internal/EntitySchemas.js"
 import type {
+  CaseInsensitive,
   DimensionFieldNames,
   EntityRefCreateType,
   EntityRefInputType,
@@ -121,7 +127,15 @@ import type {
   ZOrderKeyPart,
   ZOrderSkPart,
 } from "./KeyComposer.js"
-import { isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
+import {
+  bindShardTable,
+  isZOrderHalf,
+  normalizeGsiConfig,
+  normalizeShardTable,
+  type ShardLayoutConfig,
+  type ShardTable,
+  shardLayoutsOf,
+} from "./KeyComposer.js"
 import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
 import {
   deriveVectorFilterTypes,
@@ -243,25 +257,40 @@ export type NormalizedIndexes<
  * type — `zorder` and `prefix` are phantom carriers for the accessor typing
  * (the runtime value has `zorderHalf`) — beside the derived `composite`.
  */
+
+/**
+ * The `shards` an index declares, kept on its normalised type (#287): `declared` is a
+ * phantom (the runtime value has the normalised `IndexShards` only), carried so
+ * `ShardLayouts.of` can tell an index declared `layouts: "provided"` from one with a
+ * table, and type each `match` from its partition key composites.
+ */
+type ShardsDeclaration<G> = {
+  readonly shards?: IndexShards & {
+    readonly declared: G extends { readonly shards: infer S } ? S : undefined
+  }
+}
+
 type NormalizedGsi<G extends GsiConfig<any>> = G["sk"] extends {
   readonly zorder: infer Z extends ReadonlyArray<unknown>
 }
-  ? IndexDefinition & {
-      readonly collection: G["collection"]
-      readonly pk: { readonly composite: G["pk"]["composite"] }
-      readonly sk: ZOrderSkPart & {
-        readonly composite: readonly [...PrefixFieldNames<G["sk"]>, ...DimensionFieldNames<Z>]
-        readonly zorder: Z
-        readonly prefix: G["sk"] extends { readonly prefix: infer P } ? P : readonly []
+  ? IndexDefinition &
+      ShardsDeclaration<G> & {
+        readonly collection: G["collection"]
+        readonly pk: { readonly composite: G["pk"]["composite"] }
+        readonly sk: ZOrderSkPart & {
+          readonly composite: readonly [...PrefixFieldNames<G["sk"]>, ...DimensionFieldNames<Z>]
+          readonly zorder: Z
+          readonly prefix: G["sk"] extends { readonly prefix: infer P } ? P : readonly []
+        }
       }
-    }
-  : IndexDefinition & {
-      readonly collection: G["collection"]
-      readonly pk: { readonly composite: G["pk"]["composite"] }
-      readonly sk: {
-        readonly composite: G["sk"] extends { readonly composite: infer C } ? C : never
+  : IndexDefinition &
+      ShardsDeclaration<G> & {
+        readonly collection: G["collection"]
+        readonly pk: { readonly composite: G["pk"]["composite"] }
+        readonly sk: {
+          readonly composite: G["sk"] extends { readonly composite: infer C } ? C : never
+        }
       }
-    }
 
 /**
  * @internal Primary key definition — the `primaryKey` config form. `F` is the
@@ -352,7 +381,8 @@ export type ZOrderEntriesGuard<TIndexes, TFields> = {
   readonly [K in keyof TIndexes]: (TIndexes[K] extends { readonly sk: infer SK }
     ? { readonly sk: ZOrderHalfGuard<SK, TFields> }
     : unknown) &
-    ShardsByGuard<TIndexes[K]>
+    ShardsByGuard<TIndexes[K]> &
+    ShardTableGuard<TIndexes[K], TFields>
 }
 
 /**
@@ -374,6 +404,39 @@ type ShardsByGuard<TEntry> = TEntry extends { readonly shards: { readonly by: un
       }
     }
   : unknown
+
+/**
+ * @internal A shard table's `match` (#287) names exactly the partition key composites of
+ * its own index, each with the value an accessor would pin for it: a key outside them is
+ * typed `never`, so a typo is an error on that entry, and a missing one is an error on the
+ * `match`. `Entity.make` checks again at runtime (`EDD-9099`).
+ */
+type ShardTableGuard<TEntry, TFields> = TEntry extends {
+  readonly shards: {
+    readonly layouts: { readonly values: infer V extends ReadonlyArray<unknown> }
+  }
+  readonly pk: { readonly composite: infer C extends ReadonlyArray<string> }
+}
+  ? {
+      readonly shards: {
+        readonly layouts: {
+          readonly values: {
+            readonly [I in keyof V]: {
+              readonly match: ShardMatch<V[I], C[number], TFields>
+              readonly layout: ShardLayoutConfig
+            }
+          }
+        }
+      }
+    }
+  : unknown
+
+/** @internal One `match` of a shard table over partition key composites `P` (#287). */
+export type ShardMatch<TEntry, P extends string, TFields> = {
+  readonly [K in P]: K extends keyof TFields ? CaseInsensitive<TFields[K]> : unknown
+} & (TEntry extends { readonly match: infer M }
+  ? { readonly [K in Exclude<keyof M, P>]: never }
+  : unknown)
 
 /** The attribute a key half is stored in, when the type says which: `Entity.make` checks the rest. */
 type FieldOf<H> = H extends { readonly field: infer F extends string }
@@ -617,6 +680,14 @@ export interface EntityDefinitionData {
   /** Normalized vector index declarations, keyed by logical name. */
   readonly vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
   readonly hasVectorIndexes: boolean
+  /**
+   * Compile a table supplied at run time for index `indexName`, declared
+   * `shards: { layouts: "provided" }` (#287): its layouts checked and each entry's
+   * `match` put into this entity's key form. `[EDD-9099]` for a malformed table,
+   * `[EDD-9181]` for an index not declared `"provided"`. The result is what
+   * `KeyComposer.withShardTables` carries, keyed by the index's `shards`.
+   */
+  readonly compileShardTable: (indexName: string, declared: unknown) => ShardTable
 }
 
 /**
@@ -816,8 +887,19 @@ const bindShards = (
   indexName: string,
   index: IndexDefinition,
   primary: IndexDefinition,
+  matchKeyForm: (record: globalThis.Record<string, unknown>) => globalThis.Record<string, unknown>,
 ): IndexShards => {
-  const shards = index.shards!
+  const declared = index.shards!
+  const layouts = shardLayoutsOf(declared)
+  // A declared table's entries are put into key form (#287); a provided one is bound
+  // where it's supplied (`compileShardTable`).
+  const shards: IndexShards =
+    layouts === "provided"
+      ? declared
+      : {
+          ...declared,
+          layouts: bindShardTable(indexName, index, layouts, matchKeyForm),
+        }
   const primaryComposites = [...primary.pk.composite, ...primary.sk.composite]
   if (primaryComposites.every((attr) => index.pk.composite.includes(attr))) {
     throw new Error(
@@ -1663,13 +1745,36 @@ export const buildEntityDefinition = (config: {
   }
 
   // Bind every sharded index (#183): its source is `by`, or the primary key's
-  // composites. Unbound indexes never compose a key.
+  // composites. Unbound indexes never compose a key. A table's matches are put into
+  // the key form an accessor's pins take (#287), so a value is looked up by the text
+  // every path composes for it.
+  const shardMatchForm = makeCompositeDomainKeyForm(
+    schemas.inputSchema as Schema.Top,
+    (attr, value, reason) => {
+      throw new Error(
+        `the value ${JSON.stringify(String(value))} of "${attr}" is not one its schema keys` +
+          (reason === undefined ? "" : ` (${reason})`),
+      )
+    },
+  )
+  const matchKeyForm = (record: globalThis.Record<string, unknown>) =>
+    toCompositeKeyRecord(shardMatchForm, record)
   for (const [indexName, indexDef] of Object.entries(initialIndexes)) {
     if (indexDef.shards === undefined) continue
     initialIndexes[indexName] = {
       ...indexDef,
-      shards: bindShards(config.entityType, indexName, indexDef, primaryIndex),
+      shards: bindShards(config.entityType, indexName, indexDef, primaryIndex, matchKeyForm),
     }
+  }
+  const compileShardTable = (indexName: string, declared: unknown): ShardTable => {
+    const index = ownValue(initialIndexes, indexName)
+    if (index?.shards === undefined || shardLayoutsOf(index.shards) !== "provided") {
+      throw new Error(
+        `[EDD-9181] Entity "${config.entityType}": index "${indexName}" doesn't declare ` +
+          `shards: { layouts: "provided" }, so no table can be supplied for it.`,
+      )
+    }
+    return bindShardTable(indexName, index, normalizeShardTable(indexName, declared), matchKeyForm)
   }
   refuseRepeatedIndex(config.entityType, initialIndexes)
   refuseSharedKeyAttributeOnEverySchema(config.entityType, initialIndexes)
@@ -1818,6 +1923,7 @@ export const buildEntityDefinition = (config: {
     generatedIdVersion,
     vectorIndexes,
     hasVectorIndexes,
+    compileShardTable,
   }
 }
 

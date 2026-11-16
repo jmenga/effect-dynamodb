@@ -46,6 +46,15 @@ export interface DynamoSchema {
    * composed as it always was.
    */
   readonly objectKeys?: ((site: ObjectKeySite) => string | undefined) | undefined
+  /**
+   * @internal The shard tables supplied at run time (#287) for indexes declared
+   * `shards: { layouts: "provided" }`, keyed by the index's normalised `shards`
+   * (`KeyComposer.IndexShards`). Set only on the schema an operation composes under
+   * (`KeyComposer.withShardTables`); read only through `KeyComposer.shardTableOf`.
+   * Absent, a provided index has no table, and composing its partition key throws
+   * `[EDD-9180]`: nothing falls back to a default.
+   */
+  readonly shardTables?: ReadonlyMap<object, unknown> | undefined
 }
 
 /**
