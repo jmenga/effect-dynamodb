@@ -34,6 +34,7 @@ import {
   store,
   tableIndexes,
 } from "./helpers/InMemoryTables.js"
+import { awsValidationException, DDB_TOO_MANY_ITEMS } from "./helpers/MockDynamoClient.js"
 
 const TABLE = "races"
 const AppSchema = DynamoSchema.make({ name: "app", version: 1 })
@@ -1125,6 +1126,38 @@ describe("an update that sets nothing, in transactWrite, what it sends", () => {
         )
         expect(result).toBe("ItemNotFound")
         expect(rowsOf("Plain")).toHaveLength(0)
+      }),
+    ),
+  )
+
+  it.effect("beside 100 other writes, is counted in the transaction DynamoDB refuses", () =>
+    run(
+      Effect.gen(function* () {
+        const db = yield* database
+        yield* db.entities.Plain.put(create("a1", "a@x.io"))
+        // Nothing is counted before sending: DynamoDB refuses 101 items, and the diagnosis
+        // confirms the count against the request, the no-op's check included.
+        interceptTransaction = () =>
+          Effect.fail(
+            new DynamoError({
+              operation: "TransactWriteItems",
+              cause: awsValidationException(DDB_TOO_MANY_ITEMS),
+            }),
+          )
+        const others = Array.from({ length: 100 }, (_, n) =>
+          Plain.put({ accountId: `o${n}`, email: "o@x.io", name: "n" }),
+        )
+        const error = yield* Transaction.transactWrite([
+          Plain.update({ accountId: "a1" }).pipe(Entity.set({})),
+          ...others,
+        ]).pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoError")
+        expect(String((error as DynamoError).cause)).toContain(
+          "101 operation(s) expanded to 101 items",
+        )
+        const sentItems = requests.find((request) => request.command === "TransactWriteItems")!
+        expect(sentItems.input.TransactItems).toHaveLength(101)
+        expect(sentItems.input.TransactItems[0].ConditionCheck).toBeDefined()
       }),
     ),
   )
