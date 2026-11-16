@@ -54,6 +54,11 @@ export interface UpdateContext<TIso, TClass = unknown> {
   readonly optic: Optic.Iso<TIso, TIso>
   /** The current state as a Schema.Class instance (rarely needed) */
   readonly current: TClass
+  /**
+   * A `versioned` aggregate's version, as read (#168): `0` for a root written before the option.
+   * Absent on an aggregate without `versioned`.
+   */
+  readonly version?: number
 }
 
 /** Discriminator config for binding a sub-aggregate */

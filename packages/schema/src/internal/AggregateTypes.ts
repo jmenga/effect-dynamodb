@@ -228,6 +228,8 @@ export type AggregateInputType<
   TPK extends ReadonlyArray<string>,
   TStamps = never,
   TFields = never,
+  /** Top-level fields the library manages, optional on input: a `versioned` root's version (#168). */
+  TManaged = never,
 > = _Simplify<
   // Regular fields: not an edge, not a PK composite
   {
@@ -235,7 +237,7 @@ export type AggregateInputType<
       ? never
       : K extends TPK[number]
         ? never
-        : K extends ManagedDateField<TModel, TStamps>
+        : K extends ManagedDateField<TModel, TStamps> | TManaged
           ? never
           : K]: _StripUndefined<TModel[K]>
   } & {
@@ -244,7 +246,7 @@ export type AggregateInputType<
       ? never
       : K extends TPK[number]
         ? never
-        : K extends ManagedDateField<TModel, TStamps>
+        : K extends ManagedDateField<TModel, TStamps> | TManaged
           ? K
           : never]?: _StripUndefined<TModel[K]>
   } & {
@@ -632,6 +634,8 @@ export type AggregateCreateInputType<
   TPK extends ReadonlyArray<string>,
   TStamps = never,
   TFields = never,
+  /** {@link AggregateInputType}'s `TManaged`. */
+  TManaged = never,
 > = _Simplify<
   {
     // The aggregate's key composites
@@ -640,7 +644,10 @@ export type AggregateCreateInputType<
       _StoredForm<_FieldOf<TFields, K>>
     >
   } & _WireFields<
-    Omit<AggregateInputType<TModel, TEdges, TPK, TStamps, TFields>, _CreateReplacedKeys<TEdges>>,
+    Omit<
+      AggregateInputType<TModel, TEdges, TPK, TStamps, TFields, TManaged>,
+      _CreateReplacedKeys<TEdges>
+    >,
     TFields
   > & {
       // A `${field}Id` the model declares beside an id edge's field: the model's own data
@@ -1063,3 +1070,12 @@ type ManyEdgeSkCheck<TEdge, TField> = TEdge extends {
     ? unknown
     : { readonly sk: { readonly composite: ReadonlyArray<ManyEdgeSkPaths<TField>> } }
   : unknown
+
+/** The root attribute a `versioned` option keeps the version in (#168), `never` when off. */
+export type AggregateVersionName<TVersioned> = [TVersioned] extends [undefined | false]
+  ? never
+  : TVersioned extends { readonly field: infer F extends string }
+    ? F
+    : TVersioned extends true | object
+      ? "version"
+      : never
