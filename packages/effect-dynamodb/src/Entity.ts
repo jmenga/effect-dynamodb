@@ -14547,7 +14547,14 @@ const makeImpl = <
         // `.keepRefs()`'s guard is the caller's: a row holding another ref fails it, unchanged.
         callerCondition: uState.condition !== undefined || prepared.kept !== undefined,
         expectedVersion: uState.expectedVersion,
-        refuse: (row) => fallbackRefusal(prepared.operands.fallbacks, row),
+        // A restated immutable value the row doesn't hold is refused as standalone refuses it
+        // (`ValidationError`), never sent and retried as a lost race.
+        refuse: (row) => {
+          const immutableChange = immutableMismatch(prepared.immutables, row)
+          return immutableChange !== undefined
+            ? new ValidationError({ entityType, operation: "update", cause: immutableChange })
+            : fallbackRefusal(prepared.operands.fallbacks, row)
+        },
       },
     )
 

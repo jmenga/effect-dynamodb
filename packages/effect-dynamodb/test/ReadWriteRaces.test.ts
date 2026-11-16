@@ -1454,6 +1454,30 @@ describe("an update restating an immutable value", () => {
     return db
   })
 
+  it.effect("with a payload, changing it, is ValidationError standalone and in a transaction", () =>
+    run(
+      Effect.gen(function* () {
+        const db = yield* seeded
+        const standalone = yield* outcome(
+          db.entities.Immutables.update({ accountId: "a1" }).set({ name: "z", email: "b@x.io" }),
+        )
+        expect(standalone).toBe("ValidationError")
+        requests.length = 0
+        const planned = yield* outcome(
+          Transaction.transactWrite([
+            db.entities.Immutables.update({ accountId: "a1" }).set({ name: "z", email: "b@x.io" }),
+            Plain.put(create("other", "o@x.io")),
+          ]),
+        )
+        // Refused on the plan's read, as standalone refuses it: never sent, never retried as a
+        // lost race.
+        expect(planned).toBe("ValidationError")
+        expect(commands()).toEqual(["GetItem"])
+        expect(rowsOf("Plain")).toEqual([])
+      }),
+    ),
+  )
+
   it.effect("setting nothing else, as stored, reads the row once and sends nothing", () =>
     run(
       Effect.gen(function* () {

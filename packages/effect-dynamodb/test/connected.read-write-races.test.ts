@@ -99,6 +99,12 @@ const RetainedAccounts = Entity.make({
   unique: { email: ["email"] },
   versioned: { retain: true },
 })
+/** An immutable email: an update may restate it, never change it. */
+const Immutables = Entity.make({
+  model: DynamoModel.configure(Account, { email: { immutable: true } }),
+  entityType: "Immutable",
+  primaryKey: key,
+})
 
 class Changed extends Schema.TaggedClass<Changed>()("Changed", {}) {}
 class Removed extends Schema.TaggedClass<Removed>()("Removed", {}) {}
@@ -182,6 +188,7 @@ const entities = {
   SoftAccounts,
   Plain,
   RetainedAccounts,
+  Immutables,
   OrderViews,
   Teams,
   Players,
@@ -851,6 +858,60 @@ describeConnected("an update of a row a projection removed", () => {
         )
         expect(result).toBe("ItemNotFound")
         expect(yield* rowsAt(other)).toEqual([])
+      }),
+    ),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// An update restating an immutable value
+// ---------------------------------------------------------------------------
+
+describeConnected("an update restating an immutable value", () => {
+  it.effect(
+    "changed, is ValidationError standalone and in a transaction, with or without a payload",
+    () =>
+      provide(
+        Effect.gen(function* () {
+          const db = yield* database
+          const id = fresh("immutable")
+          const other = fresh("immutable-sibling")
+          yield* db.entities.Immutables.put(account(id, "a@x.io"))
+          for (const payload of [{ email: "b@x.io" }, { email: "b@x.io", name: "z" }]) {
+            expect(
+              yield* outcome(db.entities.Immutables.update({ accountId: id }).set(payload)),
+            ).toBe("ValidationError")
+            expect(
+              yield* outcome(
+                Transaction.transactWrite([
+                  db.entities.Immutables.update({ accountId: id }).set(payload),
+                  db.entities.Plain.put(account(other, "o@x.io")),
+                ]),
+              ),
+            ).toBe("ValidationError")
+          }
+          expect(yield* rowsAt(other)).toEqual([])
+          const [row] = yield* rowsOf("Immutable", id)
+          expect([s(row?.email), s(row?.name)]).toEqual(["a@x.io", "n"])
+        }),
+      ),
+  )
+
+  it.effect("as stored, with nothing else, is the row, standalone and in a transaction", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* database
+        const id = fresh("immutable-kept")
+        const other = fresh("immutable-kept-sibling")
+        yield* db.entities.Immutables.put(account(id, "a@x.io"))
+        expect(
+          yield* db.entities.Immutables.update({ accountId: id }).set({ email: "a@x.io" }),
+        ).toEqual({ accountId: id, email: "a@x.io", name: "n" })
+        yield* Transaction.transactWrite([
+          db.entities.Immutables.update({ accountId: id }).set({ email: "a@x.io" }),
+          db.entities.Plain.put(account(other, "o@x.io")),
+        ])
+        expect(yield* rowsOf("Plain", other)).toHaveLength(1)
       }),
     ),
   )
