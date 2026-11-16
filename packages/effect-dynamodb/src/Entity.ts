@@ -136,6 +136,7 @@ import {
   Equal,
   Exit,
   Option,
+  Result,
   Schema,
   SchemaAST,
   SchemaIssue,
@@ -10421,6 +10422,13 @@ const makeImpl = <
         /** The attribute the target stores its ref in. */
         readonly refAttribute: string
         readonly refData: AttributeValue
+        /**
+         * The target's cascade index partition-key attribute, and the value the query found it
+         * under: the source's id, as the target indexes it. The update is conditioned on the
+         * target still holding it (#132).
+         */
+        readonly heldAttribute: string
+        readonly heldValue: AttributeValue
       }> = []
 
       for (const target of targets) {
@@ -10553,6 +10561,8 @@ const makeImpl = <
                 keyFields,
                 refAttribute: refSet.attribute,
                 refData: refSet.value,
+                heldAttribute: gsiPkField,
+                heldValue: { S: gsiPkValue },
               })
             }
 
@@ -10565,68 +10575,104 @@ const makeImpl = <
 
       if (allUpdateOps.length === 0) return
 
+      /**
+       * A target's update: its ref SET, conditioned on the target still naming the source (#132).
+       * The index the targets were found through is eventually consistent, so a target deleted or
+       * pointed at another source since may still be listed: unconditioned, the update would
+       * create a key-only item at a deleted target's key (one no read decodes, blocking a later
+       * `create` there), or write this source's data into a target that no longer names it.
+       * Refused, the target is no longer this source's, and is skipped.
+       */
+      const cascadeUpdate = (op: (typeof allUpdateOps)[number]) => ({
+        TableName: op.tableName,
+        Key: op.key,
+        UpdateExpression: "SET #ref = :refData",
+        ConditionExpression: "#held = :held",
+        ExpressionAttributeNames: { "#ref": op.refAttribute, "#held": op.heldAttribute },
+        ExpressionAttributeValues: { ":refData": op.refData, ":held": op.heldValue },
+      })
+
       if (mode === "transactional") {
         // Transactional mode — one atomic transaction. DynamoDB's limits (100
         // items, 4 MB, item size, sort keys) are not pre-checked (#144): a
         // rejection is diagnosed and reported as a cascade that wrote nothing.
-        const cascadeItems: ReadonlyArray<TransactWriteItem> = allUpdateOps.map((op) => ({
-          Update: {
-            TableName: op.tableName,
-            Key: op.key,
-            UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refAttribute },
-            ExpressionAttributeValues: { ":refData": op.refData },
-          },
-        }))
-        yield* client.transactWriteItems({ TransactItems: [...cascadeItems] }).pipe(
-          diagnoseFailure({
-            sent: () => ({
-              _tag: "Transaction",
-              items: cascadeItems,
-              targets: () =>
-                cascadeItems.map((item, index) => {
-                  const op = allUpdateOps[index]!
-                  return transactItemTarget(
-                    item,
-                    op.tableName,
-                    op.keyFields,
-                    op.entityType,
-                    `the cascade update of ${op.entityType} (item ${index})`,
-                  )
+        // A target refused by its condition (#132) left the source since the query: it is
+        // dropped, and the rest sent again, up to `GUARDED_PUT_ATTEMPTS` sends in all.
+        let pending: ReadonlyArray<(typeof allUpdateOps)[number]> = allUpdateOps
+        for (let send = 1; pending.length > 0; send++) {
+          const sentOps = pending
+          const cascadeItems: ReadonlyArray<TransactWriteItem> = sentOps.map((op) => ({
+            Update: cascadeUpdate(op),
+          }))
+          const sent = yield* Effect.result(
+            client.transactWriteItems({ TransactItems: [...cascadeItems] }).pipe(
+              diagnoseFailure({
+                sent: () => ({
+                  _tag: "Transaction",
+                  items: cascadeItems,
+                  targets: () =>
+                    cascadeItems.map((item, index) => {
+                      const op = sentOps[index]!
+                      return transactItemTarget(
+                        item,
+                        op.tableName,
+                        op.keyFields,
+                        op.entityType,
+                        `the cascade update of ${op.entityType} (item ${index})`,
+                      )
+                    }),
                 }),
-            }),
-            keys: () => ({
-              partition: [...new Set(allUpdateOps.map((op) => op.keyFields[0]))],
-              sort: [...new Set(allUpdateOps.map((op) => op.keyFields[1]))],
-            }),
-            rewrite: (diagnosis, original) =>
-              new CascadePartialFailure({
-                sourceEntity: sourceEntityType,
-                sourceId: sourceIdValue,
-                succeeded: 0,
-                failed: allUpdateOps.length,
-                errors: [
-                  diagnosedValidationError(diagnosis, original, {
-                    operation: "cascade",
-                    entityType: sourceEntityType,
+                keys: () => ({
+                  partition: [...new Set(sentOps.map((op) => op.keyFields[0]))],
+                  sort: [...new Set(sentOps.map((op) => op.keyFields[1]))],
+                }),
+                rewrite: (diagnosis, original) =>
+                  new CascadePartialFailure({
+                    sourceEntity: sourceEntityType,
+                    sourceId: sourceIdValue,
+                    succeeded: 0,
+                    failed: sentOps.length,
+                    errors: [
+                      diagnosedValidationError(diagnosis, original, {
+                        operation: "cascade",
+                        entityType: sourceEntityType,
+                      }),
+                    ],
                   }),
-                ],
               }),
-          }),
-        )
+            ),
+          )
+          if (Result.isSuccess(sent)) return
+          const error = sent.failure
+          const reasons =
+            error._tag === "CascadePartialFailure" || !isAwsTransactionCancelled(error.cause)
+              ? undefined
+              : error.cause.CancellationReasons
+          const refused = new Set(
+            (reasons ?? []).flatMap((reason, index) =>
+              reason?.Code === "ConditionalCheckFailed" ? [index] : [],
+            ),
+          )
+          // Cancelled for another reason, or once the sends run out: a cascade that wrote nothing.
+          if (refused.size === 0) return yield* error
+          pending = sentOps.filter((_, index) => !refused.has(index))
+          if (send >= GUARDED_PUT_ATTEMPTS && pending.length > 0) {
+            return yield* new CascadePartialFailure({
+              sourceEntity: sourceEntityType,
+              sourceId: sourceIdValue,
+              succeeded: 0,
+              failed: pending.length,
+              errors: [error],
+            })
+          }
+        }
       } else {
         // Eventual mode — concurrent updates with partial failure tracking
         let succeeded = 0
         const errors: Array<unknown> = []
 
         const updateEffects = allUpdateOps.map((op) => {
-          const update = {
-            TableName: op.tableName,
-            Key: op.key,
-            UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refAttribute },
-            ExpressionAttributeValues: { ":refData": op.refData },
-          }
+          const update = cascadeUpdate(op)
           return client.updateItem(update).pipe(
             // An item the cascade grows past 400 KB is named in `errors`.
             diagnoseFailure({
@@ -10653,6 +10699,12 @@ const makeImpl = <
               Effect.sync(() => {
                 succeeded++
               }),
+            ),
+            // Refused (#132): the target was deleted, or no longer names this source, since the
+            // query found it. It isn't this source's: skipped, neither succeeded nor failed.
+            Effect.catchIf(
+              (err) => err._tag !== "ValidationError" && isAwsConditionalCheckFailed(err.cause),
+              () => Effect.void,
             ),
             Effect.catch((err) =>
               Effect.sync(() => {

@@ -283,11 +283,17 @@ export const suite = (
             if (shapes[label].key === "string") {
               expect(recorded.cascadeRequests[1]).toEqual(before.cascadeRequests[1])
             }
-            // The ref is written where the put stored it, as the put stored it, but the name.
+            // The ref is written where the put stored it, as the put stored it, but the name, on a
+            // row still indexed under this team (#132).
             const update = recorded.cascadeRequests[2]!.input
-            expect(update.ExpressionAttributeNames).toEqual({ "#ref": refAttribute })
+            expect(update.ConditionExpression).toBe("#held = :held")
+            expect(update.ExpressionAttributeNames).toEqual({
+              "#ref": refAttribute,
+              "#held": "gsi1pk",
+            })
             expect(update.ExpressionAttributeValues).toEqual({
               ":refData": renamedTeam(putRow[refAttribute]!),
+              ":held": putRow.gsi1pk,
             })
             // The row afterwards is the row the put wrote, but the name, and nothing else.
             expect(playerOf(recorded.cascadeRows)).toEqual({
@@ -317,6 +323,7 @@ export const suite = (
             TableName,
             Key,
             UpdateExpression,
+            ConditionExpression,
             ExpressionAttributeNames,
             ExpressionAttributeValues,
           } = eventual.cascadeRequests[2]!.input
@@ -327,6 +334,7 @@ export const suite = (
                   TableName,
                   Key,
                   UpdateExpression,
+                  ConditionExpression,
                   ExpressionAttributeNames,
                   ExpressionAttributeValues,
                 },
