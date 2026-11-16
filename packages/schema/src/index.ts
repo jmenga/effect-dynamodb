@@ -113,6 +113,7 @@ export type {
 export * as KeyComposer from "./KeyComposer.js"
 export type { ProjectionResult } from "./Projection.js"
 export * as Projection from "./Projection.js"
+export * as ShardLayouts from "./ShardLayouts.js"
 export type {
   DistanceFunction,
   Similarity,

@@ -6,7 +6,7 @@
  * the key format; KeyComposer extracts attribute values and delegates.
  */
 
-import { DateTime } from "effect"
+import { Context, DateTime, Fiber } from "effect"
 import type * as DynamoSchema from "./DynamoSchema.js"
 import {
   applyCasing,
@@ -33,6 +33,7 @@ import {
   toBytes,
 } from "./internal/ZOrderCurve.js"
 import { type DeclaredDimension, declareDimension } from "./internal/ZOrderDimension.js"
+import { ShardLayouts } from "./ShardLayouts.js"
 import type * as ZOrder from "./ZOrder.js"
 
 /**
@@ -387,7 +388,11 @@ export const assertCollectionShardsAgreement = (
     const shards = member.index.shards
     if (shards === undefined) return "unsharded"
     const schema = member.schema ?? fallback
-    if (shardLayoutsOf(shards) === "provided" && schema.shardTables?.get(shards) === undefined) {
+    if (
+      shardLayoutsOf(shards) === "provided" &&
+      schema.shardTables?.get(shards) === undefined &&
+      ambientShardTable(shards) === undefined
+    ) {
       return undefined
     }
     const table = shardTableOf(schema, member.index)
@@ -1089,7 +1094,8 @@ const composedShardMarker = (
 /**
  * The table of a sharded index (#287): the one it declares, or, for an index
  * declared `layouts: "provided"`, the one the schema an operation composes under
- * carries ({@link withShardTables}). The one way every composer and reader
+ * carries ({@link withShardTables}), else the one the `ShardLayouts` service of the
+ * context it runs in supplies. The one way every composer and reader
  * obtains a table, so a path that has none can't fall back to a default: it
  * throws `[EDD-9180]`.
  */
@@ -1103,7 +1109,8 @@ export const shardTableOf = (
   }
   const layouts = shardLayoutsOf(shards)
   if (layouts !== "provided") return layouts
-  const supplied = schema.shardTables?.get(shards) as ShardTable | undefined
+  const supplied =
+    (schema.shardTables?.get(shards) as ShardTable | undefined) ?? ambientShardTable(shards)
   if (supplied === undefined) {
     throw new Error(
       `[EDD-9180] Index "${index.index}" declares shards: { layouts: "provided" }, but no ` +
@@ -1112,6 +1119,20 @@ export const shardTableOf = (
     )
   }
   return supplied
+}
+
+/**
+ * The table a `ShardLayouts` service supplies for a provided index (#287): the
+ * service of the context the composition runs in. A bound operation runs in its
+ * binding's context, so it composes with the table `DynamoClient.make` read; an
+ * unbound one with the caller's. `undefined` outside a fiber, or without the
+ * service or the entry.
+ */
+const ambientShardTable = (shards: IndexShards): ShardTable | undefined => {
+  const fiber = Fiber.getCurrent()
+  return fiber === undefined
+    ? undefined
+    : Context.getOrUndefined(fiber.context, ShardLayouts)?.tables.get(shards)
 }
 
 /**
@@ -1130,6 +1151,63 @@ export const withShardTables = (
         ...schema,
         shardTables: new Map<object, unknown>([...(schema.shardTables ?? new Map()), ...tables]),
       }
+
+/** The `[EDD-9180]` message for provided indexes with no table (#287). */
+export const missingShardTablesMessage = (
+  where: string,
+  missing: ReadonlyArray<{ readonly entity: string; readonly index: string }>,
+): string =>
+  `[EDD-9180] ${where}: ${missing.map(({ entity, index }) => `${entity}.${index}`).join(", ")} ` +
+  `declare${missing.length === 1 ? "s" : ""} shards: { layouts: "provided" }, but no ShardLayouts ` +
+  `layer supplies ${missing.length === 1 ? "its table" : "their tables"}. Add ` +
+  `ShardLayouts.layer([ShardLayouts.of(...)]) to the application layer.`
+
+/**
+ * The provided indexes of an entity (#287) that have no table where an operation
+ * runs: none under `schema`'s tables, nor from the `ShardLayouts` service of the
+ * current fiber (or of `registry`, when given).
+ */
+export const missingShardTables = (
+  schema: DynamoSchema.DynamoSchema | undefined,
+  indexes: Readonly<Record<string, IndexDefinition>>,
+  registry?: { readonly tables: ReadonlyMap<IndexShards, ShardTable> } | undefined,
+): ReadonlyArray<string> =>
+  Object.entries(indexes).flatMap(([name, def]) => {
+    const shards = def.shards
+    if (shards === undefined || shardLayoutsOf(shards) !== "provided") return []
+    const found =
+      schema?.shardTables?.get(shards) ??
+      (registry === undefined ? ambientShardTable(shards) : registry.tables.get(shards))
+    return found === undefined ? [name] : []
+  })
+
+/**
+ * Throw `[EDD-9180]` when an entity's provided index has no table where the
+ * operation runs (#287): checked when an operation without a bound client starts,
+ * so nothing is sent, whether or not this write would have composed the index.
+ */
+export const requireShardTables = (
+  where: string,
+  schema: DynamoSchema.DynamoSchema | undefined,
+  entityType: string,
+  indexes: Readonly<Record<string, IndexDefinition>>,
+): void => {
+  const missing = missingShardTables(schema, indexes)
+  if (missing.length > 0) {
+    throw new Error(
+      missingShardTablesMessage(
+        where,
+        missing.map((index) => ({ entity: entityType, index })),
+      ),
+    )
+  }
+}
+
+/** Does any index of these have its table supplied at run time (#287)? */
+export const hasProvidedShards = (indexes: Readonly<Record<string, IndexDefinition>>): boolean =>
+  Object.values(indexes).some(
+    (def) => def.shards !== undefined && shardLayoutsOf(def.shards) === "provided",
+  )
 
 /** Does `index` have a sharded partition key whose layout can vary by value? */
 export const hasShardTable = (index: IndexDefinition): boolean =>
