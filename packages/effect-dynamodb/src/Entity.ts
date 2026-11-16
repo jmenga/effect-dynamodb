@@ -268,7 +268,7 @@ import {
   type RawCondition,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
-import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
+import { conditionCheckItem, planWrite, type TransactPlan } from "./internal/TransactPlan.js"
 import {
   batchEntries,
   type Diagnosis,
@@ -11695,7 +11695,6 @@ const makeImpl = <
 
   /** An update from what {@link prepareUpdate} decided: its reads and its write. */
   const runPreparedUpdate = (
-    key: unknown,
     prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
     mode: DecodeMode,
     /**
@@ -13578,15 +13577,35 @@ const makeImpl = <
         deleteClauses.length > 0
 
       const rv = uState.returnValues ?? "allNew"
-      if (!hasAnyUpdate) {
-        // Nothing to update: nothing written, so nothing "updated"; the
-        // whole-item modes are the current item.
-        if (rv === "none") return undefined
-        if (rv === "updatedOld" || rv === "updatedNew") {
-          return yield* decodePartial(undefined, new Set(), mode)
-        }
-        return yield* get(key)._run(mode)
-      }
+      // Nothing to update (#132): nothing is written, but the op still establishes what its write
+      // would have: the row exists (`ItemNotFound`, `patch`'s `ConditionalCheckFailed`), and its
+      // condition holds. Existence alone is read, consistently, in every return mode; a condition
+      // is sent in the update's own request with no `UpdateExpression`, which changes nothing. In a
+      // transaction's plan the read is held to the commit by a `ConditionCheck` (`planned`), and
+      // the request is recorded as one (`planWrite`).
+      const noOp = !hasAnyUpdate
+      /**
+       * A no-op's result: nothing "updated"; the whole-item modes, the row. `row`: the row it read,
+       * or its request returned; `"held"`, its request's condition proved the row there and it
+       * asked for nothing back.
+       */
+      const noOpResult = (row: globalThis.Record<string, AttributeValue> | undefined | "held") =>
+        Effect.gen(function* () {
+          if (row === undefined || (row !== "held" && isProjectionTombstone(row, entityType))) {
+            return yield* missingItem()
+          }
+          if (rv === "none") return undefined
+          if (rv === "updatedOld" || rv === "updatedNew") {
+            return yield* decodePartial(undefined, new Set(), mode)
+          }
+          // A whole-item mode always asks its request for the row.
+          if (row === "held") return yield* Effect.die(new Error("a no-op returned no row"))
+          return yield* decodeAs(
+            fromAttributeMap(row) as globalThis.Record<string, unknown>,
+            row,
+            mode,
+          )
+        })
 
       // Compose UpdateExpression from all clause types
       const expressionParts: Array<string> = []
@@ -13598,6 +13617,8 @@ const makeImpl = <
 
       // Build condition expression — combine optimistic lock + user condition
       const condParts: Array<string> = []
+      /** How many of `condParts` restate an immutable value (`#immN = :immN`). */
+      let immutableTerms = 0
       if (evExpected !== undefined && systemFields.version) {
         condParts.push(versionIs(evExpected, names, values, "#condVer", ":expectedVer"))
       }
@@ -13624,6 +13645,7 @@ const makeImpl = <
           names[`#imm${i}`] = attr
           values[`:imm${i}`] = value
           condParts.push(`#imm${i} = :imm${i}`)
+          immutableTerms++
         }
         names["#exists"] = config.indexes.primary.pk.field
         condParts.push("attribute_exists(#exists)")
@@ -13642,6 +13664,32 @@ const makeImpl = <
         condParts.push(versionIs(casRead.version, names, values, "#casVer", ":casVer"))
         const incarnation = incarnationGuard(casRead.raw, names, values)
         if (incarnation !== undefined) condParts.push(incarnation)
+      }
+      if (noOp) {
+        // Required in a no-op's request whatever else it asserts: an `UpdateItem` with no
+        // `UpdateExpression` creates a key-only item at a missing key.
+        if (!plainWrite) {
+          names["#exists"] = config.indexes.primary.pk.field
+          condParts.push("attribute_exists(#exists)")
+        }
+        // Asserting nothing but existence, and restated immutable values: the row is read (or
+        // was), consistently, and the values are compared with it, as the refusal of the same
+        // update with a payload compares them (`immutableMismatch`).
+        if (condParts.length === 1 + immutableTerms) {
+          const row = held ?? (yield* readCurrent(tableName, marshalledKey)).Item
+          const immutableChange =
+            row !== undefined && !isProjectionTombstone(row, entityType)
+              ? immutableMismatch(immutables, row)
+              : undefined
+          if (immutableChange !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update",
+              cause: immutableChange,
+            })
+          }
+          return yield* noOpResult(row)
+        }
       }
       // Sent as built: a condition over DynamoDB's expression limits is
       // DynamoDB's to reject, and is diagnosed naming the caller's part (#144).
@@ -13810,18 +13858,23 @@ const makeImpl = <
       // The image the mode returns; `none` asks for nothing unless a
       // cascade needs the new item.
       const wantsOld = casRead === undefined && (rv === "allOld" || rv === "updatedOld")
-      const returned = wantsOld
-        ? "ALL_OLD"
-        : rv === "none" && !uState.cascade && casRead === undefined
-          ? "NONE"
-          : "ALL_NEW"
+      const returned = noOp
+        ? // A no-op's item, unchanged: returned only to the whole-item modes, and never cascaded.
+          rv === "allNew" || rv === "allOld"
+          ? "ALL_NEW"
+          : "NONE"
+        : wantsOld
+          ? "ALL_OLD"
+          : rv === "none" && !uState.cascade && casRead === undefined
+            ? "NONE"
+            : "ALL_NEW"
       // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
       // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
       // combinators), `values` may be empty — omit the property entirely.
       const updateInput: UpdateItemCommandInput = {
         TableName: tableName,
         Key: marshalledKey,
-        UpdateExpression: updateExpression,
+        ...(!noOp && { UpdateExpression: updateExpression }),
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
         ConditionExpression: conditionExpression,
@@ -13848,7 +13901,8 @@ const makeImpl = <
             if (isAwsConditionalCheckFailed(err.cause)) {
               const stored = err.cause.Item
               if (stored === undefined && !uState.patch) {
-                return createsOnMissing
+                // A no-op never creates: its payload names nothing to create from.
+                return createsOnMissing && !noOp
                   ? new MissingForCreate({ input: createInput() })
                   : new ItemNotFound({ entityType, key: encodedKey })
               }
@@ -13909,6 +13963,11 @@ const makeImpl = <
         ),
       )
 
+      // The no-op's condition held: nothing changed, so nothing cascades.
+      if (noOp) {
+        return yield* noOpResult(returned === "NONE" ? "held" : result.Attributes)
+      }
+
       // A cascade never meets an old-image mode here: that combination is
       // routed to the read-then-write branch, or read first (`casRead`).
       const newImage = wantsOld ? undefined : result.Attributes
@@ -13934,7 +13993,7 @@ const makeImpl = <
     forceReadMerge = false,
   ) =>
     Effect.flatMap(prepareUpdate(key, requested), (prepared) =>
-      runPreparedUpdate(key, prepared, mode, preRead, forceReadMerge),
+      runPreparedUpdate(prepared, mode, preRead, forceReadMerge),
     )
 
   /**
@@ -13983,7 +14042,7 @@ const makeImpl = <
     const once = () =>
       prepared === undefined
         ? runUpdateSized(key, mode, requested, held)
-        : sizedUpdate((force) => runPreparedUpdate(key, prepared, mode, held, force))
+        : sizedUpdate((force) => runPreparedUpdate(prepared, mode, held, force))
     // A form race (#238): the row's renamed sparse map changed form between the update's read and
     // its write. Read again and written again, as a guarded put is; once every attempt raced, the
     // race is reported naming the map. A row handed in (a transaction's plan) is never re-read here:
@@ -14145,6 +14204,23 @@ const makeImpl = <
       }
       const pkField = config.indexes.primary.pk.field
       const skField = config.indexes.primary.sk.field
+      // An update with nothing to set writes nothing, and found its row with a consistent read
+      // (#132). Standalone, that read IS the op's answer; in a transaction, the row could be
+      // deleted before the commit, so the read is held to it: a `ConditionCheck` that the row
+      // still exists, judged below as the op's main item (a refusal is a lost race, planned again,
+      // which then finds the row missing). A no-op that asserts a condition recorded its own check.
+      if (items.length === 0 && ownRow !== undefined) {
+        const { name: tableName } = yield* tableTag
+        items = [
+          conditionCheckItem({
+            TableName: tableName,
+            Key: ownKey,
+            ConditionExpression: "attribute_exists(#pk)",
+            ExpressionAttributeNames: { "#pk": pkField },
+            ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+          }),
+        ]
+      }
       const isOwn = (row: globalThis.Record<string, AttributeValue> | undefined) => {
         if (row === undefined) return false
         const plain = fromAttributeMap(row)
@@ -14174,7 +14250,12 @@ const makeImpl = <
         | { readonly _tag: "reserve"; readonly error: UniqueConstraintViolation }
       const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
       const roles = items.map((item): Role => {
-        if (isOwn(item.Put?.Item) || isOwn(item.Update?.Key) || isOwn(item.Delete?.Key)) {
+        if (
+          isOwn(item.Put?.Item) ||
+          isOwn(item.Update?.Key) ||
+          isOwn(item.Delete?.Key) ||
+          isOwn(item.ConditionCheck?.Key)
+        ) {
           return { _tag: "main" }
         }
         // A retain snapshot: in the row's partition, at a version key.
@@ -14233,7 +14314,8 @@ const makeImpl = <
       // every write carrying it asks (`internal/FormGuard.ts`, #238); its
       // attribute is no input of the rest.
       const mainItem = items[roles.findIndex((role) => role._tag === "main")]
-      const guarded = mainItem?.Update ?? mainItem?.Put ?? mainItem?.Delete
+      const guarded =
+        mainItem?.Update ?? mainItem?.Put ?? mainItem?.Delete ?? mainItem?.ConditionCheck
       const conditionAttrs = [
         ...new Set(
           (guarded?.ConditionExpression?.match(/#[A-Za-z0-9_]+/g) ?? []).flatMap((token) => {

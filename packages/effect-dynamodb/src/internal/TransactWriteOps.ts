@@ -60,7 +60,7 @@ import {
   underCaptured,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
-import type { TransactPlan } from "./TransactPlan.js"
+import { conditionCheckItem, type TransactPlan } from "./TransactPlan.js"
 import {
   type KeyAttributes,
   keyAttributesOf,
@@ -875,14 +875,13 @@ export const buildTransactWriteItems = (
         )
       } else {
         push(
-          {
-            ConditionCheck: {
-              TableName: tableName,
-              Key: toAttributeMap(op.primaryKey!),
-              ConditionExpression: op.condition!.expression,
-              ...conditionFields(op.condition),
-            },
-          },
+          conditionCheckItem({
+            TableName: tableName,
+            Key: toAttributeMap(op.primaryKey!),
+            ConditionExpression: op.condition!.expression,
+            ExpressionAttributeNames: op.condition!.names,
+            ExpressionAttributeValues: op.condition!.values,
+          }),
           { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
         )
       }

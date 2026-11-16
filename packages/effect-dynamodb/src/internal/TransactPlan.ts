@@ -36,7 +36,10 @@ import { markNotSent, markRecording } from "./Capacity.js"
  * none of the plan's items failed.
  */
 export interface TransactPlan {
-  /** Empty when the op resolves to no write (an update with nothing to set). */
+  /**
+   * The items the op would write. An update with nothing to set writes none of its own: its plan
+   * holds the `ConditionCheck` that keeps its read (or its condition) to the commit (#132).
+   */
   readonly items: ReadonlyArray<TransactWriteItem>
   readonly verdict: (
     reasons: ReadonlyArray<WriteCancellationReason | undefined>,
@@ -87,19 +90,66 @@ const conditionOf = (input: {
 const conditionOfItem = (item: TransactWriteItem): string | undefined =>
   item.Put?.ConditionExpression ??
   item.Update?.ConditionExpression ??
-  item.Delete?.ConditionExpression
+  item.Delete?.ConditionExpression ??
+  item.ConditionCheck?.ConditionExpression
+
+/**
+ * A `ConditionCheck` on one key: the item `Transaction.check` sends, and the transact form of a
+ * write that changes nothing (an update with nothing to set, held to a transaction's commit, #132).
+ * `ExpressionAttributeValues` is left out when empty: DynamoDB refuses an empty map, and a
+ * value-free condition (`attribute_exists`) makes one.
+ */
+export const conditionCheckItem = (args: {
+  readonly TableName: string | undefined
+  readonly Key: Record<string, AttributeValue> | undefined
+  readonly ConditionExpression: string
+  readonly ExpressionAttributeNames?: Record<string, string> | undefined
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+  readonly ReturnValuesOnConditionCheckFailure?: "ALL_OLD" | "NONE" | undefined
+}): TransactWriteItem => ({
+  ConditionCheck: {
+    TableName: args.TableName,
+    Key: args.Key,
+    ConditionExpression: args.ConditionExpression,
+    ...(args.ExpressionAttributeNames !== undefined && {
+      ExpressionAttributeNames: args.ExpressionAttributeNames,
+    }),
+    ...(args.ExpressionAttributeValues !== undefined &&
+      Object.keys(args.ExpressionAttributeValues).length > 0 && {
+        ExpressionAttributeValues: args.ExpressionAttributeValues,
+      }),
+    ...(args.ReturnValuesOnConditionCheckFailure !== undefined && {
+      ReturnValuesOnConditionCheckFailure: args.ReturnValuesOnConditionCheckFailure,
+    }),
+  },
+})
 
 const asPut = (input: PutItemCommandInput): TransactWriteItem => ({
   Put: { TableName: input.TableName, Item: input.Item, ...conditionOf(input) },
 })
-const asUpdate = (input: UpdateItemCommandInput): TransactWriteItem => ({
-  Update: {
-    TableName: input.TableName,
-    Key: input.Key,
-    UpdateExpression: input.UpdateExpression,
-    ...conditionOf(input),
-  },
-})
+/**
+ * An `UpdateItem` as a transact item. One with no `UpdateExpression` changes nothing: it is an
+ * update with nothing to set, sent only for its condition (#132), and its transact form is a
+ * `ConditionCheck` on the same key, condition and `ALL_OLD`.
+ */
+const asUpdate = (input: UpdateItemCommandInput): TransactWriteItem =>
+  input.UpdateExpression === undefined && input.ConditionExpression !== undefined
+    ? conditionCheckItem({
+        TableName: input.TableName,
+        Key: input.Key,
+        ConditionExpression: input.ConditionExpression,
+        ExpressionAttributeNames: input.ExpressionAttributeNames,
+        ExpressionAttributeValues: input.ExpressionAttributeValues,
+        ReturnValuesOnConditionCheckFailure: input.ReturnValuesOnConditionCheckFailure,
+      })
+    : {
+        Update: {
+          TableName: input.TableName,
+          Key: input.Key,
+          UpdateExpression: input.UpdateExpression,
+          ...conditionOf(input),
+        },
+      }
 const asDelete = (input: DeleteItemCommandInput): TransactWriteItem => ({
   Delete: { TableName: input.TableName, Key: input.Key, ...conditionOf(input) },
 })

@@ -1786,15 +1786,29 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("a transaction of only no-op updates sends nothing", () =>
+    it.effect("a transaction of only no-op updates holds each read row to the commit", () =>
       Effect.gen(function* () {
         mockGetItem.mockImplementation(async () => ({ Item: sparseRow("a@x.io") }))
+        mockTransactWriteItems.mockResolvedValueOnce({})
 
         yield* Transaction.transactWrite([
           SparseMembers.update({ memberId: "m-1" }).pipe(Entity.set({})),
         ])
 
-        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        // Read consistently, and held to the commit by a check that the row still exists (#132).
+        expect(mockGetItem.mock.calls[0]![0].ConsistentRead).toBe(true)
+        const call = mockTransactWriteItems.mock.calls[0]![0]
+        expect(call.TransactItems).toEqual([
+          {
+            ConditionCheck: {
+              TableName: expect.any(String),
+              Key: mockGetItem.mock.calls[0]![0].Key,
+              ConditionExpression: "attribute_exists(#pk)",
+              ExpressionAttributeNames: { "#pk": "pk" },
+              ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+            },
+          },
+        ])
       }).pipe(Effect.provide(TestLayer)),
     )
 
