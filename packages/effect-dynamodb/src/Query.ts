@@ -17,7 +17,11 @@ import type { BlobStoreError } from "@effect-dynamodb/schema/Errors.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { OffloadMode } from "@effect-dynamodb/schema/internal/EntityTypes.js"
 import { ownValue, setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
-import type { ReadFanOut, ReadPartitions } from "@effect-dynamodb/schema/KeyComposer.js"
+import type {
+  ReadFanOut,
+  ReadPartitions,
+  ShardLayout,
+} from "@effect-dynamodb/schema/KeyComposer.js"
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import { Effect, Function, Option, Pipeable, Result, Stream } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "./DynamoClient.js"
@@ -165,6 +169,16 @@ export interface QueryExplain {
   }
   /** The skip-scan probe budget, for a plan that probes. */
   readonly maxSkips?: number
+  /**
+   * A sharded index's layout for the pinned value (#287): the resolved count and
+   * `previous`, and the partition key text of each partition read. Set on every
+   * query of a sharded index; a value at 1 reads its one unsharded partition.
+   */
+  readonly shards?: {
+    readonly count: number
+    readonly previous: number | undefined
+    readonly partitions: ReadonlyArray<string>
+  }
   /** A sharded index's fan-out (#183): one request per partition, merged. */
   readonly fanOut?: {
     /** The partition key text of each partition read, in merge order. */
@@ -360,6 +374,12 @@ interface QueryState {
   readonly fanOut: FanOutSpec | undefined
   /** @internal Set by {@link prepared}: each partition and where it resumes. */
   readonly fanOutStart: FanOutStart | undefined
+  /**
+   * @internal The pinned value's resolved layout on a sharded index (#287), set with
+   * the partitions by {@link fanOut}, whether they fan out or not: a value at 1 is a
+   * plain query, and still a query of a sharded index (`EDD-9104`, `explain().shards`).
+   */
+  readonly shardLayout: ShardLayout | undefined
   /** Requests a fan-out sends at once; unset, one per partition (see {@link concurrency}). */
   readonly concurrencyValue: number | undefined
 }
@@ -616,6 +636,7 @@ export const make = <A, E = never, O extends OffloadState = NoOffloadState>(conf
     operationTarget: config.operationTarget,
     fanOut: undefined,
     fanOutStart: undefined,
+    shardLayout: undefined,
     concurrencyValue: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
@@ -691,6 +712,7 @@ export const makeScan = <A, E = never, O extends OffloadState = NoOffloadState>(
     operationTarget: undefined,
     fanOut: undefined,
     fanOutStart: undefined,
+    shardLayout: undefined,
     concurrencyValue: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
@@ -810,12 +832,24 @@ export const fanOut = <A, E = never, O extends OffloadState = NoOffloadState>(
   read: ReadPartitions,
 ): Query<A, E, O> =>
   read.fanOut === undefined
-    ? self
+    ? read.layout === undefined
+      ? self
+      : // A value whose layout is a count of 1 (#287): one partition, the unsharded key
+        // the query was built with. A plain query, on a sharded index.
+        new QueryImpl<A, E, O>({ ...self._state, shardLayout: read.layout })
     : new QueryImpl<A, E, O>({
         ...self._state,
         pkValue: read.partitions[0]!,
         fanOut: { ...read.fanOut, partitions: read.partitions },
+        shardLayout: read.layout ?? {
+          count: read.fanOut.count,
+          previous: read.fanOut.previous,
+        },
       })
+
+/** @internal Does this query read a sharded index (#183), whatever its value's layout (#287)? */
+const isShardedState = (state: QueryState): boolean =>
+  state.fanOut !== undefined || state.shardLayout !== undefined
 
 /**
  * @internal A query whose terminals fail with `refusal`: building one has no error
@@ -1179,7 +1213,7 @@ export const plan = <A, E = never, O extends OffloadState = NoOffloadState>(
     | { readonly planner: PlannerFactory; readonly maxSkips: number | undefined }
     | { readonly zorder: ZOrderOptions },
 ): Query<A, E, O> => {
-  if (self._state.fanOut !== undefined) throw shardedPlanRefusal(self._state)
+  if (isShardedState(self._state)) throw shardedPlanRefusal(self._state)
   return new QueryImpl<A, E, O>(
     "zorder" in install
       ? { ...self._state, zorderOptions: { ...self._state.zorderOptions, ...install.zorder } }
@@ -1200,7 +1234,7 @@ const shardedPlanRefusal = (state: QueryState): Error =>
 
 /** @internal {@link shardedPlanRefusal}, for an accessor to raise before it plans. */
 export const refuseShardedPlan = (self: Query<unknown, unknown, any>): void => {
-  if (self._state.fanOut !== undefined) throw shardedPlanRefusal(self._state)
+  if (isShardedState(self._state)) throw shardedPlanRefusal(self._state)
 }
 
 /**
@@ -1212,8 +1246,9 @@ export const refuseShardedPlan = (self: Query<unknown, unknown, any>): void => {
 export const planEmpty = <A, E = never, O extends OffloadState = NoOffloadState>(
   self: Query<A, E, O>,
 ): Query<A, E, O> =>
-  // Nothing is read, so no partition is: a fan-out has nothing left to merge.
-  plan(new QueryImpl<A, E, O>({ ...self._state, fanOut: undefined }), {
+  // Nothing is read, so no partition is: a fan-out has nothing left to merge, and no
+  // layout is resolved (#287).
+  plan(new QueryImpl<A, E, O>({ ...self._state, fanOut: undefined, shardLayout: undefined }), {
     planner: compositePlanner({
       entityType: self._state.entityTypes.join(", ") || "unknown",
       index: self._state.indexName ?? "primary",
@@ -3933,6 +3968,10 @@ export const explain = <A, E = never, O extends OffloadState = NoOffloadState>(
         filter: undefined,
         rowChecks: [],
         sizing: explainedSizing(state),
+        // A sharded index's value at 1 (#287): its one, unsharded partition.
+        ...(state.shardLayout !== undefined && {
+          shards: { ...state.shardLayout, partitions: [state.pkValue] },
+        }),
       } satisfies QueryExplain
     }
     const planner = resolvePlanner(state, factory)
@@ -4496,6 +4535,11 @@ const explainFanOut = (state: QueryState, spec: FanOutSpec): QueryExplain => {
       partitions: partitions.map(({ pkValue }) => pkValue),
       pruned: spec.pruned,
       concurrency: fanOutConcurrency(state, partitions.length),
+    },
+    shards: {
+      count: spec.count,
+      previous: spec.previous,
+      partitions: partitions.map(({ pkValue }) => pkValue),
     },
   }
 }
