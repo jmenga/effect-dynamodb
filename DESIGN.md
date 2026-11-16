@@ -9205,6 +9205,8 @@ for unrelated errors and the collision was caught only at review.
 | 9098 | `rekey` options and resume tokens |
 | 9111, 9114–9120, 9141–9143 and 9146 | Offloaded storage: blob store, offload options, read modes, GC, escaped key text (#179) |
 | 9161–9164 | Effect value types: what DynamoDB doesn't store at an untyped position, object key composites (#242) |
+| 9173–9176 | Reads held to their writes (#132): reserved, none allocated (every outcome is an existing tagged error) |
+| 9177–9180 | Aggregate concurrency: `versioned`, `expectedVersion` (#168) |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -9358,11 +9360,14 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9168` | `Aggregate.ts` (`listGapMatch`), at `list` (`ValidationError`, through `Capacity.refusalsFail`; nothing returned) | An aggregate `list` key giving a value after a list sort key composite left out, matched on the root items read (text under a folding casing), meets a list index row with no readable value for that composite: the index doesn't project it, or the row holds something its field can't read (`readListComposite`). Such a row has no key text to compare, so the call is refused rather than the row kept or dropped. The message names the composite, to project onto the list index. Only the composites matched are read: one the key doesn't give after the gap is never asked for. |
 | `EDD-9169` | `Entity.ts` (`refuseUnkeyedRefs`, from `composeAllKeys` and the plain `upsert` before its ref reads), at `put` / `create` / `upsert` (`ValidationError`; nothing sent) | A write of a whole item giving no id for a ref whose id (`${field}Id`) is a primary key composite: `null` for a ref the model declares nullable, or none for one it declares optional. Every item has a primary key, and a ref without an id has none to compose it from. Up to 1.42.1 the `null` failed decoding (`Expected string`) and a left-out id died in key composition (`Missing composite attribute`). A non-null id is written as before. |
 | `EDD-9172` | `Entity.ts` (schema, the `unique` check in `make`), pure and operational | A `unique` constraint naming a ref (`"team"` for `refs: { team }`, or a field the model marks `ref: true`). The ref's value is the referenced item's data, which composed the key text `[object object]` for every item, so the first item written took the value for all of them (#266). Refused at load, naming the constraint and the ref and saying to write its id (`teamId`), which a constraint takes as an index composite does. The `unique` type leaves refs out, so it is a compile error too. |
+| `EDD-9177` | `Aggregate.ts` (`make`, pure and operational; #168, `docs/designs/aggregate-concurrency.md` §3.5) | An aggregate's `versioned` option the root version can't be kept under: `retain` or `ttl` (an aggregate keeps no snapshots), or a `field` that is a context field, a partition, collection or list key composite, a timestamp field, a root model field whose type isn't a number (on a root of members, a union or a suspended schema, any member declaring it), or the attribute a root model field is stored under (`Schema.encodeKeys`). Refused at load, naming the option and the field. |
+| `EDD-9178` | `Aggregate.ts` (`update`; #168, `docs/designs/aggregate-concurrency.md` §3.5) | `update(key, fn, { expectedVersion })` on an aggregate without `versioned`: there is no version to compare. A `ValidationError`, nothing read or sent; a typed caller can't write it. |
+| `EDD-9179` | `Aggregate.ts` (`make`, pure and operational; #168, `docs/designs/aggregate-concurrency.md` §0) | An aggregate's `fence` setting it can't be kept under: `fence: false` beside `versioned` (the version `Update` on the root is itself the fence, so a versioned aggregate is always fenced), or a `fence` that isn't a boolean. Refused at load. |
 
 `EDD-9076` and `EDD-9077` also cover `DynamoModel.External` binary fields from #179 (the same
 condition — an attribute DynamoDB sees as one opaque value — raised by the same walker).
 
-Next free code: `9173` (`9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: `9181` (`9173`–`9176` and `9180` are reserved for #132 and #168 and left unallocated; `9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 
