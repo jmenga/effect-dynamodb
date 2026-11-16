@@ -80,6 +80,7 @@ import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
 import * as Clears from "./helpers/ClearScenarios.js"
+import { raceAfterFirstRead } from "./helpers/RaceAfterRead.js"
 import { harnessOn } from "./helpers/RekeyRepair.js"
 import * as StampedComposites from "./helpers/StampedComposites.js"
 
@@ -2228,32 +2229,6 @@ describeConnected("Connected integration tests", () => {
         expect(yield* sentinelOwner("txd@test.com")).toBeUndefined()
       }).pipe(provide),
     )
-
-    /**
-     * Run `body` against a client that lets `concurrent` land between the
-     * FIRST read and everything after it — the window a plan's read opens.
-     */
-    const raceAfterFirstRead = <A, E>(
-      concurrent: Effect.Effect<unknown, unknown, DynamoClient | Table.TableConfig>,
-      body: Effect.Effect<A, E, DynamoClient | Table.TableConfig>,
-    ) =>
-      Effect.gen(function* () {
-        const real = yield* DynamoClient
-        let fired = false
-        return yield* body.pipe(
-          Effect.provideService(DynamoClient, {
-            ...real,
-            getItem: (input) =>
-              real.getItem(input).pipe(
-                Effect.tap(() => {
-                  if (fired) return Effect.void
-                  fired = true
-                  return concurrent.pipe(Effect.provideService(DynamoClient, real), Effect.orDie)
-                }),
-              ),
-          }),
-        )
-      })
 
     it.effect(
       "a row changed between a delete's read and its write is planned again and deleted",
