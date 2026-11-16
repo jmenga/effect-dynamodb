@@ -9700,9 +9700,16 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
           ? collection[0]!
           : (collection as string)
     }
-    // A partition key with composites, or a shard, continues its head after `#`.
+    // A partition key with composites, or a shard, continues its head after `#`. A
+    // layout of count 1 (#287) is the head itself, and a table supplied at run time may
+    // be one: either, on an empty half.
     const exactOf = (index: KeyComposer.IndexDefinition): false | undefined =>
-      index.pk.composite.length > 0 || index.shards !== undefined ? false : undefined
+      index.pk.composite.length > 0 ||
+      (index.shards !== undefined &&
+        KeyComposer.shardLayoutsOf(index.shards) !== "provided" &&
+        (KeyComposer.shardLayoutsOf(index.shards) as KeyComposer.ShardTable).default.count > 1)
+        ? false
+        : undefined
     const primary = e.indexes.primary!
     const tableKeys = [
       primary.pk.field,

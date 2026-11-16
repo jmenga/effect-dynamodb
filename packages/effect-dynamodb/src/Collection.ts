@@ -340,7 +340,7 @@ export const make = <
     name,
     entityEntries.flatMap(([key, entity]) => {
       const index = entity.indexes[sharedIndexName]
-      return index === undefined ? [] : [{ key, index }]
+      return index === undefined ? [] : [{ key, index, schema: entity._schema }]
     }),
   )
 

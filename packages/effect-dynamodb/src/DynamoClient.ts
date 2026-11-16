@@ -3338,7 +3338,7 @@ const makeFromConfig = (config: {
       )
       KeyComposer.assertCollectionShardsAgreement(
         collName,
-        members.map((m) => ({ key: m.entityKey, index: m.indexDef })),
+        members.map((m) => ({ key: m.entityKey, index: m.indexDef, schema: m.entityLike._schema })),
       )
 
       const collectionAccessor = (composites: Record<string, unknown>) => {

@@ -19352,7 +19352,9 @@ const makeImpl = <
             KeyComposer.composeStoredPk(schema, entityType, index, rowKeyForm),
           )
           if (text === undefined) {
-            if (!KeyComposer.isCurrentShardLayout(schema, entityType, index, stored)) {
+            // Judged against the row's resolved layout (#287): its value's, or for a row
+            // with a hole in its partition key, the default's or any agreeing entry's.
+            if (!KeyComposer.isCurrentShardLayout(schema, entityType, index, stored, rowKeyForm)) {
               uncomposable.push(name)
             }
           } else if (text !== stored) {

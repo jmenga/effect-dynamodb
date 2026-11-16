@@ -12,7 +12,11 @@ import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { setOwn } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { refuseSharedKeyAttribute } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
-import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
+import {
+  checkShardTables,
+  type IndexDefinition,
+  isZOrderHalf,
+} from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
 import { type Config, Context, Effect, Layer, type Option } from "effect"
@@ -212,6 +216,9 @@ export const make = <
   // leaves to the schema resolves only here.
   for (const entity of Object.values(entities)) {
     refuseSharedKeyAttribute(config.schema, entity.entityType ?? "(unnamed)", entity.indexes)
+    // Two entries of a shard table composing one key, under this schema's casing (#287,
+    // EDD-9099): the stage casing left to the schema resolves at, as above.
+    checkShardTables(config.schema, entity.entityType ?? "(unnamed)", entity.indexes)
   }
 
   // Configure all entities with this table's schema and tag — only once the
