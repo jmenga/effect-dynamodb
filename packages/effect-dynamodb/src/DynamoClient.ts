@@ -167,6 +167,7 @@ import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessor
 import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import * as ShardLayouts from "@effect-dynamodb/schema/ShardLayouts.js"
 import type {
   VectorIndexConfig,
   VectorIndexDefinition,
@@ -2793,6 +2794,39 @@ const makeFromConfig = (config: {
       Context.getOrUndefined(ctx, BlobStore),
     )
     if (storeError !== undefined) throw storeError
+    // The shard tables of every index declared `shards: { layouts: "provided" }` (#287), read
+    // here from the bind context: bound operations run in it, so they compose with these tables
+    // and keep `R = never`. A bound member's index without one is `[EDD-9180]` at bind, naming
+    // every one; nothing falls back to a default.
+    const shardRegistry = Context.getOrUndefined(baseCtx, ShardLayouts.ShardLayouts)
+    const missingShards = Object.values(config.entities).flatMap((rawEntity) => {
+      const entityLike = operational(rawEntity) as unknown as EntityLike
+      return KeyComposer.missingShardTables(
+        undefined,
+        entityLike.indexes,
+        shardRegistry ?? { tables: new Map() },
+      ).map((index) => ({ entity: entityLike.entityType, index }))
+    })
+    if (missingShards.length > 0) {
+      throw new Error(KeyComposer.missingShardTablesMessage("DynamoClient.make", missingShards))
+    }
+    /**
+     * The schema a member's accessors and collections compose their partitions under (#287):
+     * its own, carrying the tables of its provided indexes. Accessors build queries outside
+     * the bind context, so the tables travel on the schema. The schema itself for a member
+     * with no provided index.
+     */
+    const readSchemaOf = (entityLike: EntityLike): DynamoSchema.DynamoSchema => {
+      if (shardRegistry === undefined || !KeyComposer.hasProvidedShards(entityLike.indexes)) {
+        return entityLike._schema
+      }
+      const tables = new Map<KeyComposer.IndexShards, KeyComposer.ShardTable>()
+      for (const def of Object.values(entityLike.indexes)) {
+        const table = def.shards === undefined ? undefined : shardRegistry.tables.get(def.shards)
+        if (table !== undefined) tables.set(def.shards!, table)
+      }
+      return KeyComposer.withShardTables(entityLike._schema, tables)
+    }
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
@@ -2918,6 +2952,8 @@ const makeFromConfig = (config: {
         ? indexDef.sk.zorderHalf.layout
         : undefined
       const zorderPlans = zorderLayout === undefined ? undefined : makeZOrderPlans(zorderLayout)
+      // Carrying the bind's shard tables (#287).
+      const readSchema = readSchemaOf(entityLike)
 
       const accessor = (rawComposites: Record<string, unknown>) => {
         if (zorder) {
@@ -2940,9 +2976,9 @@ const makeFromConfig = (config: {
           indexDef.pk.composite,
           indexDef.sk.composite,
         )
-        // One partition, or a sharded index's several (#183).
+        // One partition, or a sharded index's several (#183), in the pinned value's layout (#287).
         const read = KeyComposer.composeReadPartitions(
-          entityLike._schema,
+          readSchema,
           entityLike.entityType,
           indexDef,
           compositesKeyForm,
@@ -3336,9 +3372,15 @@ const makeFromConfig = (config: {
         collName,
         members.map((m) => ({ key: m.entityKey, schema: m.entityLike._schema, index: m.indexDef })),
       )
+      // Compared by content, with the tables the bind read for provided indexes (#287).
+      const memberReadSchemas = new Map(members.map((m) => [m, readSchemaOf(m.entityLike)]))
       KeyComposer.assertCollectionShardsAgreement(
         collName,
-        members.map((m) => ({ key: m.entityKey, index: m.indexDef, schema: m.entityLike._schema })),
+        members.map((m) => ({
+          key: m.entityKey,
+          index: m.indexDef,
+          schema: memberReadSchemas.get(m)!,
+        })),
       )
 
       const collectionAccessor = (composites: Record<string, unknown>) => {
@@ -3386,7 +3428,7 @@ const makeFromConfig = (config: {
         // returned nothing.
         // Members share the partitions, whatever each hashes: never pruned (#183).
         const read = KeyComposer.composeReadPartitions(
-          firstMember.entityLike._schema,
+          memberReadSchemas.get(firstMember)!,
           firstMember.entityLike.entityType,
           indexDef,
           entityDomainKeyForm(firstMember.entityLike, composites, indexDef.pk.composite),
@@ -3617,6 +3659,26 @@ const makeFromConfig = (config: {
               ),
             )
             if (streamKeysError !== undefined) throw streamKeysError
+            // Every member's provided shard tables (#287), from the context the run reads them
+            // from: one missing fails the run before the scan (`EDD-9180`), naming every one,
+            // members the client didn't bind included. The table is read once, so one run judges
+            // every row against one table.
+            const missingShardTables = [...new Set(tableMembers)].flatMap((member) => {
+              const entity = member as {
+                readonly entityType?: string
+                readonly indexes?: Readonly<Record<string, IndexDefinition>>
+                readonly _schema?: DynamoSchema.DynamoSchema
+              }
+              return entity.indexes === undefined
+                ? []
+                : KeyComposer.missingShardTables(entity._schema, entity.indexes).map((index) => ({
+                    entity: entity.entityType ?? "(unnamed)",
+                    index,
+                  }))
+            })
+            if (missingShardTables.length > 0) {
+              throw new Error(KeyComposer.missingShardTablesMessage("rekey", missingShardTables))
+            }
             for (const member of [...tableMembers, ...(options?.streams ?? [])]) {
               const handler = Rekey.handlerOf(member)
               if (handler !== undefined) handlers.add(handler)

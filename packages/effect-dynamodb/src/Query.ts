@@ -380,6 +380,15 @@ interface QueryState {
    * plain query, and still a query of a sharded index (`EDD-9104`, `explain().shards`).
    */
   readonly shardLayout: ShardLayout | undefined
+  /**
+   * @internal The partitions of a query on an index whose shard table is supplied at run time
+   * (#287, `layouts: "provided"`), built before that table is known: resolved once by a
+   * terminal (`prepared`, `explain`, `asParams`) from the context it runs in, and installed as
+   * {@link fanOut} installs them. A value no key can hold resolves to the refusal.
+   */
+  readonly deferredRead: (() => ReadPartitions | ValidationError) | undefined
+  /** @internal A {@link where} replaced the pins of a deferred read: it reads every shard. */
+  readonly deferredUnpruned: boolean
   /** Requests a fan-out sends at once; unset, one per partition (see {@link concurrency}). */
   readonly concurrencyValue: number | undefined
 }
@@ -637,6 +646,8 @@ export const make = <A, E = never, O extends OffloadState = NoOffloadState>(conf
     fanOut: undefined,
     fanOutStart: undefined,
     shardLayout: undefined,
+    deferredRead: undefined,
+    deferredUnpruned: false,
     concurrencyValue: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
@@ -713,6 +724,8 @@ export const makeScan = <A, E = never, O extends OffloadState = NoOffloadState>(
     fanOut: undefined,
     fanOutStart: undefined,
     shardLayout: undefined,
+    deferredRead: undefined,
+    deferredUnpruned: false,
     concurrencyValue: undefined,
     tableName: config.tableName,
     indexName: config.indexName,
@@ -771,6 +784,7 @@ const withSortKeyCondition = <A, E = never, O extends OffloadState = NoOffloadSt
  * for values a replaced condition no longer selects.
  */
 const withoutPruning = (state: QueryState): QueryState => {
+  if (state.deferredRead !== undefined) return { ...state, deferredUnpruned: true }
   const spec = state.fanOut
   if (spec?.everyPartition === undefined) return state
   return {
@@ -847,9 +861,38 @@ export const fanOut = <A, E = never, O extends OffloadState = NoOffloadState>(
         },
       })
 
+/**
+ * @internal {@link fanOut} for an index whose table is supplied at run time (#287): `read`
+ * composes the partitions when a terminal runs, under the `ShardLayouts` of its context, and
+ * returns the refusal for a value no key can hold. Until then the query is a sharded one
+ * (`EDD-9104`) with no partition.
+ */
+export const fanOutDeferred = <A, E = never, O extends OffloadState = NoOffloadState>(
+  self: Query<A, E, O>,
+  read: () => ReadPartitions | ValidationError,
+): Query<A, E, O> =>
+  new QueryImpl<A, E, O>({ ...self._state, deferredRead: read, deferredUnpruned: false })
+
+/**
+ * @internal Resolve a deferred read (#287): once per terminal, so `explain()`, every fan-out
+ * round and the cursor use one result. A missing table throws `[EDD-9180]` (a defect).
+ */
+const resolveDeferred = (state: QueryState): QueryState => {
+  const deferred = state.deferredRead
+  if (deferred === undefined) return state
+  const read = deferred()
+  const base: QueryState = { ...state, deferredRead: undefined, deferredUnpruned: false }
+  if (read instanceof ValidationError) return { ...base, refusal: read }
+  const installed = fanOut(
+    new QueryImpl({ ...base, pkValue: read.partitions[0]! }) as Query<unknown, unknown, any>,
+    read,
+  )._state
+  return state.deferredUnpruned ? withoutPruning(installed) : installed
+}
+
 /** @internal Does this query read a sharded index (#183), whatever its value's layout (#287)? */
 const isShardedState = (state: QueryState): boolean =>
-  state.fanOut !== undefined || state.shardLayout !== undefined
+  state.fanOut !== undefined || state.shardLayout !== undefined || state.deferredRead !== undefined
 
 /**
  * @internal A query whose terminals fail with `refusal`: building one has no error
@@ -1248,28 +1291,37 @@ export const planEmpty = <A, E = never, O extends OffloadState = NoOffloadState>
 ): Query<A, E, O> =>
   // Nothing is read, so no partition is: a fan-out has nothing left to merge, and no
   // layout is resolved (#287).
-  plan(new QueryImpl<A, E, O>({ ...self._state, fanOut: undefined, shardLayout: undefined }), {
-    planner: compositePlanner({
-      entityType: self._state.entityTypes.join(", ") || "unknown",
-      index: self._state.indexName ?? "primary",
-      pkField: self._state.pkField,
-      pkValue: self._state.pkValue,
-      skField: self._state.skField ?? "",
-      fingerprint: "empty",
-      space: { _tag: "none" },
-      inner: {
-        _tag: "single",
-        conditionFor: () => {
-          throw new Error("[internal] An empty plan has no range.")
-        },
-        rowCheck: undefined,
-        empty: true,
-      },
-      filterPlan: { prefix: "", rowCheck: undefined },
-      ineligible: undefined,
+  plan(
+    new QueryImpl<A, E, O>({
+      ...self._state,
+      fanOut: undefined,
+      shardLayout: undefined,
+      deferredRead: undefined,
+      deferredUnpruned: false,
     }),
-    maxSkips: undefined,
-  })
+    {
+      planner: compositePlanner({
+        entityType: self._state.entityTypes.join(", ") || "unknown",
+        index: self._state.indexName ?? "primary",
+        pkField: self._state.pkField,
+        pkValue: self._state.pkValue,
+        skField: self._state.skField ?? "",
+        fingerprint: "empty",
+        space: { _tag: "none" },
+        inner: {
+          _tag: "single",
+          conditionFor: () => {
+            throw new Error("[internal] An empty plan has no range.")
+          },
+          rowCheck: undefined,
+          empty: true,
+        },
+        filterPlan: { prefix: "", rowCheck: undefined },
+        ineligible: undefined,
+      }),
+      maxSkips: undefined,
+    },
+  )
 
 /** @internal The decoder of a projected (raw) row: the raw-row hook, or the identity. */
 const rawRowDecoder = (hook: QueryRawRow | undefined): QueryDecoder =>
@@ -2402,6 +2454,15 @@ const refuseEmptyFilterParts = (state: QueryState): ValidationError | undefined 
  * first step (#171).
  */
 const prepared = (
+  state: QueryState,
+  tableName: string,
+): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> =>
+  state.deferredRead === undefined
+    ? preparedNow(state, tableName)
+    : // A provided shard table's partitions, from the context the terminal runs in (#287).
+      Effect.suspend(() => preparedNow(resolveDeferred(state), tableName))
+
+const preparedNow = (
   state: QueryState,
   tableName: string,
 ): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> => {
@@ -3944,7 +4005,8 @@ export const explain = <A, E = never, O extends OffloadState = NoOffloadState>(
   self: Query<A, E, O>,
 ): Effect.Effect<QueryExplain, never, never> =>
   Effect.sync(() => {
-    const state = self._state
+    // A provided shard table's partitions, resolved once from this context (#287).
+    const state = resolveDeferred(self._state)
     if (state.refusal !== undefined) {
       return {
         index: state.indexName ?? "primary",
@@ -4000,7 +4062,8 @@ export const asParams = <A, E = never, O extends OffloadState = NoOffloadState>(
   self: Query<A, E, O>,
 ): Effect.Effect<Record<string, unknown>, ValidationError, any> =>
   Effect.gen(function* () {
-    const state = self._state
+    // A provided shard table's partitions, resolved once from this context (#287).
+    const state = resolveDeferred(self._state)
     const refusal = state.refusal ?? refuseEmptyFilterParts(state)
     if (refusal !== undefined) return yield* refusal
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName

@@ -336,12 +336,19 @@ export const make = <
       return index === undefined ? [] : [{ key, schema: entity._schema, index }]
     }),
   )
-  KeyComposer.assertCollectionShardsAgreement(
-    name,
-    entityEntries.flatMap(([key, entity]) => {
-      const index = entity.indexes[sharedIndexName]
-      return index === undefined ? [] : [{ key, index, schema: entity._schema }]
-    }),
+  const checkShardsAgreement = () =>
+    KeyComposer.assertCollectionShardsAgreement(
+      name,
+      entityEntries.flatMap(([key, entity]) => {
+        const index = entity.indexes[sharedIndexName]
+        return index === undefined ? [] : [{ key, index, schema: entity._schema }]
+      }),
+    )
+  checkShardsAgreement()
+  // A member whose index's table is supplied at run time (#287): its queries compose their
+  // partitions when a terminal runs, from the `ShardLayouts` of its context.
+  const provided = entityEntries.some(([, entity]) =>
+    KeyComposer.hasProvidedShards({ index: entity.indexes[sharedIndexName]! }),
   )
 
   // Compute the SK prefix for clustered collections.
@@ -416,6 +423,9 @@ export const make = <
   // for all.
   const collectionPartitions = (pkComposites: Record<string, unknown>) => {
     const firstEntity = entityEntries[0]![1]
+    // A member's table supplied at run time (#287): the members agree only once the tables
+    // in context are known, so they are compared as the partitions are composed.
+    if (provided) checkShardsAgreement()
     // Members share the partitions, whatever each hashes: never pruned (#183).
     return KeyComposer.composeReadPartitions(
       sharedSchema!,
@@ -442,7 +452,7 @@ export const make = <
   // `collectionDecoder` (`{ _entityKey, _entityType, _decoded }`) — the
   // terminals return them as they come, ungrouped.
   const queryAll = (pkComposites: Record<string, unknown>) => {
-    const read = collectionPartitions(pkComposites)
+    const read = provided ? undefined : collectionPartitions(pkComposites)
     let q = Query.make<
       CollectionItem<TEntities>,
       MemberBlobErrors<TEntities>,
@@ -451,7 +461,7 @@ export const make = <
       tableName: "",
       indexName: sharedDynamoIndexName,
       pkField: sharedPkField!,
-      pkValue: read.partitions[0]!,
+      pkValue: read?.partitions[0] ?? "",
       skField: sharedSkField,
       entityTypes,
       resolveTableName: entityEntries[0]![1]._tableTag.useSync((tc: TableConfig) => tc.name),
@@ -466,7 +476,16 @@ export const make = <
       keyConditionDiagnosis: { operation: "query", label: `collection "${name}"` },
     })
 
-    q = Query.fanOut(q, read)
+    q =
+      read !== undefined
+        ? Query.fanOut(q, read)
+        : Query.fanOutDeferred(q, () =>
+            Query.orRefusal<KeyComposer.ReadPartitions | ValidationError>(
+              { name: "Collection.query", target: name },
+              () => collectionPartitions(pkComposites),
+              (refusal) => refusal,
+            ),
+          )
 
     // Clustered collections add begins_with SK condition on collection prefix
     if (collectionType === "clustered" && collectionSkPrefix) {
@@ -484,14 +503,17 @@ export const make = <
     selectors[key] = (pkComposites: Record<string, unknown>) =>
       refusable(() => {
         const indexDef = entity.indexes[sharedIndexName!]!
-        const read = KeyComposer.composeReadPartitions(
-          sharedSchema!,
-          entity.entityType,
-          indexDef,
-          collectionKeyForm(entity, pkComposites, indexDef.pk.composite),
-          { prune: false },
-        )
-        const pkValue = read.partitions[0]!
+        const compose = () =>
+          KeyComposer.composeReadPartitions(
+            sharedSchema!,
+            entity.entityType,
+            indexDef,
+            collectionKeyForm(entity, pkComposites, indexDef.pk.composite),
+            { prune: false },
+          )
+        // A table supplied at run time (#287): composed when a terminal runs.
+        const read = provided ? undefined : compose()
+        const pkValue = read?.partitions[0] ?? ""
 
         let q = Query.make({
           tableName: "",
@@ -510,7 +532,20 @@ export const make = <
             entity.indexes.primary?.sk.field,
           ],
           keyConditionDiagnosis: { operation: "query", label: `collection "${name}" (${key})` },
-        }).pipe((made) => Query.fanOut(made, read))
+        }).pipe((made) =>
+          read !== undefined
+            ? Query.fanOut(made, read)
+            : Query.fanOutDeferred(made, () =>
+                Query.orRefusal<KeyComposer.ReadPartitions | ValidationError>(
+                  { name: "Collection.query", target: name },
+                  () => {
+                    checkShardsAgreement()
+                    return compose()
+                  },
+                  (refusal) => refusal,
+                ),
+              ),
+        )
 
         // Clustered entity selectors add begins_with on the entity SK prefix.
         // For sub-collections, the prefix uses the FULL hierarchy from root to

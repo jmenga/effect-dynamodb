@@ -84,15 +84,51 @@ const refuseEmptyParts = <E, R>(
   condition: Expr | ConditionInput | undefined,
   run: () => Effect.Effect<any, E, R>,
 ): Effect.Effect<any, E, R> => {
-  const problem = condition === undefined ? undefined : emptyPartProblem(toExpr(condition))
-  if (problem === undefined) return run()
-  return Effect.fail(
-    new ValidationError({
-      entityType: (entity as { readonly entityType?: string }).entityType ?? "unknown",
-      operation: `${operation}.condition`,
-      cause: `${operation}: ${problem} Nothing was sent.`,
-    }),
-  ) as Effect.Effect<never, E, never>
+  const checked = (): Effect.Effect<any, E, R> => {
+    const problem = condition === undefined ? undefined : emptyPartProblem(toExpr(condition))
+    if (problem === undefined) return run()
+    return Effect.fail(
+      new ValidationError({
+        entityType: (entity as { readonly entityType?: string }).entityType ?? "unknown",
+        operation: `${operation}.condition`,
+        cause: `${operation}: ${problem} Nothing was sent.`,
+      }),
+    ) as Effect.Effect<never, E, never>
+  }
+  // A provided shard table (#287) is read from the context the write runs in: checked as it
+  // starts, so a missing one (`EDD-9180`) sends nothing. An entity without one checks nothing.
+  const requireShardTables = (
+    entity as { readonly _requireShardTables?: ((where: string) => void) | undefined }
+  )._requireShardTables
+  return requireShardTables === undefined
+    ? checked()
+    : Effect.suspend(() => {
+        requireShardTables(`Entity.${operation}`)
+        return checked()
+      })
+}
+
+/**
+ * A cascade reads each target's index after its source row is written, and its targets are
+ * given per call, so `DynamoClient.make` never checked their provided shard tables (#287): they
+ * are checked as the update starts, so a missing one (`EDD-9180`) writes nothing.
+ */
+const requireCascadeShardTables = <E, R>(
+  state: UpdateState,
+  run: () => Effect.Effect<any, E, R>,
+): Effect.Effect<any, E, R> => {
+  const targets = (state.cascade?.targets ?? []).flatMap((target) => {
+    const require = (
+      target as { readonly _requireShardTables?: ((where: string) => void) | undefined }
+    )._requireShardTables
+    return require === undefined ? [] : [require]
+  })
+  return targets.length === 0
+    ? run()
+    : Effect.suspend(() => {
+        for (const require of targets) require("Entity.update cascade")
+        return run()
+      })
 }
 
 /** @internal Map from our mode names to DynamoDB ReturnValues strings */
@@ -659,7 +695,10 @@ export class EntityUpdateImpl<A, Rec, U, E, R> implements Pipeable.Pipeable {
           this._entity,
           this._updateState.patch ? "patch" : "update",
           this._updateState.condition,
-          () => this._builder(mode, this._updateState),
+          () =>
+            requireCascadeShardTables(this._updateState, () =>
+              this._builder(mode, this._updateState),
+            ),
         ),
       )
   }

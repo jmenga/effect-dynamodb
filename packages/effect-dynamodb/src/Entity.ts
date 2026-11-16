@@ -1314,6 +1314,16 @@ export interface Entity<
    */
   readonly _ownSchema: () => DynamoSchema.DynamoSchema
   /**
+   * @internal Compile a shard table supplied at run time for an index declared
+   * `shards: { layouts: "provided" }` (#287, `ShardLayouts.of`).
+   */
+  readonly _compileShardTable: (indexName: string, declared: unknown) => KeyComposer.ShardTable
+  /**
+   * @internal Throw `[EDD-9180]` when an index declared `layouts: "provided"` has no table where
+   * the operation runs (#287); `undefined` for an entity with none, which checks nothing.
+   */
+  readonly _requireShardTables: ((where: string) => void) | undefined
+  /**
    * @internal Composes each unique sentinel `record` holds every value of under `under`, to refuse
    * an object there before anything is sent (`EDD-9162`); throws what `composeKeysOrFail` takes.
    */
@@ -4738,6 +4748,17 @@ const makeImpl = <
   }
 
   /** {@link ownSchema} for an update: the composites its `payload` gives are its own. */
+  /**
+   * `[EDD-9180]` when an index declared `shards: { layouts: "provided" }` has no table in the
+   * context this operation runs in (#287): checked as a write starts, so nothing is sent, whether
+   * or not the write would compose that index. A bound operation runs in its binding's context,
+   * which `DynamoClient.make` checked. Nothing to check, and nothing read, for an entity with no
+   * provided index.
+   */
+  const providedShards = KeyComposer.hasProvidedShards(data.initialIndexes)
+  const requireShardTables = (where: string): void =>
+    KeyComposer.requireShardTables(where, schema, entityType, data.initialIndexes)
+
   const ownPayload = (payload: globalThis.Record<string, unknown>): DynamoSchema.DynamoSchema =>
     ownSchema((site) => site.attr !== undefined && site.attr in payload)
 
@@ -16965,15 +16986,20 @@ const makeImpl = <
     // The bound definition: a Z-order half carries its layout (#171).
     const indexDef = data.initialIndexes[indexName] ?? config.indexes[indexName]!
     const zorder = KeyComposer.isZOrderHalf(indexDef.sk)
+    const provided = KeyComposer.hasProvidedShards({ [indexName]: indexDef })
     const indexQuery = (rawPk: globalThis.Record<string, unknown>) => {
       // Normalise composites to their key form before composing — same rule
       // and same function the write path uses (see `CompositeCodec`). They are
       // the caller's DOMAIN values: the key `put` wrote for one is the key form
       // of the value it stores.
       const pkKeyForm = domainKeyForm(rawPk, indexDef.pk.composite, indexDef.sk.composite)
-      // One partition, or a sharded index's several (#183).
-      const read = KeyComposer.composeReadPartitions(schema, entityType, indexDef, pkKeyForm)
-      const pkValue = read.partitions[0]!
+      // One partition, or a sharded index's several (#183). An index whose table is supplied at
+      // run time (#287) composes them when a terminal runs, from the `ShardLayouts` of its
+      // context: the query is built before that is known.
+      const read = provided
+        ? undefined
+        : KeyComposer.composeReadPartitions(schema, entityType, indexDef, pkKeyForm)
+      const pkValue = read?.partitions[0] ?? ""
       // A Z-order sort key has no text prefix: its prefix composites and
       // dimensions are bounded through `.within()` on the typed accessor, never
       // passed as accessor composites (EDD-9093).
@@ -17011,7 +17037,17 @@ const makeImpl = <
         ],
         // DynamoDB's rejection of the key condition (#144) names the accessor.
         keyConditionDiagnosis: { operation: "query", label: `${entityType}.query.${indexName}` },
-      }).pipe((made) => Query.fanOut(made, read))
+      }).pipe((made) =>
+        read !== undefined
+          ? Query.fanOut(made, read)
+          : Query.fanOutDeferred(made, () =>
+              Query.orRefusal<KeyComposer.ReadPartitions | ValidationError>(
+                { name: "Entity.query", target: entityType },
+                () => KeyComposer.composeReadPartitions(schema, entityType, indexDef, pkKeyForm),
+                (refusal) => refusal,
+              ),
+            ),
+      )
       // `composeSortKeyCondition`: a partial prefix stops on a segment boundary,
       // or it matches sibling values that merely start with the supplied one
       // (`status_done` also matching `status_done_archived`, issue #115), and on a
@@ -22480,6 +22516,8 @@ const makeImpl = <
         encodeForWrite(schemas.inputSchema as Schema.Codec<any>, prepared, operation, operation),
       ),
     _ownSchema: () => ownSchema(),
+    _compileShardTable: data.compileShardTable,
+    _requireShardTables: providedShards ? requireShardTables : undefined,
     _composeUniqueSentinels: (
       under: DynamoSchema.DynamoSchema,
       record: globalThis.Record<string, unknown>,
