@@ -22,6 +22,7 @@ import { afterAll, beforeAll, describe, expect } from "vitest"
 import { BlobStore } from "../src/BlobStore.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as EventStore from "../src/EventStore.js"
 import type { MemoryBlobStore } from "../src/internal/MemoryBlobStore.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -99,6 +100,33 @@ const RetainedAccounts = Entity.make({
   versioned: { retain: true },
 })
 
+class Changed extends Schema.TaggedClass<Changed>()("Changed", {}) {}
+class Removed extends Schema.TaggedClass<Removed>()("Removed", {}) {}
+const EventsTable = Table.make({ schema: AppSchema, entities: {} })
+const OrderStream = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Orders",
+  events: [Changed, Removed],
+  streamId: { composite: ["accountId"] },
+})
+const OrderModel = Schema.Struct({
+  accountId: Schema.String,
+  name: Schema.String,
+  checkpoint: Schema.Number,
+})
+/** A read model whose rows a projection removes, leaving tombstones (#154). */
+const OrderViews = Entity.make({ model: OrderModel, entityType: "OrderView", primaryKey: key })
+const OrderProjection = EventStore.projection({
+  stream: OrderStream,
+  readModel: OrderViews,
+  key: (row: { readonly accountId: string }) => row,
+  initial: (row: { readonly accountId: string }) => ({ ...row, name: "open", checkpoint: 0 }),
+  evolve: (state: typeof OrderModel.Type, event: EventStore.StreamEvent<Changed | Removed>) =>
+    Effect.succeed(event.data._tag === "Removed" ? EventStore.removeRow : state),
+  checkpoint: "checkpoint",
+  removal: {},
+})
+
 class Team extends Schema.Class<Team>("Team")({
   teamId: Schema.String.pipe(DynamoModel.identifier),
   name: Schema.String,
@@ -154,6 +182,7 @@ const entities = {
   SoftAccounts,
   Plain,
   RetainedAccounts,
+  OrderViews,
   Teams,
   Players,
   Members,
@@ -180,6 +209,7 @@ const provide = <A, E>(effect: Effect.Effect<A, E, any>) =>
           ClientLayer,
           MainTable.layer({ name: tableName }),
           OffloadTable.layer({ name: tableName }),
+          EventsTable.layer({ name: tableName }),
           BlobStore.layer(blobs),
         ),
       ),
@@ -734,6 +764,96 @@ describeConnected("cascade", () => {
       ),
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// An update of a row a projection removed
+// ---------------------------------------------------------------------------
+
+/** Read-model row `id` written by the projection; returns the event that removes it. */
+const projected = (id: string) =>
+  Effect.gen(function* () {
+    yield* OrderStream.append({ accountId: id }, [new Changed({}), new Removed({})], 0)
+    const events = yield* OrderStream.read({ accountId: id })
+    yield* OrderProjection.apply(events[0]!)
+    return events[1]!
+  })
+const tombstoneAt = (id: string) =>
+  rowsOf("OrderView#tombstone", id).pipe(Effect.map((rows) => rows[0]))
+
+describeConnected("an update of a row a projection removed", () => {
+  it.effect("is ItemNotFound with or without a payload, and leaves the tombstone as it was", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* database
+        const id = fresh("removed")
+        yield* OrderProjection.apply(yield* projected(id))
+        const before = yield* tombstoneAt(id)
+        expect(before).toBeDefined()
+        expect(
+          yield* outcome(
+            db.entities.OrderViews.update({ accountId: id })
+              .set({})
+              .condition((row, { gte }) => gte(row.checkpoint, 0))
+              .returnValues("none"),
+          ),
+        ).toBe("ItemNotFound")
+        expect(
+          yield* outcome(
+            db.entities.OrderViews.update({ accountId: id })
+              .set({ name: "x" })
+              .returnValues("none"),
+          ),
+        ).toBe("ItemNotFound")
+        expect(yield* outcome(db.entities.OrderViews.patch({ accountId: id }).set({}))).toBe(
+          "ConditionalCheckFailed",
+        )
+        expect(yield* tombstoneAt(id)).toEqual(before)
+      }),
+    ),
+  )
+
+  it.effect(
+    "that sets nothing, in transactWrite, removed after the plan read it, commits nothing",
+    () =>
+      provide(
+        Effect.gen(function* () {
+          const id = fresh("removed-race")
+          const other = fresh("removed-sibling")
+          const removal = yield* projected(id)
+          const result = yield* race(
+            () => OrderProjection.apply(removal),
+            (db) =>
+              Transaction.transactWrite([
+                db.entities.OrderViews.update({ accountId: id }).set({}),
+                db.entities.Plain.put(account(other, "o@x.io")),
+              ]),
+          )
+          expect(result).toBe("ItemNotFound")
+          expect(yield* tombstoneAt(id)).toBeDefined()
+          expect(yield* rowsAt(other)).toEqual([])
+        }),
+      ),
+  )
+
+  it.effect("with a payload, in transactWrite, commits nothing", () =>
+    provide(
+      Effect.gen(function* () {
+        const db = yield* database
+        const id = fresh("removed-payload")
+        const other = fresh("removed-payload-sibling")
+        yield* OrderProjection.apply(yield* projected(id))
+        const result = yield* outcome(
+          Transaction.transactWrite([
+            db.entities.OrderViews.update({ accountId: id }).set({ name: "x" }),
+            db.entities.Plain.put(account(other, "o@x.io")),
+          ]),
+        )
+        expect(result).toBe("ItemNotFound")
+        expect(yield* rowsAt(other)).toEqual([])
+      }),
+    ),
+  )
 })
 
 // ---------------------------------------------------------------------------

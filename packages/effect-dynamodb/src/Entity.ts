@@ -8773,6 +8773,33 @@ const makeImpl = <
       client.getItem({ TableName: tableName, Key: marshalledKey, ConsistentRead: true }),
     )
 
+  /**
+   * The row an update finds at its key: `undefined` for none, and for a projection tombstone
+   * (#154), a removed row that every read by key reports as absent. An update of it is an update
+   * of a missing row, by every path (#132).
+   */
+  const liveRow = (
+    row: globalThis.Record<string, AttributeValue> | undefined,
+  ): globalThis.Record<string, AttributeValue> | undefined =>
+    row !== undefined && isProjectionTombstone(row, entityType) ? undefined : row
+
+  /**
+   * The condition that the row an update writes exists, under `pkName`: `attribute_exists` of its
+   * partition key, and, on a read model whose rows may be projection tombstones, that it isn't one
+   * (#132). The term is free when it holds, and every other entity sends what it did.
+   */
+  const rowExists = (
+    names: globalThis.Record<string, string>,
+    values: globalThis.Record<string, AttributeValue>,
+    pkName: string,
+  ): string => {
+    names[pkName] = config.indexes.primary.pk.field
+    if (!hasProjectionTombstones(self)) return `attribute_exists(${pkName})`
+    names["#eddLive"] = "__edd_e__"
+    values[":eddTomb"] = { S: `${entityType}#tombstone` }
+    return `attribute_exists(${pkName}) AND #eddLive <> :eddTomb`
+  }
+
   /** Fill a `ConcurrentModification`'s `current` with the stored item, decoded. */
   const withCurrentItem = <A, E, R>(
     effect: Effect.Effect<A, E, R>,
@@ -11837,7 +11864,7 @@ const makeImpl = <
         const currentResult =
           preRead !== undefined ? { Item: preRead } : yield* readCurrent(tableName, marshalledKey)
 
-        if (!currentResult.Item) {
+        if (!currentResult.Item || isProjectionTombstone(currentResult.Item, entityType)) {
           return yield* missingItem()
         }
 
@@ -12867,7 +12894,7 @@ const makeImpl = <
         | undefined
       if (isRetainEnabled() || needsBothImages) {
         const current = yield* readCurrent(tableName, marshalledKey)
-        if (!current.Item) {
+        if (!current.Item || isProjectionTombstone(current.Item, entityType)) {
           return yield* missingItem()
         }
         yield* checkVersion(current.Item, "update")
@@ -12960,7 +12987,7 @@ const makeImpl = <
         immutables.some((asserted) => asserted.packed || asserted.offloaded !== undefined)
       ) {
         const stored = yield* readCurrent(tableName, marshalledKey)
-        if (stored.Item === undefined) {
+        if (!stored.Item || isProjectionTombstone(stored.Item, entityType)) {
           return yield* createsOnMissing
             ? new MissingForCreate({ input: createInput() })
             : missingItem()
@@ -13663,7 +13690,7 @@ const makeImpl = <
        */
       const noOpResult = (row: globalThis.Record<string, AttributeValue> | undefined | "held") =>
         Effect.gen(function* () {
-          if (row === undefined || (row !== "held" && isProjectionTombstone(row, entityType))) {
+          if (row === undefined || (row !== "held" && liveRow(row) === undefined)) {
             return yield* missingItem()
           }
           if (rv === "none") return undefined
@@ -13719,8 +13746,7 @@ const makeImpl = <
           condParts.push(`#imm${i} = :imm${i}`)
           immutableTerms++
         }
-        names["#exists"] = config.indexes.primary.pk.field
-        condParts.push("attribute_exists(#exists)")
+        condParts.push(rowExists(names, values, "#exists"))
         // A `pathIfNotExists` operand a check refuses is written only where its path is absent:
         // the write requires the path, and a refusal returning an item without it is that
         // operand's (`fallbackRefusal`, #236). None: the request is as it was.
@@ -13740,19 +13766,13 @@ const makeImpl = <
       if (noOp) {
         // Required in a no-op's request whatever else it asserts: an `UpdateItem` with no
         // `UpdateExpression` creates a key-only item at a missing key.
-        if (!plainWrite) {
-          names["#exists"] = config.indexes.primary.pk.field
-          condParts.push("attribute_exists(#exists)")
-        }
+        if (!plainWrite) condParts.push(rowExists(names, values, "#exists"))
         // Asserting nothing but existence, and restated immutable values: the row is read (or
         // was), consistently, and the values are compared with it, as the refusal of the same
         // update with a payload compares them (`immutableMismatch`).
         if (condParts.length === 1 + immutableTerms) {
-          const row = held ?? (yield* readCurrent(tableName, marshalledKey)).Item
-          const immutableChange =
-            row !== undefined && !isProjectionTombstone(row, entityType)
-              ? immutableMismatch(immutables, row)
-              : undefined
+          const row = liveRow(held ?? (yield* readCurrent(tableName, marshalledKey)).Item)
+          const immutableChange = row !== undefined ? immutableMismatch(immutables, row) : undefined
           if (immutableChange !== undefined) {
             return yield* new ValidationError({
               entityType,
@@ -13971,7 +13991,9 @@ const makeImpl = <
             // item (it must exist), a restated immutable value, the
             // version CAS, or the user's condition.
             if (isAwsConditionalCheckFailed(err.cause)) {
-              const stored = err.cause.Item
+              const stored = liveRow(
+                err.cause.Item as globalThis.Record<string, AttributeValue> | undefined,
+              )
               if (stored === undefined && !uState.patch) {
                 // A no-op never creates: its payload names nothing to create from.
                 return createsOnMissing && !noOp
@@ -14246,7 +14268,8 @@ const makeImpl = <
           Key: ownKey,
           ConsistentRead: true,
         })
-        if (read.Item === undefined) {
+        // A projection tombstone is a removed row: missing, as every read by key reports it.
+        if (read.Item === undefined || isProjectionTombstone(read.Item, entityType)) {
           ;({ items, ownRow } = yield* plan({ rowMissing: true }))
         } else {
           ownRow = read.Item
@@ -14283,12 +14306,15 @@ const makeImpl = <
       // which then finds the row missing). A no-op that asserts a condition recorded its own check.
       if (items.length === 0 && ownRow !== undefined) {
         const { name: tableName } = yield* tableTag
+        const names: globalThis.Record<string, string> = {}
+        const values: globalThis.Record<string, AttributeValue> = {}
         items = [
           conditionCheckItem({
             TableName: tableName,
             Key: ownKey,
-            ConditionExpression: "attribute_exists(#pk)",
-            ExpressionAttributeNames: { "#pk": pkField },
+            ConditionExpression: rowExists(names, values, "#pk"),
+            ExpressionAttributeNames: names,
+            ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
             ReturnValuesOnConditionCheckFailure: "ALL_OLD",
           }),
         ]
@@ -14456,12 +14482,14 @@ const makeImpl = <
                 return ownRow === undefined
                   ? lostRace(undefined)
                   : { _tag: "Fail", error: historyConflict(role.version, operation) }
-              case "main":
-                main =
-                  reason.Item === undefined
-                    ? "absent"
-                    : (reason.Item as globalThis.Record<string, AttributeValue>)
+              case "main": {
+                // A projection tombstone there is the row removed: absent, as a read reports it.
+                const stored = liveRow(
+                  reason.Item as globalThis.Record<string, AttributeValue> | undefined,
+                )
+                main = stored === undefined ? "absent" : stored
                 break
+              }
               case "side":
                 sideFailed = true
             }
