@@ -25,6 +25,21 @@ export const composePk = KeyComposer.composePk
 export const composeSk = KeyComposer.composeSk
 export const composeIndexKeys = KeyComposer.composeIndexKeys
 
+/**
+ * An index whose shard table a `ShardLayouts` layer supplies at run time (#287) has no table
+ * here, so its keys are composed under a stand-in layout and shown with the marker's count and
+ * shard as placeholders, as the language service shows them.
+ */
+const STAND_IN: KeyComposer.ShardTable = { default: { count: 2, previous: undefined }, values: [] }
+const isProvided = (index: IndexDefinition): boolean =>
+  index.shards !== undefined && KeyComposer.shardLayoutsOf(index.shards) === "provided"
+const previewSchema = (schema: DynamoSchema, index: IndexDefinition): DynamoSchema =>
+  isProvided(index)
+    ? KeyComposer.withShardTables(schema, new Map([[index.shards!, STAND_IN]]))
+    : schema
+const placeholders = (index: IndexDefinition, text: string): string =>
+  isProvided(index) ? text.replace(/#!2\.\d+(?=#|$)/, "#!{count}.{shard}") : text
+
 export const composeAllKeys = (
   schema: DynamoSchema,
   entityType: string,
@@ -35,7 +50,16 @@ export const composeAllKeys = (
   const result: Record<string, string> = {}
   for (const index of Object.values(indexes)) {
     try {
-      Object.assign(result, composeIndexKeys(schema, entityType, entityVersion, index, record))
+      const keys = composeIndexKeys(
+        previewSchema(schema, index),
+        entityType,
+        entityVersion,
+        index,
+        record,
+      )
+      for (const [attribute, value] of Object.entries(keys)) {
+        result[attribute] = typeof value === "string" ? placeholders(index, value) : (value as string)
+      }
     } catch {
       // Skip indexes with missing composites (sparse GSI)
     }
@@ -182,7 +206,11 @@ export const generateQueryParams = (
   tableName: string,
 ): GeneratedQuery => {
   // A sharded index reads several partitions (#183): this shows the first's request.
-  const pk = KeyComposer.composeReadPartitions(schema, entityType, index, pkRecord).partitions[0]!
+  const pk = placeholders(
+    index,
+    KeyComposer.composeReadPartitions(previewSchema(schema, index), entityType, index, pkRecord)
+      .partitions[0]!,
+  )
 
   // Build SK prefix for begins_with (entity type filtering)
   const skPrefix = index.collection

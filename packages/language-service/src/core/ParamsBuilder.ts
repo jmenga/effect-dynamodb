@@ -564,12 +564,34 @@ const shardMarkerText = (shards: IndexShards): string =>
   `!${shards.count ?? "{count}"}.${SHARD_PLACEHOLDER}`
 
 /** A hover's line about a sharded index. */
-const shardsInfo = (shards: IndexShards): string =>
-  `  Shards: ${shards.count ?? "{count}"}${
+const shardsInfo = (shards: IndexShards): string => {
+  const source =
     shards.by.length > 0
       ? ` by ${shards.by.join(", ")} (one shard when all are given, else all merged)`
       : " (every shard read, merged)"
-  }${shards.previous === undefined ? "" : `; also reads previous layout of ${shards.previous}`}`
+  const layouts = shards.layouts
+  // A layout per value (#287): the table, and that a value's layout is its own.
+  if (layouts === "provided") {
+    return (
+      `  Shards: by value, the table supplied at run time by a ShardLayouts layer;` +
+      `${source}. The layout varies by value: a value at 1 reads one unsharded partition.`
+    )
+  }
+  if (layouts !== undefined) {
+    const entries = (layouts.values ?? []).map(({ match, layout }) => `${match} → ${layout}`)
+    const table =
+      layouts.default === undefined && layouts.values === undefined
+        ? "a table"
+        : [`default ${layouts.default ?? "{layout}"}`, ...entries].join("; ")
+    return (
+      `  Shards: by value (${table});${source}. The layout varies by value: a value at 1 ` +
+      `reads one unsharded partition.`
+    )
+  }
+  return `  Shards: ${shards.count ?? "{count}"}${source}${
+    shards.previous === undefined ? "" : `; also reads previous layout of ${shards.previous}`
+  }`
+}
 
 /** What a Z-order sort key (#171) shows: its value is bytes, not text. */
 export const ZORDER_KEY_PLACEHOLDER = "<binary Z-order key>"

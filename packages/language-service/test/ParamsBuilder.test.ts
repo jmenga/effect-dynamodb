@@ -405,5 +405,53 @@ describe("ParamsBuilder", () => {
       expect(params.info).toContain("Shards: 20 by groupId")
       expect(params.info).toContain("previous layout of 4")
     })
+
+    const withLayouts = (
+      layouts: NonNullable<ResolvedEntity["indexes"][string]["shards"]>["layouts"],
+    ): ResolvedEntity => ({
+      ...entity,
+      indexes: {
+        ...entity.indexes,
+        byTenant: {
+          ...entity.indexes.byTenant!,
+          shards: { count: undefined, by: ["groupId"], previous: undefined, layouts },
+        },
+      },
+    })
+
+    it("a table's hover shows the table and that the layout varies by value (#287)", () => {
+      const params = buildParamsOrThrow({
+        entity: withLayouts({
+          default: "1",
+          values: [{ match: "tenantId=t-big", layout: "20" }],
+        }),
+        type: "entity-query-accessor",
+        indexName: "byTenant",
+        arguments: { tenantId: "t" },
+      })
+      expect(params.info).toContain("Shards: by value (default 1; tenantId=t-big → 20)")
+      expect(params.info).toContain("The layout varies by value")
+      expect(params.info).toContain("a value at 1 reads one unsharded partition")
+    })
+
+    it("a provided table's hover says it is supplied at run time (#287)", () => {
+      const params = buildParamsOrThrow({
+        entity: withLayouts("provided"),
+        type: "entity-query-accessor",
+        indexName: "byTenant",
+        arguments: { tenantId: "t" },
+      })
+      expect(params.info).toContain("supplied at run time by a ShardLayouts layer")
+      expect(params.info).toContain("The layout varies by value")
+    })
+
+    it("a put on an index with a table shows the marker with placeholders (#287)", () => {
+      const params = buildParamsOrThrow({
+        entity: withLayouts("provided"),
+        type: "put",
+        arguments: { channel: "c", deviceId: "d", tenantId: "t", groupId: "g" },
+      })
+      expect(params.Item!.gsi5pk).toBe("$fleet#v1#device#!{count}.{shard}#tenantid_t")
+    })
   })
 })
