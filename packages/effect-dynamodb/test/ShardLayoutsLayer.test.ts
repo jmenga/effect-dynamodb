@@ -801,6 +801,26 @@ describe("building a layer", () => {
     }),
   )
 
+  it.effect("a Config table is checked then: a wrong-kind value or an extra name is EDD-9099", () =>
+    Effect.gen(function* () {
+      // Neither is a type error: a table inside a `Config` isn't typed by the entity.
+      const wrongKind = Config.succeed({
+        default: 1,
+        values: [{ match: { tenantId: 123 }, layout: 4 }],
+      })
+      const misspelt = Config.succeed({
+        default: 1,
+        values: [{ match: { tenantId: "t-big", tenantID: "t-big" }, layout: 4 }],
+      })
+      for (const layer of [
+        ShardLayouts.layer([ShardLayouts.of(Devices, { byTenant: wrongKind })]),
+        ShardLayouts.layer([ShardLayouts.of(Devices, { byTenant: misspelt })]),
+      ]) {
+        expect(defectOf(yield* built(layer))).toContain("[EDD-9099]")
+      }
+    }),
+  )
+
   it.effect("misusing of() is EDD-9182", () =>
     Effect.gen(function* () {
       const Loose = Entity.make({
