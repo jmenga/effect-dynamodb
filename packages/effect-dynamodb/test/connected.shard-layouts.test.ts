@@ -5,6 +5,7 @@
  *   unsharded partition with one plain request, each read back whole.
  * - A table supplied by a `ShardLayouts` layer: bound and unbound writes, and `EDD-9181`
  *   with nothing written when no layer supplies it.
+ * - Bound builders in a transaction run where no layer is: they compose with their binding's.
  * - Moving one value 1 → { 4, previous: 1 } → 4 → { 1, previous: 4 } → 1 with `rekey`:
  *   every row read at every step, the dry run counting what is left, cursors of the moved
  *   value refused across a step and the other value's kept.
@@ -209,6 +210,33 @@ describeConnected("per-value shard layouts (#287)", () => {
           expect(pks.get(device.deviceId)).toMatch(/#device#tenantid_t-mid$/)
         expect(ids(yield* db.entities.Devices.byTenant({ tenantId: "t-big" }).collect())).toEqual(
           ids(big),
+        )
+      }),
+    ),
+  )
+
+  it.effect("bound builders in a transaction run where no layer is: the binding's table", () =>
+    withTable((tableName) =>
+      Effect.gen(function* () {
+        const db = yield* bindWith({ default: 1, values: [hot] })
+        yield* db.entities.Devices.put(mid[0]!)
+        // This fiber has no ShardLayouts: each builder composes with its binding's table, the
+        // update's operands before the transaction reads included.
+        yield* Transaction.transactWrite([
+          db.entities.Devices.put(big[0]!),
+          db.entities.Devices.create(big[1]!),
+          db.entities.Devices.update({ channel: mid[0]!.channel, deviceId: mid[0]!.deviceId }).set({
+            tenantId: "T-BIG",
+          }),
+        ])
+        const pks = yield* storedPks(tableName)
+        for (const device of [big[0]!, big[1]!, mid[0]!])
+          expect(pks.get(device.deviceId)).toMatch(/#!8\.\d#tenantid_t-big$/)
+        yield* Transaction.transactWrite([
+          db.entities.Devices.delete({ channel: big[0]!.channel, deviceId: big[0]!.deviceId }),
+        ])
+        expect(ids(yield* db.entities.Devices.byTenant({ tenantId: "t-big" }).collect())).toEqual(
+          ids([big[1]!, mid[0]!]),
         )
       }),
     ),
