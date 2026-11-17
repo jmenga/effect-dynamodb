@@ -293,6 +293,40 @@ export const make = <
     throw new Error(`No entity in collection "${name}" has an index with collection: "${name}"`)
   }
 
+  // Each member's own index for the collection. A member names its indexes for its own
+  // accessors, so only the physical index is shared, not the name: every check and every
+  // composition below reads the member's index by what it declares, never by another member's
+  // name for it. A member declaring none keeps the one under the shared name, as before.
+  const declares = (index: IndexDefinition): boolean =>
+    index.collection === name ||
+    (Array.isArray(index.collection) && index.collection.includes(name))
+  const memberIndexes = new Map<
+    CollectionEntity,
+    { readonly name: string; readonly index: IndexDefinition } | undefined
+  >(
+    entityEntries.map(([, entity]) => {
+      const own = Object.entries(entity.indexes).find(
+        ([indexName, def]) => indexName !== "primary" && declares(def),
+      )
+      const shared = entity.indexes[sharedIndexName!]
+      return [
+        entity,
+        own !== undefined
+          ? { name: own[0], index: own[1] }
+          : shared === undefined
+            ? undefined
+            : { name: sharedIndexName!, index: shared },
+      ]
+    }),
+  )
+  const indexOf = (entity: CollectionEntity): IndexDefinition | undefined =>
+    memberIndexes.get(entity)?.index
+  // The member the shared index was found on: it composes the collection's partitions.
+  const [, lead] = entityEntries.find(([, entity]) => {
+    const index = indexOf(entity)
+    return index !== undefined && declares(index)
+  })!
+
   // Members share ONE physical index, so they must agree on how each partition
   // key composite is spelled in a key. Two members disagreeing (`Schema.Date`
   // vs `DynamoModel.DateEpochMs`, say) write into the same partition under
@@ -302,7 +336,7 @@ export const make = <
   {
     const attrs = new Set<string>()
     for (const [, entity] of entityEntries) {
-      for (const attr of entity.indexes[sharedIndexName]?.pk.composite ?? []) attrs.add(attr)
+      for (const attr of indexOf(entity)?.pk.composite ?? []) attrs.add(attr)
     }
     for (const attr of attrs) {
       // `absent` and `identity` are the SAME behaviour — both pass the value
@@ -313,7 +347,7 @@ export const make = <
       // numeric-Type-vs-encoded; two DIFFERENT encoded transforms of the same
       // kind still classify alike and are not detected here.
       const kinds = entityEntries
-        .filter(([, e]) => (e.indexes[sharedIndexName]?.pk.composite ?? []).includes(attr))
+        .filter(([, e]) => (indexOf(e)?.pk.composite ?? []).includes(attr))
         .map(([key, entity]) => {
           const kind = compositeKeyFormKind(keyFormSourceOf(entity), attr)
           return { key, kind: kind === "absent" ? "identity" : kind }
@@ -332,7 +366,7 @@ export const make = <
   KeyComposer.assertCollectionCasingAgreement(
     name,
     entityEntries.flatMap(([key, entity]) => {
-      const index = entity.indexes[sharedIndexName]
+      const index = indexOf(entity)
       return index === undefined ? [] : [{ key, schema: entity._schema, index }]
     }),
   )
@@ -340,16 +374,15 @@ export const make = <
     KeyComposer.assertCollectionShardsAgreement(
       name,
       entityEntries.flatMap(([key, entity]) => {
-        const index = entity.indexes[sharedIndexName]
+        const index = indexOf(entity)
         return index === undefined ? [] : [{ key, index, schema: entity._schema }]
       }),
     )
   checkShardsAgreement()
   // A member whose index's table is supplied at run time (#287): its queries compose their
   // partitions when a terminal runs, from the `ShardLayouts` of its context.
-  // A member may name the collection's index differently: it has none under this name.
   const provided = entityEntries.some(([, entity]) => {
-    const index = entity.indexes[sharedIndexName]
+    const index = indexOf(entity)
     return index !== undefined && KeyComposer.hasProvidedShards({ index })
   })
 
@@ -359,7 +392,7 @@ export const make = <
   let collectionSkPrefix: string | undefined
   if (collectionType === "clustered" && sharedSkField) {
     // Find the collection hierarchy from the first entity's index definition
-    const firstIndex = entityEntries[0]![1].indexes[sharedIndexName!]!
+    const firstIndex = indexOf(lead)!
     const coll = firstIndex.collection
     const casing = KeyComposer.effectiveCasing(sharedSchema, firstIndex)
 
@@ -424,16 +457,16 @@ export const make = <
   // agreement at `Collections.make()` time, so the first member's form speaks
   // for all.
   const collectionPartitions = (pkComposites: Record<string, unknown>) => {
-    const firstEntity = entityEntries[0]![1]
+    const leadIndex = indexOf(lead)!
     // A member's table supplied at run time (#287): the members agree only once the tables
     // in context are known, so they are compared as the partitions are composed. Every
     // member's table must be there, not only the first's, whose table composes them.
     if (provided) {
       const missing = entityEntries.flatMap(([, entity]) => {
-        const index = entity.indexes[sharedIndexName!]
-        return index === undefined
+        const own = memberIndexes.get(entity)
+        return own === undefined
           ? []
-          : KeyComposer.missingShardTables(entity._schema, { [sharedIndexName!]: index }).map(
+          : KeyComposer.missingShardTables(entity._schema, { [own.name]: own.index }).map(
               (indexName) => ({ entity: entity.entityType, index: indexName }),
             )
       })
@@ -445,13 +478,9 @@ export const make = <
     // Members share the partitions, whatever each hashes: never pruned (#183).
     return KeyComposer.composeReadPartitions(
       sharedSchema!,
-      firstEntity.entityType,
-      firstEntity.indexes[sharedIndexName!]!,
-      collectionKeyForm(
-        firstEntity,
-        pkComposites,
-        firstEntity.indexes[sharedIndexName!]!.pk.composite,
-      ),
+      lead.entityType,
+      leadIndex,
+      collectionKeyForm(lead, pkComposites, leadIndex.pk.composite),
       { prune: false },
     )
   }
@@ -518,7 +547,7 @@ export const make = <
   for (const [key, entity] of entityEntries) {
     selectors[key] = (pkComposites: Record<string, unknown>) =>
       refusable(() => {
-        const indexDef = entity.indexes[sharedIndexName!]!
+        const indexDef = indexOf(entity)!
         const compose = () =>
           KeyComposer.composeReadPartitions(
             sharedSchema!,

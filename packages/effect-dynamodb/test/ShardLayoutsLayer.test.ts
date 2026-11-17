@@ -845,6 +845,105 @@ describe("collections over a provided index", () => {
       expect(recording.requests).toHaveLength(0)
     }),
   )
+
+  describe("a member that names the collection's index differently", () => {
+    // Members name their indexes for their own accessors: only the physical index is shared, so
+    // each member's own index for the collection is the one compared.
+    const named = (model: any, entityType: string, key: string, indexName: string, shards: any) =>
+      Entity.make({
+        model,
+        entityType,
+        primaryKey: {
+          pk: { field: "pk", composite: [key] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          [indexName]: {
+            collection: "assignments",
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["employee"] },
+            sk: { field: "gsi1sk", composite: [key] },
+            shards,
+          },
+        },
+      } as any) as any
+    const Chores = named(Task, "Chore", "task", "assignments", { layouts: "provided" })
+    const Staff = named(Employee, "Staffer", "office", "byEmployee", { layouts: "provided" })
+    const Crew = Table.make({ schema, entities: { Chores, Staff } })
+    const env = (recording: Recording, chores: number, staff: number) =>
+      Layer.mergeAll(
+        recording.layer,
+        Crew.layer({ name: "t" }),
+        ShardLayouts.layer([
+          ShardLayouts.of(Chores, { assignments: dana(chores) }),
+          ShardLayouts.of(Staff, { byEmployee: dana(staff) }),
+        ]),
+      )
+    const recordingOf = () =>
+      makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } }) as Recording
+    const seed = Effect.gen(function* () {
+      yield* Chores.put({ task: "t-1", employee: "dana" }).asEffect()
+      yield* Staff.put({ office: "o-1", employee: "dana" }).asEffect()
+    })
+
+    it.effect("an unbound collection: different tables are EDD-9103, equal ones read both", () =>
+      Effect.gen(function* () {
+        const Assignments = Collection.make("assignments", { chores: Chores, staff: Staff })
+        const differing = recordingOf()
+        const exit = yield* Effect.exit(
+          Effect.gen(function* () {
+            yield* seed
+            return yield* Assignments.query({ employee: "dana" }).pipe(Query.collect)
+          }).pipe(Effect.provide(env(differing, 1, 8))) as Effect.Effect<unknown>,
+        )
+        expect(defectOf(exit)).toContain("[EDD-9103]")
+        expect(differing.requests.filter((r) => r.command === "Query")).toHaveLength(0)
+
+        const rows = (yield* Effect.gen(function* () {
+          yield* seed
+          return yield* Assignments.query({ employee: "dana" }).pipe(Query.collect)
+        }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as ReadonlyArray<any>
+        expect(rows.map((row) => row._entityKey).sort()).toEqual(["chores", "staff"])
+        const staff = (yield* Effect.gen(function* () {
+          yield* seed
+          return yield* Query.collect(Assignments.staff({ employee: "dana" }) as Query.Query<any>)
+        }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as ReadonlyArray<any>
+        expect(staff.map((row) => row.office)).toEqual(["o-1"])
+      }),
+    )
+
+    it.effect("a bound collection: different tables fail the bind, equal ones read both", () =>
+      Effect.gen(function* () {
+        const bindCrew = DynamoClient.make({
+          entities: { chores: Chores, staff: Staff },
+          tables: { Crew },
+        })
+        const exit = yield* Effect.exit(bindCrew.pipe(Effect.provide(env(recordingOf(), 1, 8))))
+        expect(defectOf(exit)).toContain("[EDD-9103]")
+
+        const found = (yield* Effect.gen(function* () {
+          const db = yield* bindCrew
+          yield* seed
+          return yield* (db.collections as any).assignments({ employee: "dana" }).collect()
+        }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as any
+        expect(found.chores.map((row: any) => row.task)).toEqual(["t-1"])
+        expect(found.staff.map((row: any) => row.office)).toEqual(["o-1"])
+      }),
+    )
+
+    it("declared tables are compared when the collection is made", () => {
+      const DeclaredChores = named(Task, "DeclaredChore", "task", "assignments", {
+        layouts: { default: 1 },
+      })
+      const DeclaredStaff = named(Employee, "DeclaredStaffer", "office", "byEmployee", {
+        layouts: { default: 8 },
+      })
+      Table.make({ schema, entities: { DeclaredChores, DeclaredStaff } })
+      expect(() =>
+        Collection.make("assignments", { chores: DeclaredChores, staff: DeclaredStaff }),
+      ).toThrow("[EDD-9103]")
+    })
+  })
 })
 
 describe("paths that compose without a bound client", () => {
