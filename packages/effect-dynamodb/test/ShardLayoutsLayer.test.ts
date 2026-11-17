@@ -10,6 +10,7 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as ShardLayouts from "@effect-dynamodb/schema/ShardLayouts.js"
 import { Config, ConfigProvider, Effect, Exit, Layer, Schema } from "effect"
+import { beforeEach } from "vitest"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -19,6 +20,7 @@ import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 class Device extends Schema.Class<Device>("Device")({
@@ -737,5 +739,96 @@ describe("an entity with no provided index reads nothing (design §16.1)", () =>
       expect(withLayer.length).toBeGreaterThan(0)
       expect(JSON.stringify(withLayer)).toBe(JSON.stringify(without))
     }),
+  )
+})
+
+describe("projection rows read the table of the context they run in", () => {
+  class Placed extends Schema.TaggedClass<Placed>()("Placed", { amount: Schema.Number }) {}
+
+  const projectionSchema = DynamoSchema.make({ name: "shop", version: 1 })
+  const EventsTable = Table.make({ schema: projectionSchema, entities: {} })
+  const Orders = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "Order",
+    events: [Placed],
+    streamId: { composite: ["orderId"] },
+  })
+  const Summary = Schema.Struct({
+    orderId: Schema.String,
+    region: Schema.String,
+    total: Schema.Number,
+    version: Schema.Number,
+  })
+  const Summaries = Entity.make({
+    model: Summary,
+    entityType: "Summary",
+    primaryKey: {
+      pk: { field: "pk", composite: ["orderId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byRegion: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["region"] },
+        sk: { field: "gsi1sk", composite: ["orderId"] },
+        shards: { layouts: "provided" },
+      },
+    },
+  })
+  const ReadTable = Table.make({ schema: projectionSchema, entities: { Summaries } })
+  const Totals = EventStore.projection({
+    stream: Orders,
+    readModel: Summaries,
+    key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+    initial: (id: { readonly orderId: string }) => ({
+      orderId: id.orderId,
+      region: "emea",
+      total: 0,
+      version: 0,
+    }),
+    evolve: (state: typeof Summary.Type, event: EventStore.StreamEvent<Placed>) =>
+      Effect.succeed({ ...state, total: state.total + event.data.amount }),
+    checkpoint: "version" as const,
+  })
+  const base = Layer.mergeAll(
+    InMemoryClient,
+    EventsTable.layer({ name: "events" }),
+    ReadTable.layer({ name: "read" }),
+  )
+  const readRows = () =>
+    [...store.entries()].filter(([key]) => key.startsWith("read|")).map(([, item]) => item)
+
+  beforeEach(() => resetStore())
+
+  it.effect("supplied: the row carries the value's layout", () =>
+    Effect.gen(function* () {
+      yield* Orders.append({ orderId: "o-1" }, [new Placed({ amount: 5 })], 0)
+      const events = yield* Orders.read({ orderId: "o-1" })
+      yield* Totals.apply(events[0]!)
+      const rows = readRows()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.gsi1pk?.S).toMatch(/^\$shop#v1#summary#!4\.\d#region_emea$/)
+    }).pipe(
+      Effect.provide(
+        Layer.merge(
+          base,
+          ShardLayouts.layer([
+            ShardLayouts.of(Summaries, {
+              byRegion: { default: 1, values: [{ match: { region: "EMEA" }, layout: 4 }] },
+            }),
+          ]),
+        ),
+      ),
+    ),
+  )
+
+  it.effect("missing: EDD-9180, and no row is written", () =>
+    Effect.gen(function* () {
+      yield* Orders.append({ orderId: "o-1" }, [new Placed({ amount: 5 })], 0)
+      const events = yield* Orders.read({ orderId: "o-1" })
+      const exit = yield* Effect.exit(Totals.apply(events[0]!))
+      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(readRows()).toHaveLength(0)
+    }).pipe(Effect.provide(base)),
   )
 })
