@@ -1364,4 +1364,87 @@ describe("projection rows read the table of the context they run in", () => {
       expect(readRows()).toEqual(before)
     }).pipe(Effect.provide(sparseBase))
   })
+
+  it.effect("missing: catchUp and rebuild are EDD-9181 before anything is read", () =>
+    Effect.gen(function* () {
+      yield* Orders.append({ orderId: "o-1" }, [new Placed({ amount: 5 })], 0)
+      const sent = () => Object.values(calls).reduce((sum, n) => sum + n, 0)
+      // A stream with events and one with none: both fail, and the same way.
+      for (const orderId of ["o-1", "o-2"]) {
+        for (const run of [Totals.catchUp({ orderId }), Totals.rebuild({ orderId })]) {
+          const before = sent()
+          const exit = yield* Effect.exit(run as Effect.Effect<unknown, unknown>)
+          expect(defectOf(exit)).toContain("[EDD-9181]")
+          expect(sent()).toBe(before)
+        }
+      }
+      expect(readRows()).toHaveLength(0)
+    }).pipe(Effect.provide(base)),
+  )
+
+  it.effect(
+    "missing: a multi-source projection's catchUp is EDD-9181 before the row is read",
+    () => {
+      const Tally = Schema.Struct({
+        orderId: Schema.String,
+        region: Schema.String,
+        total: Schema.Number,
+        checkpoints: Schema.Record(Schema.String, Schema.Number),
+        revision: Schema.Number,
+      })
+      const Tallies = Entity.make({
+        model: Tally,
+        entityType: "Tally",
+        primaryKey: {
+          pk: { field: "pk", composite: ["orderId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byRegion: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["region"] },
+            sk: { field: "gsi1sk", composite: ["orderId"] },
+            shards: { layouts: "provided" },
+          },
+        },
+      })
+      const TallyTable = Table.make({ schema: projectionSchema, entities: { Tallies } })
+      const Tallying = EventStore.multiProjection({
+        readModel: Tallies,
+        initial: (key: { readonly orderId: string }) => ({
+          orderId: key.orderId,
+          region: "emea",
+          total: 0,
+          checkpoints: {},
+          revision: 0,
+        }),
+        sources: (source) => ({
+          order: source(Orders, {
+            key: (id) => ({ orderId: id.orderId }),
+            evolve: (state, event) =>
+              Effect.succeed({ ...state, total: state.total + event.data.amount }),
+          }),
+        }),
+        checkpoints: { field: "checkpoints" },
+        revision: "revision" as const,
+      })
+      return Effect.gen(function* () {
+        const before = Object.values(calls).reduce((sum, n) => sum + n, 0)
+        // No row yet: catchUp reads it, and would find nothing to do.
+        const exit = yield* Effect.exit(
+          Tallying.catchUp({ orderId: "o-1" }) as Effect.Effect<unknown, unknown>,
+        )
+        expect(defectOf(exit)).toContain("[EDD-9181]")
+        expect(Object.values(calls).reduce((sum, n) => sum + n, 0)).toBe(before)
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            InMemoryClient,
+            EventsTable.layer({ name: "events" }),
+            TallyTable.layer({ name: "read" }),
+          ),
+        ),
+      )
+    },
+  )
 })

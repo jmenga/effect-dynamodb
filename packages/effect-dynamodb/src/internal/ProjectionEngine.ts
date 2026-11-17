@@ -2088,17 +2088,24 @@ export const makeEngine = (config: EngineConfig) => {
     )
 
   /**
-   * `[EDD-9133]` once the table's TTL attribute is known: an attribute a projection keeps on the
-   * read model's rows that is stored as the TTL attribute, which a projection's tombstones set. The
-   * two would overwrite each other, and a row could expire. Every entry point that writes a row
-   * runs it before it sends anything, whatever the data: `applyRow` for each row, and `catchUp` and
-   * `rebuild` first (`operation` names the entry point). The drains write no row and don't run it:
-   * a worker providing only its outbox's table delivers as on 1.39.0.
+   * What every entry point that writes a row checks before it sends anything, whatever the
+   * data: `applyRow` for each row, and `catchUp` and `rebuild` first (`operation` names the
+   * entry point). The drains write no row and don't run it: a worker providing only its
+   * outbox's table delivers as on 1.39.0.
+   *
+   * - A provided shard table (#287) of the read model comes from the context the projection
+   *   runs in: one missing is `[EDD-9181]`, a defect, whether or not a row's write would compose
+   *   that index (a row without the index's composites, a tombstone, a stream with no events).
+   *   Nothing is checked for a read model with none.
+   * - `[EDD-9133]` once the table's TTL attribute is known: an attribute a projection keeps on
+   *   the read model's rows that is stored as the TTL attribute, which a projection's tombstones
+   *   set. The two would overwrite each other, and a row could expire.
    */
   const preflight = (operation: string): Effect.Effect<void, ValidationError, any> =>
-    Effect.suspend(() =>
+    Effect.suspend(() => {
+      readModel._requireShardTables?.(config.label)
       // The table is resolved only when there is something to check.
-      !projectionTtlChecked(readModel)
+      return !projectionTtlChecked(readModel)
         ? Effect.void
         : Effect.flatMap(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => {
             const problem = projectionTtlConflict(readModel, resolveTtlAttributeName(tc))
@@ -2111,8 +2118,8 @@ export const makeEngine = (config: EngineConfig) => {
                     cause: problem,
                   }),
                 )
-          }),
-    )
+          })
+    })
 
   // One row's read-fold-write, retries included, is an upload-ledger root
   // (#179): a re-fold that writes the same content uploads it once, and what
@@ -2918,16 +2925,7 @@ export const makeEngine = (config: EngineConfig) => {
       Capacity.refusalsFail(
         `${config.label}.apply`,
         { target: entityType },
-        // A provided shard table (#287) of the read model comes from the context the projection
-        // runs in: one missing is `EDD-9181` before the row is read or written, whether or not
-        // its write would compose that index (a row without the index's composites, a
-        // tombstone). Nothing is checked for a read model with none.
-        readModel._requireShardTables === undefined
-          ? applyRow(key, work, options)
-          : Effect.suspend(() => {
-              readModel._requireShardTables!(config.label)
-              return applyRow(key, work, options)
-            }),
+        applyRow(key, work, options),
       ),
     drain,
     drainPending,
