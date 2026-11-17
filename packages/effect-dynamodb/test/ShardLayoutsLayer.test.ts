@@ -16,6 +16,7 @@ import * as Collection from "../src/Collection.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import * as Expression from "../src/Expression.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
@@ -231,6 +232,204 @@ describe("a table from the layer is the one every path uses", () => {
       }).pipe(Effect.provide(under(table, layoutsOf(8))))
     })
   })
+})
+
+describe("a bound builder composes with its binding's table on every multi-item path", () => {
+  // Versioned with history, unique and soft-deleted: `transactWrite` guards its put, and plans
+  // its update and its delete, from reads. Its index holds the version, so a put over a stored
+  // row composes its keys again with the version it continues.
+  class Asset extends Schema.Class<Asset>("Asset")({
+    assetId: Schema.String,
+    serial: Schema.String,
+    tenantId: Schema.String,
+    note: Schema.String,
+    version: Schema.Number,
+  }) {}
+  const Assets = Entity.make({
+    model: Asset,
+    entityType: "Asset",
+    primaryKey: {
+      pk: { field: "pk", composite: ["assetId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byTenant: {
+        name: "gsi5",
+        pk: { field: "gsi5pk", composite: ["tenantId"] },
+        sk: { field: "gsi5sk", composite: ["assetId", "version"] },
+        shards: { by: ["assetId"], layouts: "provided" },
+      },
+    },
+    versioned: { retain: true },
+    softDelete: true,
+    unique: { serial: ["serial"] },
+  })
+  const AssetTable = Table.make({ schema, entities: { Assets } })
+  const asset = (i: number, tenantId: string) => ({
+    assetId: `asset-${i}`,
+    serial: `serial-${i}`,
+    tenantId,
+    note: "new",
+  })
+  const Log = EventStore.makeStream({
+    table: MainTable,
+    streamName: "Log",
+    events: [Schema.TaggedStruct("Logged", { note: Schema.String })],
+    streamId: { composite: ["id"] },
+  } as never) as any
+  const keyOf = (item: ReturnType<typeof device>) => ({
+    channel: item.channel,
+    deviceId: item.deviceId,
+  })
+  const tables = (table: Recording) =>
+    Layer.mergeAll(table.layer, MainTable.layer({ name: "t" }), AssetTable.layer({ name: "t" }))
+  const layouts = (layout: number) =>
+    ShardLayouts.layer([
+      ShardLayouts.of(Devices, { byTenant: hot(layout) }),
+      ShardLayouts.of(Assets, { byTenant: hot(layout) }),
+    ])
+  /** The live rows of one item: version snapshots and tombstones hold no index key. */
+  const indexPksOf = (table: Recording, attribute: string, value: string) =>
+    [...table.items.values()]
+      .filter((row) => row[attribute]?.S === value && row.gsi5pk !== undefined)
+      .map((row) => row.gsi5pk!.S)
+  const atEight = /#!8\.\d#tenantid_t-big$/
+  const bindBoth = DynamoClient.make({
+    entities: { Devices, Assets },
+    tables: { MainTable, AssetTable },
+  })
+
+  // The caller's context: no `ShardLayouts` at all, or one where T-BIG is at 4. Bound where it
+  // is at 8, the builder composes at 8 either way.
+  for (const [label, caller] of [
+    ["no ShardLayouts layer", null],
+    ["another table", 4],
+  ] as const) {
+    const scenario = (
+      body: (
+        db: Effect.Success<typeof bindBoth>,
+        run: <A, E>(effect: Effect.Effect<A, E, any>) => Effect.Effect<A, E>,
+        table: Recording,
+      ) => Effect.Effect<void, unknown>,
+    ) => {
+      const table = makeTable()
+      return Effect.gen(function* () {
+        const db = yield* bindBoth.pipe(Effect.provide(Layer.merge(tables(table), layouts(8))))
+        const callerLayer =
+          caller === null ? tables(table) : Layer.merge(tables(table), layouts(caller))
+        yield* body(db, (effect) => effect.pipe(Effect.provide(callerLayer)), table)
+      })
+    }
+    it.effect(`transactWrite: put, create, update, patch and delete (${label})`, () =>
+      scenario((db, run, table) =>
+        Effect.gen(function* () {
+          yield* run(
+            Transaction.transactWrite([
+              db.entities.Devices.put(big[0]!),
+              db.entities.Devices.create(big[1]!),
+            ]),
+          )
+          expectSharded(table, [big[0]!, big[1]!])
+          // Two cold rows, moved to T-BIG by an update and a patch the transaction plans.
+          yield* db.entities.Devices.put(small[0]!)
+          yield* db.entities.Devices.put(small[1]!)
+          yield* run(
+            Transaction.transactWrite([
+              db.entities.Devices.update(keyOf(small[0]!)).set({
+                tenantId: "T-BIG",
+                groupId: small[0]!.groupId,
+              }),
+              db.entities.Devices.patch(keyOf(small[1]!)).set({
+                tenantId: "t-big",
+                groupId: small[1]!.groupId,
+              }),
+            ]),
+          )
+          expectSharded(table, [small[0]!, small[1]!])
+          yield* run(Transaction.transactWrite([db.entities.Devices.delete(keyOf(big[0]!))]))
+          expect(indexPkOf(table, big[0]!.deviceId)).toBeUndefined()
+          expect(ids(yield* db.entities.Devices.byTenant({ tenantId: "t-big" }).collect())).toEqual(
+            ids([big[1]!, small[0]!, small[1]!]),
+          )
+        }),
+      ),
+    )
+
+    it.effect(`transactWrite: a guarded put, a planned update and delete (${label})`, () =>
+      scenario((db, run, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Assets.put(asset(1, "t-small"))
+          // Over the stored row: its version continued, its keys composed again.
+          yield* run(Transaction.transactWrite([db.entities.Assets.put(asset(1, "T-BIG"))]))
+          yield* run(Transaction.transactWrite([db.entities.Assets.create(asset(2, "t-small"))]))
+          yield* run(
+            Transaction.transactWrite([
+              db.entities.Assets.update({ assetId: "asset-2" }).set({
+                tenantId: "T-BIG",
+                note: "moved",
+              }),
+            ]),
+          )
+          for (const id of ["asset-1", "asset-2"]) {
+            const pks = indexPksOf(table, "assetId", id)
+            expect(pks).toHaveLength(1)
+            expect(pks[0]).toMatch(atEight)
+          }
+          yield* run(Transaction.transactWrite([db.entities.Assets.delete({ assetId: "asset-1" })]))
+          expect(indexPksOf(table, "assetId", "asset-1")).toHaveLength(0)
+          const found = yield* db.entities.Assets.byTenant({ tenantId: "t-big" }).collect()
+          expect(found.map((row) => row.assetId)).toEqual(["asset-2"])
+        }),
+      ),
+    )
+
+    it.effect(`EventStore.append({ additionalItems }) (${label})`, () =>
+      scenario((db, run, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Devices.put(big[1]!)
+          yield* run(
+            Log.append({ id: "log" }, [{ _tag: "Logged", note: "x" }], 0, {
+              additionalItems: [
+                db.entities.Devices.put(big[0]!),
+                db.entities.Devices.create(big[2]!),
+                db.entities.Devices.delete(keyOf(big[1]!)),
+                db.entities.Assets.put(asset(1, "T-BIG")),
+              ],
+            }) as Effect.Effect<unknown, unknown>,
+          )
+          expectSharded(table, [big[0]!, big[2]!])
+          expect(indexPkOf(table, big[1]!.deviceId)).toBeUndefined()
+          expect(indexPksOf(table, "assetId", "asset-1")[0]).toMatch(atEight)
+        }),
+      ),
+    )
+
+    it.effect(`Batch.write and Transaction.check (${label})`, () =>
+      scenario((db, run, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Devices.put(big[1]!)
+          yield* run(
+            Batch.write([
+              db.entities.Devices.put(big[0]!),
+              db.entities.Devices.delete(keyOf(big[1]!)),
+            ]),
+          )
+          expectSharded(table, [big[0]!])
+          expect(indexPkOf(table, big[1]!.deviceId)).toBeUndefined()
+          yield* run(
+            Transaction.transactWrite([
+              Transaction.check(
+                db.entities.Devices.get(keyOf(big[0]!)),
+                Expression.condition({ attributeExists: "pk" }),
+              ),
+              db.entities.Devices.put(big[2]!),
+            ]),
+          )
+          expectSharded(table, [big[2]!])
+        }),
+      ),
+    )
+  }
 })
 
 describe("tables from configuration", () => {
