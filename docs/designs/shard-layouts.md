@@ -66,7 +66,7 @@ The design has four load-bearing parts:
    schema they're given, as they add the marker today. A `"provided"` index's table travels on the
    schema an operation composes under (`DynamoSchema.shardTables`, internal, as `objectKeys` does),
    attached from what `ShardLayouts` supplies; composing under a schema without it throws
-   `[EDD-9180]`, so a path that forgets can't fall back to a default. Index definitions never change
+   `[EDD-9181]`, so a path that forgets can't fall back to a default. Index definitions never change
    identity (D36).
 4. **Rules stay per index** (§7, D4). `.within()`, skip-scan, `.zorder()`, `GeoIndex`, `by`, the
    update gate and `rekey`'s rule follow the index, not the value's count. Byte-identical holds for
@@ -199,7 +199,7 @@ operation composes under, as an internal `DynamoSchema.shardTables` (a map from 
 `IndexShards` to its `ShardTable`), the way `objectKeys` already travels on a write's own schema
 (`ownSchema`, `effect-dynamodb/src/Entity.ts:4699`). Every composer already takes a schema, so one
 resolver, `KeyComposer.shardTableOf(schema, index)`, returns the declared table, or the provided
-one from `schema.shardTables`, or throws `[EDD-9180]`. Lookups by definition identity
+one from `schema.shardTables`, or throws `[EDD-9181]`. Lookups by definition identity
 (`objectKeySiteName`, `Entity.ts:4660`, which names the index in `EDD-9162`, and the `ownSchemaFor`
 cache keyed by `allIndexes`, `:4708`) keep working, and a schema derived by spreading (rekey's
 older-format schemas, `{ ...schema, numericKeyText: true }`) keeps the tables.
@@ -326,14 +326,14 @@ carrying the tables (`_schemaNow`, §10.4). The copy replaces the schema at each
 (and `ownSchema` copies it again, keeping the tables); `allIndexes` is unchanged everywhere. An entity
 with no provided index reads nothing and composes under its schema as today, so its code path and its
 requests are unchanged. A site that composes a provided index under a schema without its table throws
-`[EDD-9180]` from `shardTableOf`, a defect that `composeKeysOrFail` does not turn into a
+`[EDD-9181]` from `shardTableOf`, a defect that `composeKeysOrFail` does not turn into a
 `ValidationError` (`Capacity.isRefusedValue` doesn't recognise it), so nothing is sent.
 
 **Cascade targets (D31).** An update's `.cascade({ targets })` reads each target's index after the
 source row is written (`executeCascade`, `Entity.ts:10381`, run at `:12761` and `:13714`), and the
 targets are given per call, so `DynamoClient.make` never checked their tables. The cascading update
 therefore resolves the tables of every target with a provided index **before** its own write,
-alongside its own `_schemaNow`, and a missing one dies with `[EDD-9180]` with nothing written. The
+alongside its own `_schemaNow`, and a missing one dies with `[EDD-9181]` with nothing written. The
 cascade then reads each target under the schema resolved then.
 
 All `file:line` references are to `9ec9bb63`.
@@ -410,7 +410,7 @@ terminal runs. Such a query is built with `pkValue` unset and a deferred resolut
 (`QueryState.shardRead: (tables) => ReadPartitions`). `prepared` (`Query.ts:2369`), `explain`
 (`:3908`) and `asParams` (`:3960`) read `ShardLayouts` with `Effect.serviceOption` first, run the
 resolution once, and install the result as `Query.fanOut` (`:808`) does now. Nothing is sent before
-it. A missing table dies with `[EDD-9180]`. An unbound `Query.where()` that replaced the pins
+it. A missing table dies with `[EDD-9181]`. An unbound `Query.where()` that replaced the pins
 (`withoutPruning`, `:751`) is recorded on the state, and the deferred resolution then reads every
 current shard, as `withoutPruning` would have.
 
@@ -421,7 +421,7 @@ terminals fail with a `ValidationError`. The deferred resolution runs inside the
 (`Query.refusalOf`), so the same input fails the same way on a provided index: `prepared` and
 `asParams` fail with the `ValidationError`, and `explain` (no error channel) reports the refused
 query's `empty` plan with the refusal as its reason, as it does for a query refused at build.
-`[EDD-9180]` is not a refused value, so it stays a defect.
+`[EDD-9181]` is not a refused value, so it stays a defect.
 
 ### 6.3 Rules per index, on reads
 
@@ -555,7 +555,7 @@ existing caller), it tests the default layout, which for a static declaration is
   provided one when its layer is built (D8).
 - **A missing provided table** fails the run before the scan (D8, D11): `rekey` reads `ShardLayouts`
   once at the start (`rekeyFor`, `DynamoClient.ts:3592`, runs under the bind context, so the bound
-  client's table is the one used), attaches each member's tables, and dies with `[EDD-9180]` naming the
+  client's table is the one used), attaches each member's tables, and dies with `[EDD-9181]` naming the
   first member and index without one. The table's members that the client didn't bind are checked here
   too: they were never checked at `DynamoClient.make`.
 - **One table per run.** The table is read once per process (D11), so one run judges every row against
@@ -622,7 +622,7 @@ accessor's pin does (§3.1).
   them (D20). Each value is a typed table (`match` typed as in §2.2, keyed by that index's partition
   key composites), a branded `ShardLayouts.Table`, or a `Config` of either.
 - At run time (for untyped callers, and for decoded tables): an index that isn't declared
-  `"provided"`, an unknown index, or a provided index left out is `[EDD-9181]`; a malformed table is
+  `"provided"`, an unknown index, or a provided index left out is `[EDD-9182]`; a malformed table is
   `[EDD-9099]` (§2.3).
 - **A literal is checked as `Entity.make` checks one (D37).** The branded `ShardLayouts.Table`
   member's `match: Record<string, …>` would make every key known to the union's excess-property
@@ -632,7 +632,7 @@ accessor's pin does (§3.1).
 - Entries are keyed by the entity's definition identity (the `EntityDefinitionData` a pure definition
   and the runtime entity promoted from it share), so `DynamoClient.make`'s promotion of a pure
   definition (#265) finds the same table.
-- Two entries in one layer for the same entity are `[EDD-9181]`. Two `ShardLayouts` layers in one
+- Two entries in one layer for the same entity are `[EDD-9182]`. Two `ShardLayouts` layers in one
   application are not detectable: the one provided last is the service, by Effect's rules. The guide
   says to build one layer with every entry.
 
@@ -643,11 +643,11 @@ followed exactly:
 
 | Path | Reads `ShardLayouts` | Missing table |
 |---|---|---|
-| `DynamoClient.make` | **at bind**, from the bind context (`baseCtx`, `DynamoClient.ts:2704`), added to the captured context of every bound member (as `Compression` at `:2755`), and carried on the schema its accessors and collections compose under (D36) | `[EDD-9180]` defect at bind, naming every bound member and provided index without a table, as `[EDD-9078]` names missing codecs |
+| `DynamoClient.make` | **at bind**, from the bind context (`baseCtx`, `DynamoClient.ts:2704`), added to the captured context of every bound member (as `Compression` at `:2755`), and carried on the schema its accessors and collections compose under (D36) | `[EDD-9181]` defect at bind, naming every bound member and provided index without a table, as `[EDD-9078]` names missing codecs |
 | Bound CRUD ops, bound builders | at run, from the captured context: the bind's table | can't happen: checked at bind |
-| A cascade's targets (given per call, never bound) | at run, by the cascading update **before its own write** (D31) | `[EDD-9180]` defect, nothing written |
+| A cascade's targets (given per call, never bound) | at run, by the cascading update **before its own write** (D31) | `[EDD-9181]` defect, nothing written |
 | Bound accessors and collections | at build, from the schema resolved at bind | can't happen |
-| Unbound entity ops (`Entity.put(...)` etc. run through `Transaction`, `Batch`, `EventStore.append({ additionalItems })`) | at run, `Effect.serviceOption(ShardLayouts)` once per op (`_schemaNow`), under the op's captured services when it is a bound builder | `[EDD-9180]` defect before anything is sent |
+| Unbound entity ops (`Entity.put(...)` etc. run through `Transaction`, `Batch`, `EventStore.append({ additionalItems })`) | at run, `Effect.serviceOption(ShardLayouts)` once per op (`_schemaNow`), under the op's captured services when it is a bound builder | `[EDD-9181]` defect before anything is sent |
 | Projection rows | at run, in the projection's context | as above |
 | Unbound queries (`Entity.query.<index>`, `Collections.make`) | at the terminal (§6.2) | as above |
 | `rekey` | at the start of the run, from the bind context (§9.3) | the run fails before the scan |
@@ -656,14 +656,14 @@ followed exactly:
 provided index, so such an entity reads no service and its operations are unchanged. With one, it
 reads the service and returns a copy of the schema whose `shardTables` maps each provided index's
 `IndexShards` to the supplied `ShardTable` (compiled for this entity and index), and dies with
-`[EDD-9180]` when the service or the entry is missing. Every composing site in §5 takes the schema
+`[EDD-9181]` when the service or the entry is missing. Every composing site in §5 takes the schema
 from one `_schemaNow` at the start of its operation. Index definitions are never copied (D36).
 
 **As built.** `_schemaNow` was not needed: the same effect comes from where a composition runs.
 `KeyComposer.shardTableOf` returns the table the schema carries (`DynamoSchema.shardTables`, set by
 `withShardTables`: what `DynamoClient.make` hands its accessors and collections), else the table of
 the `ShardLayouts` service in the context of the fiber the composition runs in
-(`Fiber.getCurrent()`), else throws `[EDD-9180]`. A bound op runs in its binding's captured context,
+(`Fiber.getCurrent()`), else throws `[EDD-9181]`. A bound op runs in its binding's captured context,
 which `DynamoClient.make` and `capturedServices` give the service, so it composes with the bind's
 table whatever the caller holds; an unbound op runs in the caller's. Every entry point without a
 bound client checks its entity's provided indexes as it starts (`requireShardTables`, through
@@ -674,7 +674,7 @@ needed no change.
 **Missing is always an error, never a fallback** (D11). The message, per the review:
 
 ```
-[EDD-9180] Devices.byTenant declares shards: { layouts: "provided" }, but no ShardLayouts layer
+[EDD-9181] Devices.byTenant declares shards: { layouts: "provided" }, but no ShardLayouts layer
 supplies its table. Add ShardLayouts.layer(...) to the application layer.
 ```
 
@@ -686,8 +686,8 @@ run only on paths that have no bind (D21).
 `layer` resolves each `Config` (its `ConfigError` is the layer's error), then validates each table
 against its entity and index: the checks of §2.3 that need the entity, then the text index under the
 entity's configured schema (`entity._schema`, set by `Table.make`). A table the library refuses is a
-defect with `[EDD-9099]` or `[EDD-9181]` (D22), so the application does not start. An entity not yet
-registered on any table (no schema) is `[EDD-9181]`; registration happens at module load, so in
+defect with `[EDD-9099]` or `[EDD-9182]` (D22), so the application does not start. An entity not yet
+registered on any table (no schema) is `[EDD-9182]`; registration happens at module load, so in
 practice this is a definition never added to a `Table.make`.
 
 `layerEffect` runs its Effect once, when the layer is built. Its failure is the layer's failure: a
@@ -697,7 +697,7 @@ client for a config entity, reads the item, and returns `[ShardLayouts.of(Device
 item.layouts })]`, where `item.layouts` is a field of type `ShardLayouts.Table`.
 
 A config entity that itself declares a provided layout can't be read that way: nothing supplies its
-table yet, so its first operation dies with `[EDD-9180]`. That is the documented outcome (D11), not a
+table yet, so its first operation dies with `[EDD-9181]`. That is the documented outcome (D11), not a
 special case.
 
 ### 10.6 One table per process
@@ -770,7 +770,7 @@ differing in exactly that spelling.
 - **Playground** (`docs/src/lib/playground-engine.ts:185`): composes through `composeReadPartitions`,
   so a declared table renders the pinned value's real key. A provided index renders the placeholder
   marker, as the language service does. The playground's write-key preview composes through
-  `KeyComposer.composeIndexKeys` (`playground-engine.ts:38`), which would throw `[EDD-9180]` for a
+  `KeyComposer.composeIndexKeys` (`playground-engine.ts:38`), which would throw `[EDD-9181]` for a
   provided index: it renders the same placeholder there (D38), on both paths, rather than crash.
 
 ## 14. Docs and examples
@@ -781,7 +781,7 @@ differing in exactly that spelling.
   (what switching an index to a table costs: `.within()` for every value, `by`-only updates on cold
   values), `explain()`'s `shards`, `ShardLayouts.layer` from `Config`, `layerEffect` from a config
   item, the missing-table error, and the migration recipe of §15 with its rules. "Error codes" gains
-  `EDD-9180` and `EDD-9181`, and the `EDD-9099` / `EDD-9103` rows are reworded.
+  `EDD-9181` and `EDD-9182`, and the `EDD-9099` / `EDD-9103` rows are reworded.
 - **Example** `packages/effect-dynamodb/examples/guide-sharding.ts` gains regions (`layouts-entity`,
   `layouts-explain`, `layouts-provided`, `layouts-layer`, `layouts-config-item`,
   `layouts-layer-effect`, `layouts-missing`, `layouts-provided-use`, `layouts-migrate`),
@@ -930,11 +930,11 @@ entry doesn't change is accepted at every step, both for a value at 1 (legacy) a
   unbound `Transaction`, `Batch` and `EventStore.append` ops, a bound builder passed to them from a
   client bound with another table (its captured table wins, §5), projection rows, unbound
   `Entity.query` and `Collections.make` queries, cascade, `rekey`.
-- **A missing layer**: `DynamoClient.make` dies with `EDD-9180` naming every member and index; each
+- **A missing layer**: `DynamoClient.make` dies with `EDD-9181` naming every member and index; each
   unbound path dies at its first operation with nothing written (mock client asserts no calls);
   `rekey` fails before the scan; a deferred query dies at its terminal, `explain()` and `asParams`.
 - **A failing `layerEffect`**: the layer fails with the Effect's error and the program never runs.
-- **Malformed provided tables** die at layer build with `EDD-9099`; `of()` misuse (`EDD-9181`): an
+- **Malformed provided tables** die at layer build with `EDD-9099`; `of()` misuse (`EDD-9182`): an
   index not declared `"provided"`, an unknown index, a provided index left out, the same entity twice,
   an entity on no table.
 - A `ConfigError` from a bad JSON table names the path.
@@ -1031,16 +1031,16 @@ Every item of the issue body and the review comment, as **in**, **out** or **cha
 | Cursors: a value at 1 is plain; existing checks refuse across layouts; test every step | in | §6.5, §16.6 |
 | A table change is a migration; recommend `rekey({ dryRun: true })` | in | §15 |
 | Language service hover shows the table and that the layout varies by value | in | §13 |
-| A malformed table is `EDD-9099`; new codes allocated in the registry | in | `EDD-9180`, `EDD-9181` |
+| A malformed table is `EDD-9099`; new codes allocated in the registry | in | `EDD-9181`, `EDD-9182` |
 | A table supplied at run time comes from a layer, not `DynamoClient.make` | in | §10 |
 | The entity declares `"provided"`, no default | in | §2.1 |
 | `DynamoClient.make` reads it at bind; bound ops stay `R = never`; unbound ops, projections and `rekey` read it at run | in | §10.4 |
-| A missing table fails at `DynamoClient.make` or the first unbound operation; never a fallback | in | `EDD-9180` (§10.4) |
+| A missing table fails at `DynamoClient.make` or the first unbound operation; never a fallback | in | `EDD-9181` (§10.4) |
 | An index whose hot values are the same everywhere keeps its table on the entity | in | §2.1 |
 | `ShardLayouts.layer` from `Config`; the whole table as one JSON variable | in | §10.1, §10.2 |
 | `of()` limited to provided indexes and their composites; malformed refused at layer build | in | §10.3, §10.5 |
 | `layerEffect` from a DynamoDB config item; a failed read fails the layer | in | §10.5 |
-| A config entity can't use a provided layout itself | in | Named outcome: `EDD-9180` (§10.5) |
+| A config entity can't use a provided layout itself | in | Named outcome: `EDD-9181` (§10.5) |
 | The missing-layer message | in | §10.4 |
 | Every process uses the same table; a step is finished when every process has it | in | §15 (guide) |
 | `rekey` or the next step only after that; check with a dry run | in | §15 |
@@ -1066,7 +1066,7 @@ Every item of the issue body and the review comment, as **in**, **out** or **cha
 | Bound builders compose with their binding's table in multi-item ops | in | D26 |
 | Unbound queries on a provided index resolve at the terminal | in | D27 |
 | A row with no partition key text judged against the default | in, named limit | D28 |
-| Codes start at `EDD-9180` | in | D29 |
+| Codes start at `EDD-9181` | in | D29 |
 
 ## 18. Codes
 
@@ -1075,11 +1075,11 @@ Every item of the issue body and the review comment, as **in**, **out** or **cha
 | `EDD-9099` (extended) | A malformed table or table declaration (§2.3) | `Entity.make`, `Table.make`, the `ShardLayouts` layer build |
 | `EDD-9103` (extended) | Collection members' tables differ by content | `Collections.make`, a deferred collection query, `DynamoClient.make` |
 | `EDD-9104` (unchanged, per index) | `.within()`, skip-scan, `.zorder()`, `GeoIndex` on any index with `shards` | the call |
-| `EDD-9180` (new) | A provided index has no table: no `ShardLayouts` service, or no entry for the entity | `DynamoClient.make` (bind), the first unbound operation, a deferred query's terminal, `rekey` |
-| `EDD-9181` (new) | `ShardLayouts.of` misused: an index not declared `"provided"`, an unknown index, a provided index left out, the same entity twice in one layer, an entity on no table | the layer build |
+| `EDD-9181` (new) | A provided index has no table: no `ShardLayouts` service, or no entry for the entity | `DynamoClient.make` (bind), the first unbound operation, a deferred query's terminal, `rekey` |
+| `EDD-9182` (new) | `ShardLayouts.of` misused: an index not declared `"provided"`, an unknown index, a provided index left out, the same entity twice in one layer, an entity on no table | the layer build |
 
-`EDD-9180` and `EDD-9181` are allocated in DESIGN.md's registry in this commit. `9173`–`9179` are held
-by the #168 branch in flight, so allocation starts at `9180`.
+`EDD-9181` and `EDD-9182` are allocated in DESIGN.md's registry. `9173`–`9180` were reserved by #132 and #168
+(1.44.0), so allocation starts at `9181`.
 
 ## 19. Decisions
 
@@ -1107,18 +1107,18 @@ design, for review.
 | D17 | `default` is required in a declared table | proposed |
 | D18 | A table may resolve every value to 1 (`{ default: 1 }`); only the static `shards: 1` / `{ count: 1 }` stay refused | proposed |
 | D19 | `values` refused on an empty partition key half: every entry would compose the one key | proposed |
-| D20 | `of()` must give every provided index of the entity it names (types and `EDD-9181`), so a missing table means a missing `of()` | proposed |
-| D21 | A missing table is a defect (`EDD-9180`), at bind and at run, as a missing codec is at bind (`EDD-9078`); not a member of any error union | proposed |
-| D22 | A table the layer build refuses is a defect (`EDD-9099` / `EDD-9181`); a `Config` failure stays the layer's `ConfigError`, a `layerEffect` failure its own error | proposed |
+| D20 | `of()` must give every provided index of the entity it names (types and `EDD-9182`), so a missing table means a missing `of()` | proposed |
+| D21 | A missing table is a defect (`EDD-9181`), at bind and at run, as a missing codec is at bind (`EDD-9078`); not a member of any error union | proposed |
+| D22 | A table the layer build refuses is a defect (`EDD-9099` / `EDD-9182`); a `Config` failure stays the layer's `ConfigError`, a `layerEffect` failure its own error | proposed |
 | D23 | A provided partition key half sharing its attribute with another half is refused (`EDD-9106`): no provable form | proposed |
 | D24 | `explain().shards` is set on every sharded index's query, static included (additive) | proposed |
 | D25 | `ShardLayouts` lives in `@effect-dynamodb/schema` beside `Compression`, AWS-free, re-exported | proposed |
 | D26 | `capturedServices` carries `ShardLayouts`: a bound builder in `Batch`, `Transaction` or `EventStore.append` composes with its binding's table (#179 §3.6's rule) | proposed |
 | D27 | An unbound query on a provided index resolves its partitions at the terminal (`prepared`, `explain`, `asParams`); `state.sharded`, set at build, keeps `EDD-9104` refusals at the call | proposed |
 | D28 | A row with no partition key text resolves the default layout, for writes (truncated text matches no entry) and `rekey`; named limit | proposed |
-| D29 | New codes start at `EDD-9180`: `9173`–`9179` are held by the #168 branch | proposed |
+| D29 | New codes start at `EDD-9181`: `9173`–`9180` are reserved by #132 and #168 | proposed |
 | D30 | Review F1, **accepted**: `NormalizedGsi` carries the `shards` declaration as a phantom (`shards.declared`), so `of()` can find the provided indexes and type `match` from either entity type (§2.2) | review |
-| D31 | Review F2, **accepted**: a cascading update resolves the provided tables of every cascade target before its own write; a missing one dies with `EDD-9180` with nothing written (§5, §10.4) | review |
+| D31 | Review F2, **accepted**: a cascading update resolves the provided tables of every cascade target before its own write; a missing one dies with `EDD-9181` with nothing written (§5, §10.4) | review |
 | D32 | Review F3, **accepted**: `planEmpty` clears `sharded` as it clears `fanOut`, so an empty plan on a sharded index still returns nothing (§6.3) | review |
 | D33 | Review F4, **accepted**: `IndexShards` keeps `count` and `previous` as the default layout's (`count` 0 on a provided index, which no existing reader can hold); `assertCollectionShardsAgreement` keeps its name and signature, members gain an optional `schema` (§2.4, §11). No type-level break | review |
 | D34 | Review F5, **accepted**: a row with a hole in its partition key is left alone when its stored text is in the layout of the default or of an entry agreeing with the composites it holds; `isCurrentShardLayout` gains an optional key-form `record` (§3.4, §9.2) | review |
@@ -1127,7 +1127,7 @@ design, for review.
 | D37 | Review F8, **accepted**: `layouts?: never` / `count?: never; previous?: never` make the mixed forms compile errors; `of()` puts `Entity.make`'s `never`-mapping guard on its parameter, with typo and extra-key `@ts-expect-error` cases (§2.1, §10.3, §16.9) | review |
 | D38 | Review F10, **accepted**: the playground renders the placeholder marker for a provided index on its write-key preview too (§13) | review |
 | D39 | Review F9, **accepted, strict**: a member without `shards` and a member with a table never agree (`EDD-9103`), `{ default: 1 }` included: their rules differ, and the unsharded one can't follow a value that moves (§11) | review |
-| D40 | Review F11, **accepted**: a deferred query's resolution runs inside the `orRefusal` wrapper, so a key-text refusal is a `ValidationError` at the terminal, and `explain` reports the refused `empty` plan; `EDD-9180` stays a defect (§6.2) | review |
+| D40 | Review F11, **accepted**: a deferred query's resolution runs inside the `orRefusal` wrapper, so a key-text refusal is a `ValidationError` at the terminal, and `explain` reports the refused `empty` plan; `EDD-9181` stays a defect (§6.2) | review |
 
 ## 20. Implementation order
 

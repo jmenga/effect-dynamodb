@@ -94,7 +94,7 @@ describe("ShardLayouts.of types", () => {
           static: group,
         }),
       ]),
-    ).toThrow("[EDD-9181]")
+    ).toThrow("[EDD-9182]")
   })
 
   it("refuses an unknown index", () => {
@@ -107,14 +107,14 @@ describe("ShardLayouts.of types", () => {
           byTenantt: group,
         }),
       ]),
-    ).toThrow("[EDD-9181]")
+    ).toThrow("[EDD-9182]")
   })
 
   it("requires every provided index", () => {
     expect(() =>
       // @ts-expect-error byGroup is provided and left out
       ShardLayouts.make([ShardLayouts.of(Devices, { byTenant: tenant })]),
-    ).toThrow("[EDD-9181]")
+    ).toThrow("[EDD-9182]")
   })
 
   it("a match names exactly the partition key composites", () => {

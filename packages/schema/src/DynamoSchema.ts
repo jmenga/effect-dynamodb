@@ -52,7 +52,7 @@ export interface DynamoSchema {
    * (`KeyComposer.IndexShards`). Set only on the schema an operation composes under
    * (`KeyComposer.withShardTables`); read only through `KeyComposer.shardTableOf`.
    * Absent, a provided index has no table, and composing its partition key throws
-   * `[EDD-9180]`: nothing falls back to a default.
+   * `[EDD-9181]`: nothing falls back to a default.
    */
   readonly shardTables?: ReadonlyMap<object, unknown> | undefined
 }

@@ -1,8 +1,8 @@
 /**
  * The `ShardLayouts` module (#287, design §10): the `Table` schema checks a table's shape and
  * ranges; `make` / `layer` compile each table against its entity, refusing a malformed one
- * (`EDD-9099`) or a misuse of `of` (`EDD-9181`); composition under a fiber holding the service
- * reads its table; without it, `EDD-9180`.
+ * (`EDD-9099`) or a misuse of `of` (`EDD-9182`); composition under a fiber holding the service
+ * reads its table; without it, `EDD-9181`.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -115,15 +115,15 @@ describe("composing under the service", () => {
     }).pipe(Effect.provide(ShardLayouts.layer([ShardLayouts.of(Devices, { byTenant: hot })]))),
   )
 
-  it.effect("without the service: EDD-9180, nothing falls back", () =>
+  it.effect("without the service: EDD-9181, nothing falls back", () =>
     Effect.gen(function* () {
       const exit = yield* Effect.exit(compose)
-      expect(String(exit)).toContain("[EDD-9180]")
+      expect(String(exit)).toContain("[EDD-9181]")
     }),
   )
 
-  it("outside a fiber: EDD-9180", () => {
-    expect(() => KeyComposer.composePk(schema, "Device", index, record)).toThrow("[EDD-9180]")
+  it("outside a fiber: EDD-9181", () => {
+    expect(() => KeyComposer.composePk(schema, "Device", index, record)).toThrow("[EDD-9181]")
   })
 
   it.effect("layerEffect's failure is the layer's", () =>

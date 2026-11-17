@@ -2796,7 +2796,7 @@ const makeFromConfig = (config: {
     if (storeError !== undefined) throw storeError
     // The shard tables of every index declared `shards: { layouts: "provided" }` (#287), read
     // here from the bind context: bound operations run in it, so they compose with these tables
-    // and keep `R = never`. A bound member's index without one is `[EDD-9180]` at bind, naming
+    // and keep `R = never`. A bound member's index without one is `[EDD-9181]` at bind, naming
     // every one; nothing falls back to a default.
     const shardRegistry = Context.getOrUndefined(baseCtx, ShardLayouts.ShardLayouts)
     const missingShards = Object.values(config.entities).flatMap((rawEntity) => {
@@ -3660,7 +3660,7 @@ const makeFromConfig = (config: {
             )
             if (streamKeysError !== undefined) throw streamKeysError
             // Every member's provided shard tables (#287), from the context the run reads them
-            // from: one missing fails the run before the scan (`EDD-9180`), naming every one,
+            // from: one missing fails the run before the scan (`EDD-9181`), naming every one,
             // members the client didn't bind included. The table is read once, so one run judges
             // every row against one table.
             const missingShardTables = [...new Set(tableMembers)].flatMap((member) => {

@@ -685,7 +685,7 @@ export interface EntityDefinitionData {
    * Compile a table supplied at run time for index `indexName`, declared
    * `shards: { layouts: "provided" }` (#287): its layouts checked and each entry's
    * `match` put into this entity's key form. `[EDD-9099]` for a malformed table,
-   * `[EDD-9181]` for an index not declared `"provided"`. The result is what
+   * `[EDD-9182]` for an index not declared `"provided"`. The result is what
    * `KeyComposer.withShardTables` carries, keyed by the index's `shards`.
    */
   readonly compileShardTable: (indexName: string, declared: unknown) => ShardTable
@@ -1785,7 +1785,7 @@ export const buildEntityDefinition = (config: {
     const index = ownValue(initialIndexes, indexName)
     if (index?.shards === undefined || shardLayoutsOf(index.shards) !== "provided") {
       throw new Error(
-        `[EDD-9181] Entity "${config.entityType}": index "${indexName}" doesn't declare ` +
+        `[EDD-9182] Entity "${config.entityType}": index "${indexName}" doesn't declare ` +
           `shards: { layouts: "provided" }, so no table can be supplied for it.`,
       )
     }

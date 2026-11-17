@@ -1263,7 +1263,7 @@ export const validateAndBuildPutItem = (
 > =>
   Effect.gen(function* () {
     // A provided shard table (#287) comes from the context this put runs in: one missing is
-    // `EDD-9180`, before anything is built or sent.
+    // `EDD-9181`, before anything is built or sent.
     entity._requireShardTables?.(operation)
     // Clock-backed time source resolved once per op; threaded into the sync
     // timestamp builder so the value is deterministic under `TestClock`.

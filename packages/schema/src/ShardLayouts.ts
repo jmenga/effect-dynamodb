@@ -12,7 +12,7 @@
  * `R = never`; every path that composes keys without a bound client (unbound ops in
  * `Transaction`, `Batch` and `EventStore.append({ additionalItems })`, projection
  * rows, unbound queries and collections, `rekey`) reads it from the context it runs
- * in. A provided index with no table is `[EDD-9180]`, never a fallback.
+ * in. A provided index with no table is `[EDD-9181]`, never a fallback.
  *
  * The service is built once, when its layer is built, and never changes: one table
  * per process, no hot reload.
@@ -199,7 +199,7 @@ export interface Entry {
 // Building a registry
 // ---------------------------------------------------------------------------
 
-const misused = (why: string): Error => new Error(`[EDD-9181] ShardLayouts.of: ${why}`)
+const misused = (why: string): Error => new Error(`[EDD-9182] ShardLayouts.of: ${why}`)
 
 /** The entity's own compile function: a runtime entity's, or a pure definition's. */
 const compilerOf = (
@@ -223,7 +223,7 @@ const providedIndexesOf = (entity: EntityLike): ReadonlyArray<readonly [string, 
 /**
  * Compile resolved entries into a registry: each table checked against its entity
  * and index, then its text index built under the entity's schema. A defect for a
- * malformed table (`[EDD-9099]`) or a misuse of `of` (`[EDD-9181]`).
+ * malformed table (`[EDD-9099]`) or a misuse of `of` (`[EDD-9182]`).
  */
 const buildRegistry = (
   entries: ReadonlyArray<{
@@ -350,7 +350,7 @@ export const of = <E extends EntityLike, const T extends ProvidedTables<E>>(
 /**
  * A layer from entries: each `Config` is read (a `ConfigError` fails the layer),
  * then each table is checked against its entity and index. A malformed table
- * (`[EDD-9099]`) or a misuse of {@link of} (`[EDD-9181]`) is a defect: the
+ * (`[EDD-9099]`) or a misuse of {@link of} (`[EDD-9182]`) is a defect: the
  * application doesn't start.
  */
 export const layer = (

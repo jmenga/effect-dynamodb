@@ -2,7 +2,7 @@
  * Shard tables supplied at run time (#287, `docs/designs/shard-layouts.md` §10): an index
  * declared `shards: { layouts: "provided" }` takes its table from a `ShardLayouts` layer.
  * `DynamoClient.make` reads it at bind; every path without a bound client reads it from the
- * context it runs in. A missing table is `EDD-9180`, never a fallback, and nothing is sent.
+ * context it runs in. A missing table is `EDD-9181`, never a fallback, and nothing is sent.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -323,12 +323,12 @@ describe("tables from configuration", () => {
   )
 })
 
-describe("a missing table is EDD-9180, and nothing is sent", () => {
+describe("a missing table is EDD-9181, and nothing is sent", () => {
   it.effect("DynamoClient.make names the entity and index", () => {
     const table = makeTable()
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(bound)
-      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(defectOf(exit)).toContain("[EDD-9181]")
       expect(defectOf(exit)).toContain("Device.byTenant")
       expect(table.requests).toHaveLength(0)
     }).pipe(Effect.provide(under(table, null)))
@@ -347,7 +347,7 @@ describe("a missing table is EDD-9180, and nothing is sent", () => {
         Devices.delete({ channel: "channel-0", deviceId: "device-00" }).asEffect(),
       ] as ReadonlyArray<Effect.Effect<unknown, unknown, any>>) {
         const exit = yield* Effect.exit(run)
-        expect(defectOf(exit)).toContain("[EDD-9180]")
+        expect(defectOf(exit)).toContain("[EDD-9181]")
         expect(defectOf(exit)).toContain("Device.byTenant")
       }
       // A put without the `by` value composes no entry: still refused.
@@ -398,7 +398,7 @@ describe("a missing table is EDD-9180, and nothing is sent", () => {
         Sensors.append({ sensorId: "s-1", seq: 2, value: 2 }),
       ] as ReadonlyArray<Effect.Effect<unknown, unknown, any>>) {
         const exit = yield* Effect.exit(run)
-        expect(defectOf(exit)).toContain("[EDD-9180]")
+        expect(defectOf(exit)).toContain("[EDD-9181]")
         expect(defectOf(exit)).toContain("Sensor.bySite")
       }
       expect(table.requests).toHaveLength(0)
@@ -411,7 +411,7 @@ describe("a missing table is EDD-9180, and nothing is sent", () => {
     return Effect.gen(function* () {
       for (const run of [Query.collect(query), Query.explain(query), Query.asParams(query)]) {
         const exit = yield* Effect.exit(run as Effect.Effect<unknown, unknown, any>)
-        expect(defectOf(exit)).toContain("[EDD-9180]")
+        expect(defectOf(exit)).toContain("[EDD-9181]")
       }
       expect(table.requests).toHaveLength(0)
     }).pipe(Effect.provide(under(table, null)))
@@ -437,7 +437,7 @@ describe("a missing table is EDD-9180, and nothing is sent", () => {
       const exit = yield* Effect.exit(
         Fleet.query({ tenantId: "t-big" }).pipe(Query.collect) as Effect.Effect<unknown, unknown>,
       )
-      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(defectOf(exit)).toContain("[EDD-9181]")
       expect(table.requests).toHaveLength(0)
     }).pipe(Effect.provide(under(table, null)))
   })
@@ -485,7 +485,7 @@ describe("a missing table is EDD-9180, and nothing is sent", () => {
           Effect.provide(Layer.mergeAll(table.layer, Both.layer({ name: "t" }), layoutsOf())),
         ),
       )
-      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(defectOf(exit)).toContain("[EDD-9181]")
       expect(defectOf(exit)).toContain("OtherDevice.byTenant")
       expect(table.requests.length).toBe(sent)
     })
@@ -518,7 +518,7 @@ describe("building a layer", () => {
     }),
   )
 
-  it.effect("misusing of() is EDD-9181", () =>
+  it.effect("misusing of() is EDD-9182", () =>
     Effect.gen(function* () {
       const Loose = Entity.make({
         model: Device,
@@ -548,7 +548,7 @@ describe("building a layer", () => {
         [ShardLayouts.of(Loose, { byTenant: hot() })],
       ]) {
         const exit = yield* built(ShardLayouts.layer(entries))
-        expect(defectOf(exit)).toContain("[EDD-9181]")
+        expect(defectOf(exit)).toContain("[EDD-9182]")
       }
     }),
   )
@@ -625,7 +625,7 @@ describe("collections over a provided index", () => {
     }),
   )
 
-  it.effect("an unbound collection with one member's table missing is EDD-9180", () =>
+  it.effect("an unbound collection with one member's table missing is EDD-9181", () =>
     Effect.gen(function* () {
       const Assignments = Collection.make("assignments", { Tasks, Employees })
       const recording = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
@@ -641,7 +641,7 @@ describe("collections over a provided index", () => {
           ),
         ) as Effect.Effect<unknown>,
       )
-      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(defectOf(exit)).toContain("[EDD-9181]")
       expect(defectOf(exit)).toContain("Employee.assignments")
       expect(recording.requests).toHaveLength(0)
     }),
@@ -672,7 +672,7 @@ describe("paths that compose without a bound client", () => {
     const table = makeTable()
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(appendWith(big[0]!))
-      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(defectOf(exit)).toContain("[EDD-9181]")
       expect(table.requests.filter((r) => r.command === "TransactWriteItems")).toHaveLength(0)
       expect(table.items.size).toBe(0)
     }).pipe(Effect.provide(under(table, null)))
@@ -734,11 +734,11 @@ describe("paths that compose without a bound client", () => {
       Entity.asModel,
     ) as Effect.Effect<unknown, unknown, any>
 
-    it.effect("missing: EDD-9180, and the source row is not written", () => {
+    it.effect("missing: EDD-9181, and the source row is not written", () => {
       const table = seeded()
       return Effect.gen(function* () {
         const exit = yield* Effect.exit(rename)
-        expect(defectOf(exit)).toContain("[EDD-9180]")
+        expect(defectOf(exit)).toContain("[EDD-9181]")
         expect(defectOf(exit)).toContain("Selection.byPlayer")
         expect(table.requests).toHaveLength(0)
       }).pipe(Effect.provide(Layer.merge(table.layer, Sports.layer({ name: "t" }))))
@@ -894,12 +894,12 @@ describe("projection rows read the table of the context they run in", () => {
     ),
   )
 
-  it.effect("missing: EDD-9180, and no row is written", () =>
+  it.effect("missing: EDD-9181, and no row is written", () =>
     Effect.gen(function* () {
       yield* Orders.append({ orderId: "o-1" }, [new Placed({ amount: 5 })], 0)
       const events = yield* Orders.read({ orderId: "o-1" })
       const exit = yield* Effect.exit(Totals.apply(events[0]!))
-      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(defectOf(exit)).toContain("[EDD-9181]")
       expect(readRows()).toHaveLength(0)
     }).pipe(Effect.provide(base)),
   )

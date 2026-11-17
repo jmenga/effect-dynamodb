@@ -529,7 +529,7 @@ const JsonShardsLayer = ShardLayouts.layer([
 ])
 ```
 
-`ShardLayouts.of(entity, { ... })` takes one table for every index of the entity declared `"provided"`: a table, a decoded `ShardLayouts.Table`, or a `Config` of either. The types accept only those indexes and require each of them, and a literal table's `match` names that index's partition key composites, each with its model field's type. `ShardLayouts.Table` is a `Schema` for a table, so a JSON variable that isn't one is a `ConfigError` naming the variable. When the layer is built, each table is checked against its entity: its `match` names, that each value is of its field's kind (a JSON `123` for a string field is refused), and the keys its entries compose (`EDD-9099`). An index that isn't declared `"provided"`, an unknown index, a provided index left out, or one entity given twice is `EDD-9181`. Build one layer with an `of` per entity: of two `ShardLayouts` layers, the one provided last is the only one used.
+`ShardLayouts.of(entity, { ... })` takes one table for every index of the entity declared `"provided"`: a table, a decoded `ShardLayouts.Table`, or a `Config` of either. The types accept only those indexes and require each of them, and a literal table's `match` names that index's partition key composites, each with its model field's type. `ShardLayouts.Table` is a `Schema` for a table, so a JSON variable that isn't one is a `ConfigError` naming the variable. When the layer is built, each table is checked against its entity: its `match` names, that each value is of its field's kind (a JSON `123` for a string field is refused), and the keys its entries compose (`EDD-9099`). An index that isn't declared `"provided"`, an unknown index, a provided index left out, or one entity given twice is `EDD-9182`. Build one layer with an `of` per entity: of two `ShardLayouts` layers, the one provided last is the only one used.
 
 The layer goes in the application layer, beside the client:
 
@@ -546,13 +546,13 @@ const AppLayer = Layer.mergeAll(
 A missing table is an error, never a fallback to a default:
 
 ```typescript region="layouts-missing" example="guide-sharding.ts"
-// Without a ShardLayouts layer, binding fails with EDD-9180, naming the entity
+// Without a ShardLayouts layer, binding fails with EDD-9181, naming the entity
 // and index. Nothing falls back to a default.
 const missing = yield* DynamoClient.make({
   entities: { Devices: ProvidedDevices },
   tables: { MainTable: ProvidedTable },
 }).pipe(Effect.exit)
-// missing → a defect: "[EDD-9180] DynamoClient.make: Device.byTenant declares
+// missing → a defect: "[EDD-9181] DynamoClient.make: Device.byTenant declares
 //           shards: { layouts: "provided" }, but no ShardLayouts layer supplies its table…"
 ```
 
@@ -567,7 +567,7 @@ const fromConfig = yield* providedDb.entities.Devices.byTenant({ tenantId: BIG }
 // fromConfig.shards?.count → 8
 ```
 
-`EDD-9180` is raised at `DynamoClient.make`, naming every bound entity and index without a table, or at the first operation on a path without a bound client, before anything is sent. A `rekey` run fails before it scans.
+`EDD-9181` is raised at `DynamoClient.make`, naming every bound entity and index without a table, or at the first operation on a path without a bound client, before anything is sent. A `rekey` run fails before it scans.
 
 **From a config item.** A layer can be built from any Effect, so a table can also come from a DynamoDB item, SSM or AppConfig. `ShardLayouts.Table` is a field type:
 
@@ -615,7 +615,7 @@ const AppLayer = ItemShardsLayer.pipe(
 ```
 
 - **A table is read once per process.** The service is built with its layer and never changes: an edited config item changes nothing until the process restarts. There is no hot reload, since a table that changed while a process ran could let one `rekey` run judge rows against two tables.
-- **The config entity can't use a provided layout itself.** Nothing supplies its table yet when it is read, so its first operation fails with `EDD-9180`.
+- **The config entity can't use a provided layout itself.** Nothing supplies its table yet when it is read, so its first operation fails with `EDD-9181`.
 
 ### Moving a value
 
@@ -700,8 +700,8 @@ Aggregates compose their own attributes and write no index keys of an entity's i
 | `EDD-9106` | Two key halves of one entity stored in one attribute, sharded or not, without the same fields, in the same order and casing, or a sharded partition key with one sharded differently | Types, for a sharded half they can see, `Entity.make`, and `Table.make` for a casing left to the schema |
 | `EDD-9108` | One entity uses one physical index twice, even over the same fields | `Entity.make` |
 | `EDD-9094` | A cursor from another query or layout, or a corrupted one | The terminal, as a `ValidationError` |
-| `EDD-9180` | An index declares `shards: { layouts: "provided" }` and no `ShardLayouts` layer supplies its table | `DynamoClient.make`, or the first operation on a path without a bound client, before anything is sent |
-| `EDD-9181` | `ShardLayouts.of` misused: an index not declared `"provided"`, an unknown index, a provided index left out, one entity given twice, or an entity on no table | Types, and building the layer |
+| `EDD-9181` | An index declares `shards: { layouts: "provided" }` and no `ShardLayouts` layer supplies its table | `DynamoClient.make`, or the first operation on a path without a bound client, before anything is sent |
+| `EDD-9182` | `ShardLayouts.of` misused: an index not declared `"provided"`, an unknown index, a provided index left out, one entity given twice, or an entity on no table | Types, and building the layer |
 
 ## What's Next?
 

@@ -3,7 +3,7 @@
  *
  * - A declared table: a hot value (spelled two ways) over its shards, a cold value in the
  *   unsharded partition with one plain request, each read back whole.
- * - A table supplied by a `ShardLayouts` layer: bound and unbound writes, and `EDD-9180`
+ * - A table supplied by a `ShardLayouts` layer: bound and unbound writes, and `EDD-9181`
  *   with nothing written when no layer supplies it.
  * - Moving one value 1 → { 4, previous: 1 } → 4 → { 1, previous: 4 } → 1 with `rekey`:
  *   every row read at every step, the dry run counting what is left, cursors of the moved
@@ -179,7 +179,7 @@ describeConnected("per-value shard layouts (#287)", () => {
     ),
   )
 
-  it.effect("a table from a layer: bound and unbound writes, and EDD-9180 without one", () =>
+  it.effect("a table from a layer: bound and unbound writes, and EDD-9181 without one", () =>
     withTable((tableName) =>
       Effect.gen(function* () {
         const table = { default: 1, values: [hot] }
@@ -189,9 +189,9 @@ describeConnected("per-value shard layouts (#287)", () => {
             tables: { MainTable: ProvidedTable },
           }),
         )
-        expect(String(missing)).toContain("[EDD-9180]")
+        expect(String(missing)).toContain("[EDD-9181]")
         const unbound = yield* Effect.exit(Batch.write([Provided.put(big[0]!)]))
-        expect(String(unbound)).toContain("[EDD-9180]")
+        expect(String(unbound)).toContain("[EDD-9181]")
         expect((yield* storedPks(tableName)).size).toBe(0)
 
         const db = yield* bindWith(table)

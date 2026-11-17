@@ -1097,7 +1097,7 @@ const composedShardMarker = (
  * carries ({@link withShardTables}), else the one the `ShardLayouts` service of the
  * context it runs in supplies. The one way every composer and reader
  * obtains a table, so a path that has none can't fall back to a default: it
- * throws `[EDD-9180]`.
+ * throws `[EDD-9181]`.
  */
 export const shardTableOf = (
   schema: DynamoSchema.DynamoSchema,
@@ -1113,7 +1113,7 @@ export const shardTableOf = (
     (schema.shardTables?.get(shards) as ShardTable | undefined) ?? ambientShardTable(shards)
   if (supplied === undefined) {
     throw new Error(
-      `[EDD-9180] Index "${index.index}" declares shards: { layouts: "provided" }, but no ` +
+      `[EDD-9181] Index "${index.index}" declares shards: { layouts: "provided" }, but no ` +
         `ShardLayouts layer supplies its table. Add ShardLayouts.layer(...) to the application ` +
         `layer.`,
     )
@@ -1152,12 +1152,12 @@ export const withShardTables = (
         shardTables: new Map<object, unknown>([...(schema.shardTables ?? new Map()), ...tables]),
       }
 
-/** The `[EDD-9180]` message for provided indexes with no table (#287). */
+/** The `[EDD-9181]` message for provided indexes with no table (#287). */
 export const missingShardTablesMessage = (
   where: string,
   missing: ReadonlyArray<{ readonly entity: string; readonly index: string }>,
 ): string =>
-  `[EDD-9180] ${where}: ${missing.map(({ entity, index }) => `${entity}.${index}`).join(", ")} ` +
+  `[EDD-9181] ${where}: ${missing.map(({ entity, index }) => `${entity}.${index}`).join(", ")} ` +
   `declare${missing.length === 1 ? "s" : ""} shards: { layouts: "provided" }, but no ShardLayouts ` +
   `layer supplies ${missing.length === 1 ? "its table" : "their tables"}. Add ` +
   `ShardLayouts.layer([ShardLayouts.of(...)]) to the application layer.`
@@ -1182,7 +1182,7 @@ export const missingShardTables = (
   })
 
 /**
- * Throw `[EDD-9180]` when an entity's provided index has no table where the
+ * Throw `[EDD-9181]` when an entity's provided index has no table where the
  * operation runs (#287): checked when an operation without a bound client starts,
  * so nothing is sent, whether or not this write would have composed the index.
  */

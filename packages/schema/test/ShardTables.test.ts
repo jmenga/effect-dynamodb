@@ -454,13 +454,13 @@ describe("a provided table (design §2.4, D36)", () => {
     } satisfies KeyComposer.IndexShards,
   }
 
-  it("composing without a supplied table throws EDD-9180: nothing falls back", () => {
-    expect(() => KeyComposer.composePk(schema, "DeviceState", def, item("t"))).toThrow("[EDD-9180]")
+  it("composing without a supplied table throws EDD-9181: nothing falls back", () => {
+    expect(() => KeyComposer.composePk(schema, "DeviceState", def, item("t"))).toThrow("[EDD-9181]")
     expect(() =>
       KeyComposer.composeReadPartitions(schema, "DeviceState", def, { tenantId: "t" }),
-    ).toThrow("[EDD-9180]")
+    ).toThrow("[EDD-9181]")
     expect(() => KeyComposer.tryComposeIndexKeys(schema, "DeviceState", 1, def, item("t"))).toThrow(
-      "[EDD-9180]",
+      "[EDD-9181]",
     )
   })
 
@@ -604,9 +604,9 @@ describe("Entity.make (design §2.1, §2.3)", () => {
       }),
     ).toThrow("[EDD-9099]")
     expect(() => make({ layouts: hot })._data.compileShardTable("byTenant", hot)).toThrow(
-      "[EDD-9181]",
+      "[EDD-9182]",
     )
-    expect(() => entity._data.compileShardTable("nope", hot)).toThrow("[EDD-9181]")
+    expect(() => entity._data.compileShardTable("nope", hot)).toThrow("[EDD-9182]")
   })
 })
 

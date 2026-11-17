@@ -96,7 +96,7 @@ const refuseEmptyParts = <E, R>(
     ) as Effect.Effect<never, E, never>
   }
   // A provided shard table (#287) is read from the context the write runs in: checked as it
-  // starts, so a missing one (`EDD-9180`) sends nothing. An entity without one checks nothing.
+  // starts, so a missing one (`EDD-9181`) sends nothing. An entity without one checks nothing.
   const requireShardTables = (
     entity as { readonly _requireShardTables?: ((where: string) => void) | undefined }
   )._requireShardTables
@@ -111,7 +111,7 @@ const refuseEmptyParts = <E, R>(
 /**
  * A cascade reads each target's index after its source row is written, and its targets are
  * given per call, so `DynamoClient.make` never checked their provided shard tables (#287): they
- * are checked as the update starts, so a missing one (`EDD-9180`) writes nothing.
+ * are checked as the update starts, so a missing one (`EDD-9181`) writes nothing.
  */
 const requireCascadeShardTables = <E, R>(
   state: UpdateState,

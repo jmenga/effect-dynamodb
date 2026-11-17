@@ -397,7 +397,7 @@ const writeCore = (
         })
       }
       // A provided shard table (#287) comes from the context the op runs in (its binding's, for a
-      // bound builder): one missing is `EDD-9180` before anything is sent, a delete's included.
+      // bound builder): one missing is `EDD-9181` before anything is sent, a delete's included.
       yield* underCaptured(
         info.captured,
         Effect.sync(() => info.entity._requireShardTables?.("batchWrite")),

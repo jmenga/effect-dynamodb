@@ -875,7 +875,7 @@ export const fanOutDeferred = <A, E = never, O extends OffloadState = NoOffloadS
 
 /**
  * @internal Resolve a deferred read (#287): once per terminal, so `explain()`, every fan-out
- * round and the cursor use one result. A missing table throws `[EDD-9180]` (a defect).
+ * round and the cursor use one result. A missing table throws `[EDD-9181]` (a defect).
  */
 const resolveDeferred = (state: QueryState): QueryState => {
   const deferred = state.deferredRead

@@ -1319,7 +1319,7 @@ export interface Entity<
    */
   readonly _compileShardTable: (indexName: string, declared: unknown) => KeyComposer.ShardTable
   /**
-   * @internal Throw `[EDD-9180]` when an index declared `layouts: "provided"` has no table where
+   * @internal Throw `[EDD-9181]` when an index declared `layouts: "provided"` has no table where
    * the operation runs (#287); `undefined` for an entity with none, which checks nothing.
    */
   readonly _requireShardTables: ((where: string) => void) | undefined
@@ -4748,7 +4748,7 @@ const makeImpl = <
   }
 
   /**
-   * `[EDD-9180]` when an index declared `shards: { layouts: "provided" }` has no table in the
+   * `[EDD-9181]` when an index declared `shards: { layouts: "provided" }` has no table in the
    * context this operation runs in (#287): checked as a write starts, so nothing is sent, whether
    * or not the write would compose that index. A bound operation runs in its binding's context,
    * which `DynamoClient.make` checked. Nothing to check, and nothing read, for an entity with no
@@ -16900,7 +16900,7 @@ const makeImpl = <
         offloadModes,
         BlobLedger.rootIf(
           data.offload !== undefined,
-          // A missing provided shard table (#287) is `EDD-9180` before the append reads or writes.
+          // A missing provided shard table (#287) is `EDD-9181` before the append reads or writes.
           providedShards
             ? Effect.suspend(() => {
                 requireShardTables("Entity.append")

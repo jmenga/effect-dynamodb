@@ -335,19 +335,19 @@ const perValueLayouts = Effect.gen(function* () {
   yield* Console.log(`t-big: ${busy.shards?.count} shards, t-123: ${quiet.shards?.count}`)
 
   // #region layouts-missing
-  // Without a ShardLayouts layer, binding fails with EDD-9180, naming the entity
+  // Without a ShardLayouts layer, binding fails with EDD-9181, naming the entity
   // and index. Nothing falls back to a default.
   const missing = yield* DynamoClient.make({
     entities: { Devices: ProvidedDevices },
     tables: { MainTable: ProvidedTable },
   }).pipe(Effect.exit)
-  // missing → a defect: "[EDD-9180] DynamoClient.make: Device.byTenant declares
+  // missing → a defect: "[EDD-9181] DynamoClient.make: Device.byTenant declares
   //           shards: { layouts: "provided" }, but no ShardLayouts layer supplies its table…"
   // #endregion
-  if (!String(missing).includes("[EDD-9180]")) {
-    throw new Error(`Expected EDD-9180, got ${String(missing)}`)
+  if (!String(missing).includes("[EDD-9181]")) {
+    throw new Error(`Expected EDD-9181, got ${String(missing)}`)
   }
-  yield* Console.log("No ShardLayouts layer: EDD-9180")
+  yield* Console.log("No ShardLayouts layer: EDD-9181")
 
   // #region layouts-provided-use
   // The layer goes in the application layer, beside the client. Bound operations
