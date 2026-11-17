@@ -8,6 +8,9 @@
  *   - `.concurrency()`, `.explain()` and `.onRequest()`
  *   - `by`: pruning a query to one shard, and what an update must carry
  *   - Adopting sharding on a populated index: `previous`, then `rekey`
+ *   - Per-value layouts: a table of values, declared on the entity or supplied at
+ *     run time by a `ShardLayouts` layer (from `Config`, or from a config item),
+ *     and moving one value with `previous`, `rekey` and `rekey({ dryRun: true })`
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -16,10 +19,11 @@
  *   npx tsx examples/guide-sharding.ts
  */
 
-import { Config, Console, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Config, ConfigProvider, Console, Effect, Layer, Option, Schema, Stream } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as ShardLayouts from "@effect-dynamodb/schema/ShardLayouts.js"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -145,6 +149,113 @@ const MovedTable = Table.make({ schema: AppSchema, entities: { Devices: MovedDev
 const adoptionTableName = "guide-sharding-adoption"
 
 // =============================================================================
+// 3b. Per-value layouts
+// =============================================================================
+
+// #region layouts-entity
+const TenantDevices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: deviceKey,
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      // One busy tenant takes 8 shards. Every other tenant keeps one unsharded partition.
+      shards: {
+        layouts: {
+          default: 1,
+          values: [{ match: { tenantId: "t-big" }, layout: 8 }],
+        },
+      },
+    },
+  },
+})
+// #endregion
+
+// #region layouts-provided
+// The busy tenant's id differs per environment, so the table comes from the
+// application at run time, through a ShardLayouts layer.
+const ProvidedDevices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: deviceKey,
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      shards: { layouts: "provided" },
+    },
+  },
+})
+// #endregion
+
+const LayoutsTable = Table.make({ schema: AppSchema, entities: { Devices: TenantDevices } })
+const ProvidedTable = Table.make({ schema: AppSchema, entities: { Devices: ProvidedDevices } })
+const layoutsTableName = "guide-sharding-layouts"
+
+// #region layouts-layer
+// BIG_TENANT_ID holds the busy tenant's id: t-big here, another id in staging.
+const ShardsLayer = ShardLayouts.layer([
+  ShardLayouts.of(ProvidedDevices, {
+    byTenant: Config.String("BIG_TENANT_ID").pipe(
+      Config.map((id) => ({ default: 1, values: [{ match: { tenantId: id }, layout: 8 }] })),
+    ),
+  }),
+])
+
+// Or the whole table as one JSON variable, for several tenants or one mid-migration.
+const JsonShardsLayer = ShardLayouts.layer([
+  ShardLayouts.of(ProvidedDevices, {
+    byTenant: Config.schema(Schema.fromJsonString(ShardLayouts.Table), "DEVICE_SHARDS"),
+  }),
+])
+// #endregion
+
+// The example's configuration: an application reads its environment instead.
+const exampleConfig = ConfigProvider.layer(
+  ConfigProvider.fromUnknown({
+    BIG_TENANT_ID: "t-big",
+    DEVICE_SHARDS: JSON.stringify({
+      default: 1,
+      values: [{ match: { tenantId: "t-big" }, layout: 8 }],
+    }),
+  }),
+)
+
+// #region layouts-config-item
+class ShardConfig extends Schema.Class<ShardConfig>("ShardConfig")({
+  name: Schema.String, // "Devices.byTenant"
+  layouts: ShardLayouts.Table,
+}) {}
+
+const ShardConfigs = Entity.make({
+  model: ShardConfig,
+  entityType: "ShardConfig",
+  primaryKey: {
+    pk: { field: "pk", composite: ["name"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+const ConfigTable = Table.make({ schema: AppSchema, entities: { ShardConfigs } })
+// #endregion
+const configTableName = "guide-sharding-config"
+
+// #region layouts-layer-effect
+// Read once, when the layer is built. A failed read or a missing item fails the
+// layer: the application doesn't start, rather than run unsharded.
+const ItemShardsLayer = ShardLayouts.layerEffect(
+  Effect.gen(function* () {
+    const db = yield* DynamoClient.make({ entities: { ShardConfigs }, tables: { ConfigTable } })
+    const devices = yield* db.entities.ShardConfigs.get({ name: "Devices.byTenant" })
+    return [ShardLayouts.of(ProvidedDevices, { byTenant: devices.layouts })]
+  }),
+)
+// #endregion
+
+// =============================================================================
 // 4. Seed data
 // =============================================================================
 
@@ -159,6 +270,15 @@ const devices = Array.from({ length: 200 }, (_, n) => ({
   status: n % 2 === 0 ? "online" : "offline",
 }))
 
+const BIG = "t-big"
+const bigDevices = Array.from({ length: 40 }, (_, n) => ({
+  channel: `channel-${n % 5}`,
+  deviceId: `b-${String(n).padStart(3, "0")}`,
+  tenantId: BIG,
+  groupId: GROUPS[n % GROUPS.length]!,
+  status: "online",
+}))
+
 const idsOf = (items: ReadonlyArray<{ readonly deviceId: string }>) =>
   items.map((item) => item.deviceId)
 const everyId = devices.map((device) => device.deviceId)
@@ -166,6 +286,155 @@ const everyId = devices.map((device) => device.deviceId)
 // =============================================================================
 // 5. Main program
 // =============================================================================
+
+// The per-value layouts section, run under the example's configuration.
+const perValueLayouts = Effect.gen(function* () {
+  // -------------------------------------------------------------------------
+  // Per-value layouts
+  // -------------------------------------------------------------------------
+  yield* Console.log("\n=== Per-value layouts ===\n")
+
+  const layoutsDb = yield* DynamoClient.make({
+    entities: { Devices: TenantDevices },
+    tables: { MainTable: LayoutsTable },
+  })
+  yield* layoutsDb.tables.MainTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
+  yield* layoutsDb.tables.MainTable.create()
+  yield* Batch.write([...devices, ...bigDevices].map((device) => TenantDevices.put(device)))
+
+  // #region layouts-explain
+  // "T-BIG" composes the same key as "t-big" under the default lowercase casing,
+  // so it gets the same layout.
+  const busy = yield* layoutsDb.entities.Devices.byTenant({ tenantId: "T-BIG" }).explain()
+  // busy.shards?.count             → 8
+  // busy.shards?.partitions.length → 8
+
+  // Any other tenant: one unsharded partition, the same keys and requests as an
+  // index without shards.
+  const quiet = yield* layoutsDb.entities.Devices.byTenant({ tenantId: TENANT }).explain()
+  // quiet.shards?.count      → 1
+  // quiet.shards?.partitions → ["$guide-sharding#v1#device#tenantid_t-123"]
+  // quiet.fanOut             → undefined
+  // #endregion
+  assertEq(busy.shards?.count, 8, "the busy tenant's layout")
+  assertEq(busy.shards?.partitions.length, 8, "8 partitions")
+  assertEq(busy.fanOut?.partitions.length, 8, "a fan-out over 8")
+  assertEq(quiet.shards?.count, 1, "a quiet tenant's layout")
+  assertEq(
+    quiet.shards?.partitions,
+    ["$guide-sharding#v1#device#tenantid_t-123"],
+    "the unsharded partition",
+  )
+  assertEq(quiet.fanOut, undefined, "a plain query")
+  const busyRows = yield* layoutsDb.entities.Devices.byTenant({ tenantId: BIG }).collect()
+  const quietRows = yield* layoutsDb.entities.Devices.byTenant({ tenantId: TENANT }).collect()
+  assertEq(idsOf(busyRows), idsOf(bigDevices), "the busy tenant's rows, merged in order")
+  assertEq(idsOf(quietRows), everyId, "the quiet tenant's rows")
+  yield* Console.log(`t-big: ${busy.shards?.count} shards, t-123: ${quiet.shards?.count}`)
+
+  // #region layouts-missing
+  // Without a ShardLayouts layer, binding fails with EDD-9181, naming the entity
+  // and index. Nothing falls back to a default.
+  const missing = yield* DynamoClient.make({
+    entities: { Devices: ProvidedDevices },
+    tables: { MainTable: ProvidedTable },
+  }).pipe(Effect.exit)
+  // missing → a defect: "[EDD-9181] DynamoClient.make: Device.byTenant declares
+  //           shards: { layouts: "provided" }, but no ShardLayouts layer supplies its table…"
+  // #endregion
+  if (!String(missing).includes("[EDD-9181]")) {
+    throw new Error(`Expected EDD-9181, got ${String(missing)}`)
+  }
+  yield* Console.log("No ShardLayouts layer: EDD-9181")
+
+  // #region layouts-provided-use
+  // The layer goes in the application layer, beside the client. Bound operations
+  // keep the table DynamoClient.make read, so their types don't change.
+  const providedDb = yield* DynamoClient.make({
+    entities: { Devices: ProvidedDevices },
+    tables: { MainTable: ProvidedTable },
+  }).pipe(Effect.provide(ShardsLayer))
+  const fromConfig = yield* providedDb.entities.Devices.byTenant({ tenantId: BIG }).explain()
+  // fromConfig.shards?.count → 8
+  // #endregion
+  assertEq(fromConfig.shards?.count, 8, "the layer's table")
+  const providedRows = yield* providedDb.entities.Devices.byTenant({ tenantId: BIG }).collect()
+  assertEq(idsOf(providedRows), idsOf(bigDevices), "the same rows as the declared table")
+
+  const fromJson = yield* DynamoClient.make({
+    entities: { Devices: ProvidedDevices },
+    tables: { MainTable: ProvidedTable },
+  }).pipe(Effect.provide(JsonShardsLayer))
+  const jsonExplained = yield* fromJson.entities.Devices.byTenant({ tenantId: BIG }).explain()
+  assertEq(jsonExplained.shards?.count, 8, "the JSON table")
+  yield* Console.log(`From configuration: t-big has ${fromConfig.shards?.count} shards`)
+
+  // A table in a config item
+  const configDb = yield* DynamoClient.make({ entities: { ShardConfigs }, tables: { ConfigTable } })
+  yield* configDb.tables.ConfigTable.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
+  yield* configDb.tables.ConfigTable.create()
+  const layouts = yield* Schema.decodeUnknownEffect(ShardLayouts.Table)({
+    default: 1,
+    values: [{ match: { tenantId: BIG }, layout: 8 }],
+  })
+  yield* configDb.entities.ShardConfigs.put({ name: "Devices.byTenant", layouts })
+  const itemDb = yield* DynamoClient.make({
+    entities: { Devices: ProvidedDevices },
+    tables: { MainTable: ProvidedTable },
+  }).pipe(Effect.provide(ItemShardsLayer))
+  const fromItem = yield* itemDb.entities.Devices.byTenant({ tenantId: BIG }).explain()
+  assertEq(fromItem.shards?.count, 8, "the config item's table")
+  yield* Console.log(`From a config item: t-big has ${fromItem.shards?.count} shards`)
+  yield* configDb.tables.ConfigTable.delete()
+
+  // #region layouts-migrate
+  // Moving t-123 from its one partition to 4 shards, while t-big keeps 8. Each step
+  // is a deploy or a configuration change, finished once every process runs it.
+  const tablesOf = (byTenant: ShardLayouts.TypedTable<"tenantId">) =>
+    ShardLayouts.layer([ShardLayouts.of(ProvidedDevices, { byTenant })])
+  const bindWith = (byTenant: ShardLayouts.TypedTable<"tenantId">) =>
+    DynamoClient.make({
+      entities: { Devices: ProvidedDevices },
+      tables: { MainTable: ProvidedTable },
+    }).pipe(Effect.provide(tablesOf(byTenant)))
+  const busyTenant = { match: { tenantId: "t-big" }, layout: 8 }
+
+  // Step 1: t-123 writes 4 shards, and reads them and its old partition.
+  const step1 = yield* bindWith({
+    default: 1,
+    values: [busyTenant, { match: { tenantId: TENANT }, layout: { count: 4, previous: 1 } }],
+  })
+  const pending = yield* step1.tables.MainTable.rekey({ dryRun: true })
+  // pending.indexKeysRewritten → 200: t-123's rows, still in the old partition
+
+  // Step 2: rekey, then check again.
+  yield* step1.tables.MainTable.rekey()
+  const settled = yield* step1.tables.MainTable.rekey({ dryRun: true })
+  // settled.indexKeysRewritten → 0, settled.conflicts → []: step 3 can go out
+
+  // Step 3: remove `previous`.
+  const step3 = yield* bindWith({
+    default: 1,
+    values: [busyTenant, { match: { tenantId: TENANT }, layout: 4 }],
+  })
+  const moved = yield* step3.entities.Devices.byTenant({ tenantId: TENANT }).collect()
+  // #endregion
+  assertEq(pending.indexKeysRewritten, devices.length, "the dry run counts t-123's rows")
+  assertEq(settled.indexKeysRewritten, 0, "nothing left to move")
+  assertEq(settled.conflicts.length, 0, "no conflicts")
+  assertEq(idsOf(moved), everyId, "every row of t-123 in its new layout")
+  const step3Explained = yield* step3.entities.Devices.byTenant({ tenantId: TENANT }).explain()
+  assertEq(step3Explained.shards?.partitions.length, 4, "4 partitions, no previous")
+  const untouched = yield* step3.entities.Devices.byTenant({ tenantId: BIG }).collect()
+  assertEq(idsOf(untouched), idsOf(bigDevices), "other values are untouched")
+  yield* Console.log(`t-123 moved to ${step3Explained.shards?.count} shards`)
+
+  yield* layoutsDb.tables.MainTable.delete()
+})
 
 // #region program
 const program = Effect.gen(function* () {
@@ -416,6 +685,9 @@ const program = Effect.gen(function* () {
   assertEq(idsOf(after), everyId, "nothing is missing after the adoption")
   yield* Console.log(`${after.length} devices after removing previous`)
 
+  yield* perValueLayouts.pipe(Effect.provide(exampleConfig))
+
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===\n")
   yield* movedDb.tables.MainTable.delete()
@@ -438,6 +710,9 @@ const AppLayer = Layer.mergeAll(
   OldTable.layer({ name: adoptionTableName }),
   MovingTable.layer({ name: adoptionTableName }),
   MovedTable.layer({ name: adoptionTableName }),
+  LayoutsTable.layer({ name: layoutsTableName }),
+  ProvidedTable.layer({ name: layoutsTableName }),
+  ConfigTable.layer({ name: configTableName }),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

@@ -140,6 +140,67 @@ describe("Collection", () => {
       )
     })
 
+    it("accepts a member that names the collection's index differently", () => {
+      // Members name their accessors per entity; only the first member's logical name is shared.
+      const Orders = Entity.make({
+        model: Order,
+        entityType: "RenamedOrder",
+        primaryKey: {
+          pk: { field: "pk", composite: ["orderId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          ordersByTenant: {
+            collection: "TenantItems",
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenantId"] },
+            sk: { field: "gsi1sk", composite: [] },
+          },
+        },
+      })
+      const OrdersTable = Table.make({ schema: AppSchema, entities: { Orders } })
+
+      const TenantItems = Collection.make("TenantItems", { users: UserEntity, orders: Orders })
+      expect(TenantItems.name).toBe("TenantItems")
+      // Its selector reads its own index under its own name.
+      const params = Effect.runSync(
+        Query.asParams(TenantItems.orders({ tenantId: "t-1" }) as Query.Query<unknown>).pipe(
+          Effect.provide(OrdersTable.layer({ name: "test-table" })),
+        ) as Effect.Effect<Record<string, unknown>, unknown>,
+      )
+      expect(params).toMatchObject({
+        IndexName: "gsi1",
+        ExpressionAttributeValues: { ":pk": { S: "$myapp#v1#tenantitems#tenantid_t-1" } },
+      })
+    })
+
+    it("checks a member that names the collection's index differently like any other", () => {
+      // Its index composes the collection's keys under another casing: the members' keys would
+      // never meet, whatever the member calls the index.
+      const Orders = Entity.make({
+        model: Order,
+        entityType: "PreservedOrder",
+        primaryKey: {
+          pk: { field: "pk", composite: ["orderId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          ordersByTenant: {
+            collection: "TenantItems",
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenantId"] },
+            sk: { field: "gsi1sk", composite: [] },
+            casing: "preserve",
+          },
+        },
+      })
+      Table.make({ schema: AppSchema, entities: { Orders } })
+
+      expect(() => Collection.make("TenantItems", { users: UserEntity, orders: Orders })).toThrow(
+        "[EDD-9055]",
+      )
+    })
+
     it("throws when entities list is empty", () => {
       expect(() => Collection.make("Empty", {})).toThrow("requires at least one entity")
     })

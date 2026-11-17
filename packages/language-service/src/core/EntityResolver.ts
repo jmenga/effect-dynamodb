@@ -34,11 +34,24 @@ export const isZOrderHalf = (part: KeyPart): boolean => part.zorder !== undefine
  * has no item to hash, so it shows the marker with a shard placeholder.
  */
 export interface IndexShards {
-  /** `undefined` when the count isn't a literal. */
+  /** `undefined` when the count isn't a literal, and on an index with a table. */
   readonly count: number | undefined
   /** The `by` attributes; empty for the default source. */
   readonly by: ReadonlyArray<string>
   readonly previous: number | undefined
+  /**
+   * A layout per value (#287): the table as the literal shows it, or `"provided"` for a table
+   * a `ShardLayouts` layer supplies at run time. Absent on a static declaration.
+   */
+  readonly layouts?: ShardTableText | "provided" | undefined
+}
+
+/** A shard table as text (#287); a part the literal doesn't show is `undefined`. */
+export interface ShardTableText {
+  /** The default layout, as text (`1`, `20 (previous 1)`). */
+  readonly default: string | undefined
+  /** Each entry: its match (`tenantId=t-big`) and layout, as text. */
+  readonly values: ReadonlyArray<{ readonly match: string; readonly layout: string }> | undefined
 }
 
 export interface IndexDefinition {
@@ -570,7 +583,10 @@ function resolveGsiConfig(
   }
 }
 
-/** Parse `shards: 20` or `shards: { count: 20, by: [...], previous: 1 }`. */
+/**
+ * Parse `shards: 20`, `shards: { count: 20, by: [...], previous: 1 }`, or a layout per value
+ * (#287): `shards: { by?, layouts: { default, values? } }` or `{ by?, layouts: "provided" }`.
+ */
 function resolveShards(ts: typeof import("typescript"), expr: ts.Expression): IndexShards {
   if (!ts.isObjectLiteralExpression(expr)) {
     return { count: extractNumberLiteral(ts, expr), by: [], previous: undefined }
@@ -578,6 +594,7 @@ function resolveShards(ts: typeof import("typescript"), expr: ts.Expression): In
   let count: number | undefined
   let by: ReadonlyArray<string> = []
   let previous: number | undefined
+  let layouts: ShardTableText | "provided" | undefined
   for (const prop of expr.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
     switch (prop.name.text) {
@@ -592,9 +609,75 @@ function resolveShards(ts: typeof import("typescript"), expr: ts.Expression): In
       case "previous":
         previous = extractNumberLiteral(ts, prop.initializer)
         break
+      case "layouts":
+        layouts =
+          extractStringLiteral(ts, prop.initializer) === "provided"
+            ? "provided"
+            : resolveShardTable(ts, prop.initializer)
+        break
     }
   }
-  return { count, by, previous }
+  return layouts === undefined
+    ? { count, by, previous }
+    : { count: undefined, by, previous: undefined, layouts }
+}
+
+/** A shard table literal as text (#287): what the hover shows. */
+function resolveShardTable(ts: typeof import("typescript"), expr: ts.Expression): ShardTableText {
+  if (!ts.isObjectLiteralExpression(expr)) return { default: undefined, values: undefined }
+  let defaultText: string | undefined
+  let values: ShardTableText["values"]
+  for (const prop of expr.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+    if (prop.name.text === "default") defaultText = layoutText(ts, prop.initializer)
+    if (prop.name.text === "values" && ts.isArrayLiteralExpression(prop.initializer)) {
+      values = prop.initializer.elements.map((element) => {
+        let match = "{match}"
+        let layout = "{layout}"
+        if (ts.isObjectLiteralExpression(element)) {
+          for (const entry of element.properties) {
+            if (!ts.isPropertyAssignment(entry) || !ts.isIdentifier(entry.name)) continue
+            if (entry.name.text === "layout") layout = layoutText(ts, entry.initializer) ?? layout
+            if (entry.name.text === "match" && ts.isObjectLiteralExpression(entry.initializer)) {
+              match = entry.initializer.properties
+                .flatMap((part) =>
+                  ts.isPropertyAssignment(part) && ts.isIdentifier(part.name)
+                    ? [`${part.name.text}=${literalText(ts, part.initializer)}`]
+                    : [],
+                )
+                .join(", ")
+            }
+          }
+        }
+        return { match, layout }
+      })
+    }
+  }
+  return { default: defaultText, values }
+}
+
+/** A layout literal as text: `20`, or `20 (previous 1)`. */
+function layoutText(ts: typeof import("typescript"), expr: ts.Expression): string | undefined {
+  const count = extractNumberLiteral(ts, expr)
+  if (count !== undefined) return String(count)
+  if (!ts.isObjectLiteralExpression(expr)) return undefined
+  let layoutCount: number | undefined
+  let layoutPrevious: number | undefined
+  for (const prop of expr.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+    if (prop.name.text === "count") layoutCount = extractNumberLiteral(ts, prop.initializer)
+    if (prop.name.text === "previous") layoutPrevious = extractNumberLiteral(ts, prop.initializer)
+  }
+  return `${layoutCount ?? "{count}"}${layoutPrevious === undefined ? "" : ` (previous ${layoutPrevious})`}`
+}
+
+/** A match value literal as text: the string, number or boolean, else a placeholder. */
+function literalText(ts: typeof import("typescript"), expr: ts.Expression): string {
+  const text = extractStringLiteral(ts, expr) ?? extractNumberLiteral(ts, expr)
+  if (text !== undefined) return String(text)
+  if (expr.kind === ts.SyntaxKind.TrueKeyword) return "true"
+  if (expr.kind === ts.SyntaxKind.FalseKeyword) return "false"
+  return "{value}"
 }
 
 function resolveIndexDefinition(

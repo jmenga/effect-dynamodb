@@ -93,6 +93,7 @@ export type {
 export * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 export type { ProjectionResult } from "@effect-dynamodb/schema/Projection.js"
 export * as Projection from "@effect-dynamodb/schema/Projection.js"
+export * as ShardLayouts from "@effect-dynamodb/schema/ShardLayouts.js"
 export type {
   DistanceFunction,
   Similarity,

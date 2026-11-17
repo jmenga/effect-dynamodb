@@ -494,106 +494,130 @@ export const prepareTransactWriteOps = (
           cause: `${operation}: unrecognized operation type. Use EntityPut, EntityDelete, or Transaction.check().`,
         })
       }
-
-      if (options?.plan === true && info.opType === "update" && info.updateState !== undefined) {
-        const { entity, key, updateState } = info
-        yield* rejectUnsupportedOp(entity, operation, "update", undefined, undefined, {
-          updateState,
-        })
-        // Its condition, refused here as every op's is, before any op of the transaction reads:
-        // planning compiles it only after the reads (#236).
-        yield* refuseEmptyParts(entity, operation, "update", updateState.condition)
-        const encoded = yield* entity._encodeKey(key, `${operation}.update.decodeKey`)
-        // What the update decides from its own operands: refused here, and planned from.
-        const prepared = yield* entity._prepareUpdate(key, updateState, encoded)
-        // No `condition` here, so a planned op is never in `conditioned`, even
-        // with a `.condition()` of its own: its verdict reports that as
-        // `"Condition"`. Only `EventStore.append` reads `conditioned`, and it
-        // plans nothing — if it ever does, add planned ops to it.
-        ops.push({
-          type: "planned",
-          entity,
-          opIndex,
-          // Under a bound op's captured store and compressors (§3.6): the plan
-          // packs and uploads as the standalone update would.
-          plan: () => underCaptured(info.captured, entity._planUpdate(key, updateState, prepared)),
-        })
-        continue
-      }
-      if (
-        options?.plan === true &&
-        info.opType === "delete" &&
-        info.deleteRequest !== undefined &&
-        info.entity._multiItemWriteFeatures.length > 0
-      ) {
-        const { entity, key, deleteRequest } = info
-        yield* rejectUnsupportedOp(entity, operation, "delete", undefined, undefined, {
-          returnValues: deleteRequest.returnValues,
-          readsStoredRow: true,
-        })
-        yield* refuseEmptyParts(entity, operation, "delete", deleteRequest.condition)
-        const encoded = yield* entity._encodeKey(key, `${operation}.delete.decodeKey`)
-        ops.push({
-          type: "planned",
-          entity,
-          opIndex,
-          plan: () =>
-            underCaptured(
-              info.captured,
-              entity._planDelete(
-                key,
-                { condition: deleteRequest.condition, mustExist: deleteRequest.mustExist },
-                encoded,
-              ),
-            ),
-        })
-        continue
-      }
-
-      if (info.opType === "put") {
-        yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
-        yield* refuseEmptyParts(info.entity, operation, "put", info.condition)
-        ops.push({
-          type: "put",
-          putKind: info.putKind,
-          entity: info.entity,
-          opIndex,
-          input: info.input!,
-          condition: compileOpCondition(info.entity, info.condition),
-          callerCondition: info.callerCondition,
-          captured: info.captured,
-          // Packed under the op's captured compressor registry (§3.6).
-          built: yield* underCaptured(
-            info.captured,
-            validateAndBuildPutItem(info.entity, info.input!, `${operation}.put`),
-          ),
-        })
-      } else if (info.opType === "delete") {
-        yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined, undefined, {
-          returnValues: info.deleteRequest?.returnValues,
-        })
-        yield* refuseEmptyParts(info.entity, operation, "delete", info.condition)
-        ops.push({
-          type: "delete",
-          entity: info.entity,
-          opIndex,
-          condition: compileOpCondition(info.entity, info.condition),
-          primaryKey: yield* composePrimaryKeyOrFail(info.entity, info.key!, `${operation}.delete`),
-        })
-      } else {
-        return yield* new ValidationError({
-          entityType: info.entity.entityType,
-          operation,
-          cause:
-            info.opType === "update"
-              ? `${operation}: update is not supported here — compiling an update reads the ` +
-                "stored row, which this path does not do. Transaction.transactWrite accepts " +
-                "updates; otherwise run the update as its own operation."
-              : `${operation}: unsupported operation type "${info.opType}". Use EntityPut, EntityDelete, or Transaction.check().`,
-        })
-      }
+      // A bound op is prepared wholly under its binding's captured services (§3.6, #287): its
+      // keys compose with its binding's shard tables and its item packs with its compressors,
+      // whatever the caller's context holds. An unbound op captured none: the caller's apply.
+      ops.push(
+        yield* underCaptured(info.captured, prepareEntityOp(info, opIndex, operation, options)),
+      )
     }
     return { count: operations.length, ops, streamOps }
+  })
+
+/**
+ * One entity op of {@link prepareTransactWriteOps}, prepared in the context it runs in: its
+ * binding's captured services for a bound op (`underCaptured`), else the caller's.
+ */
+const prepareEntityOp = (
+  info: TransactableInfo,
+  opIndex: number,
+  operation: string,
+  options:
+    | {
+        readonly streams?: boolean | undefined
+        readonly plan?: boolean | undefined
+      }
+    | undefined,
+): Effect.Effect<PreparedOp, ValidationError | DynamoClientError, TableConfig | DynamoClient> =>
+  Effect.gen(function* () {
+    // A provided shard table (#287) comes from the context the op runs in: one missing is
+    // `EDD-9181` before any op reads or anything is sent, whether or not this op composes that
+    // index.
+    info.entity._requireShardTables?.(operation)
+
+    if (options?.plan === true && info.opType === "update" && info.updateState !== undefined) {
+      const { entity, key, updateState } = info
+      yield* rejectUnsupportedOp(entity, operation, "update", undefined, undefined, {
+        updateState,
+      })
+      // Its condition, refused here as every op's is, before any op of the transaction reads:
+      // planning compiles it only after the reads (#236).
+      yield* refuseEmptyParts(entity, operation, "update", updateState.condition)
+      const encoded = yield* entity._encodeKey(key, `${operation}.update.decodeKey`)
+      // What the update decides from its own operands: refused here, and planned from.
+      const prepared = yield* entity._prepareUpdate(key, updateState, encoded)
+      // No `condition` here, so a planned op is never in `conditioned`, even
+      // with a `.condition()` of its own: its verdict reports that as
+      // `"Condition"`. Only `EventStore.append` reads `conditioned`, and it
+      // plans nothing — if it ever does, add planned ops to it.
+      return {
+        type: "planned",
+        entity,
+        opIndex,
+        // Run later, by `planTransactWriteOps`: under the op's captured services again, so
+        // the plan composes, packs and uploads as the standalone update would.
+        plan: () => underCaptured(info.captured, entity._planUpdate(key, updateState, prepared)),
+      } satisfies PreparedOp
+    }
+    if (
+      options?.plan === true &&
+      info.opType === "delete" &&
+      info.deleteRequest !== undefined &&
+      info.entity._multiItemWriteFeatures.length > 0
+    ) {
+      const { entity, key, deleteRequest } = info
+      yield* rejectUnsupportedOp(entity, operation, "delete", undefined, undefined, {
+        returnValues: deleteRequest.returnValues,
+        readsStoredRow: true,
+      })
+      yield* refuseEmptyParts(entity, operation, "delete", deleteRequest.condition)
+      const encoded = yield* entity._encodeKey(key, `${operation}.delete.decodeKey`)
+      return {
+        type: "planned",
+        entity,
+        opIndex,
+        plan: () =>
+          underCaptured(
+            info.captured,
+            entity._planDelete(
+              key,
+              { condition: deleteRequest.condition, mustExist: deleteRequest.mustExist },
+              encoded,
+            ),
+          ),
+      } satisfies PreparedOp
+    }
+
+    if (info.opType === "put") {
+      yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
+      yield* refuseEmptyParts(info.entity, operation, "put", info.condition)
+      return {
+        type: "put",
+        putKind: info.putKind,
+        entity: info.entity,
+        opIndex,
+        input: info.input!,
+        condition: compileOpCondition(info.entity, info.condition),
+        callerCondition: info.callerCondition,
+        // Its reads, its guarded plan and its upload run under them too
+        // (`buildTransactWriteItems`).
+        captured: info.captured,
+        built: yield* validateAndBuildPutItem(info.entity, info.input!, `${operation}.put`),
+      } satisfies PreparedOp
+    }
+    if (info.opType === "delete") {
+      yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined, undefined, {
+        returnValues: info.deleteRequest?.returnValues,
+      })
+      yield* refuseEmptyParts(info.entity, operation, "delete", info.condition)
+      return {
+        type: "delete",
+        entity: info.entity,
+        opIndex,
+        condition: compileOpCondition(info.entity, info.condition),
+        primaryKey: yield* composePrimaryKeyOrFail(info.entity, info.key!, `${operation}.delete`),
+      } satisfies PreparedOp
+    }
+    return yield* new ValidationError({
+      entityType: info.entity.entityType,
+      operation,
+      cause:
+        info.opType === "update"
+          ? `${operation}: update is not supported here — compiling an update reads the ` +
+            "stored row, which this path does not do. Transaction.transactWrite accepts " +
+            "updates; otherwise run the update as its own operation."
+          : `${operation}: unsupported operation type "${info.opType}". Use EntityPut, EntityDelete, or Transaction.check().`,
+    })
   })
 
 /**
@@ -793,40 +817,12 @@ export const buildTransactWriteItems = (
       }
 
       if (op.type === "put") {
-        const built = op.built!
-        const guardedPut =
-          op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")
-        // `create` over a projection tombstone (#154): take its place,
-        // carrying its checkpoints over, guarded on that tombstone.
-        const over =
-          !guardedPut && op.putKind === "create"
-            ? yield* op.entity._overTombstone(built.item)
-            : Option.none<{
-                readonly guard: ConditionInput
-                readonly term: RawCondition | undefined
-              }>()
-        // Offloaded fields (#179, design §6.7): routed and uploaded as the
-        // entity's own put does — after the tombstone read, before the
-        // guarded put's read — under the op's captured store (§3.6). The
-        // uploads settle by the transaction that carries their pointers.
-        if (op.entity._offloads) {
-          yield* underCaptured(
-            op.captured,
-            op.entity._offloadItem(built.item, tableName, `${operation}.put`),
-          )
-        }
-        if (guardedPut) {
-          const plan = yield* op.entity._planPut({
-            tableName,
-            ttlAttrName: resolveTtlAttributeName(yield* op.entity._tableTag),
-            now: built.now,
-            item: built.item,
-            createdAtSupplied: built.createdAtSupplied,
-            userCondition: op.condition,
-            create: op.putKind === "create",
-            operation,
-            composeKeys: built.composeKeys,
-          })
+        // Its reads, its guarded plan (which composes its keys again with what it carries over),
+        // its upload and its item run under a bound op's captured services (§3.6, #287), as
+        // its item was built.
+        const put = yield* underCaptured(op.captured, buildPut(op, tableName, operation))
+        if (put._tag === "guarded") {
+          const { plan } = put
           guarded.push({ opIndex: op.opIndex, start: items.length, plan })
           for (const [i, item] of plan.items.entries()) {
             push(
@@ -837,31 +833,7 @@ export const buildTransactWriteItems = (
           }
           continue
         }
-
-        push(
-          {
-            Put: {
-              TableName: tableName,
-              // Routed above, or taken over a tombstone: marshalled again.
-              Item:
-                op.entity._offloads || Option.isSome(over)
-                  ? yield* marshalPutItem(op.entity, built.item, `${operation}.put`)
-                  : built.marshalled,
-              ...conditionFields(
-                Option.isSome(over)
-                  ? andRaw(
-                      compileOpCondition(
-                        op.entity,
-                        withGuard(over.value.guard, op.callerCondition),
-                      ),
-                      over.value.term,
-                    )
-                  : op.condition,
-              ),
-            },
-          },
-          { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
-        )
+        push(put.item, { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType })
       } else if (op.type === "delete") {
         push(
           {
@@ -896,6 +868,77 @@ export const buildTransactWriteItems = (
       )
     const targets = () => naming.map((name) => name())
     return { items, provenance, targets, guarded, streams, conditioned, keys }
+  })
+
+/**
+ * A prepared put's transact item, or its guarded plan ({@link buildTransactWriteItems}): the reads
+ * it makes, the plan, the upload and the item, in the context it runs in.
+ */
+const buildPut = (
+  op: PreparedOp,
+  tableName: string,
+  operation: string,
+): Effect.Effect<
+  | { readonly _tag: "guarded"; readonly plan: TransactPlan }
+  | { readonly _tag: "main"; readonly item: TransactWriteItem },
+  ValidationError | DynamoClientError | BlobStoreError,
+  TableConfig | DynamoClient
+> =>
+  Effect.gen(function* () {
+    const built = op.built!
+    const guardedPut =
+      op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")
+    // `create` over a projection tombstone (#154): take its place,
+    // carrying its checkpoints over, guarded on that tombstone.
+    const over =
+      !guardedPut && op.putKind === "create"
+        ? yield* op.entity._overTombstone(built.item)
+        : Option.none<{
+            readonly guard: ConditionInput
+            readonly term: RawCondition | undefined
+          }>()
+    // Offloaded fields (#179, design §6.7): routed and uploaded as the
+    // entity's own put does — after the tombstone read, before the
+    // guarded put's read. The uploads settle by the transaction that carries
+    // their pointers.
+    if (op.entity._offloads) {
+      yield* op.entity._offloadItem(built.item, tableName, `${operation}.put`)
+    }
+    if (guardedPut) {
+      const plan = yield* op.entity._planPut({
+        tableName,
+        ttlAttrName: resolveTtlAttributeName(yield* op.entity._tableTag),
+        now: built.now,
+        item: built.item,
+        createdAtSupplied: built.createdAtSupplied,
+        userCondition: op.condition,
+        create: op.putKind === "create",
+        operation,
+        composeKeys: built.composeKeys,
+      })
+      return { _tag: "guarded", plan } as const
+    }
+    return {
+      _tag: "main",
+      item: {
+        Put: {
+          TableName: tableName,
+          // Routed above, or taken over a tombstone: marshalled again.
+          Item:
+            op.entity._offloads || Option.isSome(over)
+              ? yield* marshalPutItem(op.entity, built.item, `${operation}.put`)
+              : built.marshalled,
+          ...conditionFields(
+            Option.isSome(over)
+              ? andRaw(
+                  compileOpCondition(op.entity, withGuard(over.value.guard, op.callerCondition)),
+                  over.value.term,
+                )
+              : op.condition,
+          ),
+        },
+      },
+    } as const
   })
 
 // ---------------------------------------------------------------------------

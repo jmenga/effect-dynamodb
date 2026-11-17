@@ -626,6 +626,7 @@ describe("Entity.make's checks on `shards`", () => {
       by: undefined,
       previous: undefined,
       source: ["channel", "deviceId"],
+      layouts: { default: { count: 20, previous: undefined }, values: [] },
     })
   })
 
@@ -636,6 +637,7 @@ describe("Entity.make's checks on `shards`", () => {
       by: ["groupId"],
       previous: 1,
       source: ["groupId"],
+      layouts: { default: { count: 20, previous: 1 }, values: [] },
     })
   })
 

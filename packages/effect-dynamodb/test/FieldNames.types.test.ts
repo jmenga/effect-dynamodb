@@ -440,3 +440,60 @@ describe("definition attribute names are typed from the model (runtime package)"
     })
   })
 })
+
+describe("Entity.make shards.layouts match (#287)", () => {
+  const key = {
+    pk: { field: "pk", composite: ["task"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const byProject = {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["project"] },
+    sk: { field: "gsi1sk", composite: ["status"] },
+  } as const
+
+  it("names the partition key composites", () => {
+    const made = Entity.make({
+      model: Task,
+      entityType: "Task",
+      primaryKey: key,
+      indexes: {
+        byProject: {
+          ...byProject,
+          shards: { layouts: { default: 1, values: [{ match: { project: "P-1" }, layout: 20 }] } },
+        },
+      },
+    })
+    expect(made.indexes.byProject.shards?.count).toBe(1)
+  })
+
+  it("a typo is an error on that entry", () => {
+    expect(() =>
+      Entity.make({
+        model: Task,
+        entityType: "Task",
+        primaryKey: key,
+        indexes: {
+          byProject: {
+            ...byProject,
+            shards: {
+              layouts: {
+                default: 1,
+                values: [
+                  {
+                    match: {
+                      project: "p",
+                      // @ts-expect-error not a partition key composite (a typo of project)
+                      projct: "p",
+                    },
+                    layout: 20,
+                  },
+                ],
+              },
+            },
+          },
+        },
+      }),
+    ).toThrow("[EDD-9099]")
+  })
+})

@@ -596,5 +596,44 @@ describe("EntityResolver", () => {
     it("a count that isn't a literal stays unknown", () => {
       expect(resolve("SHARDS")).toEqual({ count: undefined, by: [], previous: undefined })
     })
+
+    it("parses a table of layouts per value (#287)", () => {
+      expect(
+        resolve(
+          `{ by: ["groupId"], layouts: { default: 1, values: [` +
+            `{ match: { tenantId: "t-big" }, layout: 20 }, ` +
+            `{ match: { tenantId: "t-old" }, layout: { count: 1, previous: 8 } }] } }`,
+        ),
+      ).toEqual({
+        count: undefined,
+        by: ["groupId"],
+        previous: undefined,
+        layouts: {
+          default: "1",
+          values: [
+            { match: "tenantId=t-big", layout: "20" },
+            { match: "tenantId=t-old", layout: "1 (previous 8)" },
+          ],
+        },
+      })
+    })
+
+    it("parses a table supplied at run time (#287)", () => {
+      expect(resolve('{ layouts: "provided" }')).toEqual({
+        count: undefined,
+        by: [],
+        previous: undefined,
+        layouts: "provided",
+      })
+    })
+
+    it("a table that isn't a literal is shown as a table (#287)", () => {
+      expect(resolve("{ layouts: TABLE }")).toEqual({
+        count: undefined,
+        by: [],
+        previous: undefined,
+        layouts: { default: undefined, values: undefined },
+      })
+    })
   })
 })

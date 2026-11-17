@@ -396,6 +396,12 @@ const writeCore = (
             "bound builders db.entities.X.put(...) / .delete(...).",
         })
       }
+      // A provided shard table (#287) comes from the context the op runs in (its binding's, for a
+      // bound builder): one missing is `EDD-9181` before anything is sent, a delete's included.
+      yield* underCaptured(
+        info.captured,
+        Effect.sync(() => info.entity._requireShardTables?.("batchWrite")),
+      )
 
       const entity = info.entity
       const { name: tableName } = yield* entity._tableTag

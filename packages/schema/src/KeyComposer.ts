@@ -6,7 +6,7 @@
  * the key format; KeyComposer extracts attribute values and delegates.
  */
 
-import { DateTime } from "effect"
+import { Context, DateTime, Fiber } from "effect"
 import type * as DynamoSchema from "./DynamoSchema.js"
 import {
   applyCasing,
@@ -15,6 +15,7 @@ import {
   composeIsolatedSortKey,
   composeKey,
   KEY_DELIMITER,
+  make as makeDynamoSchema,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
 import { encodeBigInt, encodeNumber, isStoredNaN, KeyValueError } from "./internal/NumericKey.js"
@@ -32,6 +33,7 @@ import {
   toBytes,
 } from "./internal/ZOrderCurve.js"
 import { type DeclaredDimension, declareDimension } from "./internal/ZOrderDimension.js"
+import { ShardLayouts } from "./ShardLayouts.js"
 import type * as ZOrder from "./ZOrder.js"
 
 /**
@@ -153,10 +155,14 @@ export interface IndexPolicy {
 
 /**
  * Write sharding as declared on a secondary index (#183): one logical partition
- * spread over `count` physical ones.
+ * spread over `count` physical ones. The same layout for every partition key value:
+ * a table with only a default (#287).
  */
 export interface ShardsConfig<F extends string = string> {
-  /** How many physical partitions. An integer from 2 to 256. */
+  /**
+   * How many physical partitions. An integer from 2 to 256; `1` only beside
+   * `previous`, to move an index back to its unsharded key.
+   */
   readonly count: number
   /**
    * The attributes to hash instead of the item's primary key: sort key
@@ -169,19 +175,97 @@ export interface ShardsConfig<F extends string = string> {
    * old `count`. Deploy with it, run `rekey`, then remove it.
    */
   readonly previous?: number
+  /** A table of layouts is the other form: `{ by?, layouts }` (#287). */
+  readonly layouts?: never
 }
 
-/** A normalised {@link ShardsConfig}. Built only by {@link normalizeGsiConfig}. */
-export interface IndexShards {
+/**
+ * One layout of a sharded index (#287): a count, or `{ count, previous }` while
+ * a value migrates. A count of `1` is the unsharded key, byte for byte.
+ */
+export type ShardLayoutConfig = number | { readonly count: number; readonly previous?: number }
+
+/**
+ * A table of layouts (#287): the `default`, and the values with a layout of their
+ * own. `match` names every partition key composite of the index, with the value
+ * an accessor would pin.
+ */
+export interface ShardTableConfig<TMatch = globalThis.Record<string, unknown>> {
+  readonly default: ShardLayoutConfig
+  readonly values?: ReadonlyArray<{ readonly match: TMatch; readonly layout: ShardLayoutConfig }>
+}
+
+/**
+ * Write sharding with a layout per partition key value (#287): a table declared
+ * here, or `"provided"`, supplied at run time by a `ShardLayouts` layer.
+ */
+export interface ShardsTableConfig<F extends string = string> {
+  /** As {@link ShardsConfig.by}: one per index, whatever any value's layout. */
+  readonly by?: ReadonlyArray<F>
+  readonly layouts: ShardTableConfig<{ readonly [K in F]?: unknown }> | "provided"
+  /** A table's layouts carry their own counts. */
+  readonly count?: never
+  /** A table's layouts carry their own `previous`. */
+  readonly previous?: never
+}
+
+/** A normalised layout (#287): `count` 1 is the unsharded key. */
+export interface ShardLayout {
   readonly count: number
-  readonly by: ReadonlyArray<string> | undefined
   readonly previous: number | undefined
+}
+
+/** One value of a {@link ShardTable} with a layout of its own. */
+export interface ShardTableEntry {
+  /** As declared. */
+  readonly match: globalThis.Record<string, unknown>
+  /**
+   * The match in key form, as a query accessor's pins compose: what its unsharded
+   * partition key text is composed from. `undefined` until `Entity.make` binds the
+   * index; such a table can't be looked up.
+   */
+  readonly keyRecord: globalThis.Record<string, unknown> | undefined
+  readonly layout: ShardLayout
+}
+
+/**
+ * A sharded index's layouts, compiled (#287). A value is looked up by the
+ * unsharded partition key text it composes ({@link shardLayoutFor}), so every
+ * spelling of one key, and every path's value form, gets one layout.
+ */
+export interface ShardTable {
+  readonly default: ShardLayout
+  readonly values: ReadonlyArray<ShardTableEntry>
+}
+
+/** A normalised {@link ShardsConfig} or {@link ShardsTableConfig}. Built only by {@link normalizeGsiConfig}. */
+export interface IndexShards {
+  /**
+   * The default layout's count: the only one of a static declaration. `0` on a
+   * `"provided"` index, whose layouts are known only when a table is supplied.
+   * Composition never reads it: it resolves each value's layout.
+   */
+  readonly count: number
+  /** The default layout's `previous`. */
+  readonly previous: number | undefined
+  readonly by: ReadonlyArray<string> | undefined
   /**
    * The attributes hashed: `by`, or the primary key composites. `undefined`
    * until `Entity.make` binds it; such an index can't compose a key.
    */
   readonly source: ReadonlyArray<string> | undefined
+  /**
+   * The layouts (#287): the table (a static declaration's has only a default), or
+   * `"provided"`, whose table an operation's schema carries ({@link shardTableOf}).
+   * Absent on a hand-built definition: `count` and `previous` are its one layout
+   * ({@link shardLayoutsOf}).
+   */
+  readonly layouts?: ShardTable | "provided"
 }
+
+/** The layouts of `shards` (#287): as declared, or a static one's `count` and `previous`. */
+export const shardLayoutsOf = (shards: IndexShards): ShardTable | "provided" =>
+  shards.layouts ?? { default: { count: shards.count, previous: shards.previous }, values: [] }
 
 /** Index definition for primary or secondary index (internal format) */
 export interface IndexDefinition {
@@ -237,9 +321,14 @@ export interface GsiConfig<TFields = globalThis.Record<string, unknown>> {
    * Spread each logical partition over several physical ones, for a key too hot
    * for one partition's write limit. `20` is short for `{ count: 20 }`. Writes
    * hash the shard source; a query reads every shard and merges them, so callers
-   * don't change.
+   * don't change. `{ by?, layouts }` gives each partition key value its own layout
+   * (#287): `layouts: { default: 1, values: [{ match: { tenantId: "t-big" }, layout: 20 }] }`,
+   * or `layouts: "provided"` for a table a `ShardLayouts` layer supplies.
    */
-  readonly shards?: number | ShardsConfig<keyof TFields & string>
+  readonly shards?:
+    | number
+    | ShardsConfig<keyof TFields & string>
+    | ShardsTableConfig<keyof TFields & string>
 }
 
 /** The casing an index's keys are composed with: its own, else the schema's. */
@@ -275,30 +364,70 @@ export const assertCollectionCasingAgreement = (
 /**
  * Fail when a collection's members would read different partitions (#183). They
  * share one physical index and one logical key, so they must agree on how many
- * partitions it is spread over and on the layout being migrated from. `by` may
- * differ: each member hashes its own source, into the same partitions.
+ * partitions it is spread over and on the layout being migrated from: with layouts
+ * per value (#287), their tables, compared by content: equal defaults, and the same
+ * layout for every key text an entry composes, under the member's `schema` (the
+ * default casing without one). A static member is a table with only a default; a
+ * member without shards agrees only with members without them. `by` may differ:
+ * each member hashes its own source, into the same partitions. A member whose table
+ * is supplied at run time and not carried by its `schema` is compared when it is.
  */
 export const assertCollectionShardsAgreement = (
   collectionName: string,
   members: ReadonlyArray<{
     readonly key: string
     readonly index: IndexDefinition
+    readonly schema?: DynamoSchema.DynamoSchema | undefined
   }>,
 ): void => {
-  const layout = (member: { readonly index: IndexDefinition }) =>
-    `${member.index.shards?.count ?? "unsharded"}/${member.index.shards?.previous ?? "none"}`
-  if (new Set(members.map(layout)).size > 1) {
-    const shown = members.map((member) => {
-      const { count, previous } = member.index.shards ?? {}
-      return `${member.key}: ${count === undefined ? "unsharded" : `count ${count}`}${
-        previous === undefined ? "" : `, previous ${previous}`
-      }`
-    })
+  const fallback = makeDynamoSchema({ name: "collection", version: 1 })
+  const layoutText = ({ count, previous }: ShardLayout) =>
+    `count ${count}${previous === undefined ? "" : `, previous ${previous}`}`
+  const layoutOf = ({ count, previous }: ShardLayout) => [count, previous ?? null] as const
+  /**
+   * A member's layouts: `content` is what two members must agree on, structured, so no
+   * key text can spell another table's (a value may hold any text when keys aren't
+   * escaped); `shown` is the same for the message. `undefined`: not known yet.
+   */
+  const contentOf = (
+    member: (typeof members)[number],
+  ): { readonly content: string; readonly shown: string } | undefined => {
+    const shards = member.index.shards
+    if (shards === undefined) return { content: "unsharded", shown: "unsharded" }
+    const schema = member.schema ?? fallback
+    if (
+      shardLayoutsOf(shards) === "provided" &&
+      schema.shardTables?.get(shards) === undefined &&
+      ambientShardTable(shards) === undefined
+    ) {
+      return undefined
+    }
+    const table = shardTableOf(schema, member.index)
+    const entries = [...textIndexOf(schema, member.key, member.index, table)].sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    )
+    return {
+      content: JSON.stringify([
+        layoutOf(table.default),
+        entries.map(([text, layout]) => [text, ...layoutOf(layout)]),
+      ]),
+      shown:
+        entries.length === 0
+          ? layoutText(table.default)
+          : `default ${layoutText(table.default)}; ` +
+            entries.map(([text, layout]) => `${text} → ${layoutText(layout)}`).join("; "),
+    }
+  }
+  const contents = members.map((member) => ({ key: member.key, of: contentOf(member) }))
+  const known = contents.flatMap((c) => (c.of === undefined ? [] : [c.of.content]))
+  const shardedness = new Set(contents.map((c) => c.of?.content === "unsharded"))
+  if (new Set(known).size > 1 || shardedness.size > 1) {
+    const shown = contents.map((c) => `${c.key}: ${c.of?.shown ?? "a table supplied at run time"}`)
     throw new Error(
       `[EDD-9103] Collection "${collectionName}" members spread its index differently ` +
         `(${shown.join("; ")}). They share one logical partition, so a query has to read one ` +
-        `set of partitions: give the collection's index the same \`shards\` count and \`previous\` ` +
-        `on every member.`,
+        `set of partitions: give the collection's index the same \`shards\` layouts (count and ` +
+        `\`previous\`, or the same table) on every member.`,
     )
   }
 }
@@ -306,32 +435,169 @@ export const assertCollectionShardsAgreement = (
 const shardsMalformed = (index: string, why: string): Error =>
   new Error(`[EDD-9099] Index "${index}" declares malformed shards: ${why}`)
 
-/** Normalise and check a declared `shards` (the rest is `Entity.make`'s, which has the model). */
-const normalizeShards = (index: string, declared: unknown): IndexShards => {
-  const config: { readonly count?: unknown; readonly by?: unknown; readonly previous?: unknown } =
-    typeof declared === "number" ? { count: declared } : (declared as object)
-  if (typeof config !== "object" || config === null || Array.isArray(config)) {
-    throw shardsMalformed(index, "pass a count, or { count, by?, previous? }.")
-  }
-  const unknownKeys = Object.keys(config).filter(
-    (key) => key !== "count" && key !== "by" && key !== "previous",
-  )
+const isPlainObject = (u: unknown): u is globalThis.Record<string, unknown> =>
+  typeof u === "object" && u !== null && !Array.isArray(u)
+
+const refuseUnknownKeys = (
+  index: string,
+  where: string,
+  value: globalThis.Record<string, unknown>,
+  allowed: ReadonlyArray<string>,
+): void => {
+  const unknownKeys = Object.keys(value).filter((key) => !allowed.includes(key))
   if (unknownKeys.length > 0) {
     throw shardsMalformed(
       index,
-      `unknown option ${unknownKeys.map((key) => `"${key}"`).join(", ")}: it takes count, by and previous.`,
+      `unknown option ${unknownKeys.map((key) => `"${key}"`).join(", ")} in ${where}: it takes ` +
+        `${allowed.join(", ")}.`,
     )
   }
-  const { count, by, previous } = config
-  if (
-    typeof count !== "number" ||
-    !Number.isInteger(count) ||
-    count < 2 ||
-    count > MAX_SHARD_COUNT
-  ) {
+}
+
+const isShardCount = (u: unknown, least: number): u is number =>
+  typeof u === "number" && Number.isInteger(u) && u >= least && u <= MAX_SHARD_COUNT
+
+/**
+ * Check one layout (#287): a count from 1 to 256, or `{ count, previous? }` with
+ * `previous` from 1 to 256 and not `count`. `where` names it in the message.
+ */
+export const normalizeShardLayout = (
+  index: string,
+  where: string,
+  declared: unknown,
+): ShardLayout => {
+  const layout: { readonly count?: unknown; readonly previous?: unknown } =
+    typeof declared === "number" ? { count: declared } : isPlainObject(declared) ? declared : {}
+  if (typeof declared !== "number" && !isPlainObject(declared)) {
+    throw shardsMalformed(index, `${where} must be a count, or { count, previous? }.`)
+  }
+  if (isPlainObject(declared)) refuseUnknownKeys(index, where, declared, ["count", "previous"])
+  const { count, previous } = layout
+  if (!isShardCount(count, 1)) {
     throw shardsMalformed(
       index,
-      `count ${JSON.stringify(count)} must be an integer from 2 to ${MAX_SHARD_COUNT}.`,
+      `${where}: count ${JSON.stringify(count)} must be an integer from 1 to ${MAX_SHARD_COUNT}.`,
+    )
+  }
+  if (previous !== undefined) {
+    if (typeof previous !== "number" || !Number.isInteger(previous) || previous < 1) {
+      throw shardsMalformed(
+        index,
+        `${where}: previous ${JSON.stringify(previous)} must be a positive integer: 1 for the ` +
+          `unsharded key, or the old count.`,
+      )
+    }
+    if (previous === count) {
+      throw shardsMalformed(
+        index,
+        `${where}: previous ${previous} equals count: it names the layout being migrated from, ` +
+          `which has to differ.`,
+      )
+    }
+    if (previous > MAX_SHARD_COUNT) {
+      throw shardsMalformed(index, `${where}: previous ${previous} is above ${MAX_SHARD_COUNT}.`)
+    }
+  }
+  return { count, previous: previous as number | undefined }
+}
+
+/**
+ * Check a table's layouts and the shape of its entries (#287). What needs the
+ * model (each `match`'s names and values) is `Entity.make`'s, through
+ * {@link bindShardTable}. Used for a declared table and for a supplied one.
+ */
+export const normalizeShardTable = (index: string, declared: unknown): ShardTable => {
+  if (!isPlainObject(declared)) {
+    throw shardsMalformed(
+      index,
+      `layouts must be "provided", or a table { default, values? }; got ${JSON.stringify(declared)}.`,
+    )
+  }
+  refuseUnknownKeys(index, "layouts", declared, ["default", "values"])
+  if (declared.default === undefined) {
+    throw shardsMalformed(
+      index,
+      `layouts has no default: give the layout of every value the table doesn't list (1 for ` +
+        `the unsharded key).`,
+    )
+  }
+  const values = declared.values ?? []
+  if (!Array.isArray(values)) {
+    throw shardsMalformed(index, "layouts.values must be an array of { match, layout }.")
+  }
+  return {
+    default: normalizeShardLayout(index, "layouts.default", declared.default),
+    values: values.map((entry: unknown, i): ShardTableEntry => {
+      const where = `layouts.values[${i}]`
+      if (!isPlainObject(entry)) {
+        throw shardsMalformed(index, `${where} must be { match, layout }.`)
+      }
+      refuseUnknownKeys(index, where, entry, ["match", "layout"])
+      if (!isPlainObject(entry.match)) {
+        throw shardsMalformed(
+          index,
+          `${where}.match must name every partition key composite of the index, with its value.`,
+        )
+      }
+      if (entry.layout === undefined) throw shardsMalformed(index, `${where} has no layout.`)
+      return {
+        match: { ...entry.match },
+        keyRecord: undefined,
+        layout: normalizeShardLayout(index, `${where}.layout`, entry.layout),
+      }
+    }),
+  }
+}
+
+/** Normalise and check a declared `shards` (the rest is `Entity.make`'s, which has the model). */
+const normalizeShards = (index: string, declared: unknown): IndexShards => {
+  const config: globalThis.Record<string, unknown> | undefined =
+    typeof declared === "number"
+      ? { count: declared }
+      : isPlainObject(declared)
+        ? declared
+        : undefined
+  if (config === undefined) {
+    throw shardsMalformed(
+      index,
+      "pass a count, { count, by?, previous? }, or { by?, layouts } for a layout per value.",
+    )
+  }
+  const by = config.by
+  const normalizedBy =
+    by === undefined ? undefined : ([...(by as ReadonlyArray<string>)] as ReadonlyArray<string>)
+  if ("layouts" in config) {
+    const stray = ["count", "previous"].filter((key) => key in config)
+    if (stray.length > 0) {
+      throw shardsMalformed(
+        index,
+        `${stray.map((key) => `"${key}"`).join(" and ")} can't stand beside layouts: each ` +
+          `layout carries its own count and previous.`,
+      )
+    }
+    refuseUnknownKeys(index, "shards", config, ["by", "layouts"])
+    const layouts =
+      config.layouts === "provided" ? "provided" : normalizeShardTable(index, config.layouts)
+    return {
+      count: layouts === "provided" ? 0 : layouts.default.count,
+      previous: layouts === "provided" ? undefined : layouts.default.previous,
+      by: normalizedBy,
+      source: undefined,
+      layouts,
+    }
+  }
+  refuseUnknownKeys(index, "shards", config, ["count", "by", "previous"])
+  const { count, previous } = config
+  // A bare count of 1 says "sharded" and means nothing; `{ count: 1, previous }`
+  // moves an index back to its unsharded key (#287).
+  if (!isShardCount(count, previous === undefined ? 2 : 1)) {
+    throw shardsMalformed(
+      index,
+      `count ${JSON.stringify(count)} must be an integer from 2 to ${MAX_SHARD_COUNT}` +
+        (previous === undefined
+          ? ""
+          : " (or 1 beside previous, to move back to the unsharded key)") +
+        ".",
     )
   }
   if (previous !== undefined) {
@@ -351,12 +617,13 @@ const normalizeShards = (index: string, declared: unknown): IndexShards => {
       throw shardsMalformed(index, `previous ${previous} is above ${MAX_SHARD_COUNT}.`)
     }
   }
+  const layout: ShardLayout = { count, previous: previous as number | undefined }
   return {
     count,
-    by:
-      by === undefined ? undefined : ([...(by as ReadonlyArray<string>)] as ReadonlyArray<string>),
-    previous,
+    by: normalizedBy,
+    previous: layout.previous,
     source: undefined,
+    layouts: { default: layout, values: [] },
   }
 }
 
@@ -754,7 +1021,9 @@ export const composePk = (
     index,
     composites,
     index.pk.composite,
-    composedShardMarker(entityType, index, record),
+    composedShardMarker(schema, entityType, index, record, () =>
+      composePkText(schema, entityType, index, composites, index.pk.composite, undefined),
+    ),
   )
 }
 
@@ -786,14 +1055,22 @@ const composePkText = (
 }
 
 /**
- * The marker of the shard `record` hashes to; `undefined` on an unsharded index.
- * Throws `[EDD-9100]` when the source is missing: a sharded index never composes
- * an unsharded partition key, so a write can't go wrong by forgetting it.
+ * The marker of the shard `record` hashes to; `undefined` on an unsharded index,
+ * and for a value whose layout has a count of 1 (#287): that value's key is the
+ * unsharded text, never `!1.0`. Throws `[EDD-9100]` when the source is missing,
+ * whatever the value's count: a sharded index never composes an unsharded
+ * partition key for want of it, so a write can't go wrong by forgetting it.
+ *
+ * `unsharded` composes the value's unsharded partition key text, which its
+ * layout is looked up by; a truncated key has none (`undefined`), and takes the
+ * table's default: no entry composes truncated text.
  */
 const composedShardMarker = (
+  schema: DynamoSchema.DynamoSchema,
   entityType: string,
   index: IndexDefinition,
   record: Record<string, unknown>,
+  unsharded: (() => string) | undefined,
 ): string | undefined => {
   const shards = index.shards
   if (shards === undefined) return undefined
@@ -810,13 +1087,347 @@ const composedShardMarker = (
         `Include ${absent.length === 1 ? "it" : "them"} in the write.`,
     })
   }
+  const table = shardTableOf(schema, index)
+  const { count } =
+    unsharded === undefined
+      ? table.default
+      : shardLayoutFor(schema, entityType, index, table, unsharded)
+  if (count === 1) return undefined
   return shardMarker(
-    shards.count,
+    count,
     shardOf(
       source.map((attr) => serializeValue(given(record, attr))),
-      shards.count,
+      count,
     ),
   )
+}
+
+// ---------------------------------------------------------------------------
+// Shard tables (#287, docs/designs/shard-layouts.md)
+// ---------------------------------------------------------------------------
+
+/**
+ * The table of a sharded index (#287): the one it declares, or, for an index
+ * declared `layouts: "provided"`, the one the schema an operation composes under
+ * carries ({@link withShardTables}), else the one the `ShardLayouts` service of the
+ * context it runs in supplies. The one way every composer and reader
+ * obtains a table, so a path that has none can't fall back to a default: it
+ * throws `[EDD-9181]`.
+ */
+export const shardTableOf = (
+  schema: DynamoSchema.DynamoSchema,
+  index: IndexDefinition,
+): ShardTable => {
+  const shards = index.shards
+  if (shards === undefined) {
+    throw new Error(`KeyComposer.shardTableOf: index "${index.index}" is not sharded.`)
+  }
+  const layouts = shardLayoutsOf(shards)
+  if (layouts !== "provided") return layouts
+  const supplied =
+    (schema.shardTables?.get(shards) as ShardTable | undefined) ?? ambientShardTable(shards)
+  if (supplied === undefined) {
+    throw new Error(
+      `[EDD-9181] Index "${index.index}" declares shards: { layouts: "provided" }, but no ` +
+        `ShardLayouts layer supplies its table. Add ShardLayouts.layer(...) to the application ` +
+        `layer.`,
+    )
+  }
+  return supplied
+}
+
+/**
+ * The table a `ShardLayouts` service supplies for a provided index (#287): the
+ * service of the context the composition runs in. A bound operation runs in its
+ * binding's context, so it composes with the table `DynamoClient.make` read; an
+ * unbound one with the caller's. `undefined` outside a fiber, or without the
+ * service or the entry.
+ */
+const ambientShardTable = (shards: IndexShards): ShardTable | undefined => {
+  const fiber = Fiber.getCurrent()
+  return fiber === undefined
+    ? undefined
+    : Context.getOrUndefined(fiber.context, ShardLayouts)?.tables.get(shards)
+}
+
+/**
+ * `schema` carrying the tables supplied for `"provided"` indexes (#287), keyed by
+ * each index's normalised `shards`: what an operation composes under, so
+ * {@link shardTableOf} finds them. Every other composition is unchanged; index
+ * definitions never change identity.
+ */
+export const withShardTables = (
+  schema: DynamoSchema.DynamoSchema,
+  tables: ReadonlyMap<IndexShards, ShardTable>,
+): DynamoSchema.DynamoSchema =>
+  tables.size === 0
+    ? schema
+    : {
+        ...schema,
+        shardTables: new Map<object, unknown>([...(schema.shardTables ?? new Map()), ...tables]),
+      }
+
+/** The `[EDD-9181]` message for provided indexes with no table (#287). */
+export const missingShardTablesMessage = (
+  where: string,
+  missing: ReadonlyArray<{ readonly entity: string; readonly index: string }>,
+): string =>
+  `[EDD-9181] ${where}: ${missing.map(({ entity, index }) => `${entity}.${index}`).join(", ")} ` +
+  `declare${missing.length === 1 ? "s" : ""} shards: { layouts: "provided" }, but no ShardLayouts ` +
+  `layer supplies ${missing.length === 1 ? "its table" : "their tables"}. Add ` +
+  `ShardLayouts.layer([ShardLayouts.of(...)]) to the application layer.`
+
+/**
+ * The provided indexes of an entity (#287) that have no table where an operation
+ * runs: none under `schema`'s tables, nor from the `ShardLayouts` service of the
+ * current fiber (or of `registry`, when given).
+ */
+export const missingShardTables = (
+  schema: DynamoSchema.DynamoSchema | undefined,
+  indexes: Readonly<Record<string, IndexDefinition>>,
+  registry?: { readonly tables: ReadonlyMap<IndexShards, ShardTable> } | undefined,
+): ReadonlyArray<string> =>
+  Object.entries(indexes).flatMap(([name, def]) => {
+    const shards = def.shards
+    if (shards === undefined || shardLayoutsOf(shards) !== "provided") return []
+    const found =
+      schema?.shardTables?.get(shards) ??
+      (registry === undefined ? ambientShardTable(shards) : registry.tables.get(shards))
+    return found === undefined ? [name] : []
+  })
+
+/**
+ * Throw `[EDD-9181]` when an entity's provided index has no table where the
+ * operation runs (#287): checked when an operation without a bound client starts,
+ * so nothing is sent, whether or not this write would have composed the index.
+ */
+export const requireShardTables = (
+  where: string,
+  schema: DynamoSchema.DynamoSchema | undefined,
+  entityType: string,
+  indexes: Readonly<Record<string, IndexDefinition>>,
+): void => {
+  const missing = missingShardTables(schema, indexes)
+  if (missing.length > 0) {
+    throw new Error(
+      missingShardTablesMessage(
+        where,
+        missing.map((index) => ({ entity: entityType, index })),
+      ),
+    )
+  }
+}
+
+/** Does any index of these have its table supplied at run time (#287)? */
+export const hasProvidedShards = (indexes: Readonly<Record<string, IndexDefinition>>): boolean =>
+  Object.values(indexes).some(
+    (def) => def.shards !== undefined && shardLayoutsOf(def.shards) === "provided",
+  )
+
+/** Does `index` have a sharded partition key whose layout can vary by value? */
+export const hasShardTable = (index: IndexDefinition): boolean =>
+  index.shards !== undefined &&
+  (shardLayoutsOf(index.shards) === "provided" ||
+    (shardLayoutsOf(index.shards) as ShardTable).values.length > 0)
+
+/** Memoised text indexes: per table, per key text settings (design §3.3). */
+const textIndexes = new WeakMap<ShardTable, Map<string, ReadonlyMap<string, ShardLayout>>>()
+
+/**
+ * What a key's text depends on besides its values: the schema's key text settings
+ * (its own casing spells its name, whatever the index's), the index's casing and the
+ * label.
+ */
+const keyTextSettings = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+): string =>
+  JSON.stringify([
+    schema.name,
+    schema.version,
+    schema.casing,
+    effectiveCasing(schema, index),
+    schema.escapeKeys === true,
+    schema.numericKeyText === true,
+    schema.text136 === true,
+    index.collection === undefined ? entityType : null,
+  ])
+
+/** What a table entry is called in a message. */
+const describeEntry = (entry: ShardTableEntry, i: number): string =>
+  `layouts.values[${i}] (match ${JSON.stringify(entry.match, (_, v) =>
+    typeof v === "bigint" ? `${v}n` : v,
+  )})`
+
+/**
+ * The text index of `table` under these key text settings: each entry's unsharded
+ * partition key text to its layout. Built once per table and settings; two entries
+ * composing one key are `[EDD-9099]`.
+ */
+const textIndexOf = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  table: ShardTable,
+): ReadonlyMap<string, ShardLayout> => {
+  let bySettings = textIndexes.get(table)
+  if (bySettings === undefined) {
+    bySettings = new Map()
+    textIndexes.set(table, bySettings)
+  }
+  const settings = keyTextSettings(schema, entityType, index)
+  const known = bySettings.get(settings)
+  if (known !== undefined) return known
+  // The entries are the table's, never a write's own values: composed as a read composes.
+  const { objectKeys: _o, shardTables: _t, ...plain } = schema
+  const texts = new Map<string, ShardLayout>()
+  const owners = new Map<string, number>()
+  table.values.forEach((entry, i) => {
+    if (entry.keyRecord === undefined) {
+      throw new Error(
+        `KeyComposer: the shard table of index "${index.index}" was never bound to an entity — ` +
+          `Entity.make puts each entry's match into key form.`,
+      )
+    }
+    let text: string
+    try {
+      text = composePkText(
+        plain,
+        entityType,
+        index,
+        extractKeyComposites(plain, index, index.pk.composite, entry.keyRecord),
+        index.pk.composite,
+        undefined,
+      )
+    } catch (cause) {
+      throw shardsMalformed(
+        index.index ?? "primary",
+        `${describeEntry(entry, i)} composes no key: ${cause instanceof Error ? cause.message : String(cause)}`,
+      )
+    }
+    const first = owners.get(text)
+    if (first !== undefined) {
+      throw shardsMalformed(
+        index.index ?? "primary",
+        `${describeEntry(table.values[first]!, first)} and ${describeEntry(entry, i)} compose one ` +
+          `key, ${JSON.stringify(text)}, under the casing "${effectiveCasing(schema, index)}": one ` +
+          `value can have one layout. Remove one of them.`,
+      )
+    }
+    owners.set(text, i)
+    texts.set(text, entry.layout)
+  })
+  bySettings.set(settings, texts)
+  return texts
+}
+
+/**
+ * The layout of the value whose unsharded partition key text `unsharded` composes
+ * (#287): its entry's, else the default. Composed only for a table with entries.
+ * Nothing caches a value's layout: the text index is the compiled table.
+ */
+export const shardLayoutFor = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  table: ShardTable,
+  unsharded: () => string,
+): ShardLayout =>
+  table.values.length === 0
+    ? table.default
+    : (textIndexOf(schema, entityType, index, table).get(unsharded()) ?? table.default)
+
+/**
+ * Check every declared shard table of an entity's indexes under `schema`, and build
+ * its text index (#287): two entries composing one key are `[EDD-9099]`. `Table.make`
+ * calls it, which knows the casing an index leaves to the schema. A provided index's
+ * table is checked where it's supplied, by passing it as `tables`.
+ */
+export const checkShardTables = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  indexes: Readonly<Record<string, IndexDefinition>>,
+  tables?: ReadonlyMap<IndexShards, ShardTable>,
+): void => {
+  for (const index of Object.values(indexes)) {
+    const shards = index.shards
+    if (shards === undefined) continue
+    const layouts = shardLayoutsOf(shards)
+    const table = layouts === "provided" ? tables?.get(shards) : layouts
+    if (table !== undefined) textIndexOf(schema, entityType, index, table)
+  }
+}
+
+/**
+ * Bind a table to its entity's index (#287): check each entry's `match` names
+ * exactly the index's partition key composites, and put it into key form with
+ * `keyForm` (the entity's domain key form, which accepts a domain value or its
+ * stored form, as an accessor's pins do). `[EDD-9099]` for a malformed entry; a
+ * value with no key text is refused here, so a bound table always composes.
+ */
+export const bindShardTable = (
+  indexName: string,
+  index: IndexDefinition,
+  table: ShardTable,
+  keyForm: (record: globalThis.Record<string, unknown>) => globalThis.Record<string, unknown>,
+): ShardTable => {
+  if (table.values.length === 0) return table
+  const composites = index.pk.composite
+  if (composites.length === 0) {
+    throw shardsMalformed(
+      indexName,
+      `layouts.values on an index whose partition key has no composites: every value composes ` +
+        `the one key, so only the default applies. Remove values.`,
+    )
+  }
+  const probe = makeDynamoSchema({ name: "shards", version: 1 })
+  return {
+    default: table.default,
+    values: table.values.map((entry, i) => {
+      const where = describeEntry(entry, i)
+      const names = Object.keys(entry.match)
+      const missing = composites.filter((attr) => !names.includes(attr))
+      const extra = names.filter((name) => !composites.includes(name))
+      if (missing.length > 0 || extra.length > 0) {
+        throw shardsMalformed(
+          indexName,
+          `${where} must name exactly the partition key composites of the index ` +
+            `(${composites.join(", ")})` +
+            (missing.length > 0 ? `; missing ${missing.map((a) => `"${a}"`).join(", ")}` : "") +
+            (extra.length > 0
+              ? `; not a composite: ${extra.map((a) => `"${a}"`).join(", ")}`
+              : "") +
+            ".",
+        )
+      }
+      let keyRecord: globalThis.Record<string, unknown>
+      try {
+        const absent = composites.filter((attr) => !hasValue(given(entry.match, attr)))
+        if (absent.length > 0) {
+          throw new Error(`no value for ${absent.map((a) => `"${a}"`).join(", ")}`)
+        }
+        keyRecord = keyForm(entry.match)
+        const objects = composites.filter((attr) => {
+          const value = given(keyRecord, attr)
+          return typeof value === "object" || typeof value === "function"
+        })
+        if (objects.length > 0) {
+          throw new Error(
+            `${objects.map((a) => `"${a}"`).join(", ")} is not a value a key can hold`,
+          )
+        }
+        // A value with no key text (`NaN`) is refused here, under any schema.
+        extractKeyComposites(probe, index, composites, keyRecord)
+      } catch (cause) {
+        throw shardsMalformed(
+          indexName,
+          `${where} composes no key: ${cause instanceof Error ? cause.message : String(cause)}`,
+        )
+      }
+      return { match: entry.match, keyRecord, layout: entry.layout }
+    }),
+  }
 }
 
 /**
@@ -885,17 +1496,72 @@ export const tryComposeStructuralKeys = (
 
 /**
  * Does stored partition key text lie in `index`'s current layout (#183): shard
- * marker with this count, whatever shard? A row whose values can't compose its key
- * can only be left alone when this holds.
+ * marker with this count, whatever shard, or the unsharded text for a count of 1
+ * (#287)? A row whose values can't compose its key can only be left alone when
+ * this holds.
+ *
+ * The layout is the row's resolved one (#287), from its key-form `record`: the
+ * value's own when every partition key composite is present; for a row with a hole
+ * in them, any of the default's and those of the entries agreeing with the
+ * composites it holds. Without `record`, the default's: a static declaration's
+ * only layout.
  */
 export const isCurrentShardLayout = (
   schema: DynamoSchema.DynamoSchema,
   entityType: string,
   index: IndexDefinition,
   stored: string,
-): boolean =>
-  index.shards !== undefined &&
-  stored.startsWith(composePkText(schema, entityType, index, [], [], `!${index.shards.count}.`))
+  record?: Record<string, unknown>,
+): boolean => {
+  if (index.shards === undefined) return false
+  const table = shardTableOf(schema, index)
+  const head = composePkText(schema, entityType, index, [], [], undefined)
+  const inLayout = ({ count }: ShardLayout): boolean =>
+    count === 1
+      ? stored === head ||
+        (stored.startsWith(`${head}${KEY_DELIMITER}`) &&
+          !stored.startsWith(`${head}${KEY_DELIMITER}!`))
+      : stored.startsWith(composePkText(schema, entityType, index, [], [], `!${count}.`))
+  return candidateLayouts(schema, entityType, index, table, record).some(inLayout)
+}
+
+/** The layouts a row may be in, for {@link isCurrentShardLayout}. */
+const candidateLayouts = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  table: ShardTable,
+  record: Record<string, unknown> | undefined,
+): ReadonlyArray<ShardLayout> => {
+  if (record === undefined || table.values.length === 0) return [table.default]
+  const composites = index.pk.composite
+  const textOf = (attr: string, from: Record<string, unknown>): string | undefined => {
+    try {
+      return extractKeyComposites(schema, index, [attr], from)[0]
+    } catch {
+      return undefined
+    }
+  }
+  if (composites.every((attr) => hasValue(given(record, attr)))) {
+    try {
+      const own = extractKeyComposites(schema, index, composites, record)
+      return [
+        shardLayoutFor(schema, entityType, index, table, () =>
+          composePkText(schema, entityType, index, own, composites, undefined),
+        ),
+      ]
+    } catch {
+      return [table.default]
+    }
+  }
+  const present = composites.filter((attr) => hasValue(given(record, attr)))
+  const agreeing = table.values.filter(
+    (entry) =>
+      entry.keyRecord !== undefined &&
+      present.every((attr) => textOf(attr, record) === textOf(attr, entry.keyRecord!)),
+  )
+  return [table.default, ...agreeing.map((entry) => entry.layout)]
+}
 
 const boundShardSource = (index: IndexDefinition, shards: IndexShards): ReadonlyArray<string> => {
   if (shards.source === undefined) {
@@ -935,11 +1601,18 @@ const pinsShardSource = (
 export interface ReadPartitions {
   /** The one partition of an unsharded index; else the current shards, then `previous`'s. */
   readonly partitions: ReadonlyArray<string>
+  /**
+   * The fan-out of a sharded index; `undefined` without shards, and for a value
+   * whose layout is a count of 1 with no `previous` (#287): its query is a plain one.
+   */
   readonly fanOut: ReadFanOut | undefined
+  /** The pinned value's resolved layout (#287); `undefined` only on an index without shards. */
+  readonly layout?: ShardLayout | undefined
 }
 
 /** The layout a sharded query reads: what its cursor's fingerprint covers. */
 export interface ReadFanOut {
+  /** The resolved count (#287); `1` reads the unsharded key. */
   readonly count: number
   readonly source: ReadonlyArray<string>
   readonly previous: number | undefined
@@ -960,6 +1633,10 @@ export interface ReadFanOut {
  * then the `previous` layout's, which are never pruned: the old source isn't
  * recorded. Every read path uses this; {@link composePk} composes the one key a
  * write stores.
+ *
+ * The layout is the pinned value's (#287). A layout of count 1 reads the unsharded
+ * key: alone, it is a plain query (no fan-out), exactly what an index without
+ * shards reads.
  */
 export const composeReadPartitions = (
   schema: DynamoSchema.DynamoSchema,
@@ -974,7 +1651,17 @@ export const composeReadPartitions = (
     return { partitions: [composePk(schema, entityType, index, record)], fanOut: undefined }
   }
   const source = boundShardSource(index, shards)
+  const table = shardTableOf(schema, index)
   const composites = extractKeyComposites(schema, index, index.pk.composite, record)
+  const unsharded = composePkText(
+    schema,
+    entityType,
+    index,
+    composites,
+    index.pk.composite,
+    undefined,
+  )
+  const resolved = shardLayoutFor(schema, entityType, index, table, () => unsharded)
   const partition = (count: number, shard: number) =>
     composePkText(
       schema,
@@ -984,38 +1671,36 @@ export const composeReadPartitions = (
       index.pk.composite,
       shardMarker(count, shard),
     )
-  const layout = (count: number) => Array.from({ length: count }, (_, i) => partition(count, i))
-  const pruned = options?.prune !== false && pinsShardSource(index, source, record)
+  const layout = (count: number) =>
+    count === 1 ? [unsharded] : Array.from({ length: count }, (_, i) => partition(count, i))
+  const { count, previous } = resolved
+  if (count === 1 && previous === undefined) {
+    return { partitions: [unsharded], fanOut: undefined, layout: resolved }
+  }
+  // A count of 1 has nothing to prune.
+  const pruned = count > 1 && options?.prune !== false && pinsShardSource(index, source, record)
   const current = pruned
     ? [
         partition(
-          shards.count,
+          count,
           shardOf(
             source.map((attr) => serializeValue(given(record, attr))),
-            shards.count,
+            count,
           ),
         ),
       ]
-    : layout(shards.count)
-  const unsharded =
-    shards.previous === 1
-      ? composePkText(schema, entityType, index, composites, index.pk.composite, undefined)
-      : undefined
-  const previous =
-    unsharded !== undefined
-      ? [unsharded]
-      : shards.previous === undefined
-        ? []
-        : layout(shards.previous)
+    : layout(count)
+  const before = previous === undefined ? [] : layout(previous)
   return {
-    partitions: [...current, ...previous],
+    partitions: [...current, ...before],
     fanOut: {
-      count: shards.count,
+      count,
       source,
-      previous: shards.previous,
+      previous,
       pruned,
-      everyPartition: pruned ? [...layout(shards.count), ...previous] : undefined,
+      everyPartition: pruned ? [...layout(count), ...before] : undefined,
     },
+    layout: resolved,
   }
 }
 
@@ -1311,7 +1996,8 @@ const composePkPrefixUpTo = (
     index,
     extractKeyComposites(schema, index, slice, record, "pk"),
     slice,
-    composedShardMarker(entityType, index, record),
+    // Truncated text, which no entry composes: the default's layout (#287).
+    composedShardMarker(schema, entityType, index, record, undefined),
   )
 }
 

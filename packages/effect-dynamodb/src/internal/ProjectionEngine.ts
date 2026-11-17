@@ -206,6 +206,11 @@ export interface EngineEntity {
   readonly schemas: any
   /** The mark a row tombstone or outbox item takes for the key `key` composes — see `Entity`. */
   readonly _keyTextMark: (key: Record<string, unknown>) => 2 | undefined
+  /**
+   * `[EDD-9181]` when a provided shard table of the read model has no table in the context the
+   * projection runs in (#287) — `Entity._requireShardTables`; `undefined` with none provided.
+   */
+  readonly _requireShardTables?: ((where: string) => void) | undefined
   /** True iff the read model offloads a field (#179). */
   readonly _offloads: boolean
   /**
@@ -2083,17 +2088,24 @@ export const makeEngine = (config: EngineConfig) => {
     )
 
   /**
-   * `[EDD-9133]` once the table's TTL attribute is known: an attribute a projection keeps on the
-   * read model's rows that is stored as the TTL attribute, which a projection's tombstones set. The
-   * two would overwrite each other, and a row could expire. Every entry point that writes a row
-   * runs it before it sends anything, whatever the data: `applyRow` for each row, and `catchUp` and
-   * `rebuild` first (`operation` names the entry point). The drains write no row and don't run it:
-   * a worker providing only its outbox's table delivers as on 1.39.0.
+   * What every entry point that writes a row checks before it sends anything, whatever the
+   * data: `applyRow` for each row, and `catchUp` and `rebuild` first (`operation` names the
+   * entry point). The drains write no row and don't run it: a worker providing only its
+   * outbox's table delivers as on 1.39.0.
+   *
+   * - A provided shard table (#287) of the read model comes from the context the projection
+   *   runs in: one missing is `[EDD-9181]`, a defect, whether or not a row's write would compose
+   *   that index (a row without the index's composites, a tombstone, a stream with no events).
+   *   Nothing is checked for a read model with none.
+   * - `[EDD-9133]` once the table's TTL attribute is known: an attribute a projection keeps on
+   *   the read model's rows that is stored as the TTL attribute, which a projection's tombstones
+   *   set. The two would overwrite each other, and a row could expire.
    */
   const preflight = (operation: string): Effect.Effect<void, ValidationError, any> =>
-    Effect.suspend(() =>
+    Effect.suspend(() => {
+      readModel._requireShardTables?.(config.label)
       // The table is resolved only when there is something to check.
-      !projectionTtlChecked(readModel)
+      return !projectionTtlChecked(readModel)
         ? Effect.void
         : Effect.flatMap(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => {
             const problem = projectionTtlConflict(readModel, resolveTtlAttributeName(tc))
@@ -2106,8 +2118,8 @@ export const makeEngine = (config: EngineConfig) => {
                     cause: problem,
                   }),
                 )
-          }),
-    )
+          })
+    })
 
   // One row's read-fold-write, retries included, is an upload-ledger root
   // (#179): a re-fold that writes the same content uploads it once, and what

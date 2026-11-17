@@ -16,6 +16,7 @@ import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySche
 import { given, ownValue } from "@effect-dynamodb/schema/internal/OwnNames.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import * as ShardLayouts from "@effect-dynamodb/schema/ShardLayouts.js"
 import { Context, DateTime, Effect, Option, type Schema } from "effect"
 import { SecureRandom } from "effect/crypto"
 import { BlobStore } from "../BlobStore.js"
@@ -29,9 +30,9 @@ import type { PutKind, ReturnValuesMode, UpdateState } from "./EntityOps.js"
 import { DEFAULT_MODES, type Modes } from "./OffloadRead.js"
 
 /**
- * @internal The blob store and compressor registry of a binding's context
- * (#179, design §3.6) — whichever of the two it holds, `undefined` for
- * neither. A bound builder carries them (`BoundCrudConfig.captured`), and the
+ * @internal The blob store, compressor registry and shard tables of a binding's
+ * context (#179, design §3.6; #287) — whichever of them it holds, `undefined`
+ * for none. A bound builder carries them (`BoundCrudConfig.captured`), and the
  * multi-item entry points build and read its item under them.
  */
 export const capturedServices = (
@@ -46,6 +47,15 @@ export const capturedServices = (
       captured === undefined
         ? Context.make(Compression, registry)
         : Context.add(captured, Compression, registry)
+    ) as Context.Context<never>
+  }
+  // The shard tables of a binding (#287): its op composes with them whatever the caller holds.
+  const layouts = Context.getOrUndefined(context, ShardLayouts.ShardLayouts)
+  if (layouts !== undefined) {
+    captured = (
+      captured === undefined
+        ? Context.make(ShardLayouts.ShardLayouts, layouts)
+        : Context.add(captured, ShardLayouts.ShardLayouts, layouts)
     ) as Context.Context<never>
   }
   return captured
@@ -1252,6 +1262,9 @@ export const validateAndBuildPutItem = (
   ValidationError
 > =>
   Effect.gen(function* () {
+    // A provided shard table (#287) comes from the context this put runs in: one missing is
+    // `EDD-9181`, before anything is built or sent.
+    entity._requireShardTables?.(operation)
     // Clock-backed time source resolved once per op; threaded into the sync
     // timestamp builder so the value is deterministic under `TestClock`.
     const now = yield* DateTime.now
