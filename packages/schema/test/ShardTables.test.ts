@@ -669,6 +669,26 @@ describe("collections compare tables by content (design §11)", () => {
     ).toThrow("[EDD-9103]")
   })
 
+  it("no key text can make two tables' contents collide", () => {
+    // Without escaping, a value can hold what a table's content was once written with.
+    const text = (tenantId: string) =>
+      KeyComposer.composePk(schema, "a", plainIndex({ collection: "fleet" }), { tenantId })
+    const two = coll({
+      default: 1,
+      values: [
+        { match: { tenantId: "a" }, layout: 2 },
+        { match: { tenantId: "b" }, layout: 4 },
+      ],
+    })
+    const one = coll({
+      default: 1,
+      values: [{ match: { tenantId: `a → count 2; ${text("b")}` }, layout: 4 }],
+    })
+    expect(() =>
+      KeyComposer.assertCollectionShardsAgreement("fleet", [member("a", two), member("b", one)]),
+    ).toThrow("[EDD-9103]")
+  })
+
   it("under preserve, T-BIG and t-big are two values", () => {
     expect(() =>
       KeyComposer.assertCollectionShardsAgreement("fleet", [

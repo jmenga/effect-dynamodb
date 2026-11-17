@@ -383,10 +383,17 @@ export const assertCollectionShardsAgreement = (
   const fallback = makeDynamoSchema({ name: "collection", version: 1 })
   const layoutText = ({ count, previous }: ShardLayout) =>
     `count ${count}${previous === undefined ? "" : `, previous ${previous}`}`
-  /** A member's layouts as text: what two members must agree on. `undefined`: not known yet. */
-  const contentOf = (member: (typeof members)[number]): string | undefined => {
+  const layoutOf = ({ count, previous }: ShardLayout) => [count, previous ?? null] as const
+  /**
+   * A member's layouts: `content` is what two members must agree on, structured, so no
+   * key text can spell another table's (a value may hold any text when keys aren't
+   * escaped); `shown` is the same for the message. `undefined`: not known yet.
+   */
+  const contentOf = (
+    member: (typeof members)[number],
+  ): { readonly content: string; readonly shown: string } | undefined => {
     const shards = member.index.shards
-    if (shards === undefined) return "unsharded"
+    if (shards === undefined) return { content: "unsharded", shown: "unsharded" }
     const schema = member.schema ?? fallback
     if (
       shardLayoutsOf(shards) === "provided" &&
@@ -396,18 +403,26 @@ export const assertCollectionShardsAgreement = (
       return undefined
     }
     const table = shardTableOf(schema, member.index)
-    const entries = [...textIndexOf(schema, member.key, member.index, table)]
-      .map(([text, layout]) => `${text} → ${layoutText(layout)}`)
-      .sort()
-    return entries.length === 0
-      ? layoutText(table.default)
-      : `default ${layoutText(table.default)}; ${entries.join("; ")}`
+    const entries = [...textIndexOf(schema, member.key, member.index, table)].sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    )
+    return {
+      content: JSON.stringify([
+        layoutOf(table.default),
+        entries.map(([text, layout]) => [text, ...layoutOf(layout)]),
+      ]),
+      shown:
+        entries.length === 0
+          ? layoutText(table.default)
+          : `default ${layoutText(table.default)}; ` +
+            entries.map(([text, layout]) => `${text} → ${layoutText(layout)}`).join("; "),
+    }
   }
-  const contents = members.map((member) => ({ key: member.key, content: contentOf(member) }))
-  const known = contents.filter((c) => c.content !== undefined)
-  const shardedness = new Set(contents.map((c) => c.content === "unsharded"))
-  if (new Set(known.map((c) => c.content)).size > 1 || shardedness.size > 1) {
-    const shown = contents.map((c) => `${c.key}: ${c.content ?? "a table supplied at run time"}`)
+  const contents = members.map((member) => ({ key: member.key, of: contentOf(member) }))
+  const known = contents.flatMap((c) => (c.of === undefined ? [] : [c.of.content]))
+  const shardedness = new Set(contents.map((c) => c.of?.content === "unsharded"))
+  if (new Set(known).size > 1 || shardedness.size > 1) {
+    const shown = contents.map((c) => `${c.key}: ${c.of?.shown ?? "a table supplied at run time"}`)
     throw new Error(
       `[EDD-9103] Collection "${collectionName}" members spread its index differently ` +
         `(${shown.join("; ")}). They share one logical partition, so a query has to read one ` +
