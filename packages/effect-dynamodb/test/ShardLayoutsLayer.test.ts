@@ -574,6 +574,28 @@ describe("collections over a provided index", () => {
       expect(defectOf(exit)).toContain("[EDD-9103]")
     }),
   )
+
+  it.effect("an unbound collection with one member's table missing is EDD-9180", () =>
+    Effect.gen(function* () {
+      const Assignments = Collection.make("assignments", { Tasks, Employees })
+      const recording = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+      const exit = yield* Effect.exit(
+        Assignments.query({ employee: "dana" }).pipe(
+          Query.collect,
+          Effect.provide(
+            Layer.mergeAll(
+              recording.layer,
+              People.layer({ name: "t" }),
+              ShardLayouts.layer([ShardLayouts.of(Tasks, { assignments: dana(1) })]),
+            ),
+          ),
+        ) as Effect.Effect<unknown>,
+      )
+      expect(defectOf(exit)).toContain("[EDD-9180]")
+      expect(defectOf(exit)).toContain("Employee.assignments")
+      expect(recording.requests).toHaveLength(0)
+    }),
+  )
 })
 
 describe("paths that compose without a bound client", () => {

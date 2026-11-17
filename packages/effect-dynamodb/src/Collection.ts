@@ -426,8 +426,22 @@ export const make = <
   const collectionPartitions = (pkComposites: Record<string, unknown>) => {
     const firstEntity = entityEntries[0]![1]
     // A member's table supplied at run time (#287): the members agree only once the tables
-    // in context are known, so they are compared as the partitions are composed.
-    if (provided) checkShardsAgreement()
+    // in context are known, so they are compared as the partitions are composed. Every
+    // member's table must be there, not only the first's, whose table composes them.
+    if (provided) {
+      const missing = entityEntries.flatMap(([, entity]) => {
+        const index = entity.indexes[sharedIndexName!]
+        return index === undefined
+          ? []
+          : KeyComposer.missingShardTables(entity._schema, { [sharedIndexName!]: index }).map(
+              (indexName) => ({ entity: entity.entityType, index: indexName }),
+            )
+      })
+      if (missing.length > 0) {
+        throw new Error(KeyComposer.missingShardTablesMessage(`Collection "${name}"`, missing))
+      }
+      checkShardsAgreement()
+    }
     // Members share the partitions, whatever each hashes: never pruned (#183).
     return KeyComposer.composeReadPartitions(
       sharedSchema!,
