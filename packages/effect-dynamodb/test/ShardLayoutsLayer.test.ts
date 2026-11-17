@@ -317,7 +317,11 @@ describe("a bound builder composes with its binding's table on every multi-item 
         const db = yield* bindBoth.pipe(Effect.provide(Layer.merge(tables(table), layouts(8))))
         const callerLayer =
           caller === null ? tables(table) : Layer.merge(tables(table), layouts(caller))
-        yield* body(db, (effect) => effect.pipe(Effect.provide(callerLayer)), table)
+        yield* body(
+          db,
+          (effect) => effect.pipe(Effect.provide(callerLayer)) as Effect.Effect<any, any>,
+          table,
+        )
       })
     }
     it.effect(`transactWrite: put, create, update, patch and delete (${label})`, () =>
@@ -940,49 +944,53 @@ describe("collections over a provided index", () => {
       yield* Staff.put({ office: "o-1", employee: "dana" }).asEffect()
     })
 
-    it.effect("an unbound collection: different tables are EDD-9103, equal ones read both", () =>
-      Effect.gen(function* () {
-        const Assignments = Collection.make("assignments", { chores: Chores, staff: Staff })
-        const differing = recordingOf()
-        const exit = yield* Effect.exit(
-          Effect.gen(function* () {
+    it.effect(
+      "an unbound collection: different tables are EDD-9103, equal ones read both",
+      () =>
+        Effect.gen(function* () {
+          const Assignments = Collection.make("assignments", { chores: Chores, staff: Staff })
+          const differing = recordingOf()
+          const exit = yield* Effect.exit(
+            Effect.gen(function* () {
+              yield* seed
+              return yield* Assignments.query({ employee: "dana" }).pipe(Query.collect)
+            }).pipe(Effect.provide(env(differing, 1, 8))) as Effect.Effect<unknown>,
+          )
+          expect(defectOf(exit)).toContain("[EDD-9103]")
+          expect(differing.requests.filter((r) => r.command === "Query")).toHaveLength(0)
+
+          const rows = (yield* Effect.gen(function* () {
             yield* seed
             return yield* Assignments.query({ employee: "dana" }).pipe(Query.collect)
-          }).pipe(Effect.provide(env(differing, 1, 8))) as Effect.Effect<unknown>,
-        )
-        expect(defectOf(exit)).toContain("[EDD-9103]")
-        expect(differing.requests.filter((r) => r.command === "Query")).toHaveLength(0)
-
-        const rows = (yield* Effect.gen(function* () {
-          yield* seed
-          return yield* Assignments.query({ employee: "dana" }).pipe(Query.collect)
-        }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as ReadonlyArray<any>
-        expect(rows.map((row) => row._entityKey).sort()).toEqual(["chores", "staff"])
-        const staff = (yield* Effect.gen(function* () {
-          yield* seed
-          return yield* Query.collect(Assignments.staff({ employee: "dana" }) as Query.Query<any>)
-        }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as ReadonlyArray<any>
-        expect(staff.map((row) => row.office)).toEqual(["o-1"])
-      }),
+          }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as ReadonlyArray<any>
+          expect(rows.map((row) => row._entityKey).sort()).toEqual(["chores", "staff"])
+          const staff = (yield* Effect.gen(function* () {
+            yield* seed
+            return yield* Query.collect(Assignments.staff({ employee: "dana" }) as Query.Query<any>)
+          }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as ReadonlyArray<any>
+          expect(staff.map((row) => row.office)).toEqual(["o-1"])
+        }) as Effect.Effect<void, unknown>,
     )
 
-    it.effect("a bound collection: different tables fail the bind, equal ones read both", () =>
-      Effect.gen(function* () {
-        const bindCrew = DynamoClient.make({
-          entities: { chores: Chores, staff: Staff },
-          tables: { Crew },
-        })
-        const exit = yield* Effect.exit(bindCrew.pipe(Effect.provide(env(recordingOf(), 1, 8))))
-        expect(defectOf(exit)).toContain("[EDD-9103]")
+    it.effect(
+      "a bound collection: different tables fail the bind, equal ones read both",
+      () =>
+        Effect.gen(function* () {
+          const bindCrew = DynamoClient.make({
+            entities: { chores: Chores, staff: Staff },
+            tables: { Crew },
+          })
+          const exit = yield* Effect.exit(bindCrew.pipe(Effect.provide(env(recordingOf(), 1, 8))))
+          expect(defectOf(exit)).toContain("[EDD-9103]")
 
-        const found = (yield* Effect.gen(function* () {
-          const db = yield* bindCrew
-          yield* seed
-          return yield* (db.collections as any).assignments({ employee: "dana" }).collect()
-        }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as any
-        expect(found.chores.map((row: any) => row.task)).toEqual(["t-1"])
-        expect(found.staff.map((row: any) => row.office)).toEqual(["o-1"])
-      }),
+          const found = (yield* Effect.gen(function* () {
+            const db = yield* bindCrew
+            yield* seed
+            return yield* (db.collections as any).assignments({ employee: "dana" }).collect()
+          }).pipe(Effect.provide(env(recordingOf(), 8, 8)))) as any
+          expect(found.chores.map((row: any) => row.task)).toEqual(["t-1"])
+          expect(found.staff.map((row: any) => row.office)).toEqual(["o-1"])
+        }) as Effect.Effect<void, unknown>,
     )
 
     it("declared tables are compared when the collection is made", () => {

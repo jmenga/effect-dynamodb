@@ -163,9 +163,11 @@ describe("Collection", () => {
       const TenantItems = Collection.make("TenantItems", { users: UserEntity, orders: Orders })
       expect(TenantItems.name).toBe("TenantItems")
       // Its selector reads its own index under its own name.
-      const params = Query.asParams(
-        TenantItems.orders({ tenantId: "t-1" }) as Query.Query<unknown>,
-      ).pipe(Effect.provide(OrdersTable.layer({ name: "test-table" })), Effect.runSync)
+      const params = Effect.runSync(
+        Query.asParams(TenantItems.orders({ tenantId: "t-1" }) as Query.Query<unknown>).pipe(
+          Effect.provide(OrdersTable.layer({ name: "test-table" })),
+        ) as Effect.Effect<Record<string, unknown>, unknown>,
+      )
       expect(params).toMatchObject({
         IndexName: "gsi1",
         ExpressionAttributeValues: { ":pk": { S: "$myapp#v1#tenantitems#tenantid_t-1" } },
