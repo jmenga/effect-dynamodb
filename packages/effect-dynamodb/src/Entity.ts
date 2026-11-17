@@ -17360,6 +17360,10 @@ const makeImpl = <
     new EntityGetImpl(
       (mode: DecodeMode, _opts: EntityGetOpts) =>
         Effect.gen(function* () {
+          // A restore writes the row's keys again: a missing provided shard table (#287) is
+          // `EDD-9181` before it reads, whether or not this row composes that index. It is
+          // get-shaped, so no write's own check runs for it.
+          if (providedShards) requireShardTables("Entity.restore")
           const client = yield* Capacity.client
           const tc = yield* tableTag
           const tableName = tc.name

@@ -206,6 +206,11 @@ export interface EngineEntity {
   readonly schemas: any
   /** The mark a row tombstone or outbox item takes for the key `key` composes — see `Entity`. */
   readonly _keyTextMark: (key: Record<string, unknown>) => 2 | undefined
+  /**
+   * `[EDD-9181]` when a provided shard table of the read model has no table in the context the
+   * projection runs in (#287) — `Entity._requireShardTables`; `undefined` with none provided.
+   */
+  readonly _requireShardTables?: ((where: string) => void) | undefined
   /** True iff the read model offloads a field (#179). */
   readonly _offloads: boolean
   /**
@@ -2913,7 +2918,16 @@ export const makeEngine = (config: EngineConfig) => {
       Capacity.refusalsFail(
         `${config.label}.apply`,
         { target: entityType },
-        applyRow(key, work, options),
+        // A provided shard table (#287) of the read model comes from the context the projection
+        // runs in: one missing is `EDD-9181` before the row is read or written, whether or not
+        // its write would compose that index (a row without the index's composites, a
+        // tombstone). Nothing is checked for a read model with none.
+        readModel._requireShardTables === undefined
+          ? applyRow(key, work, options)
+          : Effect.suspend(() => {
+              readModel._requireShardTables!(config.label)
+              return applyRow(key, work, options)
+            }),
       ),
     drain,
     drainPending,

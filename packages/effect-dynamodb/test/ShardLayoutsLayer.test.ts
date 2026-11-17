@@ -21,7 +21,7 @@ import { toAttributeMap } from "../src/Marshaller.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
+import { calls, InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 class Device extends Schema.Class<Device>("Device")({
@@ -602,6 +602,60 @@ describe("a missing table is EDD-9181, and nothing is sent", () => {
       }
       expect(table.requests).toHaveLength(0)
     }).pipe(Effect.provide(Layer.merge(table.layer, Sensing.layer({ name: "t" }))))
+  })
+
+  it.effect("restore and purge, before anything is read; a read of the primary key runs", () => {
+    class Badge extends Schema.Class<Badge>("Badge")({
+      badgeId: Schema.String,
+      tenantId: Schema.optionalKey(Schema.String),
+    }) {}
+    const Badges = Entity.make({
+      model: Badge,
+      entityType: "Badge",
+      primaryKey: {
+        pk: { field: "pk", composite: ["badgeId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byTenant: {
+          name: "gsi5",
+          pk: { field: "gsi5pk", composite: ["tenantId"] },
+          sk: { field: "gsi5sk", composite: ["badgeId"] },
+          shards: { layouts: "provided" },
+        },
+      },
+      softDelete: true,
+    })
+    const BadgeTable = Table.make({ schema, entities: { Badges } })
+    const table = makeTable()
+    const base = Layer.merge(table.layer, BadgeTable.layer({ name: "t" }))
+    const key = { badgeId: "b-1" }
+    return Effect.gen(function* () {
+      // Written and soft-deleted where the table is known. It has no tenant, so its restore
+      // would compose no key of the provided index: refused all the same.
+      yield* Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { Badges }, tables: { BadgeTable } })
+        yield* db.entities.Badges.put({ badgeId: "b-1" })
+        yield* db.entities.Badges.delete(key)
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            base,
+            ShardLayouts.layer([ShardLayouts.of(Badges, { byTenant: { default: 1 } })]),
+          ),
+        ),
+      )
+      table.requests.length = 0
+      for (const run of [Badges.restore(key).asEffect(), Badges.purge(key).asEffect()]) {
+        const exit = yield* Effect.exit(run as Effect.Effect<unknown, unknown, any>)
+        expect(defectOf(exit)).toContain("[EDD-9181]")
+        expect(defectOf(exit)).toContain("Badge.byTenant")
+      }
+      expect(table.requests).toHaveLength(0)
+      // Reading the tombstone composes the primary key alone: no table needed.
+      const tombstone = yield* Badges.deleted.get(key).asEffect()
+      expect(tombstone.badgeId).toBe("b-1")
+    }).pipe(Effect.provide(base))
   })
 
   it.effect("an unbound query dies at its terminal, explain and asParams", () => {
@@ -1201,4 +1255,71 @@ describe("projection rows read the table of the context they run in", () => {
       expect(readRows()).toHaveLength(0)
     }).pipe(Effect.provide(base)),
   )
+
+  it.effect("missing, over a row with no key of the index: EDD-9181 before the row is read", () => {
+    // The row has no region, so writing it composes no key of the provided index.
+    const Sparse = Schema.Struct({
+      orderId: Schema.String,
+      region: Schema.optionalKey(Schema.String),
+      total: Schema.Number,
+      version: Schema.Number,
+    })
+    const SparseSummaries = Entity.make({
+      model: Sparse,
+      entityType: "SparseSummary",
+      primaryKey: {
+        pk: { field: "pk", composite: ["orderId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byRegion: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["region"] },
+          sk: { field: "gsi1sk", composite: ["orderId"] },
+          shards: { layouts: "provided" },
+        },
+      },
+    })
+    const SparseTable = Table.make({ schema: projectionSchema, entities: { SparseSummaries } })
+    const SparseTotals = EventStore.projection({
+      stream: Orders,
+      readModel: SparseSummaries,
+      key: (id: { readonly orderId: string }) => ({ orderId: id.orderId }),
+      initial: (id: { readonly orderId: string }) => ({
+        orderId: id.orderId,
+        total: 0,
+        version: 0,
+      }),
+      evolve: (state: typeof Sparse.Type, event: EventStore.StreamEvent<Placed>) =>
+        Effect.succeed({ ...state, total: state.total + event.data.amount }),
+      checkpoint: "version" as const,
+    })
+    const sparseBase = Layer.mergeAll(
+      InMemoryClient,
+      EventsTable.layer({ name: "events" }),
+      SparseTable.layer({ name: "read" }),
+    )
+    return Effect.gen(function* () {
+      yield* Orders.append(
+        { orderId: "o-1" },
+        [new Placed({ amount: 5 }), new Placed({ amount: 7 })],
+        0,
+      )
+      const events = yield* Orders.read({ orderId: "o-1" })
+      // The row, written where the table is known.
+      yield* SparseTotals.apply(events[0]!).pipe(
+        Effect.provide(
+          ShardLayouts.layer([ShardLayouts.of(SparseSummaries, { byRegion: { default: 1 } })]),
+        ),
+      )
+      const before = readRows()
+      expect(before).toHaveLength(1)
+      const reads = calls.getItem + calls.query
+      const exit = yield* Effect.exit(SparseTotals.apply(events[1]!))
+      expect(defectOf(exit)).toContain("[EDD-9181]")
+      expect(defectOf(exit)).toContain("SparseSummary.byRegion")
+      expect(calls.getItem + calls.query).toBe(reads)
+      expect(readRows()).toEqual(before)
+    }).pipe(Effect.provide(sparseBase))
+  })
 })
