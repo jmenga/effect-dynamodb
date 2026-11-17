@@ -494,6 +494,13 @@ export const prepareTransactWriteOps = (
           cause: `${operation}: unrecognized operation type. Use EntityPut, EntityDelete, or Transaction.check().`,
         })
       }
+      // A provided shard table (#287) comes from the context the op runs in (its binding's, for a
+      // bound builder): one missing is `EDD-9180` before any op reads or anything is sent, whether
+      // or not this op composes that index.
+      yield* underCaptured(
+        info.captured,
+        Effect.sync(() => info.entity._requireShardTables?.(operation)),
+      )
 
       if (options?.plan === true && info.opType === "update" && info.updateState !== undefined) {
         const { entity, key, updateState } = info

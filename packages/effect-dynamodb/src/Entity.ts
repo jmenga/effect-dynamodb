@@ -16900,7 +16900,13 @@ const makeImpl = <
         offloadModes,
         BlobLedger.rootIf(
           data.offload !== undefined,
-          appendCore(input, givenCondition, skipFollowUp, removeAttrs),
+          // A missing provided shard table (#287) is `EDD-9180` before the append reads or writes.
+          providedShards
+            ? Effect.suspend(() => {
+                requireShardTables("Entity.append")
+                return appendCore(input, givenCondition, skipFollowUp, removeAttrs)
+              })
+            : appendCore(input, givenCondition, skipFollowUp, removeAttrs),
         ),
       ),
     )

@@ -355,6 +355,56 @@ describe("a missing table is EDD-9180, and nothing is sent", () => {
     }).pipe(Effect.provide(under(table, null)))
   })
 
+  it.effect("writes that compose no provided key: transactWrite, Batch.write, append", () => {
+    class Sensor extends Schema.Class<Sensor>("Sensor")({
+      sensorId: Schema.String,
+      siteId: Schema.String,
+      seq: Schema.Number,
+      value: Schema.Number,
+    }) {}
+    const Sensors = Entity.make({
+      model: Sensor,
+      entityType: "Sensor",
+      primaryKey: {
+        pk: { field: "pk", composite: ["sensorId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        bySite: {
+          name: "gsi5",
+          pk: { field: "gsi5pk", composite: ["siteId"] },
+          sk: { field: "gsi5sk", composite: ["sensorId"] },
+          shards: { layouts: "provided" },
+        },
+      },
+      timeSeries: {
+        orderBy: "seq",
+        appendInput: Schema.Struct({
+          sensorId: Schema.String,
+          seq: Schema.Number,
+          value: Schema.Number,
+        }),
+      },
+    })
+    const Sensing = Table.make({ schema, entities: { Sensors } })
+    const table = makeTable()
+    const key = { sensorId: "s-1" }
+    return Effect.gen(function* () {
+      for (const run of [
+        // An update that touches no attribute of the provided index, planned by the transaction.
+        Transaction.transactWrite([Sensors.update(key).pipe(Entity.set({ value: 2 }))]),
+        Transaction.transactWrite([Sensors.delete(key)]),
+        Batch.write([Sensors.delete(key)]),
+        Sensors.append({ sensorId: "s-1", seq: 2, value: 2 }),
+      ] as ReadonlyArray<Effect.Effect<unknown, unknown, any>>) {
+        const exit = yield* Effect.exit(run)
+        expect(defectOf(exit)).toContain("[EDD-9180]")
+        expect(defectOf(exit)).toContain("Sensor.bySite")
+      }
+      expect(table.requests).toHaveLength(0)
+    }).pipe(Effect.provide(Layer.merge(table.layer, Sensing.layer({ name: "t" }))))
+  })
+
   it.effect("an unbound query dies at its terminal, explain and asParams", () => {
     const table = makeTable()
     const query = Devices.query.byTenant({ tenantId: "t-big" })
