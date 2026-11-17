@@ -4747,7 +4747,6 @@ const makeImpl = <
     return ownSchemaFor.own
   }
 
-  /** {@link ownSchema} for an update: the composites its `payload` gives are its own. */
   /**
    * `[EDD-9180]` when an index declared `shards: { layouts: "provided" }` has no table in the
    * context this operation runs in (#287): checked as a write starts, so nothing is sent, whether
@@ -4759,6 +4758,7 @@ const makeImpl = <
   const requireShardTables = (where: string): void =>
     KeyComposer.requireShardTables(where, schema, entityType, data.initialIndexes)
 
+  /** {@link ownSchema} for an update: the composites its `payload` gives are its own. */
   const ownPayload = (payload: globalThis.Record<string, unknown>): DynamoSchema.DynamoSchema =>
     ownSchema((site) => site.attr !== undefined && site.attr in payload)
 
