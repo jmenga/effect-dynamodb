@@ -169,4 +169,29 @@ describe("ShardLayouts.of types", () => {
       ]),
     ).toThrow("[EDD-9099]")
   })
+
+  it("a match value is the model field's type", () => {
+    expect(() =>
+      ShardLayouts.make([
+        ShardLayouts.of(Devices, {
+          byTenant: {
+            default: 1,
+            values: [
+              // @ts-expect-error tenantId is a string: 123 composes another key than "123"
+              { match: { tenantId: 123, regionId: "r" }, layout: 8 },
+            ],
+          },
+          byGroup: group,
+        }),
+      ]),
+    ).toThrow(/\[EDD-9099\].*tenantId.*string/)
+    // A decoded table's values are known only at run time: refused when the layer builds.
+    const decoded = Schema.decodeUnknownSync(ShardLayouts.Table)({
+      default: 1,
+      values: [{ match: { tenantId: 123, regionId: "r" }, layout: 8 }],
+    })
+    expect(() =>
+      ShardLayouts.make([ShardLayouts.of(Devices, { byTenant: decoded, byGroup: group })]),
+    ).toThrow(/\[EDD-9099\].*tenantId.*string/)
+  })
 })

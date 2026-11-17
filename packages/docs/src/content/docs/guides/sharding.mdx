@@ -448,7 +448,7 @@ const TenantDevices = Entity.make({
 | Field | Meaning |
 |---|---|
 | `default` | The layout of every value without an entry |
-| `values` | Entries `{ match, layout }`. `match` names every partition key composite of the index, and nothing else: the type system offers exactly those, with completions and a compile error for a typo |
+| `values` | Entries `{ match, layout }`. `match` names every partition key composite of the index, and nothing else: the type system offers exactly those, with completions and a compile error for a typo. Each value has its model field's type (`123` for a string field is a compile error, and `EDD-9099` at run time: it would compose another key than `"123"`) |
 | `by` | Beside `layouts`, as on a static index: the sort key composites to hash |
 
 A **layout** is a count, or `{ count, previous }` while a value [moves](#moving-a-value). The static forms are a table with only a default: `shards: 8` is `{ layouts: { default: 8 } }`, and `{ count: 8, by, previous: 1 }` is `{ by, layouts: { default: { count: 8, previous: 1 } } }`. `previous` lives only inside a layout, so a table has no `previous` of its own.
@@ -529,7 +529,7 @@ const JsonShardsLayer = ShardLayouts.layer([
 ])
 ```
 
-`ShardLayouts.of(entity, { ... })` takes one table for every index of the entity declared `"provided"`: a table, a decoded `ShardLayouts.Table`, or a `Config` of either. The types accept only those indexes and require each of them, and a literal table's `match` names that index's partition key composites. `ShardLayouts.Table` is a `Schema` for a table, so a JSON variable that isn't one is a `ConfigError` naming the variable. When the layer is built, each table is checked against its entity: its `match` names and the keys its entries compose (`EDD-9099`). An index that isn't declared `"provided"`, an unknown index, a provided index left out, or one entity given twice is `EDD-9181`. Build one layer with an `of` per entity: of two `ShardLayouts` layers, the one provided last is the only one used.
+`ShardLayouts.of(entity, { ... })` takes one table for every index of the entity declared `"provided"`: a table, a decoded `ShardLayouts.Table`, or a `Config` of either. The types accept only those indexes and require each of them, and a literal table's `match` names that index's partition key composites, each with its model field's type. `ShardLayouts.Table` is a `Schema` for a table, so a JSON variable that isn't one is a `ConfigError` naming the variable. When the layer is built, each table is checked against its entity: its `match` names, that each value is of its field's kind (a JSON `123` for a string field is refused), and the keys its entries compose (`EDD-9099`). An index that isn't declared `"provided"`, an unknown index, a provided index left out, or one entity given twice is `EDD-9181`. Build one layer with an `of` per entity: of two `ShardLayouts` layers, the one provided last is the only one used.
 
 The layer goes in the application layer, beside the client:
 
@@ -690,7 +690,7 @@ Aggregates compose their own attributes and write no index keys of an entity's i
 
 | Code | When | Raised by |
 |---|---|---|
-| `EDD-9099` | Malformed `shards`: `count` not an integer from 2 to 256 (a layout in a table may be 1), `previous` not a positive integer or equal to `count`, an unknown option, `shards` on the primary key, or a malformed table: a `match` not naming exactly the partition key composites, or two entries composing one key | `Entity.make`, and building a `ShardLayouts` layer |
+| `EDD-9099` | Malformed `shards`: `count` not an integer from 2 to 256 (a layout in a table may be 1), `previous` not a positive integer or equal to `count`, an unknown option, `shards` on the primary key, or a malformed table: a `match` not naming exactly the partition key composites, a `match` value of another kind than its field's key, or two entries composing one key | `Entity.make`, and building a `ShardLayouts` layer |
 | `EDD-9100` | A shard source value is missing when the partition key is composed, or an update changes `by` and the sort key can't be recomposed | Every write path, as a `ValidationError` |
 | `EDD-9101` | Nothing to spread: every primary key composite is also a partition key composite of the index | `Entity.make` |
 | `EDD-9102` | `by` is empty, duplicated, not a sort key composite of this index, or on a Z-order sort key | Types and `Entity.make` |

@@ -47,6 +47,7 @@ import { refIdAttribute, refIdField } from "./internal/AggregateSchemas.js"
 import {
   bothKindsKeyRefusal,
   keyFormValueKind,
+  keyFormValueKindOf,
   makeCompositeDomainKeyForm,
   toCompositeKeyRecord,
 } from "./internal/CompositeCodec.js"
@@ -1757,8 +1758,22 @@ export const buildEntityDefinition = (config: {
       )
     },
   )
-  const matchKeyForm = (record: globalThis.Record<string, unknown>) =>
-    toCompositeKeyRecord(shardMatchForm, record)
+  const matchKeyForm = (record: globalThis.Record<string, unknown>) => {
+    const keyed = toCompositeKeyRecord(shardMatchForm, record)
+    // A value of another kind than the field's key holds composes another key (`123` is not
+    // `"123"`), so the entry would match nothing: refused, as the types refuse it.
+    for (const [attr, value] of Object.entries(keyed)) {
+      const field = ownValue(inputFields, attr) as Schema.Top | undefined
+      const expected = field === undefined ? undefined : keyFormValueKind(field)
+      if (expected !== undefined && keyFormValueKindOf(value) !== expected) {
+        throw new Error(
+          `the value ${JSON.stringify(String(ownValue(record, attr)))} of "${attr}" is a ` +
+            `${typeof ownValue(record, attr)}, but its key holds a ${expected}`,
+        )
+      }
+    }
+    return keyed
+  }
   for (const [indexName, indexDef] of Object.entries(initialIndexes)) {
     if (indexDef.shards === undefined) continue
     initialIndexes[indexName] = {

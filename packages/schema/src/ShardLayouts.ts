@@ -22,6 +22,7 @@
 
 import { Config, Context, Effect, Layer, Schema } from "effect"
 import type * as DynamoSchema from "./DynamoSchema.js"
+import type { CaseInsensitive, ModelFields } from "./internal/EntityTypes.js"
 import {
   checkShardTables,
   type IndexDefinition,
@@ -91,6 +92,11 @@ export interface TypedTable<P extends string> {
   }>
 }
 
+/** The model fields of `E`, which a `match`'s values are typed by. */
+export type FieldsOf<E> = E extends { readonly model: infer M extends Schema.Top }
+  ? ModelFields<M>
+  : {}
+
 /** What {@link of} accepts for an entity: one with indexes. */
 export interface EntityLike {
   readonly entityType: string
@@ -157,13 +163,26 @@ type ProvidedTablesGuardOf<E, T> = {
                     // Every key of the entry is kept, so a fresh literal's other
                     // properties (`layout`) pass the excess property check.
                     readonly [P in keyof V[I]]: P extends "match"
-                      ? { readonly [X in Exclude<keyof M, PartitionComposites<E, K>>]: never }
+                      ? MatchGuard<M, PartitionComposites<E, K>, FieldsOf<E>>
                       : unknown
                   }
                 : unknown
             }
           }
         : unknown
+    : never
+}
+
+/**
+ * A literal `match`: a key outside the partition key composites `P` is `never`, and each
+ * composite's value is its type in the model's fields `F`, the value an accessor would pin
+ * for it (`123` is not `"123"`: it composes another key).
+ */
+type MatchGuard<M, P extends string, F> = {
+  readonly [X in keyof M]: X extends P
+    ? X extends keyof F
+      ? CaseInsensitive<F[X]>
+      : unknown
     : never
 }
 
