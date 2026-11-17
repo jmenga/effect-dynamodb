@@ -271,7 +271,13 @@ memoised build never fails later (D16).
   `KeyComposer.ts:1300`) composes truncated text, which no entry composes, since an entry names
   every composite. It resolves the default. Writes and `rekey` compose the same truncated text, so
   they agree. No accessor can query a truncated partition key (an accessor requires every partition
-  key composite), so no read depends on it.
+  key composite), so no read depends on it. **Named limit:** partition key text is not escaped, so a
+  value that spells the composites after it (a `tenantId` of `"hot#region_eu"`, truncated before
+  `region`) composes the same text as the full key of another value (`{ tenantId: "hot", region:
+  "eu" }`). Its row already shares that value's partition, as on an index without `shards`; with a
+  table it takes the default layout where that value's entry may give another, so the row is in no
+  partition the value's query reads, and `rekey` reports nothing (it composes the same truncated
+  text). Not handled: it needs a key value that spells another composite's name and value.
 - **A row whose partition key composites can't compose any text** (a hole, or no leading value) has
   no value to look up. `rekey` leaves it alone when its stored text lies in the layout of the default
   **or of any entry whose match agrees with the composites the row still holds**, and reports it
@@ -740,7 +746,11 @@ to be provably the same (#183 D50). It becomes the canonical declaration of the 
 entries sorted by their key-form match, each with its layout) and the source. A provided half has no
 provable form at `Entity.make`, so a provided partition key half sharing its attribute with any other
 half is refused (`EDD-9106`, D23). Contrived either way: an entity storing two sharded partition keys
-in one attribute is the inverted-index case #183 D68 already discourages.
+in one attribute is the inverted-index case #183 D68 already discourages. **Named limit:** the form
+spells a bigint match value as its digits and `n`, so a field typed as a union of string and bigint
+whose tables differ only in `5n` and `"5n"` passes as one form though the two compose different keys.
+Not handled: it needs that union type, two indexes sharing a partition key attribute and two tables
+differing in exactly that spelling.
 
 ## 13. Language service and playground
 
