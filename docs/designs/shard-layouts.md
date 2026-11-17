@@ -583,7 +583,7 @@ export class ShardLayouts extends Context.Service<ShardLayouts, ShardLayoutsRegi
     effect: Effect.Effect<Es, E, R>,
   ) => Layer.Layer<ShardLayouts, E | ErrorsOf<Es>, R>
   /** A Schema for one table, for Config.schema with Schema.fromJsonString, or an entity field. */
-  static readonly Table: Schema.Codec<ShardLayouts.Table, ShardLayouts.TableEncoded>
+  static readonly Table: Schema.Codec<ShardLayouts.Table, unknown>
 }
 ```
 
@@ -607,7 +607,11 @@ const ShardsLayer = ShardLayouts.layer([
 A `Schema` for `{ default: Layout, values?: Array<{ match: Record<string, string | number | boolean>,
 layout: Layout }> }`, with a brand. It checks the shape and the ranges a schema can (count and previous
 integers in range, previous not equal to count), so a bad JSON variable is a `ConfigError` naming the
-path. What needs the entity (match names, key text, duplicates) is checked by `of` when the layer
+path. It refuses a key it doesn't declare, at every level (the table, a value entry, a layout object):
+decoding strips one by default, and a stripped `previuos` would leave a migrating value read without
+its `previous`, so its rows under the old layout would never be found. The check runs on the input,
+before each struct, so it holds whatever parse options the decode is given; its encoded side is
+therefore `unknown`. What needs the entity (match names, key text, duplicates) is checked by `of` when the layer
 builds (§10.5). The brand is what lets `of` accept a decoded table without typing its `match` (a
 decoded table's names are known only at run time) while still checking a literal one: a literal isn't
 branded, so it must satisfy the typed form.
@@ -629,6 +633,11 @@ accessor's pin does (§3.1).
   check, so a literal holding the right composite and a typo (`{ tenantId, tenantID }`) would pass.
   `of()` puts the same `never`-mapping guard on its parameter that §2.2 puts on `Entity.make`'s, so
   an unbranded literal is checked key by key.
+- **Named limit:** a table inside a `Config` (`Config.succeed`, `Config.map`, `Config.schema`) is not
+  typed by the entity, because the types can't tell a hand-written `Config` table from a
+  schema-decoded one. A wrong-kind value (`tenantId: 123`) or an extra name (`tenantID`) in it
+  type-checks; the layer refuses both with `[EDD-9099]` when it is built (§10.5), so the application
+  doesn't start with it.
 - Entries are keyed by the entity's definition identity (the `EntityDefinitionData` a pure definition
   and the runtime entity promoted from it share), so `DynamoClient.make`'s promotion of a pure
   definition (#265) finds the same table.
@@ -675,8 +684,9 @@ secondary index. Every entry point without a bound client checks its entity's pr
 it starts (`requireShardTables`, through `entity._requireShardTables`, `undefined` on an entity with
 none, which therefore reads nothing), so a missing table sends nothing even on a write that wouldn't
 compose that index: the write ops as they run (`refuseEmptyParts`), `append`, `restore` (get-shaped,
-so its builder checks), a projection's row before it is read (`applyRow`; its row writes can bypass
-the entity op's own check), and the multi-item entry points per op. Reads that compose only the
+so its builder checks), a projection's entry points before they read anything (the engine's
+`preflight`, run by `catchUp`, `rebuild` and each row's apply; its row writes can bypass the entity
+op's own check), and the multi-item entry points per op. Reads that compose only the
 primary key (`get`, `getVersion`, `deleted.get`, `versions`, `deleted.list`, `history`,
 `Transaction.check`) check nothing. The sites of §5 needed no change.
 
@@ -720,7 +730,9 @@ could tell. Hot reload needs its own design.
 Members of a collection on a sharded index must agree on the partitions a query reads (#183 D9).
 `assertCollectionShardsAgreement` (`KeyComposer.ts:281`) compares `count`/`previous` today; it
 compares the members' **tables by content** instead (D5): equal defaults, and equal text indexes
-(text → layout) under the collection's schema. A collection's partition key is labelled with the
+(text → layout) under the collection's schema. The content compared is structured (the default, then
+the `[text, count, previous]` entries sorted by text, as JSON), never text joined with separators:
+partition key text isn't escaped, so a value could hold a separator and spell another table's entries. A collection's partition key is labelled with the
 collection name, so two members' entries for one value compose the same text, and two tables spelled
 differently but meaning the same (an entry in domain form on one member and stored form on the other,
 or `T-BIG` and `t-big` under `lowercase`) are equal. A static member compares as a table with only a
@@ -740,7 +752,8 @@ Where it runs, after runtime tables are applied:
 - `Collections.make` (`Collection.ts:339`): members with declared tables are compared at once. If any
   member's index is provided, the content comparison runs when a query of the collection resolves its
   partitions (§6.2), from the tables in context, and a disagreement dies with `[EDD-9103]` before
-  anything is sent.
+  anything is sent. Every member's table must be in context (`[EDD-9181]` otherwise), for the whole
+  collection's query and for each member's selector alike: one rule for the collection.
 - `DynamoClient.make` (`DynamoClient.ts:3338`): after the tables are attached at bind, so a
   disagreement fails the bind.
 
