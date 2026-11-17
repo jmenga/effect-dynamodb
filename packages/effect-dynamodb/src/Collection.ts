@@ -347,9 +347,11 @@ export const make = <
   checkShardsAgreement()
   // A member whose index's table is supplied at run time (#287): its queries compose their
   // partitions when a terminal runs, from the `ShardLayouts` of its context.
-  const provided = entityEntries.some(([, entity]) =>
-    KeyComposer.hasProvidedShards({ index: entity.indexes[sharedIndexName]! }),
-  )
+  // A member may name the collection's index differently: it has none under this name.
+  const provided = entityEntries.some(([, entity]) => {
+    const index = entity.indexes[sharedIndexName]
+    return index !== undefined && KeyComposer.hasProvidedShards({ index })
+  })
 
   // Compute the SK prefix for clustered collections.
   // For sub-collections (collection: ["parent", "child"]), the prefix includes

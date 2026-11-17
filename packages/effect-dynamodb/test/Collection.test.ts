@@ -140,6 +140,30 @@ describe("Collection", () => {
       )
     })
 
+    it("accepts a member that names the collection's index differently", () => {
+      // Members name their accessors per entity; only the first member's logical name is shared.
+      const Orders = Entity.make({
+        model: Order,
+        entityType: "RenamedOrder",
+        primaryKey: {
+          pk: { field: "pk", composite: ["orderId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          ordersByTenant: {
+            collection: "TenantItems",
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["tenantId"] },
+            sk: { field: "gsi1sk", composite: [] },
+          },
+        },
+      })
+      Table.make({ schema: AppSchema, entities: { Orders } })
+
+      const TenantItems = Collection.make("TenantItems", { users: UserEntity, orders: Orders })
+      expect(TenantItems.name).toBe("TenantItems")
+    })
+
     it("throws when entities list is empty", () => {
       expect(() => Collection.make("Empty", {})).toThrow("requires at least one entity")
     })
