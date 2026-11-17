@@ -308,6 +308,19 @@ describe("lookup by unsharded key text (design §3)", () => {
     expect(() => KeyComposer.checkShardTables(preserve, "DeviceState", { gsi: def })).not.toThrow()
   })
 
+  it("the schema's casing spells its prefix: one table looked up under two schemas", () => {
+    // The index's own casing leaves the schema name's casing to the schema.
+    const def = tabled(hot, { def: plainIndex({ casing: "preserve" }) })
+    const lower = DynamoSchema.make({ name: "Fleet", version: 1 })
+    const upper = DynamoSchema.make({ name: "Fleet", version: 1, casing: "uppercase" })
+    for (const s of [lower, upper, lower]) {
+      expect(
+        KeyComposer.composeReadPartitions(s, "DeviceState", def, { tenantId: "t-big" }).layout
+          ?.count,
+      ).toBe(20)
+    }
+  })
+
   it("a collection index looks up the collection's key", () => {
     const def = tabled(hot, { def: plainIndex({ collection: "fleet" }) })
     expect(KeyComposer.composePk(schema, "DeviceState", def, item("t-small"))).toBe(

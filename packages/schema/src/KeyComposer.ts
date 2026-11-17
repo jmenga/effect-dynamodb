@@ -1219,8 +1219,9 @@ export const hasShardTable = (index: IndexDefinition): boolean =>
 const textIndexes = new WeakMap<ShardTable, Map<string, ReadonlyMap<string, ShardLayout>>>()
 
 /**
- * What a key's text depends on besides its values: the schema's key text settings,
- * the index's casing and the label.
+ * What a key's text depends on besides its values: the schema's key text settings
+ * (its own casing spells its name, whatever the index's), the index's casing and the
+ * label.
  */
 const keyTextSettings = (
   schema: DynamoSchema.DynamoSchema,
@@ -1230,6 +1231,7 @@ const keyTextSettings = (
   JSON.stringify([
     schema.name,
     schema.version,
+    schema.casing,
     effectiveCasing(schema, index),
     schema.escapeKeys === true,
     schema.numericKeyText === true,
