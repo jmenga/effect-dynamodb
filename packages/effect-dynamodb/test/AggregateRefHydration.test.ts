@@ -107,6 +107,12 @@ const batchGetKeys = (requests: ReadonlyArray<Request>) =>
       ).flatMap((entry) => entry.Keys),
     )
 
+/** Consecutive transactions as one: a write's groups go in one when they fit (#168, D3). */
+const oneTransaction = (commands: ReadonlyArray<string>) =>
+  commands.filter(
+    (command, i) => !(command === "TransactWriteItems" && commands[i - 1] === "TransactWriteItems"),
+  )
+
 /** How many `BatchGetItem` requests were sent. */
 const fetches = (requests: ReadonlyArray<string>) =>
   requests.filter((command) => command === "BatchGetItem").length
@@ -622,8 +628,11 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
         const { create, requests, rows, get } = yield* run(SHAPES[label]!())
         const was = fixture.shapes[label]!
         expect(outcomeOf(create)).toBe(was.create)
-        // The requests 1.39.0's `create` sent, each as the recording table names its command.
-        expect(requests).toEqual(was.requests!.map((op) => `${op[0]!.toUpperCase()}${op.slice(1)}`))
+        // The requests 1.39.0's `create` sent, each as the recording table names its command, its
+        // groups' transactions one now that they fit one (#168, D3).
+        expect(requests).toEqual(
+          oneTransaction(was.requests!.map((op) => `${op[0]!.toUpperCase()}${op.slice(1)}`)),
+        )
         expect(byKey(rows)).toEqual(byKey(was.rows))
         expect(outcomeOf(get)).toBe(was.get)
       }),
@@ -641,9 +650,8 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
           expect(Exit.isSuccess(create) && json(create.value)).toBe(
             json(sub ? { id: "a", part: { lines } } : { id: "a", lines }),
           )
-          expect(requests).toEqual(
-            sub ? ["TransactWriteItems", "TransactWriteItems"] : ["TransactWriteItems"],
-          )
+          // A sub-aggregate's group joins the root's transaction (#168, D3).
+          expect(requests).toEqual(["TransactWriteItems"])
           expect(Exit.isSuccess(get) && json(get.value)).toBe(
             json((create as Exit.Success<unknown>).value),
           )

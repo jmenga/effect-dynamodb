@@ -102,12 +102,19 @@ export class ConditionalCheckFailed extends Data.TaggedError("ConditionalCheckFa
  * update re-reads the item and recomputes from its new values. `current` is
  * read, never printed: `toJSON`, which `JSON.stringify`, `inspect` and
  * Effect's loggers print an error through, leaves it out.
+ *
+ * An aggregate's `update` (#168) raises it when a row it sends changed since its read: `entityType`
+ * is the aggregate, `attributes` names each changed row by its member path and attribute
+ * (`"team1.lines[b].copy"`; a root attribute alone, a row that appeared or vanished by its path),
+ * `current` is `None`. `committed`, set only for a write past one transaction, names the
+ * sub-aggregates its earlier transactions already committed.
  */
 export class ConcurrentModification extends Data.TaggedError("ConcurrentModification")<{
   readonly entityType: string
   readonly key: Record<string, unknown>
   readonly attributes: ReadonlyArray<string>
   readonly current: Option.Option<unknown>
+  readonly committed?: ReadonlyArray<string>
 }> {
   override toJSON(): unknown {
     return printedJson(super.toJSON(), "current")
@@ -222,6 +229,12 @@ export class UniqueConstraintViolation extends Data.TaggedError("UniqueConstrain
  * `attributes`, when present, names what changed without the version moving: a sparse map whose
  * stored form another writer changed between this write's read and its write, on every attempt
  * (#238). Retrying the write re-reads the item.
+ *
+ * A `versioned` aggregate's `update` (#168) raises it when the root's version or incarnation moved
+ * since its read (or differs from the `expectedVersion` passed), and, with `attributes` named as
+ * `ConcurrentModification` names them, when a row it sends changed without the version moving.
+ * `committed`, set only for a write past one transaction, names the sub-aggregates its earlier
+ * transactions already committed.
  */
 export class OptimisticLockError extends Data.TaggedError("OptimisticLockError")<{
   readonly entityType: string
@@ -229,6 +242,7 @@ export class OptimisticLockError extends Data.TaggedError("OptimisticLockError")
   readonly expectedVersion: number
   readonly actualVersion: number
   readonly attributes?: ReadonlyArray<string>
+  readonly committed?: ReadonlyArray<string>
 }> {}
 
 // ---------------------------------------------------------------------------
@@ -371,13 +385,14 @@ export type AggregateTransactionOverflowFields = {
   readonly limit: number
   /**
    * The sub-aggregates earlier transactions of the same write already
-   * committed (each group is its own transaction, so a multi-group write is
-   * not atomic). Empty: nothing was written.
+   * committed (a write past one transaction is sent as several, so it is not
+   * atomic; #168). Empty: nothing was written.
    */
   readonly committed?: ReadonlyArray<string> | undefined
   /**
-   * The write that failed, when known. A failed `create` may leave its root
-   * committed (the root is in the first group), which its `message` says.
+   * The write that failed, when known. A failed `create` past one transaction
+   * may leave its root committed (the root is in the first request), which its
+   * `message` says.
    */
   readonly operation?: "create" | "update" | undefined
   /**

@@ -26,9 +26,10 @@ import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
+import { asBefore168 } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
-type Request = { readonly command: string; readonly input: unknown }
+type Request = { readonly command: string; readonly input: any }
 type Recorded = {
   readonly create: { readonly ok?: unknown; readonly failed?: string }
   readonly requests: ReadonlyArray<Request>
@@ -173,6 +174,17 @@ export const shapes: Record<string, () => Shape> = {
 }
 
 const isLine = (item: Row): boolean => item.__edd_e__?.S === "Line"
+
+/** The requests without the items putting an element's row. */
+const withoutLines = (requests: ReadonlyArray<Request>): ReadonlyArray<Request> =>
+  requests.flatMap((request) => {
+    const items = request.input?.TransactItems as ReadonlyArray<any> | undefined
+    if (items === undefined) return [request]
+    const left = items.filter((item) => item.Put === undefined || !isLine(item.Put.Item))
+    return left.length === 0
+      ? []
+      : [{ ...request, input: { ...request.input, TransactItems: left } }]
+  })
 
 /**
  * What 1.40.0 sent and stored, with each row of `entityType` changed by `change` into the form this
@@ -359,14 +371,21 @@ export const suite = (
               then.rows.filter(isLine).map(({ pk, sk, __edd_e__, ...rest }) => rest),
             )
             expect(actual.create).toEqual(then.create)
-            expect(actual.requests).toEqual(storedRequests(then.requests, shape.stored))
+            expect(asBefore168(actual.requests)).toEqual(
+              asBefore168(storedRequests(then.requests, shape.stored) as ReadonlyArray<Request>),
+            )
             expect(actual.rows).toEqual(then.rows.map((row) => storedRow(row, shape.stored)))
             const read = shape.read === undefined ? then.get : { ok: shape.read }
             expect(actual.get).toEqual(read)
-            expect(actual.noopRequests).toEqual(then.noopRequests)
+            expect(asBefore168(actual.noopRequests)).toEqual(asBefore168(then.noopRequests))
             expect(actual.noopRequests.map((request) => request.command)).toEqual(["Query"])
             expect(actual.noop).toEqual(read)
-            expect(actual.updateRequests).toEqual(storedRequests(then.updateRequests, shape.stored))
+            expect(asBefore168(actual.updateRequests, { stored: actual.noopRows })).toEqual(
+              asBefore168(
+                storedRequests(then.updateRequests, shape.stored) as ReadonlyArray<Request>,
+                { stored: actual.noopRows },
+              ),
+            )
             expect(actual.updateRows).toEqual(
               then.updateRows.map((row) => storedRow(row, shape.stored)),
             )
@@ -382,32 +401,25 @@ export const suite = (
             const actual = yield* run(harness, shape, then.rows)
             expect(actual.get).toEqual(then.get)
             expect(actual.noop).toEqual(then.noop)
-            expect(actual.noopRequests).toEqual(then.noopRequests)
+            expect(asBefore168(actual.noopRequests)).toEqual(asBefore168(then.noopRequests))
             expect(actual.noopRows).toEqual(then.rows)
             expect(actual.getAfterUpdate).toEqual(then.getAfterUpdate)
-            if (shape.changeGroup === undefined) {
-              // The root's title is in the element's group.
-              expect(actual.updateRequests).toEqual(
-                storedRequests(then.updateRequests, shape.stored),
-              )
-              expect(actual.updateRows).toEqual(
-                then.updateRows.map((row) => storedRow(row, shape.stored)),
-              )
-              return
-            }
-            // The title's write leaves the element's group as it is, then a change of that group
-            // rewrites it.
-            expect(actual.updateRequests).toEqual(then.updateRequests)
-            expect(actual.updateRows).toEqual(then.updateRows)
-            expect(actual.groupRows!.filter(isLine)).toEqual(
-              then.updateRows.filter(isLine).map((row) => storedRow(row, shape.stored)),
+            // 1.40.0 rewrote every row of a changed group, so a change elsewhere in the element's
+            // group stored it encoded. Its decomposed value didn't change: it isn't sent now, and
+            // stays as 1.40.0 stored it, which reads back as before (#168, D2).
+            expect(asBefore168(actual.updateRequests, { stored: then.rows })).toEqual(
+              withoutLines(asBefore168(then.updateRequests, { stored: then.rows })),
             )
+            expect(actual.updateRows.filter(isLine)).toEqual(then.rows.filter(isLine))
+            expect(actual.updateRows.filter((row) => !isLine(row))).toEqual(
+              then.updateRows.filter((row) => !isLine(row)),
+            )
+            if (shape.changeGroup === undefined) return
+            expect(actual.groupRows!.filter(isLine)).toEqual(then.rows.filter(isLine))
+            // The element still as 1.40.0 stored it, so read as 1.40.0's get read it.
+            const after = (then.getAfterUpdate as { ok: any }).ok
             expect(actual.getAfterGroup).toEqual({
-              ok: {
-                ...(shape.read as any),
-                title: "t2",
-                part: { ...(shape.read as any).part, name: "p2" },
-              },
+              ok: { ...after, part: { ...after.part, name: "p2" } },
             })
           }),
         ))

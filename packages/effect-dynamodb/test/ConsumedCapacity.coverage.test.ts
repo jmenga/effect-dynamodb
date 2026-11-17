@@ -40,6 +40,7 @@ import {
 import { indexesOf } from "./helpers/DynamoExpressions.js"
 import {
   InMemoryClient,
+  rejection,
   resetStore,
   store as rows,
   tableIndexes,
@@ -117,6 +118,25 @@ const Profiles = Entity.make({
   },
   versioned: { retain: true },
   softDelete: true,
+})
+
+class Customer extends Schema.Class<Customer>("Customer")({
+  customerId: Schema.String,
+  email: Schema.String,
+}) {}
+
+/**
+ * Unique email: purge deletes its live row and sentinel in a guarded transaction (#132). No
+ * index, timestamps or version: an update that sets nothing writes nothing.
+ */
+const Customers = Entity.make({
+  model: Customer,
+  entityType: "Customer",
+  primaryKey: {
+    pk: { field: "pk", composite: ["customerId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  unique: { email: ["email"] },
 })
 
 class Reading extends Schema.Class<Reading>("Reading")({
@@ -253,6 +273,7 @@ const MainTable = Table.make({
     Orders,
     Invoices,
     Profiles,
+    Customers,
     Readings,
     Products,
     Parcels,
@@ -350,6 +371,51 @@ const PurchaseOrders = Aggregate.make(PurchaseOrder, {
   },
 })
 
+/**
+ * Two sub-aggregate groups and the root's, `versioned` (so fenced): an update changing them all is
+ * one transaction, and `delete` deletes the root first (#168).
+ */
+const ShipmentLine = Schema.Struct({ lineId: Schema.String, sku: Schema.String })
+const ShipmentPartModel = Schema.Struct({ label: Schema.String, lines: Schema.Array(ShipmentLine) })
+const ShipmentPart = Aggregate.make(ShipmentPartModel, {
+  root: { entityType: "ShipmentPart" },
+  edges: { lines: Aggregate.many({ entityType: "ShipmentLine", sk: { composite: ["lineId"] } }) },
+} as any)
+const Shipments = Aggregate.make(
+  Schema.Struct({
+    shipmentId: Schema.String,
+    note: Schema.String,
+    part1: ShipmentPartModel,
+    part2: ShipmentPartModel,
+  }),
+  {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["shipmentId"] },
+    collection: { index: "lsi1", name: "shipment", sk: { field: "lsi1sk", composite: [] } },
+    root: { entityType: "ShipmentItem" },
+    versioned: true,
+    edges: {
+      part1: (ShipmentPart as any).with({ discriminator: { part: 1 } }),
+      part2: (ShipmentPart as any).with({ discriminator: { part: 2 } }),
+    },
+  } as any,
+) as any
+const seedShipment = () =>
+  Shipments.create({
+    shipmentId: "s-1",
+    note: "n",
+    part1: { label: "a", lines: [{ lineId: "l-1", sku: "A" }] },
+    part2: { label: "b", lines: [{ lineId: "l-2", sku: "B" }] },
+  }) as Effect.Effect<unknown, unknown, any>
+const relabelShipment = () =>
+  Shipments.update({ shipmentId: "s-1" }, ({ state }: any) => ({
+    ...state,
+    note: "m",
+    part1: { ...state.part1, label: "a2" },
+    part2: { ...state.part2, label: "b2" },
+  })) as Effect.Effect<unknown, unknown, any>
+
 const feed = { streamArn: "arn:aws:dynamodb:local:stream/1", consumer: "ledger-reader" }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +444,7 @@ const baseLayer = () =>
 
 const bindAll = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
-    entities: { Orders, Invoices, Profiles, Readings, Products, Parcels },
+    entities: { Orders, Invoices, Profiles, Customers, Readings, Products, Parcels },
     tables: { MainTable },
   })
   const orders = yield* Entity.bind(Orders)
@@ -417,6 +483,20 @@ const parcelBox = ({ db }: Bound) =>
   db.entities.Parcels.byDepot({ depotId: "d-1" })
     .within({ weight: { between: [1, 4] }, volume: { between: [2, 3] } })
     .zorder({ strategy: "precise", concurrency: 4 })
+const seedCustomer = ({ db }: Bound) =>
+  db.entities.Customers.put({ customerId: "cu-1", email: "a@x.io" }).asEffect()
+/** Every conditional write refused for the duration of `effect`: each attempt loses its race. */
+const losingEveryRace = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      rejection.all = true
+    }),
+    () => effect,
+    () =>
+      Effect.sync(() => {
+        rejection.all = false
+      }),
+  )
 const seedProfile = ({ db }: Bound) =>
   Effect.gen(function* () {
     yield* db.entities.Profiles.put({ profileId: "p-1", name: "Ada" })
@@ -525,6 +605,27 @@ const cases: ReadonlyArray<Case> = [
     ({ db }) => db.entities.Orders.patch({ orderId: "o-1" }).set({ total: 2 }).asEffect(),
     seedOrder,
   ],
+  // An update that sets nothing (#132): its consistent read, or its condition's UpdateItem
+  [
+    "Entity.update",
+    ({ db }) =>
+      db.entities.Customers.update({ customerId: "cu-1" }).set({}).returnValues("none").asEffect(),
+    seedCustomer,
+  ],
+  [
+    "Entity.update",
+    ({ db }) =>
+      db.entities.Customers.update({ customerId: "cu-1" })
+        .set({})
+        .condition({ email: "a@x.io" })
+        .asEffect(),
+    seedCustomer,
+  ],
+  [
+    "Entity.patch",
+    ({ db }) => db.entities.Customers.patch({ customerId: "cu-1" }).set({}).asEffect(),
+    seedCustomer,
+  ],
   [
     "Entity.delete",
     ({ db }) => db.entities.Orders.delete({ orderId: "o-1" }).asEffect(),
@@ -549,6 +650,13 @@ const cases: ReadonlyArray<Case> = [
   ],
   ["Entity.restore", ({ db }) => db.entities.Profiles.restore({ profileId: "p-1" }), seedProfile],
   ["Entity.purge", ({ db }) => db.entities.Profiles.purge({ profileId: "p-1" }), seedProfile],
+  // A unique entity's guarded purge (#132), and one losing every attempt: its retries too.
+  ["Entity.purge", ({ db }) => db.entities.Customers.purge({ customerId: "cu-1" }), seedCustomer],
+  [
+    "Entity.purge",
+    ({ db }) => losingEveryRace(db.entities.Customers.purge({ customerId: "cu-1" })),
+    seedCustomer,
+  ],
   ["Entity.deleted.get", ({ db }) => db.entities.Profiles.deleted.get({ profileId: "p-1" })],
   [
     "Entity.deleted.list",
@@ -641,6 +749,10 @@ const cases: ReadonlyArray<Case> = [
   ["Aggregate.get", ({ purchaseOrders }) => purchaseOrders.get({ purchaseOrderId: "po-1" })],
   ["Aggregate.delete", () => PurchaseOrders.delete({ purchaseOrderId: "po-1" })],
   ["Aggregate.list", () => (PurchaseOrders as any).list({ purchaseOrderId: "po-1" })],
+  // A versioned aggregate (#168): a multi-group update, and a fenced delete (its root first).
+  ["Aggregate.create", () => seedShipment()],
+  ["Aggregate.update", () => relabelShipment(), seedShipment],
+  ["Aggregate.delete", () => Shipments.delete({ shipmentId: "s-1" }), seedShipment],
   // Event streams
   [
     "EventStream.append",
@@ -786,6 +898,55 @@ describe("consumed-capacity coverage", () => {
 })
 
 describe("consumed-capacity targets", () => {
+  it.effect("a no-op update's read, and a raced purge's retries, report under the op (#132)", () =>
+    Effect.gen(function* () {
+      const layer = baseLayer()
+      const bound = yield* bindAll.pipe(Effect.provide(layer))
+      yield* seedOrder(bound).pipe(Effect.provide(layer), Effect.orDie)
+      yield* seedCustomer(bound).pipe(Effect.provide(layer), Effect.orDie)
+      const { reports, onOperation } = collectReports()
+      yield* Effect.gen(function* () {
+        yield* bound.db.entities.Customers.update({ customerId: "cu-1" })
+          .set({})
+          .returnValues("none")
+        yield* bound.db.entities.Customers.update({ customerId: "cu-1" })
+          .set({})
+          .condition({ email: "a@x.io" })
+        yield* losingEveryRace(bound.db.entities.Customers.purge({ customerId: "cu-1" })).pipe(
+          Effect.ignore,
+        )
+      }).pipe(Effect.provide(ConsumedCapacity.layer({ onOperation })), Effect.provide(layer))
+      expect(
+        reports.map((report) => [report.operation, report.requestsByCommand.TransactWriteItems]),
+      ).toEqual([
+        ["Entity.update", undefined],
+        ["Entity.update", undefined],
+        ["Entity.purge", 3],
+      ])
+      expect(reports[0]!.requestsByCommand).toEqual({ GetItem: 1 })
+      expect(reports[1]!.requestsByCommand).toEqual({ UpdateItem: 1 })
+    }),
+  )
+
+  it.effect("an aggregate's multi-group update and fenced delete are one report each (#168)", () =>
+    Effect.gen(function* () {
+      const layer = baseLayer()
+      yield* seedShipment().pipe(Effect.provide(layer), Effect.orDie)
+      const { reports, onOperation } = collectReports()
+      yield* Effect.andThen(relabelShipment(), Shipments.delete({ shipmentId: "s-1" })).pipe(
+        Effect.provide(ConsumedCapacity.layer({ onOperation })),
+        Effect.provide(layer),
+      )
+      expect(reports.map((report) => report.operation)).toEqual([
+        "Aggregate.update",
+        "Aggregate.delete",
+      ])
+      // Three groups changed, one transaction; the root first, then one read, then the batch.
+      expect(reports[0]!.requestsByCommand).toEqual({ Query: 1, TransactWriteItems: 1 })
+      expect(reports[1]!.requestsByCommand).toEqual({ DeleteItem: 1, Query: 1, BatchWriteItem: 1 })
+    }),
+  )
+
   it.effect("a skip-scan's probes and reads are one Entity.query report (#171)", () =>
     Effect.gen(function* () {
       const layer = baseLayer()

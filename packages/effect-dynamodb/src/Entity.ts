@@ -136,6 +136,7 @@ import {
   Equal,
   Exit,
   Option,
+  Result,
   Schema,
   SchemaAST,
   SchemaIssue,
@@ -268,7 +269,7 @@ import {
   type RawCondition,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
-import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
+import { conditionCheckItem, planWrite, type TransactPlan } from "./internal/TransactPlan.js"
 import {
   batchEntries,
   type Diagnosis,
@@ -1909,12 +1910,20 @@ export interface Entity<
    * Permanently remove an item plus all version history and sentinels. Deletes
    * in `BatchWriteItem` chunks of 25, retrying `UnprocessedItems` with
    * backoff; not atomic, so a failure says exactly how many items it had
-   * already deleted.
+   * already deleted. With `unique`, the live row and the sentinels it owns are
+   * deleted first, in one transaction guarded on the row as read (as `delete`
+   * sends it); a race with a concurrent write is retried from a fresh read, and
+   * once every attempt has lost it fails `OptimisticLockError` (versioned) or
+   * `ConcurrentModification`, having deleted nothing (#132).
    */
   readonly purge: (
     key: EntityKeyType<TModel, TIndexes, TRefs>,
   ) => EntityDelete<
-    DynamoClientError | ValidationError | WriteBlobErrors<TOffload>,
+    | DynamoClientError
+    | ValidationError
+    | OptimisticLockError
+    | ConcurrentModification
+    | WriteBlobErrors<TOffload>,
     DynamoClient | TableConfig
   >
 
@@ -2622,11 +2631,23 @@ export interface BoundEntity<
    * Permanently remove an item plus all version history and sentinels. Deletes
    * in `BatchWriteItem` chunks of 25, retrying `UnprocessedItems` with
    * backoff; not atomic, so a failure says exactly how many items it had
-   * already deleted.
+   * already deleted. With `unique`, the live row and the sentinels it owns are
+   * deleted first, in one transaction guarded on the row as read (as `delete`
+   * sends it); a race with a concurrent write is retried from a fresh read, and
+   * once every attempt has lost it fails `OptimisticLockError` (versioned) or
+   * `ConcurrentModification`, having deleted nothing (#132).
    */
   readonly purge: (
     key: TKey,
-  ) => Effect.Effect<void, DynamoClientError | ValidationError | WriteBlobErrors<TOffload>, never>
+  ) => Effect.Effect<
+    void,
+    | DynamoClientError
+    | ValidationError
+    | OptimisticLockError
+    | ConcurrentModification
+    | WriteBlobErrors<TOffload>,
+    never
+  >
 
   /** Soft-deleted item accessors. */
   readonly deleted: {
@@ -8752,6 +8773,33 @@ const makeImpl = <
       client.getItem({ TableName: tableName, Key: marshalledKey, ConsistentRead: true }),
     )
 
+  /**
+   * The row an update finds at its key: `undefined` for none, and for a projection tombstone
+   * (#154), a removed row that every read by key reports as absent. An update of it is an update
+   * of a missing row, by every path (#132).
+   */
+  const liveRow = (
+    row: globalThis.Record<string, AttributeValue> | undefined,
+  ): globalThis.Record<string, AttributeValue> | undefined =>
+    row !== undefined && isProjectionTombstone(row, entityType) ? undefined : row
+
+  /**
+   * The condition that the row an update writes exists, under `pkName`: `attribute_exists` of its
+   * partition key, and, on a read model whose rows may be projection tombstones, that it isn't one
+   * (#132). The term is free when it holds, and every other entity sends what it did.
+   */
+  const rowExists = (
+    names: globalThis.Record<string, string>,
+    values: globalThis.Record<string, AttributeValue>,
+    pkName: string,
+  ): string => {
+    names[pkName] = config.indexes.primary.pk.field
+    if (!hasProjectionTombstones(self)) return `attribute_exists(${pkName})`
+    names["#eddLive"] = "__edd_e__"
+    values[":eddTomb"] = { S: `${entityType}#tombstone` }
+    return `attribute_exists(${pkName}) AND #eddLive <> :eddTomb`
+  }
+
   /** Fill a `ConcurrentModification`'s `current` with the stored item, decoded. */
   const withCurrentItem = <A, E, R>(
     effect: Effect.Effect<A, E, R>,
@@ -10401,6 +10449,13 @@ const makeImpl = <
         /** The attribute the target stores its ref in. */
         readonly refAttribute: string
         readonly refData: AttributeValue
+        /**
+         * The target's cascade index partition-key attribute, and the value the query found it
+         * under: the source's id, as the target indexes it. The update is conditioned on the
+         * target still holding it (#132).
+         */
+        readonly heldAttribute: string
+        readonly heldValue: AttributeValue
       }> = []
 
       for (const target of targets) {
@@ -10533,6 +10588,8 @@ const makeImpl = <
                 keyFields,
                 refAttribute: refSet.attribute,
                 refData: refSet.value,
+                heldAttribute: gsiPkField,
+                heldValue: { S: gsiPkValue },
               })
             }
 
@@ -10545,68 +10602,104 @@ const makeImpl = <
 
       if (allUpdateOps.length === 0) return
 
+      /**
+       * A target's update: its ref SET, conditioned on the target still naming the source (#132).
+       * The index the targets were found through is eventually consistent, so a target deleted or
+       * pointed at another source since may still be listed: unconditioned, the update would
+       * create a key-only item at a deleted target's key (one no read decodes, blocking a later
+       * `create` there), or write this source's data into a target that no longer names it.
+       * Refused, the target is no longer this source's, and is skipped.
+       */
+      const cascadeUpdate = (op: (typeof allUpdateOps)[number]) => ({
+        TableName: op.tableName,
+        Key: op.key,
+        UpdateExpression: "SET #ref = :refData",
+        ConditionExpression: "#held = :held",
+        ExpressionAttributeNames: { "#ref": op.refAttribute, "#held": op.heldAttribute },
+        ExpressionAttributeValues: { ":refData": op.refData, ":held": op.heldValue },
+      })
+
       if (mode === "transactional") {
         // Transactional mode — one atomic transaction. DynamoDB's limits (100
         // items, 4 MB, item size, sort keys) are not pre-checked (#144): a
         // rejection is diagnosed and reported as a cascade that wrote nothing.
-        const cascadeItems: ReadonlyArray<TransactWriteItem> = allUpdateOps.map((op) => ({
-          Update: {
-            TableName: op.tableName,
-            Key: op.key,
-            UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refAttribute },
-            ExpressionAttributeValues: { ":refData": op.refData },
-          },
-        }))
-        yield* client.transactWriteItems({ TransactItems: [...cascadeItems] }).pipe(
-          diagnoseFailure({
-            sent: () => ({
-              _tag: "Transaction",
-              items: cascadeItems,
-              targets: () =>
-                cascadeItems.map((item, index) => {
-                  const op = allUpdateOps[index]!
-                  return transactItemTarget(
-                    item,
-                    op.tableName,
-                    op.keyFields,
-                    op.entityType,
-                    `the cascade update of ${op.entityType} (item ${index})`,
-                  )
+        // A target refused by its condition (#132) left the source since the query: it is
+        // dropped, and the rest sent again, up to `GUARDED_PUT_ATTEMPTS` sends in all.
+        let pending: ReadonlyArray<(typeof allUpdateOps)[number]> = allUpdateOps
+        for (let send = 1; pending.length > 0; send++) {
+          const sentOps = pending
+          const cascadeItems: ReadonlyArray<TransactWriteItem> = sentOps.map((op) => ({
+            Update: cascadeUpdate(op),
+          }))
+          const sent = yield* Effect.result(
+            client.transactWriteItems({ TransactItems: [...cascadeItems] }).pipe(
+              diagnoseFailure({
+                sent: () => ({
+                  _tag: "Transaction",
+                  items: cascadeItems,
+                  targets: () =>
+                    cascadeItems.map((item, index) => {
+                      const op = sentOps[index]!
+                      return transactItemTarget(
+                        item,
+                        op.tableName,
+                        op.keyFields,
+                        op.entityType,
+                        `the cascade update of ${op.entityType} (item ${index})`,
+                      )
+                    }),
                 }),
-            }),
-            keys: () => ({
-              partition: [...new Set(allUpdateOps.map((op) => op.keyFields[0]))],
-              sort: [...new Set(allUpdateOps.map((op) => op.keyFields[1]))],
-            }),
-            rewrite: (diagnosis, original) =>
-              new CascadePartialFailure({
-                sourceEntity: sourceEntityType,
-                sourceId: sourceIdValue,
-                succeeded: 0,
-                failed: allUpdateOps.length,
-                errors: [
-                  diagnosedValidationError(diagnosis, original, {
-                    operation: "cascade",
-                    entityType: sourceEntityType,
+                keys: () => ({
+                  partition: [...new Set(sentOps.map((op) => op.keyFields[0]))],
+                  sort: [...new Set(sentOps.map((op) => op.keyFields[1]))],
+                }),
+                rewrite: (diagnosis, original) =>
+                  new CascadePartialFailure({
+                    sourceEntity: sourceEntityType,
+                    sourceId: sourceIdValue,
+                    succeeded: 0,
+                    failed: sentOps.length,
+                    errors: [
+                      diagnosedValidationError(diagnosis, original, {
+                        operation: "cascade",
+                        entityType: sourceEntityType,
+                      }),
+                    ],
                   }),
-                ],
               }),
-          }),
-        )
+            ),
+          )
+          if (Result.isSuccess(sent)) return
+          const error = sent.failure
+          const reasons =
+            error._tag === "CascadePartialFailure" || !isAwsTransactionCancelled(error.cause)
+              ? undefined
+              : error.cause.CancellationReasons
+          const refused = new Set(
+            (reasons ?? []).flatMap((reason, index) =>
+              reason?.Code === "ConditionalCheckFailed" ? [index] : [],
+            ),
+          )
+          // Cancelled for another reason, or once the sends run out: a cascade that wrote nothing.
+          if (refused.size === 0) return yield* error
+          pending = sentOps.filter((_, index) => !refused.has(index))
+          if (send >= GUARDED_PUT_ATTEMPTS && pending.length > 0) {
+            return yield* new CascadePartialFailure({
+              sourceEntity: sourceEntityType,
+              sourceId: sourceIdValue,
+              succeeded: 0,
+              failed: pending.length,
+              errors: [error],
+            })
+          }
+        }
       } else {
         // Eventual mode — concurrent updates with partial failure tracking
         let succeeded = 0
         const errors: Array<unknown> = []
 
         const updateEffects = allUpdateOps.map((op) => {
-          const update = {
-            TableName: op.tableName,
-            Key: op.key,
-            UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refAttribute },
-            ExpressionAttributeValues: { ":refData": op.refData },
-          }
+          const update = cascadeUpdate(op)
           return client.updateItem(update).pipe(
             // An item the cascade grows past 400 KB is named in `errors`.
             diagnoseFailure({
@@ -10633,6 +10726,12 @@ const makeImpl = <
               Effect.sync(() => {
                 succeeded++
               }),
+            ),
+            // Refused (#132): the target was deleted, or no longer names this source, since the
+            // query found it. It isn't this source's: skipped, neither succeeded nor failed.
+            Effect.catchIf(
+              (err) => err._tag !== "ValidationError" && isAwsConditionalCheckFailed(err.cause),
+              () => Effect.void,
             ),
             Effect.catch((err) =>
               Effect.sync(() => {
@@ -11695,7 +11794,6 @@ const makeImpl = <
 
   /** An update from what {@link prepareUpdate} decided: its reads and its write. */
   const runPreparedUpdate = (
-    key: unknown,
     prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
     mode: DecodeMode,
     /**
@@ -11766,7 +11864,7 @@ const makeImpl = <
         const currentResult =
           preRead !== undefined ? { Item: preRead } : yield* readCurrent(tableName, marshalledKey)
 
-        if (!currentResult.Item) {
+        if (!currentResult.Item || isProjectionTombstone(currentResult.Item, entityType)) {
           return yield* missingItem()
         }
 
@@ -12796,7 +12894,7 @@ const makeImpl = <
         | undefined
       if (isRetainEnabled() || needsBothImages) {
         const current = yield* readCurrent(tableName, marshalledKey)
-        if (!current.Item) {
+        if (!current.Item || isProjectionTombstone(current.Item, entityType)) {
           return yield* missingItem()
         }
         yield* checkVersion(current.Item, "update")
@@ -12889,7 +12987,7 @@ const makeImpl = <
         immutables.some((asserted) => asserted.packed || asserted.offloaded !== undefined)
       ) {
         const stored = yield* readCurrent(tableName, marshalledKey)
-        if (stored.Item === undefined) {
+        if (!stored.Item || isProjectionTombstone(stored.Item, entityType)) {
           return yield* createsOnMissing
             ? new MissingForCreate({ input: createInput() })
             : missingItem()
@@ -13578,15 +13676,35 @@ const makeImpl = <
         deleteClauses.length > 0
 
       const rv = uState.returnValues ?? "allNew"
-      if (!hasAnyUpdate) {
-        // Nothing to update: nothing written, so nothing "updated"; the
-        // whole-item modes are the current item.
-        if (rv === "none") return undefined
-        if (rv === "updatedOld" || rv === "updatedNew") {
-          return yield* decodePartial(undefined, new Set(), mode)
-        }
-        return yield* get(key)._run(mode)
-      }
+      // Nothing to update (#132): nothing is written, but the op still establishes what its write
+      // would have: the row exists (`ItemNotFound`, `patch`'s `ConditionalCheckFailed`), and its
+      // condition holds. Existence alone is read, consistently, in every return mode; a condition
+      // is sent in the update's own request with no `UpdateExpression`, which changes nothing. In a
+      // transaction's plan the read is held to the commit by a `ConditionCheck` (`planned`), and
+      // the request is recorded as one (`planWrite`).
+      const noOp = !hasAnyUpdate
+      /**
+       * A no-op's result: nothing "updated"; the whole-item modes, the row. `row`: the row it read,
+       * or its request returned; `"held"`, its request's condition proved the row there and it
+       * asked for nothing back.
+       */
+      const noOpResult = (row: globalThis.Record<string, AttributeValue> | undefined | "held") =>
+        Effect.gen(function* () {
+          if (row === undefined || (row !== "held" && liveRow(row) === undefined)) {
+            return yield* missingItem()
+          }
+          if (rv === "none") return undefined
+          if (rv === "updatedOld" || rv === "updatedNew") {
+            return yield* decodePartial(undefined, new Set(), mode)
+          }
+          // A whole-item mode always asks its request for the row.
+          if (row === "held") return yield* Effect.die(new Error("a no-op returned no row"))
+          return yield* decodeAs(
+            fromAttributeMap(row) as globalThis.Record<string, unknown>,
+            row,
+            mode,
+          )
+        })
 
       // Compose UpdateExpression from all clause types
       const expressionParts: Array<string> = []
@@ -13598,6 +13716,8 @@ const makeImpl = <
 
       // Build condition expression — combine optimistic lock + user condition
       const condParts: Array<string> = []
+      /** How many of `condParts` restate an immutable value (`#immN = :immN`). */
+      let immutableTerms = 0
       if (evExpected !== undefined && systemFields.version) {
         condParts.push(versionIs(evExpected, names, values, "#condVer", ":expectedVer"))
       }
@@ -13624,9 +13744,9 @@ const makeImpl = <
           names[`#imm${i}`] = attr
           values[`:imm${i}`] = value
           condParts.push(`#imm${i} = :imm${i}`)
+          immutableTerms++
         }
-        names["#exists"] = config.indexes.primary.pk.field
-        condParts.push("attribute_exists(#exists)")
+        condParts.push(rowExists(names, values, "#exists"))
         // A `pathIfNotExists` operand a check refuses is written only where its path is absent:
         // the write requires the path, and a refusal returning an item without it is that
         // operand's (`fallbackRefusal`, #236). None: the request is as it was.
@@ -13642,6 +13762,26 @@ const makeImpl = <
         condParts.push(versionIs(casRead.version, names, values, "#casVer", ":casVer"))
         const incarnation = incarnationGuard(casRead.raw, names, values)
         if (incarnation !== undefined) condParts.push(incarnation)
+      }
+      if (noOp) {
+        // Required in a no-op's request whatever else it asserts: an `UpdateItem` with no
+        // `UpdateExpression` creates a key-only item at a missing key.
+        if (!plainWrite) condParts.push(rowExists(names, values, "#exists"))
+        // Asserting nothing but existence, and restated immutable values: the row is read (or
+        // was), consistently, and the values are compared with it, as the refusal of the same
+        // update with a payload compares them (`immutableMismatch`).
+        if (condParts.length === 1 + immutableTerms) {
+          const row = liveRow(held ?? (yield* readCurrent(tableName, marshalledKey)).Item)
+          const immutableChange = row !== undefined ? immutableMismatch(immutables, row) : undefined
+          if (immutableChange !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update",
+              cause: immutableChange,
+            })
+          }
+          return yield* noOpResult(row)
+        }
       }
       // Sent as built: a condition over DynamoDB's expression limits is
       // DynamoDB's to reject, and is diagnosed naming the caller's part (#144).
@@ -13810,18 +13950,23 @@ const makeImpl = <
       // The image the mode returns; `none` asks for nothing unless a
       // cascade needs the new item.
       const wantsOld = casRead === undefined && (rv === "allOld" || rv === "updatedOld")
-      const returned = wantsOld
-        ? "ALL_OLD"
-        : rv === "none" && !uState.cascade && casRead === undefined
-          ? "NONE"
-          : "ALL_NEW"
+      const returned = noOp
+        ? // A no-op's item, unchanged: returned only to the whole-item modes, and never cascaded.
+          rv === "allNew" || rv === "allOld"
+          ? "ALL_NEW"
+          : "NONE"
+        : wantsOld
+          ? "ALL_OLD"
+          : rv === "none" && !uState.cascade && casRead === undefined
+            ? "NONE"
+            : "ALL_NEW"
       // DynamoDB rejects an empty `ExpressionAttributeValues` map. When
       // the UpdateExpression is REMOVE-only (e.g. clearMap with no other
       // combinators), `values` may be empty — omit the property entirely.
       const updateInput: UpdateItemCommandInput = {
         TableName: tableName,
         Key: marshalledKey,
-        UpdateExpression: updateExpression,
+        ...(!noOp && { UpdateExpression: updateExpression }),
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: Object.keys(values).length > 0 ? values : undefined,
         ConditionExpression: conditionExpression,
@@ -13846,9 +13991,12 @@ const makeImpl = <
             // item (it must exist), a restated immutable value, the
             // version CAS, or the user's condition.
             if (isAwsConditionalCheckFailed(err.cause)) {
-              const stored = err.cause.Item
+              const stored = liveRow(
+                err.cause.Item as globalThis.Record<string, AttributeValue> | undefined,
+              )
               if (stored === undefined && !uState.patch) {
-                return createsOnMissing
+                // A no-op never creates: its payload names nothing to create from.
+                return createsOnMissing && !noOp
                   ? new MissingForCreate({ input: createInput() })
                   : new ItemNotFound({ entityType, key: encodedKey })
               }
@@ -13909,6 +14057,11 @@ const makeImpl = <
         ),
       )
 
+      // The no-op's condition held: nothing changed, so nothing cascades.
+      if (noOp) {
+        return yield* noOpResult(returned === "NONE" ? "held" : result.Attributes)
+      }
+
       // A cascade never meets an old-image mode here: that combination is
       // routed to the read-then-write branch, or read first (`casRead`).
       const newImage = wantsOld ? undefined : result.Attributes
@@ -13934,7 +14087,7 @@ const makeImpl = <
     forceReadMerge = false,
   ) =>
     Effect.flatMap(prepareUpdate(key, requested), (prepared) =>
-      runPreparedUpdate(key, prepared, mode, preRead, forceReadMerge),
+      runPreparedUpdate(prepared, mode, preRead, forceReadMerge),
     )
 
   /**
@@ -13983,7 +14136,7 @@ const makeImpl = <
     const once = () =>
       prepared === undefined
         ? runUpdateSized(key, mode, requested, held)
-        : sizedUpdate((force) => runPreparedUpdate(key, prepared, mode, held, force))
+        : sizedUpdate((force) => runPreparedUpdate(prepared, mode, held, force))
     // A form race (#238): the row's renamed sparse map changed form between the update's read and
     // its write. Read again and written again, as a guarded put is; once every attempt raced, the
     // race is reported naming the map. A row handed in (a transaction's plan) is never re-read here:
@@ -14115,7 +14268,8 @@ const makeImpl = <
           Key: ownKey,
           ConsistentRead: true,
         })
-        if (read.Item === undefined) {
+        // A projection tombstone is a removed row: missing, as every read by key reports it.
+        if (read.Item === undefined || isProjectionTombstone(read.Item, entityType)) {
           ;({ items, ownRow } = yield* plan({ rowMissing: true }))
         } else {
           ownRow = read.Item
@@ -14145,6 +14299,26 @@ const makeImpl = <
       }
       const pkField = config.indexes.primary.pk.field
       const skField = config.indexes.primary.sk.field
+      // An update with nothing to set writes nothing, and found its row with a consistent read
+      // (#132). Standalone, that read IS the op's answer; in a transaction, the row could be
+      // deleted before the commit, so the read is held to it: a `ConditionCheck` that the row
+      // still exists, judged below as the op's main item (a refusal is a lost race, planned again,
+      // which then finds the row missing). A no-op that asserts a condition recorded its own check.
+      if (items.length === 0 && ownRow !== undefined) {
+        const { name: tableName } = yield* tableTag
+        const names: globalThis.Record<string, string> = {}
+        const values: globalThis.Record<string, AttributeValue> = {}
+        items = [
+          conditionCheckItem({
+            TableName: tableName,
+            Key: ownKey,
+            ConditionExpression: rowExists(names, values, "#pk"),
+            ExpressionAttributeNames: names,
+            ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+            ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+          }),
+        ]
+      }
       const isOwn = (row: globalThis.Record<string, AttributeValue> | undefined) => {
         if (row === undefined) return false
         const plain = fromAttributeMap(row)
@@ -14174,7 +14348,12 @@ const makeImpl = <
         | { readonly _tag: "reserve"; readonly error: UniqueConstraintViolation }
       const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
       const roles = items.map((item): Role => {
-        if (isOwn(item.Put?.Item) || isOwn(item.Update?.Key) || isOwn(item.Delete?.Key)) {
+        if (
+          isOwn(item.Put?.Item) ||
+          isOwn(item.Update?.Key) ||
+          isOwn(item.Delete?.Key) ||
+          isOwn(item.ConditionCheck?.Key)
+        ) {
           return { _tag: "main" }
         }
         // A retain snapshot: in the row's partition, at a version key.
@@ -14233,7 +14412,8 @@ const makeImpl = <
       // every write carrying it asks (`internal/FormGuard.ts`, #238); its
       // attribute is no input of the rest.
       const mainItem = items[roles.findIndex((role) => role._tag === "main")]
-      const guarded = mainItem?.Update ?? mainItem?.Put ?? mainItem?.Delete
+      const guarded =
+        mainItem?.Update ?? mainItem?.Put ?? mainItem?.Delete ?? mainItem?.ConditionCheck
       const conditionAttrs = [
         ...new Set(
           (guarded?.ConditionExpression?.match(/#[A-Za-z0-9_]+/g) ?? []).flatMap((token) => {
@@ -14302,12 +14482,14 @@ const makeImpl = <
                 return ownRow === undefined
                   ? lostRace(undefined)
                   : { _tag: "Fail", error: historyConflict(role.version, operation) }
-              case "main":
-                main =
-                  reason.Item === undefined
-                    ? "absent"
-                    : (reason.Item as globalThis.Record<string, AttributeValue>)
+              case "main": {
+                // A projection tombstone there is the row removed: absent, as a read reports it.
+                const stored = liveRow(
+                  reason.Item as globalThis.Record<string, AttributeValue> | undefined,
+                )
+                main = stored === undefined ? "absent" : stored
                 break
+              }
               case "side":
                 sideFailed = true
             }
@@ -14365,13 +14547,151 @@ const makeImpl = <
         // `.keepRefs()`'s guard is the caller's: a row holding another ref fails it, unchanged.
         callerCondition: uState.condition !== undefined || prepared.kept !== undefined,
         expectedVersion: uState.expectedVersion,
-        refuse: (row) => fallbackRefusal(prepared.operands.fallbacks, row),
+        // A restated immutable value the row doesn't hold is refused as standalone refuses it
+        // (`ValidationError`), never sent and retried as a lost race.
+        refuse: (row) => {
+          const immutableChange = immutableMismatch(prepared.immutables, row)
+          return immutableChange !== undefined
+            ? new ValidationError({ entityType, operation: "update", cause: immutableChange })
+            : fallbackRefusal(prepared.operands.fallbacks, row)
+        },
       },
     )
 
   // ---------------------------------------------------------------------------
   // delete operation
   // ---------------------------------------------------------------------------
+
+  /**
+   * The parts of the transaction a read-first delete sends (#133), for the item at `primaryKey`:
+   * the main `Delete`'s condition (its guard on the row as read, ANDed with the caller's), the
+   * owned sentinels' releases, and how a cancellation of it reads. `delete` sends them for an
+   * entity with `unique`, retain or soft delete, and `purge` for a unique entity's live row
+   * (#132), so the two can't drift.
+   */
+  const hardDeleteParts = ({
+    encodedKey,
+    primaryKey,
+    userCondition,
+  }: {
+    readonly encodedKey: globalThis.Record<string, unknown>
+    readonly primaryKey: globalThis.Record<string, unknown>
+    readonly userCondition: ReturnType<typeof compileOwnCondition>
+  }) => {
+    const primary = config.indexes.primary
+    /** The guard ANDed with the user's condition, for the main Delete. */
+    const guardedDeleteCondition = (guard: {
+      readonly expression: string
+      readonly names: globalThis.Record<string, string>
+      readonly values: globalThis.Record<string, AttributeValue>
+    }) => {
+      const values = { ...guard.values, ...userCondition?.values }
+      return {
+        ConditionExpression: userCondition
+          ? `${guard.expression} AND (${userCondition.expression})`
+          : guard.expression,
+        ExpressionAttributeNames: { ...guard.names, ...userCondition?.names },
+        ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
+      }
+    }
+    /**
+     * Run a guarded delete transaction: index 0 is the main Delete, the
+     * only conditioned item, so its rejection is read from the stored
+     * item (ALL_OLD) — gone, raced, or the user's condition.
+     */
+    const guardedDelete = <A>(
+      write: Effect.Effect<A, DynamoClientError>,
+      read: globalThis.Record<string, AttributeValue>,
+      inputs: ReadonlyArray<string>,
+      snapshotAt: { readonly index: number; readonly version: number } | undefined,
+      releases: ReadonlyArray<{ readonly index: number; readonly constraintName: string }>,
+    ) => {
+      let rejected: globalThis.Record<string, AttributeValue> | undefined
+      const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
+        rejected = stored as globalThis.Record<string, AttributeValue> | undefined
+        // Deleted since the read: with nothing asserted, read it again —
+        // a delete of a missing item reports what such a delete does.
+        if (stored === undefined && userCondition === undefined) {
+          return new DeletedConcurrently()
+        }
+        return deleteRejection(
+          encodedKey as globalThis.Record<string, unknown>,
+          read,
+          inputs,
+          stored,
+          userCondition !== undefined,
+        )
+      }
+      return withCurrentItem(
+        write.pipe(
+          Effect.mapError((err) => {
+            if (isAwsTransactionCancelled(err.cause)) {
+              const main = err.cause.CancellationReasons?.[0]
+              if (main?.Code === "ConditionalCheckFailed") return reject(main.Item)
+              if (
+                snapshotAt !== undefined &&
+                err.cause.CancellationReasons?.[snapshotAt.index]?.Code === "ConditionalCheckFailed"
+              ) {
+                return historyConflict(snapshotAt.version, "delete")
+              }
+              for (const { index, constraintName } of releases) {
+                if (err.cause.CancellationReasons?.[index]?.Code === "ConditionalCheckFailed") {
+                  return releaseRaced(
+                    encodedKey as globalThis.Record<string, unknown>,
+                    constraintName,
+                  )
+                }
+              }
+            }
+            if (isAwsConditionalCheckFailed(err.cause)) return reject(err.cause.Item)
+            return err
+          }),
+        ),
+        () => rejected,
+      )
+    }
+
+    /**
+     * Append a release for each sentinel the stored item `raw` holds AND
+     * owns (#133) — composed from its domain view, since the stored row is
+     * attribute-keyed and the constraint is not (#127) — returning where
+     * each landed, so a release that lost a race can be reported.
+     */
+    const ownedReleases = (
+      table: string,
+      raw: globalThis.Record<string, unknown>,
+      into: Array<unknown>,
+    ) =>
+      Effect.gen(function* () {
+        const rawDomain = toDomainView(raw)
+        const held: Array<{
+          readonly pk: string
+          readonly sk: string
+          readonly constraintName: string
+        }> = []
+        for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
+          const sentinel = composeUniqueSentinel(
+            schema,
+            entityType,
+            constraintName,
+            constraintDef,
+            rawDomain,
+            readSentinelValue,
+          )
+          if (!sentinel) continue
+          held.push({ ...sentinel.key, constraintName })
+        }
+        const owner = { pk: primaryKey[primary.pk.field], sk: primaryKey[primary.sk.field] }
+        const releases: Array<{ index: number; constraintName: string }> = []
+        for (const sentinel of yield* ownedSentinels(table, held, owner)) {
+          releases.push({ index: into.length, constraintName: sentinel.constraintName })
+          into.push(sentinelRelease(table, sentinel, owner))
+        }
+        return releases
+      })
+    return { guardedDeleteCondition, guardedDelete, ownedReleases }
+  }
 
   const del = (key: unknown) =>
     new EntityDeleteImpl(
@@ -14484,120 +14804,11 @@ const makeImpl = <
             return err
           }
 
-          /** The guard ANDed with the user's condition, for the main Delete. */
-          const guardedDeleteCondition = (guard: {
-            readonly expression: string
-            readonly names: globalThis.Record<string, string>
-            readonly values: globalThis.Record<string, AttributeValue>
-          }) => {
-            const values = { ...guard.values, ...userCondition?.values }
-            return {
-              ConditionExpression: userCondition
-                ? `${guard.expression} AND (${userCondition.expression})`
-                : guard.expression,
-              ExpressionAttributeNames: { ...guard.names, ...userCondition?.names },
-              ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
-              ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
-            }
-          }
-          /**
-           * Run a guarded delete transaction: index 0 is the main Delete, the
-           * only conditioned item, so its rejection is read from the stored
-           * item (ALL_OLD) — gone, raced, or the user's condition.
-           */
-          const guardedDelete = <A>(
-            write: Effect.Effect<A, DynamoClientError>,
-            read: globalThis.Record<string, AttributeValue>,
-            inputs: ReadonlyArray<string>,
-            snapshotAt: { readonly index: number; readonly version: number } | undefined,
-            releases: ReadonlyArray<{ readonly index: number; readonly constraintName: string }>,
-          ) => {
-            let rejected: globalThis.Record<string, AttributeValue> | undefined
-            const reject = (stored: Readonly<globalThis.Record<string, unknown>> | undefined) => {
-              rejected = stored as globalThis.Record<string, AttributeValue> | undefined
-              // Deleted since the read: with nothing asserted, read it again —
-              // a delete of a missing item reports what such a delete does.
-              if (stored === undefined && userCondition === undefined) {
-                return new DeletedConcurrently()
-              }
-              return deleteRejection(
-                encodedKey as globalThis.Record<string, unknown>,
-                read,
-                inputs,
-                stored,
-                userCondition !== undefined,
-              )
-            }
-            return withCurrentItem(
-              write.pipe(
-                Effect.mapError((err) => {
-                  if (isAwsTransactionCancelled(err.cause)) {
-                    const main = err.cause.CancellationReasons?.[0]
-                    if (main?.Code === "ConditionalCheckFailed") return reject(main.Item)
-                    if (
-                      snapshotAt !== undefined &&
-                      err.cause.CancellationReasons?.[snapshotAt.index]?.Code ===
-                        "ConditionalCheckFailed"
-                    ) {
-                      return historyConflict(snapshotAt.version, "delete")
-                    }
-                    for (const { index, constraintName } of releases) {
-                      if (
-                        err.cause.CancellationReasons?.[index]?.Code === "ConditionalCheckFailed"
-                      ) {
-                        return releaseRaced(
-                          encodedKey as globalThis.Record<string, unknown>,
-                          constraintName,
-                        )
-                      }
-                    }
-                  }
-                  if (isAwsConditionalCheckFailed(err.cause)) return reject(err.cause.Item)
-                  return err
-                }),
-              ),
-              () => rejected,
-            )
-          }
-
-          /**
-           * Append a release for each sentinel the stored item `raw` holds AND
-           * owns (#133) — composed from its domain view, since the stored row is
-           * attribute-keyed and the constraint is not (#127) — returning where
-           * each landed, so a release that lost a race can be reported.
-           */
-          const ownedReleases = (
-            table: string,
-            raw: globalThis.Record<string, unknown>,
-            into: Array<unknown>,
-          ) =>
-            Effect.gen(function* () {
-              const rawDomain = toDomainView(raw)
-              const held: Array<{
-                readonly pk: string
-                readonly sk: string
-                readonly constraintName: string
-              }> = []
-              for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                const sentinel = composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  rawDomain,
-                  readSentinelValue,
-                )
-                if (!sentinel) continue
-                held.push({ ...sentinel.key, constraintName })
-              }
-              const owner = { pk: primaryKey[primary.pk.field], sk: primaryKey[primary.sk.field] }
-              const releases: Array<{ index: number; constraintName: string }> = []
-              for (const sentinel of yield* ownedSentinels(table, held, owner)) {
-                releases.push({ index: into.length, constraintName: sentinel.constraintName })
-                into.push(sentinelRelease(table, sentinel, owner))
-              }
-              return releases
-            })
+          const { guardedDeleteCondition, guardedDelete, ownedReleases } = hardDeleteParts({
+            encodedKey: encodedKey as globalThis.Record<string, unknown>,
+            primaryKey,
+            userCondition,
+          })
 
           if (isSoftDeleteEnabled() || hasUniqueConstraints || isRetainEnabled()) {
             const readFirst = Effect.gen(function* () {
@@ -17423,7 +17634,6 @@ const makeImpl = <
           const primary = config.indexes.primary
           const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
           const liveSk = liveSkOf(encodedKey)
-          const allItems: Array<globalThis.Record<string, AttributeValue>> = []
           const history = historyKeyOptions(liveSk)
 
           /**
@@ -17486,110 +17696,241 @@ const makeImpl = <
           offloadedAttributeNames.forEach((attr, i) => {
             projected[`#o${i}`] = attr
           })
-          let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
+          const hasUniqueConstraints =
+            config.unique !== undefined && Object.keys(config.unique).length > 0
+          const owner = { pk: pkValue, sk: liveSk }
+          const liveKey = toAttributeMap({
+            [primary.pk.field]: owner.pk,
+            [primary.sk.field]: owner.sk,
+          })
+          const isLiveRow = (row: globalThis.Record<string, AttributeValue>) =>
+            row[primary.pk.field]?.S === pkValue && row[primary.sk.field]?.S === liveSk
 
-          do {
-            const result = yield* client.query({
-              TableName: tableName,
-              KeyConditionExpression: "#pk = :pk",
-              ExpressionAttributeNames: {
-                "#pk": primary.pk.field,
-                "#sk": primary.sk.field,
-                ...projected,
-              },
-              ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
-              ProjectionExpression: ["#pk", "#sk", ...Object.keys(projected)].join(", "),
-              ExclusiveStartKey: exclusiveStartKey,
-            })
-
-            allItems.push(...(result.Items ?? []).filter(belongsToItem))
-            exclusiveStartKey = result.LastEvaluatedKey as
-              | globalThis.Record<string, AttributeValue>
-              | undefined
-          } while (exclusiveStartKey)
-
-          // The unique sentinels the item holds — live, or soft-deleted with
-          // `preserveUnique` — and owns (#133): a sentinel of a value the item
-          // holds without owning its reservation belongs to another item.
-          if (config.unique && Object.keys(config.unique).length > 0) {
-            const owner = { pk: pkValue, sk: liveSk }
-            const holders: Array<globalThis.Record<string, AttributeValue>> = []
-            const mainResult = yield* client.getItem({
-              TableName: tableName,
-              Key: toAttributeMap({ [primary.pk.field]: owner.pk, [primary.sk.field]: owner.sk }),
-              ConsistentRead: true,
-            })
-            if (mainResult.Item) holders.push(mainResult.Item)
-            // Every soft-deleted incarnation (each kept its reservations).
-            const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
-            let deletedStart: globalThis.Record<string, AttributeValue> | undefined
+          /**
+           * One attempt: read the item's rows, and with `unique`, delete the live row and the
+           * sentinels it owns in one transaction guarded on the row as read — the one `delete`
+           * sends (#132). A batch delete carries no condition, so a concurrent update moving a
+           * unique value after the read would otherwise leave the new value's sentinel reserving
+           * for a row the batch then deletes. A lost race fails the attempt, and the purge starts
+           * again from the query. Returns every row read, and whether the transaction deleted the
+           * live row.
+           *
+           * The live row is read before the partition query: on a versioned entity its guard then
+           * covers every row the query can see, since a write landing after the read moves the
+           * version and refuses the transaction. Read after the query, a write in between was
+           * guarded against while the rows it added (its snapshot) were missed.
+           */
+          const attempt = Effect.gen(function* () {
+            const mainResult = hasUniqueConstraints
+              ? yield* client.getItem({ TableName: tableName, Key: liveKey, ConsistentRead: true })
+              : undefined
+            let liveDeleted = false
+            const allItems: Array<globalThis.Record<string, AttributeValue>> = []
+            let exclusiveStartKey: globalThis.Record<string, AttributeValue> | undefined
             do {
-              const deletedResult = yield* client.query({
+              // Consistent (#132): a purge straight after the item's last write sees every row
+              // that write left — a new live row, a fresh snapshot — and deletes it.
+              const result = yield* client.query({
                 TableName: tableName,
-                KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+                KeyConditionExpression: "#pk = :pk",
                 ExpressionAttributeNames: {
                   "#pk": primary.pk.field,
                   "#sk": primary.sk.field,
+                  ...projected,
                 },
-                ExpressionAttributeValues: {
-                  ":pk": toAttributeValue(pkValue),
-                  ":skPrefix": toAttributeValue(deletedPrefix),
-                },
+                ExpressionAttributeValues: { ":pk": toAttributeValue(pkValue) },
+                ProjectionExpression: ["#pk", "#sk", ...Object.keys(projected)].join(", "),
                 ConsistentRead: true,
-                ExclusiveStartKey: deletedStart,
+                ExclusiveStartKey: exclusiveStartKey,
               })
-              holders.push(...(deletedResult.Items ?? []).filter(belongsToItem))
-              deletedStart = deletedResult.LastEvaluatedKey as
+
+              allItems.push(...(result.Items ?? []).filter(belongsToItem))
+              exclusiveStartKey = result.LastEvaluatedKey as
                 | globalThis.Record<string, AttributeValue>
                 | undefined
-            } while (deletedStart !== undefined)
+            } while (exclusiveStartKey)
 
-            // Sparse — fields that were unset never had a sentinel. The stored
-            // row is attribute-keyed, the constraint is not (#127).
-            const held = new Map<string, { readonly pk: string; readonly sk: string }>()
-            for (const holder of holders) {
-              const holderDomain = toDomainView(fromAttributeMap(holder))
-              for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-                const sentinel = composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  holderDomain,
-                  readSentinelValue,
+            // The unique sentinels the item holds — live, or soft-deleted with
+            // `preserveUnique` — and owns (#133): a sentinel of a value the item
+            // holds without owning its reservation belongs to another item.
+            if (hasUniqueConstraints) {
+              // The live row, with the sentinels it owns, in `delete`'s guarded transaction.
+              if (mainResult?.Item) {
+                const live = mainResult.Item
+                const parts = hardDeleteParts({
+                  encodedKey: encodedKey as globalThis.Record<string, unknown>,
+                  primaryKey: { [primary.pk.field]: owner.pk, [primary.sk.field]: owner.sk },
+                  userCondition: undefined,
+                })
+                const hardGuard = deleteGuard(
+                  live,
+                  [
+                    ...new Set(
+                      Object.values(config.unique!).flatMap((def) =>
+                        resolveUniqueFields(def).map(compositeAttribute),
+                      ),
+                    ),
+                  ],
+                  undefined,
                 )
-                if (!sentinel) continue
-                held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
+                const transactItems: Array<TransactWriteItem> = [
+                  {
+                    Delete: {
+                      TableName: tableName,
+                      Key: liveKey,
+                      ...parts.guardedDeleteCondition(hardGuard),
+                    },
+                  },
+                ]
+                const releases = yield* parts.ownedReleases(
+                  tableName,
+                  fromAttributeMap(live) as globalThis.Record<string, unknown>,
+                  transactItems,
+                )
+                yield* parts
+                  .guardedDelete(
+                    client.transactWriteItems({ TransactItems: transactItems }),
+                    live,
+                    hardGuard.inputs,
+                    undefined,
+                    releases,
+                  )
+                  .pipe(
+                    // A delete of stored keys meets no size limit; wrapped for uniformity (#144).
+                    diagnoseFailure({
+                      sent: () => ({
+                        _tag: "Transaction",
+                        items: transactItems,
+                        targets: () =>
+                          targetsFor(transactItems, entityKeyFields(), entityType, (index) =>
+                            index === 0 ? "the item" : `item ${index} of the purge transaction`,
+                          ),
+                      }),
+                      keys: entityKeys,
+                      rewrite: (diagnosis, original) =>
+                        diagnosedValidationError(diagnosis, original, {
+                          operation: "purge",
+                          entityType,
+                        }),
+                    }),
+                  )
+                liveDeleted = true
+              }
+              // Every soft-deleted incarnation (each kept its reservations).
+              const holders: Array<globalThis.Record<string, AttributeValue>> = []
+              const deletedPrefix = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+              let deletedStart: globalThis.Record<string, AttributeValue> | undefined
+              do {
+                const deletedResult = yield* client.query({
+                  TableName: tableName,
+                  KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :skPrefix)",
+                  ExpressionAttributeNames: {
+                    "#pk": primary.pk.field,
+                    "#sk": primary.sk.field,
+                  },
+                  ExpressionAttributeValues: {
+                    ":pk": toAttributeValue(pkValue),
+                    ":skPrefix": toAttributeValue(deletedPrefix),
+                  },
+                  ConsistentRead: true,
+                  ExclusiveStartKey: deletedStart,
+                })
+                holders.push(...(deletedResult.Items ?? []).filter(belongsToItem))
+                deletedStart = deletedResult.LastEvaluatedKey as
+                  | globalThis.Record<string, AttributeValue>
+                  | undefined
+              } while (deletedStart !== undefined)
+
+              // Sparse — fields that were unset never had a sentinel. The stored
+              // row is attribute-keyed, the constraint is not (#127).
+              const held = new Map<string, { readonly pk: string; readonly sk: string }>()
+              for (const holder of holders) {
+                const holderDomain = toDomainView(fromAttributeMap(holder))
+                for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
+                  const sentinel = composeUniqueSentinel(
+                    schema,
+                    entityType,
+                    constraintName,
+                    constraintDef,
+                    holderDomain,
+                    readSentinelValue,
+                  )
+                  if (!sentinel) continue
+                  held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
+                }
+              }
+              // Released one by one, each only while still this item's: a batch
+              // delete cannot carry the ownership condition. A tombstone's
+              // reservation that the live row shared went with it above.
+              for (const sentinel of yield* ownedSentinels(tableName, [...held.values()], owner)) {
+                const release = sentinelRelease(tableName, sentinel, owner)
+                yield* client.deleteItem(release.Delete).pipe(
+                  Effect.catchIf(
+                    (err) => isAwsConditionalCheckFailed(err.cause),
+                    () => Effect.void,
+                  ),
+                  // A delete of a stored key cannot meet a size limit; wrapped
+                  // for uniformity (#144), so it passes through in practice.
+                  diagnoseItemWrite("purge", release),
+                )
               }
             }
-            // Released one by one, each only while still this item's: a batch
-            // delete cannot carry the ownership condition.
-            for (const sentinel of yield* ownedSentinels(tableName, [...held.values()], owner)) {
-              const release = sentinelRelease(tableName, sentinel, owner)
-              yield* client.deleteItem(release.Delete).pipe(
-                Effect.catchIf(
-                  (err) => isAwsConditionalCheckFailed(err.cause),
-                  () => Effect.void,
+            return { allItems, liveDeleted }
+          })
+
+          // A lost race on the live row is retried from the query, as a read-first delete is;
+          // purge refuses a `.condition()`, so it always is. Once every attempt has lost, it is
+          // what such a delete reports — a row deleted concurrently each time, a change.
+          const { allItems, liveDeleted } = yield* attempt.pipe(
+            Effect.retry({
+              times: GUARDED_PUT_ATTEMPTS - 1,
+              while: (e) =>
+                e instanceof OptimisticLockError ||
+                e instanceof ConcurrentModification ||
+                e instanceof DeletedConcurrently,
+            }),
+            Effect.catchIf(
+              (e): e is DeletedConcurrently | ItemNotFound | ConditionalCheckFailed =>
+                e instanceof DeletedConcurrently ||
+                e instanceof ItemNotFound ||
+                e instanceof ConditionalCheckFailed,
+              () =>
+                Effect.fail(
+                  new ConcurrentModification({
+                    entityType,
+                    key: encodedKey as globalThis.Record<string, unknown>,
+                    attributes: [],
+                    current: Option.none(),
+                  }),
                 ),
-                // A delete of a stored key cannot meet a size limit; wrapped
-                // for uniformity (#144), so it passes through in practice.
-                diagnoseItemWrite("purge", release),
-              )
-            }
-          }
+            ),
+          )
+          // With `unique`, the live row went in the transaction: the batch never deletes it, so a
+          // row created after the attempt's read keeps its sentinels with it.
+          const batchItems = hasUniqueConstraints
+            ? allItems.filter((row) => !isLiveRow(row))
+            : allItems
 
           // Batch delete in chunks of 25. `UnprocessedItems` are retried with
           // `Batch.write`'s backoff; what the purge had deleted is always
           // stated exactly, whether a request is rejected or retries run out. By count alone: 25
           // stored keys (at most 2048 + 1024 bytes each, so at most about 0.5 MB as JSON) can't
           // reach the 16 MB request limit.
+          // The live row the transaction deleted is one of the partition's items, and counted;
+          // the reservations it released are in other partitions, and named.
+          const inTransaction = liveDeleted ? 1 : 0
+          const partitionItems = batchItems.length + inTransaction
           let deleted = 0
           const deletedSoFar = () =>
-            deleted === 0
+            deleted + inTransaction === 0
               ? "the purge had deleted none of the partition's items"
-              : `the purge had already deleted ${deleted} of the partition's ${allItems.length} items`
-          for (let i = 0; i < allItems.length; i += 25) {
-            const chunk = allItems.slice(i, i + 25)
+              : `the purge had already deleted ${deleted + inTransaction} of the partition's ` +
+                `${partitionItems} items` +
+                (liveDeleted
+                  ? ", the live item among them, with the reservations of its unique values"
+                  : "")
+          for (let i = 0; i < batchItems.length; i += 25) {
+            const chunk = batchItems.slice(i, i + 25)
             let requestItems: globalThis.Record<string, Array<WriteRequest>> = {
               [tableName]: chunk.map((item) => ({
                 DeleteRequest: {
@@ -17647,7 +17988,7 @@ const makeImpl = <
                 return yield* new DynamoError({
                   operation: "BatchWriteItem",
                   cause: new Error(
-                    `purge: ${remaining} of the partition's ${allItems.length} items were still ` +
+                    `purge: ${remaining} of the partition's ${partitionItems} items were still ` +
                       `unprocessed after ${MAX_RETRIES} retries; ${deletedSoFar()}. The rest ` +
                       "were not deleted: purge again to finish.",
                   ),

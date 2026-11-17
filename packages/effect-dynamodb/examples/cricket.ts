@@ -10,7 +10,7 @@
  * Part 3: Demonstrates the full Aggregate lifecycle:
  * - Aggregate.create: ref hydration, decomposition, sub-aggregate transactions
  * - Aggregate.get: query, discriminate, assemble from partition items
- * - Aggregate.update: fetch -> mutate -> diff -> write only changed groups
+ * - Aggregate.update: fetch -> mutate -> diff -> write only changed rows
  * - Aggregate.delete: remove all items in the partition
  *
  * Key patterns:

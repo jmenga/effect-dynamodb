@@ -11,10 +11,10 @@
  * - an unversioned entity with a unique constraint, whose update reads the
  *   row first: naming the field uploads afresh; carrying it (the read-merge
  *   wide fallback) is guarded, so the write is refused;
- * - an aggregate edge: an update diffs against its read, and a changed group
+ * - an aggregate edge: an update diffs against its read, and a changed row
  *   re-uploads every offloaded value — freed before its eager decode, the
- *   read fails and nothing is written; freed after it, the update commits
- *   its own upload, and the reaper then frees what it superseded.
+ *   read fails and nothing is written; changed (and freed) after it, the
+ *   row's guard refuses the write (#168) and its upload is deleted.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -309,9 +309,9 @@ describe("Offload interleavings with the reaper", () => {
   )
 
   it.effect(
-    "an aggregate update re-uploads its changed edge group: never the freed version",
+    "an aggregate update whose edge another writer changed after its read is refused: its upload is deleted, never the freed version",
     () => {
-      // B and the reaper run after A's eager decode, as A uploads its changed group.
+      // B and the reaper run after A's eager decode, as A uploads its changed row.
       let beforeUpload: Effect.Effect<void> | undefined
       blobs = BlobStore.memory({
         failures: (call) => {
@@ -326,30 +326,30 @@ describe("Offload interleavings with the reaper", () => {
           const db = yield* client
           const gc = yield* BlobGc.make({ aggregates: { Matches }, reaper: { gracePeriod: 0 } })
           const v1 = yield* seedMatch(db)
-          let afterB = new Map(rows)
           let v2: BlobRef | undefined
           beforeUpload = Effect.map(writerB(db, gc), () => {
-            afterB = new Map(rows)
             v2 = refOf(rowOf("MatchVenue").plan)
           })
-          // A's update is last-writer-wins over the edge: it commits its own
-          // upload of the content it read — never v1, which the reaper freed.
-          const match = yield* writerA(db)
+          // A's row is guarded on the row it read (#168): B changed it in between, so A's
+          // write is refused, naming the attribute, and B's change stays. 1.43.0 committed
+          // A's own upload over B's (last writer wins).
+          const refused = yield* Effect.flip(writerA(db))
           expect(beforeUpload).toBeUndefined()
-          expect(match.venue).toMatchObject({ name: "Stadium", plan: bytes(6, 1) })
+          expect(refused).toBeInstanceOf(ConcurrentModification)
+          expect((refused as ConcurrentModification).attributes).toEqual(["venue.plan"])
           expect(exists(v1)).toBe(false)
           const now = refOf(rowOf("MatchVenue").plan)
-          expect(same(now, v1)).toBe(false)
-          expect(same(now, v2!)).toBe(false)
+          expect(same(now, v2!)).toBe(true)
           expect(exists(now)).toBe(true)
+          expect(rowOf("MatchVenue").name?.S).toBe("Arena")
+          // A's upload of the cancelled write is deleted: the only version left is B's.
+          expect(blobs.inspect().versions.map((v) => v.ref)).toEqual([now])
+          // A retry reads B's change and commits its own rename over it.
+          const match = yield* writerA(db)
+          expect(match.venue).toMatchObject({ name: "Stadium", plan: bytes(6, 2) })
           expect((yield* db.aggregates.Matches.get({ matchId: "m-1" })).venue.plan).toEqual(
-            bytes(6, 1),
+            bytes(6, 2),
           )
-          // A's stream record frees what A superseded: B's v2.
-          const report = yield* gc.reap(yield* recordsSince(afterB))
-          expect(report.freed).toBe(1)
-          expect(exists(v2!)).toBe(false)
-          expect(exists(now)).toBe(true)
         }),
       )
     },

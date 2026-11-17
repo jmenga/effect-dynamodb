@@ -20,6 +20,7 @@ import { Cause, Clock, Config, Effect, Exit, Layer, Option, Schema } from "effec
 import { describe, expect, it } from "vitest"
 import * as Zlib from "../src/compression/zlib.js"
 import * as Lib from "../src/index.js"
+import { runAsBefore168 } from "./helpers/Before168.js"
 import { type Api, capture, type Outcome } from "./helpers/InheritedNames.js"
 import {
   kindOf,
@@ -83,8 +84,9 @@ describeConnected("a __proto__ field left out, or storing nothing (#239)", () =>
       const recorded = fixture.cases[position.key]!
       expect(outcome.refused).toBeUndefined()
       expect(Object.keys(outcome.steps)).toEqual(Object.keys(recorded.steps))
-      const sent = requestsByStep(outcome)
-      const recordedSent = requestsByStep(recorded)
+      // Requests compared but for what #168 changed of an aggregate's writes (`runAsBefore168`).
+      const sent = requestsByStep(runAsBefore168(outcome))
+      const recordedSent = requestsByStep(runAsBefore168(recorded))
       const refusedItems: Array<string> = []
       let write: string | undefined
       for (const label of Object.keys(recorded.steps)) {

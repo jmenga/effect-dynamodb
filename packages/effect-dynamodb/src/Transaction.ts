@@ -486,7 +486,8 @@ const transactWriteCore = (
               cause: withCause(
                 `TransactWriteItems supports a maximum of ${diagnosis.limit} items; ` +
                   `${operations.length} operation(s) expanded to ${diagnosis.count} items ` +
-                  "(uniqueness sentinels and version snapshots each occupy one)",
+                  "(uniqueness sentinels, version snapshots and the existence checks of updates " +
+                  "that set nothing each occupy one)",
                 original,
               ),
             })

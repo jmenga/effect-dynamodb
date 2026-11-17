@@ -21,12 +21,15 @@ import type * as DynamoSchemaModule from "./DynamoSchema.js"
 import type { DiscriminatorConfig } from "./internal/AggregateCursor.js"
 import type { AggregateEdge } from "./internal/AggregateEdges.js"
 import {
+  type AggregateVersioned,
+  aggregateVersionField,
   deriveAggregateSchemas,
   getSchemaFields,
   manyEdgePaths,
   refuseAggregateKeyOverMovingValue,
   refuseAggregateKeysOverBothKinds,
   refuseAggregateProtoName,
+  refuseAggregateVersioning,
   refuseManySortKeysOverMovingValue,
   unwrapModel,
 } from "./internal/AggregateSchemas.js"
@@ -35,6 +38,7 @@ import type {
   AggregateEdgesGuard,
   AggregateInputType,
   AggregateStampNames,
+  AggregateVersionName,
   BoundSubAggregate,
   SchemaFieldsOf,
   SubAggregate,
@@ -152,6 +156,16 @@ interface AggregateConfig<
    * it.
    */
   readonly ownsRows?: boolean
+  /**
+   * A version and an incarnation token on the root row (#168). Accepted here for parity with the
+   * operational `Aggregate.make`, whose `update` checks it; judged here as there (`EDD-9177`).
+   */
+  readonly versioned?: AggregateVersioned
+  /**
+   * Every update checks the root (#168). Accepted here for parity with the operational
+   * `Aggregate.make`; judged here as there (`EDD-9179`).
+   */
+  readonly fence?: boolean
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }
@@ -231,11 +245,13 @@ export function make<
   const TEdges extends AggregateEdgesConfig<TSchema>,
   const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
   const TTimestamps extends TimestampsConfig | undefined = undefined,
+  const TVersioned extends AggregateVersioned | undefined = undefined,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK> & {
     readonly edges: AggregateEdgesGuard<TSchema, TEdges>
     readonly timestamps?: TTimestamps
+    readonly versioned?: TVersioned
   },
 ): AggregateDefinition<
   TSchema,
@@ -244,7 +260,8 @@ export function make<
     TEdges,
     TPK,
     AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
-    SchemaFieldsOf<TSchema>
+    SchemaFieldsOf<TSchema>,
+    AggregateVersionName<TVersioned>
   >
 >
 export function make<
@@ -321,6 +338,7 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
     getSchemaFields(schema),
     config.pk.composite,
   )
+  refuseAggregateVersioning(config.root.entityType, config, getSchemaFields(schema), schema)
   refuseManySortKeysOverMovingValue(
     config.root.entityType,
     config.timestamps,
@@ -333,11 +351,13 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
     config,
     config.edges,
   )
+  const versionField = aggregateVersionField(config.versioned)
   const derivedSchemas = deriveAggregateSchemas(
     schema,
     config.edges,
     config.pk.composite,
     config.timestamps,
+    versionField === undefined ? [] : [versionField],
   )
 
   return {

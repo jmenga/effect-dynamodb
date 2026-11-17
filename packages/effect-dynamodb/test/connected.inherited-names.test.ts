@@ -43,6 +43,7 @@ import { Cause, Clock, Config, Effect, Exit, Layer, Option, Schema } from "effec
 import { describe, expect, it } from "vitest"
 import * as Zlib from "../src/compression/zlib.js"
 import * as Lib from "../src/index.js"
+import { expectRequestsSince168 } from "./helpers/Before168.js"
 import {
   type Api,
   CONTROL,
@@ -179,7 +180,9 @@ describeConnected("names every object inherits (#239)", () => {
           expect(recordedControl).toBeDefined()
           if (asOrdinary(recorded!, recordedControl!)) {
             expect(recorded!.requests).toBeDefined()
-            expect(outcome.requests).toEqual(recorded!.requests)
+            // But for #132's reads held to their writes and what #168 changed of an
+            // aggregate's writes (`expectRequestsSince168`).
+            expectRequestsSince168(outcome, recorded!)
             expect(outcome.rows).toEqual(recorded!.rows)
             expect(outcome.steps).toEqual(recorded!.steps)
           }

@@ -484,14 +484,16 @@ for (const kind of ["plain", "ref"] as const) {
             expect((updated as any).name).toBe("Renamed")
             expect(isRealUtc((updated as any).matchDays[0], DOB_MS)).toBe(true)
 
-            // The root group changed (name); the legacy root row is rewritten in
-            // wire form along with it. Its umpire edge items sit in the same
-            // (root) group, so they are rewritten too.
+            // The root changed (name); the legacy root row is rewritten in wire form. Its
+            // umpire edge items sit in the same (root) group but didn't change, so they are not
+            // sent and keep their legacy form (#168, D2; 1.43.0 rewrote the whole group), which
+            // reads back as before.
             const after = itemOf("m1", "MatchItem")
             expect(after.matchDays).toEqual({ L: [S(DOB), S(DAY2)] })
             for (const umpire of itemsOf("m1", "MatchUmpire")) {
-              expect(umpire.umpire?.M?.dateOfBirth).toEqual(S(DOB))
+              expect(umpire.umpire?.M?.dateOfBirth).toEqual(form(DOB_MS))
             }
+            expect(isRealUtc((updated as any).umpires[0].umpire.dateOfBirth, DOB_MS)).toBe(true)
             // The two sub-aggregate groups did not change, so they were not written.
             expect(transactCalls).toHaveLength(1)
             expect(keysOf("m1")).toHaveLength(9)
@@ -520,8 +522,9 @@ for (const kind of ["plain", "ref"] as const) {
           team2: { ...c.state.team2, homeTeam: true },
         }))
         expect(transactCalls).toHaveLength(1)
+        // The team's row alone: its coach and players didn't change (#168, D2).
         const written = transactCalls[0]!.map((op) => op.Put?.Item?.__edd_e__?.S).sort()
-        expect(written).toEqual(["MatchCoach", "MatchPlayer", "MatchTeam"])
+        expect(written).toEqual(["MatchTeam"])
         const player = itemOf("m1", "MatchPlayer", (item) => item.teamNumber?.N === "2")
         expect(player.player?.M?.dateOfBirth).toEqual(S(DOB))
       }).pipe(Effect.provide(TestLayer)),
@@ -1412,8 +1415,9 @@ describe("#133 nested sub-aggregates", () => {
         club2: { ...c.state.club2, squad: { ...c.state.club2.squad, name: "B2" } },
       }))
       expect(transactCalls).toHaveLength(1)
+      // The squad's row alone: its players didn't change (#168, D2).
       const written = transactCalls[0]!.map((op) => op.Put?.Item?.__edd_e__?.S).sort()
-      expect(written).toEqual(["LeagueSquad", "LeagueSquadPlayer"])
+      expect(written).toEqual(["LeagueSquad"])
       const got = (yield* LeagueAggregate.get({ id: "l1" } as any)) as League
       expect(got.club2.squad.name).toBe("B2")
       expect(got.club1.squad.name).toBe("A")

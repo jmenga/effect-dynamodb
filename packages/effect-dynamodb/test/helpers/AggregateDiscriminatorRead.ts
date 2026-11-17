@@ -31,6 +31,7 @@ import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
 import { renamedAttribute, storedAsNow } from "./AggregateWholeElements.js"
+import { asBefore168 } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
 type Request = { readonly command: string; readonly input: unknown }
@@ -463,11 +464,13 @@ export const suite = (
                     ? { row: (row: Row) => row, requests: (sent: unknown) => sent }
                     : storedAsNow("Sheet", shape.nowStored)
                 expect(judged(actual.create)).toEqual(judged(then.create))
-                expect(actual.requests).toEqual(now.requests(then.requests))
+                expect(asBefore168(actual.requests)).toEqual(
+                  asBefore168(now.requests(then.requests) as ReadonlyArray<Request>),
+                )
                 expect(actual.rows).toEqual(sorted(then.rows.map(now.row)))
                 // A no-op update sends its read and nothing else.
                 expect(actual.updateRequests.map((request) => request.command)).toEqual(["Query"])
-                expect(actual.updateRequests).toEqual(then.updateRequests)
+                expect(asBefore168(actual.updateRequests)).toEqual(asBefore168(then.updateRequests))
                 expect(actual.updateRows).toEqual(sorted(then.updateRows.map(now.row)))
                 for (const step of ["get", "update", "getAfterUpdate"] as const) {
                   expect({ step, ...judged(then[step]) }).toEqual({ step, ok: shape.published })

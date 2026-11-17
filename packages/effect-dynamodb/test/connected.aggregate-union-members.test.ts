@@ -16,6 +16,7 @@ import { it } from "@effect/vitest"
 import { Config, Effect, Layer } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
+import { asBefore168 } from "./helpers/Before168.js"
 import {
   compareCreateResult,
   createResultFieldShapes,
@@ -134,9 +135,17 @@ describeConnected(
             for (const step of ["create", "get", "update", "getAfterUpdate"] as const) {
               expect({ step, ...judged(actual[step]) }).toEqual({ step, ...judged(expected[step]) })
             }
-            expect(actual.requests).toEqual(expected.requests)
+            // Compared as #168 changed them (`asBefore168`): consistent update reads, guarded rows,
+            // one transaction, only the rows that changed.
+            expect(asBefore168(actual.requests as never)).toEqual(
+              asBefore168(expected.requests as never),
+            )
             expect(actual.rows).toEqual(expected.rows)
-            expect(actual.updateRequests).toEqual(expected.updateRequests)
+            expect(
+              asBefore168(actual.updateRequests as never, { stored: actual.rows as never }),
+            ).toEqual(
+              asBefore168(expected.updateRequests as never, { stored: expected.rows as never }),
+            )
             expect(actual.updateRows).toEqual(expected.updateRows)
           }),
         )

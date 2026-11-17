@@ -176,6 +176,37 @@ export const storedFieldNames = (schema: Schema.Top): ReadonlySet<string> => {
   return names
 }
 
+/**
+ * The types the objects of `schema` declare a property `name` with, on their type side: through
+ * classes, unions and suspensions (#168). A root that exposes no `.fields` (a union of members, a
+ * suspended schema) declares its `versioned` field this way, in some members or all.
+ */
+export const declaredPropertyTypes = (
+  schema: Schema.Top,
+  name: string,
+): ReadonlyArray<SchemaAST.AST> => {
+  const types: Array<SchemaAST.AST> = []
+  const seen = new Set<SchemaAST.AST>()
+  const visit = (ast: SchemaAST.AST): void => {
+    if (seen.has(ast)) return
+    seen.add(ast)
+    if (SchemaAST.isObjects(ast)) {
+      for (const property of ast.propertySignatures) {
+        if (property.name === name) types.push(property.type)
+      }
+    } else if (SchemaAST.isUnion(ast)) {
+      for (const member of ast.types) visit(member)
+    } else if (SchemaAST.isSuspend(ast)) {
+      visit(ast.thunk())
+    } else if (SchemaAST.isDeclaration(ast)) {
+      for (const parameter of ast.typeParameters) visit(parameter)
+      visit(SchemaAST.toEncoded(ast))
+    }
+  }
+  visit(schema.ast)
+  return types
+}
+
 /** The kinds of row an aggregate writes, by how a read hands back the value one holds. */
 export type RowKind = "root" | "subAggregate" | "edge"
 
@@ -505,6 +536,8 @@ export const deriveAggregateSchemas = <
   edges: TEdges,
   pkComposites: TPK,
   timestamps?: TTimestamps,
+  /** Root fields the library manages, optional on input: a `versioned` root's version (#168). */
+  managed: ReadonlyArray<string> = [],
 ): DerivedAggregateSchemas<
   AggregateInputType<
     Schema.Schema.Type<TSchema>,
@@ -515,10 +548,16 @@ export const deriveAggregateSchemas = <
   >
 > => {
   const own = resolveAggregateStamps(timestamps, getSchemaFields(schema), "Aggregate")
-  return deriveWithStamps(schema, edges, pkComposites, {
-    config: timestamps,
-    names: new Set([own.createdAt, own.updatedAt].filter((name) => name !== null)),
-  }) as never
+  return deriveWithStamps(
+    schema,
+    edges,
+    pkComposites,
+    {
+      config: timestamps,
+      names: new Set([own.createdAt, own.updatedAt].filter((name) => name !== null)),
+    },
+    new Set(managed),
+  ) as never
 }
 
 const deriveWithStamps = (
@@ -526,6 +565,7 @@ const deriveWithStamps = (
   edges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
   pkComposites: ReadonlyArray<string>,
   stamps: AggregateStamps,
+  topManaged: ReadonlySet<string> = new Set(),
 ): DerivedAggregateSchemas<unknown> => {
   type Result = DerivedAggregateSchemas<unknown>
   const fields = getSchemaFields(schema)
@@ -581,7 +621,11 @@ const deriveWithStamps = (
     }
 
     // Regular field → keep as-is (toCodecJson applied at the end handles Date)
-    setOwn(newFields, name, managed.has(name) ? stampInput(fieldSchema) : fieldSchema)
+    setOwn(
+      newFields,
+      name,
+      managed.has(name) || topManaged.has(name) ? stampInput(fieldSchema) : fieldSchema,
+    )
   }
 
   const inputSchema = Schema.toCodecJson(Schema.Struct(newFields as any))
@@ -1139,3 +1183,150 @@ export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undef
  */
 export const getSchemaFields = (schema: Schema.Top): Record<string, Schema.Top> | undefined =>
   getSchemaFieldsImpl(schema)
+
+// ---------------------------------------------------------------------------
+// versioned / fence (#168)
+// ---------------------------------------------------------------------------
+
+/** An aggregate's `versioned` option: a version (and incarnation token) on the root row. */
+export type AggregateVersioned = boolean | { readonly field?: string }
+
+/** The attribute a versioned aggregate keeps its root's version in, when none is named. */
+export const DEFAULT_AGGREGATE_VERSION_FIELD = "version"
+
+/**
+ * The root version attribute `versioned` names, or `undefined` when the aggregate isn't versioned.
+ */
+export const aggregateVersionField = (versioned: unknown): string | undefined => {
+  if (versioned === true) return DEFAULT_AGGREGATE_VERSION_FIELD
+  if (versioned === null || typeof versioned !== "object") return undefined
+  const field = (versioned as { readonly field?: unknown }).field
+  return typeof field === "string" ? field : DEFAULT_AGGREGATE_VERSION_FIELD
+}
+
+/**
+ * `[EDD-9177]` / `[EDD-9179]` (#168, `docs/designs/aggregate-concurrency.md` §0, §3.5): an
+ * aggregate's `versioned` and `fence` options, judged at load. `versioned` keeps a number on the
+ * root row, so its attribute can't be one the library or the aggregate's keys already write, nor a
+ * root model field holding anything but a stored number; an aggregate keeps no snapshots, so
+ * `retain` and `ttl` mean nothing. `versioned` always fences (the version `Update` on the root is
+ * the fence), so `fence: false` beside it is refused, as is a `fence` that isn't a boolean.
+ */
+export const refuseAggregateVersioning = (
+  aggregate: string,
+  config: {
+    readonly versioned?: unknown
+    readonly fence?: unknown
+    readonly timestamps?: TimestampsConfig | undefined
+    readonly context?: ReadonlyArray<string> | undefined
+    readonly pk: { readonly field: string; readonly composite: ReadonlyArray<string> }
+    readonly collection: {
+      readonly sk?:
+        | { readonly field: string; readonly composite: ReadonlyArray<string> }
+        | undefined
+    }
+    readonly list?:
+      | {
+          readonly pk: { readonly field: string; readonly composite: ReadonlyArray<string> }
+          readonly sk: { readonly field: string; readonly composite: ReadonlyArray<string> }
+        }
+      | undefined
+  },
+  rootFields: Record<string, Schema.Top> | undefined,
+  rootSchema?: Schema.Top,
+): void => {
+  const owner = `Aggregate "${aggregate}"`
+  if (config.fence !== undefined && typeof config.fence !== "boolean") {
+    throw new Error(
+      `[EDD-9179] ${owner}: \`fence\` takes \`true\` or \`false\`, not ${JSON.stringify(
+        config.fence,
+      )}.`,
+    )
+  }
+  const versioned = config.versioned
+  if (versioned === undefined || versioned === false) return
+  if (versioned !== true && (versioned === null || typeof versioned !== "object")) {
+    throw new Error(
+      `[EDD-9177] ${owner}: \`versioned\` takes \`true\` or \`{ field }\`, not ${JSON.stringify(
+        versioned,
+      )}.`,
+    )
+  }
+  if (config.fence === false) {
+    throw new Error(
+      `[EDD-9179] ${owner}: \`versioned\` with \`fence: false\`. A versioned aggregate's every ` +
+        "update moves the version on its root in the same transaction, which is the fence, so it " +
+        "is always fenced. Drop `fence`, or drop `versioned`.",
+    )
+  }
+  if (typeof versioned === "object") {
+    for (const option of ["retain", "ttl"] as const) {
+      if (Object.hasOwn(versioned, option)) {
+        throw new Error(
+          `[EDD-9177] ${owner}: \`versioned.${option}\`. An aggregate keeps no snapshots of its ` +
+            "versions: `versioned` keeps a version on its root row only. Remove it.",
+        )
+      }
+    }
+    const field = (versioned as { readonly field?: unknown }).field
+    if (field !== undefined && (typeof field !== "string" || field === "")) {
+      throw new Error(
+        `[EDD-9177] ${owner}: \`versioned.field\` names the root attribute the version is kept ` +
+          `in, a non-empty string, not ${JSON.stringify(field)}.`,
+      )
+    }
+  }
+  const field = aggregateVersionField(versioned)!
+  const refuse = (what: string): never => {
+    throw new Error(
+      `[EDD-9177] ${owner}: \`versioned\` keeps the root's version in "${field}", which is ${what}. ` +
+        "Name another attribute with `versioned: { field }`.",
+    )
+  }
+  const keyAttributes = [
+    config.pk.field,
+    "sk",
+    "__edd_e__",
+    "__edd_i__",
+    ...(config.collection.sk === undefined ? [] : [config.collection.sk.field]),
+    ...(config.list === undefined ? [] : [config.list.pk.field, config.list.sk.field]),
+  ]
+  if (keyAttributes.includes(field)) refuse("a key attribute the aggregate writes")
+  const composites = [
+    ...config.pk.composite,
+    ...(config.collection.sk?.composite ?? []),
+    ...(config.list === undefined
+      ? []
+      : [...config.list.pk.composite, ...config.list.sk.composite]),
+  ]
+  if (composites.includes(field)) refuse("a key composite (its value is composed into a key)")
+  if ((config.context ?? []).includes(field)) refuse("a context field (copied onto every row)")
+  const stamps = resolveAggregateStamps(config.timestamps, rootFields, owner)
+  if (field === stamps.createdAt || field === stamps.updatedAt) refuse("a timestamp field")
+  const declared = own(rootFields, field)
+  if (declared !== undefined) {
+    const inner = optionalField(declared)?.inner ?? declared
+    if (inner.ast._tag !== "Number" || SchemaAST.toEncoded(inner.ast)._tag !== "Number") {
+      refuse("a root model field whose stored value isn't a number")
+    }
+  } else if (rootFields === undefined && rootSchema !== undefined) {
+    // A root of members (a union, a suspended schema): each member declaring it declares a number.
+    const types = declaredPropertyTypes(rootSchema, field)
+    if (types.length === 0 && storedFieldNames(rootSchema).has(field)) {
+      // A field renamed onto it (`Schema.encodeKeys`): the row would hold two values under one name.
+      refuse("the attribute a root model field is stored under")
+    }
+    for (const type of types) {
+      const defined = SchemaAST.isUnion(type)
+        ? type.types.filter((member) => !SchemaAST.isUndefined(member))
+        : [type]
+      if (
+        defined.length !== 1 ||
+        defined[0]!._tag !== "Number" ||
+        SchemaAST.toEncoded(defined[0]!)._tag !== "Number"
+      ) {
+        refuse("a root model field whose stored value isn't a number")
+      }
+    }
+  }
+}

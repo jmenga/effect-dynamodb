@@ -118,7 +118,7 @@ db.Matches.get({ matchId: "m-1" })
 | DynamoClient.make(table) as typed gateway | `Table.make({ entities, aggregates })` declares members; `DynamoClient.make(table)` binds them all and returns typed access. Matches `HttpApiClient.make(api)` pattern from Effect v4 |
 | Entities are pure definitions | `Entity.make()` has no `table` parameter — entities carry only model, indexes, and config. Table association happens at `Table.make()` time |
 | Table declares its members | `Table.make({ schema, entities: { Users, Tasks }, aggregates: { Matches } })` — the named record provides property names on the typed client |
-| Aggregates own their read and write path | Read: one partition query + assembly. Write: decompose the domain object, compose the rows, and issue one `transactWriteItems` per sub-aggregate group (`delete` uses `batchWriteItem`). They reuse Entity definitions for keys and schemas but do not route writes through Entity ops |
+| Aggregates own their read and write path | Read: one partition query + assembly. Write: decompose the domain object, compose the rows, and send them, guarded, in one `transactWriteItems` when they fit, whole sub-aggregate groups packed into several past it (#168; `delete` uses `batchWriteItem`, after a `deleteItem` of the root with `fence`). They reuse Entity definitions for keys and schemas but do not route writes through Entity ops |
 | ElectroDB-style composite indexes | `{ pk: { field, composite }, sk: { field, composite } }` — attribute lists not templates |
 | DynamoSchema for key namespacing | `$schema#v1#entity#attrs` format with `$` sentinel prefix for ORM/non-ORM coexistence |
 | `__edd_e__` entity type attribute | Ugly name convention (like ElectroDB's `__edb_e__`) avoids collisions with user model fields |
@@ -128,7 +128,7 @@ db.Matches.get({ matchId: "m-1" })
 ### Module Dependencies
 
 ```
-Aggregate → Entity, Batch (ref hydration), Table, KeyComposer, Marshaller, Errors, DynamoClient via Capacity.client (partition query, transactWriteItems per group, batchWriteItem for delete)
+Aggregate → Entity, Batch (ref hydration), Table, KeyComposer, Marshaller, Errors, DynamoClient via Capacity.client (partition query, guarded transactWriteItems packed by AggregateWrite, deleteItem + batchWriteItem for delete)
 Entity → DynamoClient, DynamoSchema, Table, KeyComposer, Marshaller, Expression, Errors
 Collection → DynamoClient, Entity, Table, Marshaller, Errors
 Transaction → DynamoClient, Entity, KeyComposer, Marshaller, Expression, Errors
@@ -4808,15 +4808,18 @@ an update or a delete with a `.condition()` (an unconditioned delete is retried
 too). (`releaseRaced` marks those errors, `releaseRaces`, so
 `guardedUpsert` can tell them from a change of the item itself, which fails an
 upsert as it fails an update.) Each sentinel a write would release costs one consistent
-`GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` releases them
-one by one with a conditional `DeleteItem`, since a batch delete cannot carry
-the condition, collects them from the live item and every tombstone, and skips
-a release whose reservation changed hands in between. It then batch-deletes the
-item's rows in `BatchWriteItem` chunks of 25 (by count alone: 25 stored keys can't
+`GetItem` (projecting only `_entity_pk` / `_entity_sk`). `purge` collects them
+from the live item and every tombstone. Those the live item owns go in one
+transaction with the live row's `Delete`, guarded on the row as read, exactly as
+`delete` sends them (#132, see "Reads Held to Their Writes"). Those a tombstone
+keeps (`preserveUnique`) are released one by one with a conditional
+`DeleteItem`, since a batch delete cannot carry the condition, skipping a
+release whose reservation changed hands in between. It then batch-deletes the
+item's other rows in `BatchWriteItem` chunks of 25 (by count alone: 25 stored keys can't
 reach the 16 MB request limit), resending `UnprocessedItems` with
 `Batch.write`'s backoff (5 retries); when they run out it fails with a
-`DynamoError` stating how many rows remain and exactly how many it had deleted
-(#144). A sentinel an update
+`DynamoError` stating how many rows remain and exactly how many it had deleted,
+the live row its transaction deleted included (#144, #132). A sentinel an update
 writes for a changed value carries its constraint's `ttl`, as a put's does.
 A reservation no row holds any more (a release that never happened, as a delete
 of a `Schema.BigInt` unique value on 1.39 and earlier left it, or a write outside
@@ -5008,6 +5011,111 @@ db.Users.update(key, changes, { expectedVersion: 5 })
 // Fails with OptimisticLockError if version doesn't match
 ```
 
+#### Reads Held to Their Writes (#132)
+
+Full design: [`docs/designs/standalone-read-guards.md`](docs/designs/standalone-read-guards.md).
+An op that reads a row and then writes from what it read holds the read to the write: the
+write carries a condition on the row as read, and a refusal is a lost race, answered by a
+fresh read (bounded by `GUARDED_PUT_ATTEMPTS`, the budget of every guarded write) or by
+the op's own error. Read-first deletes, soft deletes, unique and retain updates, guarded
+puts, `upsert` and `restore` have held their reads since earlier releases. #132 closes the
+three paths that did not; the aggregate paths are #168's.
+
+- **An update that sets nothing.** It writes nothing, so what its write would have
+  established is established otherwise. Only an entity with no timestamps, no version and
+  no index half recomposed on every write reaches it: those always `SET` something.
+  - With no `.condition()` or `.keepRefs()`, it reads the row with one consistent `GetItem`
+    in every return mode. The item modes decode it, `none` returns nothing and `updated*`
+    an empty object; a missing row is `ItemNotFound` (`ConditionalCheckFailed` for
+    `patch`, as `patch`'s contract says). Cost: one consistent read (1 RCU per 4 KB),
+    where `none` / `updated*` sent nothing before and the item modes read eventually
+    (half the cost). An eventually consistent read could miss the row the caller just
+    wrote. A row the update already read (a packed or offloaded immutable's check) is
+    that read: no second one. A restated immutable value is compared with the row read,
+    as the refusal of the same update with a payload compares it: a different value is
+    `ValidationError` (1.43.0 returned the row). Nothing is sent for it: the value is in
+    hand, and a request would cost a write (1 WCU per KB) where the read costs 1 RCU
+    per 4 KB.
+  - With one, the update's own `UpdateItem` is sent with no `UpdateExpression`, which
+    DynamoDB accepts and which changes nothing. Its condition is ANDed with
+    `attribute_exists(#exists)` whatever it asserts, because an `UpdateItem` with no
+    `UpdateExpression` creates a key-only item at a missing key. The item modes ask for
+    `ALL_NEW`, so the item comes back in the response. Cost: one write (1 WCU per KB of
+    the row) that stores nothing. A no-op never takes the create fallback and never
+    cascades.
+  - In `transactWrite`, `planWrite` records that conditioned request as a `ConditionCheck`,
+    and an op whose plan read the row but wrote nothing gains an existence
+    `ConditionCheck` (the existence term below, `ALL_OLD`) on its key. Each is judged by the
+    plan's verdict like any planned item: a row gone at the commit is a lost race, planned
+    again, and then `ItemNotFound`; a caller's condition failing on an unchanged row is
+    `TransactionCancelled`. Each check is a billed item of the caller's transaction (2 WCU
+    per KB of the row): it counts toward the 100 items and can repeat a key, both diagnosed
+    after DynamoDB refuses them (#144), never pre-checked.
+  - A restated immutable value a transaction's update doesn't match is refused on the
+    plan's read of the row, with the `ValidationError` standalone reports, whether or not
+    the update sets anything else. It was sent, refused on the unchanged row, taken for a
+    lost race and retried until `ConcurrentModification`.
+- **A projection tombstone is a missing row to every update (#154).** A projection with
+  `removal` leaves a tombstone (`__edd_e__ = <entity>#tombstone`) at the removed row's
+  key, which every read by key reports as absent. An update's existence term
+  (`rowExists`), in its own request, a no-op's request and the plan's `ConditionCheck`,
+  is `attribute_exists(#pk) AND #eddLive <> :eddTomb` on such a read model, and
+  `attribute_exists(#pk)` on every other entity, which sends what it did. `<>` holds on a
+  row with no `__edd_e__`, so rows written outside the library are judged as before. A
+  returned or read row that is a tombstone (`liveRow`) is a missing row on every path: the
+  refusal mapping, the read-first updates, the plan's read and its verdict, where a
+  tombstone in place of the row read is a lost race, planned again, then `ItemNotFound`.
+  So an update of a removed row is `ItemNotFound` (`ConditionalCheckFailed` for `patch`)
+  and writes nothing; one whose payload is a whole row creates it over the tombstone,
+  through `create`'s own path (`overTombstone`, which carries the checkpoints). Up to
+  1.43.0, an update with a payload wrote its attributes onto the tombstone and reported
+  success (or a decode failure of the tombstone it returned), and siblings in a
+  transaction committed. The term costs nothing when it holds.
+- **`purge`.** Its queries are consistent (twice the read cost of an eventual query: 1 RCU
+  per 4 KB of the item's rows), so a purge straight after a write deletes that write's
+  rows. For a `unique` entity each attempt reads the live row consistently, before the
+  partition query, and deletes it with the sentinels it owns in one transaction guarded on
+  the row as read, sharing
+  `delete`'s parts (`hardDeleteParts`); a concurrent change of a unique value refuses the
+  transaction instead of orphaning the new value's sentinel. A lost race restarts from the
+  partition query; once every attempt has lost, `purge` fails as `delete` does
+  (`OptimisticLockError` when versioned, `ConcurrentModification` otherwise) with nothing
+  deleted. The transaction is billed at the transactional rate (2 WCU per KB) for the live
+  row and its sentinels; every other row is batch-deleted as before. Reading the live row
+  first costs nothing more (the same two reads, in the other order) and makes a versioned
+  entity's guard cover every row the query can see: a write landing after the read moves
+  the version and refuses the transaction, so the rows it added (a snapshot) are seen by
+  the next attempt's query. Read after the query, such a write was guarded against while
+  its snapshot was left behind. When the batch fails after the transaction committed, the
+  error counts the live row among the partition's items it had deleted, and says its
+  reservations went with it.
+- **Cascade updates.** Each target's update is conditioned on the target's cascade-index
+  partition-key attribute still holding what the query found (`#held = :held`): the
+  source's id as the target indexes it. A target deleted after the query (which an
+  unconditioned `UpdateItem` would re-create as an item with no entity type) or re-pointed
+  to another source is refused. Eventual mode skips it, counting it neither succeeded nor
+  failed; transactional mode drops the refused items and resends the rest, for at most
+  `GUARDED_PUT_ATTEMPTS` sends, then `CascadePartialFailure`. A condition that holds costs
+  nothing; a transactional round with a refusal costs one more `TransactWriteItems`. The
+  guard names the index key attribute, never the ref's id inside the ref value (which may
+  be renamed or packed).
+
+Named limits: a no-op update never creates a row (only a keyless singleton entity whose
+fields are all optional could otherwise count as complete); a writer still writing while
+`purge` runs can leave rows behind (a sweep can't tell them from a re-created item's), and
+a `restore` racing `purge` is not ordered; a cascade target whose shard moved between the
+query and its update (a concurrent change of a `by` attribute) is skipped and keeps its
+copy until a later write hydrates it; a cascade's `filter` runs in its query only, so a
+target that stopped matching it after the query is still updated (holding it would mean
+ANDing the filter into each update's condition, which only equality terms translate to);
+a transaction's delete of a retained (`retain`, no `unique` or soft delete) row its plan
+read missing writes nothing and holds nothing, as the standalone delete of a missing
+retained row writes nothing, so a row created between the plan's read and the commit
+survives (holding it would add an `attribute_not_exists`
+`ConditionCheck`, a billed item, to every such delete); on a non-versioned `unique`
+entity, `purge`'s guard holds the unique values only, so a write in its window that
+changes nothing unique can leave the rows it added (the writer-during-purge limit).
+
 #### Write Limits and Request Rules — Diagnosed, Not Pre-checked (#144)
 
 Full design: [`docs/designs/eventstore-event-metadata.md`](docs/designs/eventstore-event-metadata.md) §6 and §6A.
@@ -5080,7 +5188,7 @@ conditional failure, which would read as a lost race. On failure only, it:
 | `Entity` transactional cascade | `CascadePartialFailure` (`succeeded: 0`) | `CascadePartialFailure` |
 | `Transaction.transactWrite` / `transactGet` | `DynamoError` (same message as before) | `ValidationError` |
 | `Batch.write` (versioned-put transactions and `BatchWriteItem`) | — | `ValidationError`; the message says exactly what the batch had already written (its versioned-put transactions, its non-versioned requests) and what was not sent |
-| `Aggregate` create / update (one transaction per group) | `AggregateTransactionOverflow` | `ValidationError` |
+| `Aggregate` create / update (one transaction when it fits, else one per packed set of groups) | `AggregateTransactionOverflow` | `ValidationError` |
 | `EventStore.append` / `commandHandler` | `AppendTooLarge` (expanded `count`) | `ValidationError`; a stream-index key: `operation: "EventStore.append.indexes"` |
 | `EventStore` snapshot `PutItem` | — | `ValidationError` naming the snapshot |
 
@@ -5225,7 +5333,7 @@ A production cricket match management system built on ElectroDB demonstrates the
 
 **Context** — Fields on the aggregate's domain schema that must be propagated to every edge entity item in DynamoDB for query support. Defined once at the aggregate level.
 
-**Aggregate** — A domain object composed of multiple entity types that share a partition key. The aggregate reuses its edge entities' definitions for keys and schemas, and reads its partition and writes its rows through the DynamoClient itself (one partition query to read, one `transactWriteItems` per sub-aggregate group to write). The underlying structure is a directed acyclic graph (DAG) where nodes are entity types and edges are relationships with cardinality.
+**Aggregate** — A domain object composed of multiple entity types that share a partition key. The aggregate reuses its edge entities' definitions for keys and schemas, and reads its partition and writes its rows through the DynamoClient itself (one partition query to read; one `TransactWriteItems` to write when the rows fit, whole sub-aggregate groups packed into several past it, #168). The underlying structure is a directed acyclic graph (DAG) where nodes are entity types and edges are relationships with cardinality.
 
 **Optics** — Effect v4's `effect/Optic` library solves aggregate mutation: instead of manual destructuring, an optic navigates to the target and produces an updated aggregate immutably.
 
@@ -5398,11 +5506,12 @@ the first transaction, conditioned on `attribute_not_exists(pk)`. An existing
 aggregate cancels that transaction — nothing is written — and its cancellation
 reason maps to `ConditionalCheckFailed` (the root's `entityType`, `key`
 `{ pk, sk }`), never a raw `TransactionCancelled`. Edge, `many` and nested
-sub-aggregate rows carry no guard: they are written only after the root's
-transaction commits. Each sub-aggregate group remains its own transaction, so a
-later group that fails leaves the earlier groups written — exactly as before;
-the guard only makes the first transaction refuse. `update` and `delete` are
-unchanged. The guard sees the root only: orphan edge rows (a root-less
+sub-aggregate rows carry no guard of their own. Since #168 every group goes in
+that one transaction when the rows fit (100 items, 4 MB), so a failed `create`
+writes nothing; past one transaction, whole groups are packed into several, the
+root's first, and a later request's failure leaves the earlier ones written and
+names them. `update` and `delete` are below ("Aggregate Concurrency"). The guard
+sees the root only: orphan edge rows (a root-less
 partition left by a partial earlier write) don't stop `create`, and `get`
 merges them in; detecting them would cost a partition read on every create, so
 it is documented instead (`delete` the key first). `delete` retries the
@@ -6020,7 +6129,98 @@ db.Matches.update({ matchId: "m-1" }, mutation)
     )
 ```
 
-**Transaction Decomposition:** Each sub-aggregate is a transactional unit, keeping transactions well within DynamoDB's 100-item limit.
+**Transaction Decomposition:** Each sub-aggregate is a unit that is never split across requests. A write sends one `TransactWriteItems` when its units fit one (100 items, 4 MB); past that, whole units are packed into several, the root's first ("Aggregate Concurrency (#168)").
+
+### Aggregate Concurrency (#168)
+
+`docs/designs/aggregate-concurrency.md` is the design, with the owner's decisions (§0) and every cost.
+
+**The write plan.** `update` builds units in order: the root group, each changed sub-aggregate group, then
+the `ownsRows` cleanup `Delete`s. `packRequests` (`internal/ItemSize.ts`) packs them into requests
+against a shape that leaves room for the fence; one request when they fit, so a multi-group update is
+atomic. `internal/AggregateWrite.ts` (`sendUnits`) sends them and keeps the diagnosis order of every
+write site: `RepeatedItem` before the verdict, the size and count diagnoses after (#144). `create` builds
+the same units, guarded only on the root (#134).
+
+**The rows a write sends (narrowing).** A changed group sends only the rows whose decomposed value
+changed, the rows the new state adds and its `Delete`s, matched old to new by stored sort key. Every
+row is sent when a context field changed or the group's context copies are stale (#241). An unchanged
+row keeps its `updated` stamp and produces no stream record. `EDD-9160` is judged on the rows sent.
+
+**The guard on each item.** Built from the row as the `Query` returned it (the raw `AttributeValue`
+map, never unmarshalled and marshalled again):
+
+| Item | Condition |
+|------|-----------|
+| `Put` of a row read | `wholeRowGuard` over the row read (`updatedAt` first); when it doesn't fit one expression, `preferredGuard` (`updatedAt`, then what fits) |
+| `Put` of a new row | `attribute_not_exists(#pk)` |
+| `Delete` of a row read | the row as read |
+| `ownsRows` cleanup `Delete` | `attribute_not_exists(#pk) OR (<the row as read>)` |
+| Fence | `ConditionCheck` `attribute_exists(#pk)` on the root, or a versioned root's version `Update` |
+
+Every guarded item asks `ReturnValuesOnConditionCheckFailure: ALL_OLD`; the verdict is computed from
+those rows, with no further read. A unit over 4 MB only because of its guards (its rows fit) compares
+its largest attributes over 1 KB by `size(#a) = :n` instead of by value, as few as it takes (D18); a
+string only when it is ASCII, where every way of counting its length agrees.
+
+**The fence (`fence: true`, off by default).** Each request that doesn't `Put` the root carries an item
+on the root, so a deleted aggregate cancels every later write. `versioned` implies it (its version
+`Update` is the fence); `versioned` with `fence: false`, or a `fence` that isn't a boolean, is refused
+at `make` (`EDD-9179`). The root's key is composed from its entity type alone, so it is the same text
+under either `escapeKeys` setting.
+
+**`versioned` (`true` or `{ field }`).** A number on the root row only (default attribute `version`)
+beside the incarnation token `__edd_i__`. `create` writes 1 and a token; every update that sends
+anything moves it by one, by the root's `Put` or, when the root isn't rewritten, an `Update` of it
+(`SET #ver = :v1`, unstamped), conditioned `attribute_exists(#pk) AND #ver = :v AND #inc = :inc`. A root
+written before the option reads as 0; its first update is conditioned `attribute_not_exists(#ver)` /
+`attribute_not_exists(#inc)` and adds both. Stripped on read unless the root model declares the field;
+a declared field is optional on `create`. `UpdateContext.version` holds it. `update(key, fn, {
+expectedVersion })` compares it before `fn` runs, on the consistent read, and fails
+`OptimisticLockError` with nothing written; given to an unversioned aggregate it is `EDD-9178`
+(`ValidationError`, nothing read). Refused at `make` (`EDD-9177`): `retain` / `ttl`, or a field that is a
+context field, a key composite, a timestamp field, or a root model field that isn't a number.
+
+**Verdicts.** From the cancellation reasons and the `ALL_OLD` rows: an item on the root failed and the
+root is gone → `AggregateAssemblyError` ("No items found for aggregate key"); versioned, the version or
+token moved → `OptimisticLockError { expectedVersion, actualVersion }`; a row guard failed →
+`ConcurrentModification` (versioned: `OptimisticLockError` with equal versions) whose `attributes` name
+each changed row by member path and attribute (`"team1.lines[b].copy"`, a root attribute by name alone,
+a row that appeared or vanished by its path); anything else → `TransactionCancelled`. Past one
+transaction, the error carries `committed`, naming what the earlier requests wrote. Nothing re-runs the
+mutation: the caller retries (`Effect.retry` with a bounded, jittered schedule).
+
+**`update`'s read** is strongly consistent on a base-table collection, whatever `consistentRead`
+says (a guard built on a stale read fails as a conflict); on a collection index it is read as
+`consistentRead` says, eventually consistent by default. A GSI may be keyed on the table's own partition
+key, so an index collection is read consistently only when `consistentRead: true` says it can be (an
+LSI).
+
+**`delete`.** With the fence: `DeleteItem` of the root (`ALL_OLD`), then one partition `Query`
+(consistent on a base-table collection), then `BatchWriteItem` of the aggregate's other rows; an
+update landing after the root went fails on its fence; a root the read finds is a `create` that reused
+the key after the root went, and nothing is deleted. Without it: the read and batches as before, then
+one sweep `Query` (consistent where the collection allows) whose rows of the aggregate's types are
+deleted, unless it finds a root (a `create` reused the key), when it deletes nothing.
+
+**Named limits** (each in the design's §3.11):
+- Write skew, unversioned: a mutation depending on rows it doesn't write can commit over their writer.
+- Wide rows: a row whose whole-row guard doesn't fit is guarded on `updatedAt` and what fits.
+- Past one transaction a write is neither atomic nor isolated; the error names what committed.
+- Readers during a commit can see part of it.
+- Unversioned, a deleted and re-created aggregate whose rows equal the old ones passes.
+- A non-library writer that doesn't move the version is caught only on the rows the update sends.
+- An older release writing a `versioned` aggregate drops the version and token, restarting the count:
+  turn `versioned` on once every writer has it.
+- D18's size comparison misses a same-size change to a large attribute.
+- A collection index must project `ALL`: an attribute it leaves out fails its row's guard every time.
+- A raw writer adding a row after `delete`'s last `Query` stays.
+- Fence off: an update that sends only new rows can leave root-less rows after a delete, and its
+  verdict on a deleted aggregate is `ConcurrentModification` naming the vanished row, not
+  `AggregateAssemblyError`. A `create` reusing the key during a `delete` stops the sweep.
+- Fenced: a group sent alone holds at most 99 items (100 and the fence is 101, refused by DynamoDB and
+  diagnosed, nothing written).
+- GSI collection reads are eventually consistent: an update within the index's lag can surface a conflict.
 
 ### Attribute Encoding (#72, #133)
 
@@ -6740,9 +6940,9 @@ are these (`entityWriters`, and an aggregate's `_attributeWriters`):
   `__edd_e__` and the mirror, which it writes after them. Its list keys aren't among those: a root row
   whose list composites are absent has none, so an attribute of that name stays.
 
-**`update` with `ownsRows`.** Its group transactions are exactly the ones it sends without the option.
-After the last of them commits, it deletes the other rows it read of each node that changed, where the
-new value doesn't write their sort key.
+**`update` with `ownsRows`.** Its groups are exactly the ones it sends without the option. In the same
+transaction (#168, after the groups' items when they fit one), it deletes the other rows it read of each
+node that changed, where the new value doesn't write their sort key.
 - A node changed when the update writes its group (the base's diff) and the node's items of the old
   value and of the new one differ by the base's comparison (`sameItems`: types and attributes in order,
   not keys).
@@ -6752,15 +6952,11 @@ new value doesn't write their sort key.
   its decomposition writes for the new value, but for rows handed to another node too, which stay. A
   custom `decompose` that doesn't write an element it keeps loses that element. The rows of a node that
   didn't change stay, whatever happened to its group.
-- These `Delete`s go in their own `TransactWriteItems` requests, up to 100 to a request. Each is
-  conditioned `attribute_not_exists(#pk) OR #e = :e`: the row is gone, or still of the type read. A
-  concurrent removal is fine. A row replaced with one of another type is left.
-- When a request is cancelled, the `Delete`s whose condition failed (from the cancellation reasons)
-  are dropped and the rest are resent once. The mutation is never run again, and nothing is read
-  again.
-- A cleanup request that fails is reported the way a later group's failure is
-  (`TransactionCancelled`, or the client's error). By then the update's groups have committed, and the
-  rows it didn't delete stay until the next update that changes their node.
+- These `Delete`s are the last unit of the update's write plan. Each is conditioned
+  `attribute_not_exists(#pk) OR (<the row as read>)`: the row is gone, or still exactly as read. A
+  concurrent removal is fine; a row another writer changed (made visible to the node again) cancels
+  the update with `ConcurrentModification` naming it, nothing written when the update is one
+  transaction. Nothing is resent, and the mutation is never run again.
 - A no-op update writes nothing, cleanup included. Nothing more is read, assembled or decomposed.
 
 **`rekey` with `ownsRows`.** It moves exactly what it moves without the option: the rows its value
@@ -6994,6 +7190,8 @@ yield* Players.provide(
 **Explicit targets required.** No implicit discovery. Default mode is eventual consistency (batch writes). Transactional mode available for small datasets.
 
 Each target item found through the target's `_cascade_<field>` GSI is updated under the **target entity's own primary-key fields** (`primaryKey.pk.field` / `sk.field`), and a rejected update is diagnosed under those fields, so one transactional cascade may span targets keyed differently. Before 1.25.0 the cascade read the hard-coded `pk` / `sk` attributes, so on a table keyed otherwise (e.g. `PK` / `SK`) every eventual-mode update failed (`CascadePartialFailure` with `succeeded: 0`) and a transactional cascade was rejected whole.
+
+**Held to the entry the query found (#132).** Each target's update is conditioned on its cascade-index partition-key attribute holding the value the query found it under, so a target deleted or re-pointed since is refused rather than re-created or overwritten: skipped in eventual mode, dropped and the rest resent in transactional mode (see "Reads Held to Their Writes").
 
 ### Aggregate vs Collection
 
@@ -9006,7 +9204,7 @@ pre-#179 unions.
 | `deleteIfExists` | as `delete`, plus `ConditionalCheckFailed` |
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
 | `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
-| `purge` | `ValidationError` (plus `BlobStoreError` for an entity that offloads: it needs the store up front and deletes the purged rows' versions) |
+| `purge` | `ValidationError`, `OptimisticLockError`, `ConcurrentModification` (a `unique` entity's live row changed under every attempt, #132), plus `BlobStoreError` for an entity that offloads: it needs the store up front and deletes the purged rows' versions |
 | `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
 | `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
@@ -9095,6 +9293,8 @@ for unrelated errors and the collision was caught only at review.
 | 9098 | `rekey` options and resume tokens |
 | 9111, 9114–9120, 9141–9143 and 9146 | Offloaded storage: blob store, offload options, read modes, GC, escaped key text (#179) |
 | 9161–9164 | Effect value types: what DynamoDB doesn't store at an untyped position, object key composites (#242) |
+| 9173–9176 | Reads held to their writes (#132): reserved, none allocated (every outcome is an existing tagged error) |
+| 9177–9180 | Aggregate concurrency: `versioned`, `expectedVersion` (#168) |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -9248,11 +9448,14 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9168` | `Aggregate.ts` (`listGapMatch`), at `list` (`ValidationError`, through `Capacity.refusalsFail`; nothing returned) | An aggregate `list` key giving a value after a list sort key composite left out, matched on the root items read (text under a folding casing), meets a list index row with no readable value for that composite: the index doesn't project it, or the row holds something its field can't read (`readListComposite`). Such a row has no key text to compare, so the call is refused rather than the row kept or dropped. The message names the composite, to project onto the list index. Only the composites matched are read: one the key doesn't give after the gap is never asked for. |
 | `EDD-9169` | `Entity.ts` (`refuseUnkeyedRefs`, from `composeAllKeys` and the plain `upsert` before its ref reads), at `put` / `create` / `upsert` (`ValidationError`; nothing sent) | A write of a whole item giving no id for a ref whose id (`${field}Id`) is a primary key composite: `null` for a ref the model declares nullable, or none for one it declares optional. Every item has a primary key, and a ref without an id has none to compose it from. Up to 1.42.1 the `null` failed decoding (`Expected string`) and a left-out id died in key composition (`Missing composite attribute`). A non-null id is written as before. |
 | `EDD-9172` | `Entity.ts` (schema, the `unique` check in `make`), pure and operational | A `unique` constraint naming a ref (`"team"` for `refs: { team }`, or a field the model marks `ref: true`). The ref's value is the referenced item's data, which composed the key text `[object object]` for every item, so the first item written took the value for all of them (#266). Refused at load, naming the constraint and the ref and saying to write its id (`teamId`), which a constraint takes as an index composite does. The `unique` type leaves refs out, so it is a compile error too. |
+| `EDD-9177` | `Aggregate.ts` (`make`, pure and operational; #168, `docs/designs/aggregate-concurrency.md` §3.5) | An aggregate's `versioned` option the root version can't be kept under: `retain` or `ttl` (an aggregate keeps no snapshots), or a `field` that is a context field, a partition, collection or list key composite, a timestamp field, a root model field whose type isn't a number (on a root of members, a union or a suspended schema, any member declaring it), or the attribute a root model field is stored under (`Schema.encodeKeys`). Refused at load, naming the option and the field. |
+| `EDD-9178` | `Aggregate.ts` (`update`; #168, `docs/designs/aggregate-concurrency.md` §3.5) | `update(key, fn, { expectedVersion })` on an aggregate without `versioned`: there is no version to compare. A `ValidationError`, nothing read or sent; a typed caller can't write it. |
+| `EDD-9179` | `Aggregate.ts` (`make`, pure and operational; #168, `docs/designs/aggregate-concurrency.md` §0) | An aggregate's `fence` setting it can't be kept under: `fence: false` beside `versioned` (the version `Update` on the root is itself the fence, so a versioned aggregate is always fenced), or a `fence` that isn't a boolean. Refused at load. |
 
 `EDD-9076` and `EDD-9077` also cover `DynamoModel.External` binary fields from #179 (the same
 condition — an attribute DynamoDB sees as one opaque value — raised by the same walker).
 
-Next free code: `9173` (`9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: `9181` (`9173`–`9176` and `9180` are reserved for #132 and #168 and left unallocated; `9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

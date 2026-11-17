@@ -381,6 +381,11 @@ const expectedDifference = (
   [label, , leaves, namesEntry, mapped]: (typeof writes)[number],
   was: Captured,
 ): ReadonlyArray<string> => {
+  // Nothing to write (#132): 1.40.0's read, made consistently, and in a transaction held to the
+  // commit by a check that the row still exists. A retained update writes its version.
+  if (leaves === undefined && entity !== "Retained") {
+    return ["[0].getItem.ConsistentRead", ...(inTransaction ? ["[1]"] : [])]
+  }
   if (leaves === "refused" || leaves === undefined || !namesEntry) return []
   const unread = !inTransaction && entity !== "Retained" && label !== ".clearMap('counts')"
   if (label.startsWith("condition")) {
@@ -505,9 +510,32 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
                   expect(captured.rows).toEqual(got.before)
                   return
                 }
-                if (leaves === undefined) {
-                  // Nothing to write: as 1.40.0.
+                if (leaves === undefined && entity === "Retained") {
+                  // A version to write, and nothing else: as 1.40.0.
                   expect(captured).toEqual(was)
+                  return
+                }
+                if (leaves === undefined) {
+                  // Nothing to write: as 1.40.0, but for the read (#132).
+                  expect({ ...captured, sent: [] }).toEqual({ ...was, sent: [] })
+                  expect((captured.sent[0] as any).getItem.ConsistentRead).toBe(true)
+                  if (inTransaction) {
+                    expect(captured.sent[1]).toEqual({
+                      transactWriteItems: {
+                        TransactItems: [
+                          {
+                            ConditionCheck: {
+                              TableName: expect.any(String),
+                              Key: (was.sent[0] as any).getItem.Key,
+                              ConditionExpression: "attribute_exists(#pk)",
+                              ExpressionAttributeNames: { "#pk": "pk" },
+                              ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                            },
+                          },
+                        ],
+                      },
+                    })
+                  }
                   return
                 }
                 if (refusedWhole) {

@@ -140,8 +140,9 @@ describe("error channels match 1.25.0 whether or not a field is packed (#147)", 
           | ValidationError
           | DeleteAppliedButUnreadable
         >()
+        // A unique entity's live row changed under every attempt (#132).
         expectTypeOf<ErrorOf<ReturnType<typeof E.purge>>>().toEqualTypeOf<
-          DynamoClientError | ValidationError
+          DynamoClientError | ValidationError | OptimisticLockError | ConcurrentModification
         >()
       }
     })

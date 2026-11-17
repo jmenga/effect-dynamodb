@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
+import { asBefore168 } from "./Before168.js"
 
 type Row = Record<string, AttributeValue>
 
@@ -163,7 +164,9 @@ export const suite = (
           const alone = yield* deleteOn(() => [])
           const beside = yield* deleteOn(foreignRows)
           expect(published.generatedFrom).toBe("effect-dynamodb@1.40.0")
-          expect(alone).toEqual(published.alone.requests)
+          // #168 adds a consistent sweep read after the batches (§3.8): 1.40.0's requests
+          // otherwise.
+          expect(asBefore168(alone)).toEqual(asBefore168(published.alone.requests))
           expect(beside).toEqual(alone)
         }),
       ))

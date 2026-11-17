@@ -11,7 +11,12 @@
  * - where 1.40.0's `get` after the update read what the update returned, the update sends, stores
  *   and returns what 1.40.0 did, request for request;
  * - where it read something else, the update is refused with `EDD-9160` naming the member, the row
- *   and `rekey`, after its `Query` and before anything is written.
+ *   and `rekey`, after its `Query` and before anything is written, where it would send or delete a
+ *   row stored under the other setting's text. Since #168 an update sends only the rows that changed
+ *   (D2), so one that leaves every such row as it is isn't refused: it reads back what it returned,
+ *   and the rows stay for `rekey`.
+ *
+ * Requests are compared as #168 changed them (`helpers/Before168.ts`).
  */
 
 import { readFileSync } from "node:fs"
@@ -37,6 +42,7 @@ import {
   sortRows,
   stepNames,
 } from "./helpers/AggregateEscapeFlip.js"
+import { asBefore168 } from "./helpers/Before168.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const published: {
@@ -92,7 +98,7 @@ const runKind = (c: KindCase, step: (typeof kindStepNames)[number], created?: Re
 const run = (
   c: (typeof cases)[number],
   step: (typeof stepNames)[number],
-  created: ReadonlyArray<Row>,
+  created?: ReadonlyArray<Row>,
 ) => {
   const tableName = `flip-${made++}`
   const table = makeRecordingTable()
@@ -112,6 +118,39 @@ const run = (
 }
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+
+const keyOf = (row: Partial<Row> | undefined) => `${row?.pk?.S}|${row?.sk?.S}`
+
+/**
+ * Whether the update refuses (#168): `EDD-9160` is judged on the rows the update sends (D2), so it
+ * refuses where it would rewrite or delete a row stored under the other setting's text. Which rows
+ * it rewrites or deletes is what the same step sends with the setting kept (`kept`, rows created
+ * under `to`): each row of those it sends that isn't stored at that key in `flipped` is under the
+ * other text there.
+ */
+const refusesOn = (
+  kept: { readonly created: ReadonlyArray<Row>; readonly step: { readonly requests: any } },
+  flipped: ReadonlyArray<Row>,
+): boolean => {
+  const before = new Set(kept.created.map(keyOf))
+  const there = new Set(flipped.map(keyOf))
+  return (kept.step.requests as ReadonlyArray<{ command: string; input: any }>).some(
+    ({ command, input }) =>
+      command === "TransactWriteItems" &&
+      (input.TransactItems as ReadonlyArray<any>).some((item) => {
+        const key = keyOf(item.Put?.Item ?? item.Delete?.Key)
+        return before.has(key) && !there.has(key)
+      }),
+  )
+}
+
+/** A not-refused update on flipped rows: it reads back what it returned, and wrote no row twice. */
+const readsBack = (now: {
+  readonly step: { readonly update: { ok?: unknown }; readonly get: { ok?: unknown } }
+}) => {
+  expect(now.step.update.ok).toBeDefined()
+  expect(unordered(now.step.update.ok)).toEqual(unordered(now.step.get.ok))
+}
 
 /** A value read, its arrays' elements in one order: what a read holds, whatever the order. */
 const unordered = (value: unknown): unknown =>
@@ -143,10 +182,14 @@ describe("escapeKeys turned over without rekey (EDD-9160)", () => {
       const was = then.steps[step]!
       const misread = was.get.ok === undefined || !same(was.update.ok, was.get.ok)
       const title = misread
-        ? "1.40.0's get read otherwise than its update returned: refused, nothing written"
+        ? "1.40.0's get read otherwise than its update returned: refused where it sends a row under the other text (#168), else reads back what it returned"
         : "sends, stores and returns what 1.40.0 did"
       it(`${c.name}, ${step}: ${title}`, async () => {
         const now = await run(c, step, then.created)
+        if (misread && !refusesOn(await run({ ...c, from: c.to }, step), then.created)) {
+          readsBack(now)
+          return
+        }
         if (misread) {
           expect(now.step.update.failed).toBe("ValidationError")
           expect(now.step.update.cause).toMatch(refusal("flip", c.to))
@@ -154,7 +197,10 @@ describe("escapeKeys turned over without rekey (EDD-9160)", () => {
           expect(now.step.rows).toEqual(then.created)
           return
         }
-        expect(now.step.requests).toEqual(was.requests)
+        // Compared as #168 changed them (`asBefore168`).
+        expect(asBefore168(now.step.requests, { stored: then.created })).toEqual(
+          asBefore168(was.requests, { stored: then.created }),
+        )
         expect(now.step.rows).toEqual(was.rows)
         expect(now.step.update).toEqual(was.update)
         expect(now.step.get).toEqual(was.get)
@@ -196,13 +242,21 @@ describe("escapeKeys turned over without rekey, every key kind (EDD-9160)", () =
           : moves
             ? "moves 1.40.0's entity-edge rows and reads back what it returned"
             : misread
-              ? "1.40.0's get read otherwise than its update returned: refused, nothing written"
+              ? "1.40.0's get read otherwise than its update returned: refused where it sends a row under the other text (#168), else reads back what it returned"
               : "sends, stores and returns what 1.40.0 did"
       it(`${c.name}, ${step}, on 1.40.0's rows: ${title}`, async () => {
         const now = await runKind(c, step, then.created)
+        if (
+          !moves &&
+          misread &&
+          !refusesOn(await runKind({ ...c, from: c.to }, step), then.created)
+        ) {
+          readsBack(now)
+          return
+        }
         if (step === "delete") {
           expect(now.step.update).toEqual(was.update)
-          expect(now.step.requests).toEqual(was.requests)
+          expect(asBefore168(now.step.requests)).toEqual(asBefore168(was.requests))
           expect(now.step.rows).toEqual([])
           expect(was.rows).toEqual([])
           return
@@ -219,7 +273,10 @@ describe("escapeKeys turned over without rekey, every key kind (EDD-9160)", () =
           expect(now.step.rows).toEqual(then.created)
           return
         }
-        expect(now.step.requests).toEqual(was.requests)
+        // Compared as #168 changed them (`asBefore168`).
+        expect(asBefore168(now.step.requests, { stored: then.created })).toEqual(
+          asBefore168(was.requests, { stored: then.created }),
+        )
         expect(now.step.rows).toEqual(was.rows)
         expect(now.step.update).toEqual(was.update)
         expect(now.step.get).toEqual(was.get)
@@ -230,12 +287,16 @@ describe("escapeKeys turned over without rekey, every key kind (EDD-9160)", () =
       // doesn't compose), else written and read back once.
       const refused =
         step !== "delete" && (c.kind === "entity" ? !c.to && step !== "no change" : misread)
-      it(`${c.name}, ${step}, on this release's rows: ${step === "delete" ? "deletes every row" : refused ? "refused, nothing written" : "reads back what it returned"}`, async () => {
+      it(`${c.name}, ${step}, on this release's rows: ${step === "delete" ? "deletes every row" : refused ? "refused where it sends a row under the other text (#168), nothing written" : "reads back what it returned"}`, async () => {
         const now = await runKind(c, step)
         expect(now.create.ok).toEqual(then.create.ok)
         if (step === "delete") {
           expect(now.step.update).toEqual({ ok: null })
           expect(now.step.rows).toEqual([])
+          return
+        }
+        if (refused && !refusesOn(await runKind({ ...c, from: c.to }, step), now.created)) {
+          readsBack(now)
           return
         }
         if (refused) {

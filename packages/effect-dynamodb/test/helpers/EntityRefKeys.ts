@@ -20,6 +20,7 @@ import { describe, expect, it } from "vitest"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
+import { withCascadeGuard } from "./CascadeGuard.js"
 
 type Row = Record<string, AttributeValue>
 type Sent = { readonly command: string; readonly input: unknown }
@@ -38,17 +39,34 @@ type Recorded = {
   readonly cascadeRows: ReadonlyArray<Row>
 }
 
-const published = JSON.parse(
-  readFileSync(new URL("../fixtures/entity-ref-keys-1.39.0.json", import.meta.url), "utf8"),
-) as { readonly generatedFrom: string; readonly shapes: Record<string, Recorded> }
+type Published = { readonly generatedFrom: string; readonly shapes: Record<string, Recorded> }
+
+/** A fixture's cascades, each update guarded on its target still naming the team (#132). */
+const guardingCascades = (fixture: Published): Published => ({
+  ...fixture,
+  shapes: Object.fromEntries(
+    Object.entries(fixture.shapes).map(([label, shape]) => [
+      label,
+      { ...shape, cascadeRequests: withCascadeGuard(shape.cascadeRequests) },
+    ]),
+  ),
+})
+
+const published = guardingCascades(
+  JSON.parse(
+    readFileSync(new URL("../fixtures/entity-ref-keys-1.39.0.json", import.meta.url), "utf8"),
+  ) as Published,
+)
 
 /** An entity keyed by two composites, one with an encoding default: published 1.40.0's (and 1.39.0's). */
-const published140 = JSON.parse(
-  readFileSync(
-    new URL("../fixtures/entity-ref-keys-encoding-default-1.40.0.json", import.meta.url),
-    "utf8",
-  ),
-) as { readonly generatedFrom: string; readonly shapes: Record<string, Recorded> }
+const published140 = guardingCascades(
+  JSON.parse(
+    readFileSync(
+      new URL("../fixtures/entity-ref-keys-encoding-default-1.40.0.json", import.meta.url),
+      "utf8",
+    ),
+  ) as Published,
+)
 
 /** The secondary indexes every table here has. */
 export const INDEXES = {

@@ -29,16 +29,17 @@ import type { EntityDefinition } from "@effect-dynamodb/schema/Entity.js"
 import {
   AggregateAssemblyError,
   AggregateDecompositionError,
-  AggregateTransactionOverflow,
+  type AggregateTransactionOverflow,
   type BlobStoreError,
+  type ConcurrentModification,
   ConditionalCheckFailed,
   DynamoError,
   DynamoValidationError,
   type ItemNotFound,
   isAwsTransactionCancelled,
+  OptimisticLockError,
   RefNotFound,
-  TRANSACT_WRITE_ITEMS_LIMIT,
-  TransactionCancelled,
+  type TransactionCancelled,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
@@ -130,7 +131,7 @@ import * as Batch from "./Batch.js"
 import { BlobStore } from "./BlobStore.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
-import { expiredWithCommitted } from "./internal/BlobCalls.js"
+import * as AggregateWrite from "./internal/AggregateWrite.js"
 import * as BlobLedger from "./internal/BlobLedger.js"
 import { entityNaming } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
@@ -175,6 +176,7 @@ import * as Rekey from "./internal/Rekey.js"
 import { asRead, notReadBack, notStoredForm, readBackRefusal } from "./internal/RoundTrip.js"
 import {
   composePrimaryKeyOrFail,
+  freshIncarnationToken,
   generateTimestampPrimitive,
   INCARNATION_TOKEN,
   KEY_TEXT,
@@ -191,12 +193,10 @@ import {
 } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
-  diagnosedValidationError,
   diagnoseFailure,
   explainDiagnosis,
   type KeyAttributes,
   mergeKeyAttributes,
-  transactItemTarget,
   withCause,
 } from "./internal/WriteDiagnosis.js"
 import {
@@ -259,6 +259,8 @@ import {
 } from "@effect-dynamodb/schema/internal/AggregateCursor.js"
 import type { AggregateEdge, RefEntity } from "@effect-dynamodb/schema/internal/AggregateEdges.js"
 import {
+  type AggregateVersioned,
+  aggregateVersionField,
   declaredValueNames,
   deriveAggregateSchemas,
   deriveEntityFieldName,
@@ -282,6 +284,7 @@ import {
   refuseAggregateKeyOverMovingValue,
   refuseAggregateKeysOverBothKinds,
   refuseAggregateProtoName,
+  refuseAggregateVersioning,
   refuseManySortKeysOverMovingValue,
   resolveAggregateStamps,
   rowKeysOn,
@@ -294,6 +297,7 @@ import type {
   AggregateEdgesGuard,
   AggregateInputType,
   AggregateStampNames,
+  AggregateVersionName,
   BoundSubAggregate,
   SchemaFieldsOf,
   SubAggregate,
@@ -598,6 +602,34 @@ export type AggregateWriteError =
 export type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
 
 /**
+ * `update`'s errors (#168): a write's, plus the conflicts its guards report. A row it sends that
+ * changed since its read fails it with `ConcurrentModification`; on a `versioned` aggregate, with
+ * `OptimisticLockError`, which is also the answer to a root whose version or incarnation moved, or
+ * to an `expectedVersion` other than the one read. Nothing was written (a write past one
+ * transaction says what earlier transactions committed, in `committed`). Retry by running the
+ * update again: it reads afresh.
+ */
+export type AggregateUpdateError =
+  | AggregateWriteError
+  | ConcurrentModification
+  | OptimisticLockError
+
+/**
+ * `update`'s options (#168). `expectedVersion`, on a `versioned` aggregate only (`EDD-9178`
+ * otherwise), is the version the caller last saw: compared with the version read before the
+ * mutation runs, and a mismatch fails `OptimisticLockError` with nothing written. Such a call reads
+ * strongly consistent on a base-table collection; a collection index is read as `consistentRead` says.
+ */
+export type AggregateUpdateOptions<TVersioned extends boolean = boolean> = [TVersioned] extends [
+  false,
+]
+  ? { readonly expectedVersion?: never }
+  : { readonly expectedVersion?: number }
+
+/** Whether a `versioned` option turns versioning on, at the type level. */
+type IsVersioned<V> = [AggregateVersionName<V>] extends [never] ? false : true
+
+/**
  * The fields an edge entity offloads (#179) — {@link NoOffload} when none,
  * for an edge without an entity, and for type-erased ones (`any`).
  */
@@ -666,6 +698,8 @@ export interface Aggregate<
    * design §9.3), `never` when no edge entity offloads a field.
    */
   TBlobErrors = never,
+  /** Whether it is `versioned` (#168): `update` takes an `expectedVersion` only then. */
+  TVersioned extends boolean = boolean,
 > {
   readonly [TypeId]: TypeId
   readonly _tag: "Aggregate"
@@ -790,23 +824,38 @@ export interface Aggregate<
    *
    * Return either a class instance or a plain object — the schema decode handles both.
    *
-   * A rewritten group re-uploads its edge items' offloaded fields (#179): no pointer read from the
-   * current state is written back (design §6.9). An unchanged group uploads nothing.
+   * A rewritten row re-uploads its edge item's offloaded fields (#179): no pointer read from the
+   * current state is written back (design §6.9). An unchanged row uploads nothing.
+   *
+   * Concurrency (#168): only the rows whose value changed are sent, each guarded on the row as read
+   * (a new row on nothing being there), all in one transaction when they fit; a row another writer
+   * changed in between fails the update with `ConcurrentModification` (`OptimisticLockError` when
+   * `versioned`), with nothing written. The read is strongly consistent on a base-table collection
+   * (a collection index is read as `consistentRead` says). Retry by running the update again (`Effect.retry` on the error's tag, bounded and
+   * jittered): it reads afresh and runs the mutation on what it reads.
    */
   readonly update: (
     key: TKey,
     mutationFn: (
       context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
+    options?: AggregateUpdateOptions<TVersioned>,
   ) => Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateWriteError | TBlobErrors,
+    AggregateUpdateError | TBlobErrors,
     DynamoClient | TableConfig
   >
 
   /**
    * Delete an aggregate: every row in its partition whose entity type is one of the aggregate's
    * own (its root's, each edge's and each sub-aggregate's). Any other row there stays.
+   *
+   * Concurrency (#168): with `fence` (or `versioned`) the root is deleted first, so no update can
+   * commit after it, then the partition is read once, consistently, and the rest deleted, unless the
+   * read finds a root (a `create` that reused the key after the root went). Without
+   * it, the partition is read, its rows deleted, and read once more (consistently): rows a write
+   * added after the first read are deleted too, unless that read finds a root, a `create` that
+   * reused the key, whose rows are left as they are.
    */
   readonly delete: (
     key: TKey,
@@ -894,6 +943,8 @@ export interface BoundAggregate<
   TCreate = any,
   /** {@link Aggregate}'s blob store errors (#179, design §9.3). */
   TBlobErrors = never,
+  /** {@link Aggregate}'s `TVersioned` (#168). */
+  TVersioned extends boolean = boolean,
 > {
   readonly schema: TSchema
 
@@ -910,12 +961,14 @@ export interface BoundAggregate<
     input: CreateArgument<I, TCreate>,
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError | TBlobErrors, never>
 
+  /** {@link Aggregate.update}, with its services resolved. */
   readonly update: (
     key: TKey,
     mutationFn: (
       context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
-  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError | TBlobErrors, never>
+    options?: AggregateUpdateOptions<TVersioned>,
+  ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateUpdateError | TBlobErrors, never>
 
   readonly delete: (
     key: TKey,
@@ -1022,8 +1075,13 @@ interface AggregateConfig<
   readonly collection: CollectionConfig<ModelFieldName<_TSchema>>
   readonly list?: ListCollectionConfig<ModelFieldName<_TSchema>>
   /**
-   * Use strongly consistent reads when assembling this aggregate. Defaults to `false`,
-   * matching DynamoDB and `Entity`.
+   * Use strongly consistent reads when assembling this aggregate (`get`, `list`). Defaults to
+   * `false`, matching DynamoDB and `Entity`. Whatever this says, `update`'s read and the read
+   * `delete` makes after its root goes (with `fence`) or its sweep read (without) are strongly
+   * consistent on a base-table collection (#168): a guarded write built on a stale read
+   * fails as a conflict, and a stale sweep misses a row. On a collection index they read as this
+   * says: a GSI may be keyed on the table's own partition key, and DynamoDB refuses a consistent
+   * read of it, so only `true` here says the index is an LSI.
    *
    * Aggregate writes are transactional, so an eventually consistent read taken shortly
    * after a write can observe a torn item collection — the root may be missing (raising
@@ -1070,8 +1128,33 @@ interface AggregateConfig<
    * `unrecognizedKey` otherwise. `DynamoClient.make` refuses the aggregate (`EDD-9130`) when another
    * member it can see can write a row of one of its types into its partition; a writer it doesn't
    * bind, here or in another process, isn't seen.
+   *
+   * Its cleanup `Delete`s are guarded on the row being gone or still as read, and go in the update's
+   * own transactions (#168): a row changed since the read fails the update instead of being deleted.
    */
   readonly ownsRows?: boolean
+  /**
+   * A version on the root row, moved by every update that writes anything, and the entity's hidden
+   * incarnation token beside it (#168, `docs/designs/aggregate-concurrency.md` §3.5): `true` keeps it
+   * in `"version"`, `{ field }` names the attribute. Every update's transaction then holds the root's
+   * version condition, so two updates of one aggregate never both commit on the same read (write skew
+   * included), and a deleted and re-created aggregate is never mistaken for the one read. A conflict
+   * is `OptimisticLockError`; `update(key, fn, { expectedVersion })` compares the version read first.
+   * The root model may declare the field (a number) to read it; `create` writes 1, a root written
+   * before the option reads as 0. Implies `fence`. Refused with `retain` / `ttl`, or a field the
+   * aggregate already writes (`EDD-9177`). Cost: two attributes on the root, and, on an update that
+   * doesn't rewrite the root, one `Update` of the root in its transaction (billed as a transactional
+   * write of the root's size). Turn it on once every writer runs a release that has it.
+   */
+  readonly versioned?: AggregateVersioned
+  /**
+   * Every update request that doesn't rewrite the root checks that it still exists (a
+   * `ConditionCheck` in its transaction), and `delete` deletes the root first (#168). Off by default:
+   * the check is one more item per update transaction, billed as a transactional write of the root's
+   * size. Without it, an update that only adds rows can commit after a concurrent `delete` and leave
+   * rows without a root. Implied by `versioned`, which refuses `fence: false` (`EDD-9179`).
+   */
+  readonly fence?: boolean
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }
@@ -1097,11 +1180,13 @@ export function make<
   const TEdges extends AggregateEdgesConfig<TSchema>,
   const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
   const TTimestamps extends TimestampsConfig | undefined = undefined,
+  const TVersioned extends AggregateVersioned | undefined = undefined,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK> & {
     readonly edges: AggregateEdgesGuard<TSchema, TEdges>
     readonly timestamps?: TTimestamps
+    readonly versioned?: TVersioned
   },
 ): Aggregate<
   TSchema,
@@ -1111,16 +1196,19 @@ export function make<
     TEdges,
     TPK,
     AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
-    SchemaFieldsOf<TSchema>
+    SchemaFieldsOf<TSchema>,
+    AggregateVersionName<TVersioned>
   >,
   AggregateCreateInputType<
     Schema.Schema.Type<TSchema>,
     TEdges,
     TPK,
     AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
-    SchemaFieldsOf<TSchema>
+    SchemaFieldsOf<TSchema>,
+    AggregateVersionName<TVersioned>
   >,
-  AggregateBlobErrors<TEdges>
+  AggregateBlobErrors<TEdges>,
+  IsVersioned<TVersioned>
 >
 export function make<
   TSchema extends Schema.Top,
@@ -2364,7 +2452,8 @@ type RuntimeAggregate<TSchema extends Schema.Top> = Aggregate<
   Record<string, unknown>,
   unknown,
   any,
-  BlobStoreError
+  BlobStoreError,
+  any
 >
 
 const makeAggregate = <TSchema extends Schema.Top>(
@@ -2483,13 +2572,33 @@ const makeAggregate = <TSchema extends Schema.Top>(
           ),
         }
       : undefined
+  // `versioned` and `fence` (#168, `docs/designs/aggregate-concurrency.md` §3.4, §3.5): judged at
+  // load (`EDD-9177`, `EDD-9179`). The version is a number on the root row, beside the entity's hidden
+  // incarnation token; `versioned` implies the fence.
+  refuseAggregateVersioning(aggregateName, config, schemaFields, schema)
+  const versionField = aggregateVersionField(config.versioned)
+  const fenced = versionField !== undefined || config.fence === true
+  /**
+   * The root model declares the version field: a read hands it over (0 for a root without one). A
+   * root of members (a union, a suspended schema) declares it when a member does.
+   */
+  const versionDeclared =
+    versionField !== undefined &&
+    (schemaFields === undefined
+      ? storedFieldNames(schema).includes(versionField)
+      : ownValue(schemaFields, versionField) !== undefined)
+  /** The root's sort key: composed from its entity type alone, under every key-text setting. */
+  const rootSortKey = composeKey(config.schema, config.root.entityType, [])
+
   // What the read path may drop before decoding: each node drops those its rows
-  // don't declare ({@link stampsToStrip}). Declared, it belongs to the domain object.
-  const systemAttrs: ReadonlySet<string> = new Set(
-    [timestampFields.createdAt, timestampFields.updatedAt].filter(
+  // don't declare ({@link stampsToStrip}). Declared, it belongs to the domain object. A versioned
+  // root's version is dropped the same way, and its incarnation token always (#168).
+  const systemAttrs: ReadonlySet<string> = new Set([
+    ...[timestampFields.createdAt, timestampFields.updatedAt].filter(
       (name): name is string => name !== null,
     ),
-  )
+    ...(versionField === undefined ? [] : [versionField, INCARNATION_TOKEN]),
+  ])
 
   const requiredIn = (fields: Record<string, Schema.Top> | undefined, name: string | null) =>
     name !== null && ownValue(fields, name) !== undefined && !isFieldOptional(fields![name]!)
@@ -2561,6 +2670,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
       cardinality: "root",
       edges: config.edges,
       parentFields: schemaFields,
+      // A root that exposes no `.fields` (a union, a suspended schema): its stored names.
+      valueSchema: schema,
       resolveRef,
       escapeKeys: config.schema.escapeKeys === true,
       rowKeys: config,
@@ -2724,6 +2835,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // assembly read diagnoses it, naming the aggregate and the index (#144).
   const consistentRead = config.consistentRead ?? false
   const tablePrimary = resolvePrimaryKey(config.table.entities)
+  /**
+   * Whether `update`, an If-Match and `delete`'s second read read strongly consistent whatever
+   * `consistentRead` says (#168, D11 reversed): on the base table only. A collection index is read
+   * as `consistentRead` says, as on 1.43.0: an index keyed on the table's own partition key may be a
+   * GSI (one added to a table after it was created, where an LSI can't be), which DynamoDB refuses a
+   * consistent read of, so only the caller's `consistentRead: true` says it is an LSI.
+   */
+  const readConsistent = config.collection.index === undefined
 
   if (tablePrimary !== undefined && config.collection.index === undefined) {
     if (config.pk.field !== tablePrimary.pk) {
@@ -2897,16 +3016,34 @@ const makeAggregate = <TSchema extends Schema.Top>(
     )
 
   /** Compose the PK and query all items; a rejected read fails as `rejected` names it. */
+  /**
+   * A versioned root the model declares the version of reads 0 without one (#168, §3.5): a root
+   * written before `versioned` was turned on. In place, on rows read.
+   */
+  const withReadVersion = (rows: ReadonlyArray<Record<string, unknown>>): void => {
+    if (!versionDeclared) return
+    for (const row of rows) {
+      if (
+        row.__edd_e__ === config.root.entityType &&
+        row.sk === rootSortKey &&
+        !hasOwnName(row, versionField!)
+      ) {
+        setOwn(row, versionField!, 0)
+      }
+    }
+  }
+
   const readPartition = <E>(
     key: Record<string, unknown>,
     rejected: (diagnosis: Diagnosis, original: unknown) => E,
     rekeyRead?: RekeyRead,
   ) =>
-    Effect.flatMap(readPartitionRaw(key, rejected, rekeyRead), (read) =>
+    Effect.flatMap(readPartitionRaw(key, rejected, rekeyRead), (read) => {
+      withReadVersion(read.allItems)
       // Packed edge attributes, read by their stored form (#147); offloaded ones resolved
       // eagerly, both kinds (#179, design §8.4).
-      Effect.as(loadAggregateItems(read.allItems, readPlans), read),
-    )
+      return Effect.as(loadAggregateItems(read.allItems, readPlans), read)
+    })
 
   // A root row's partition key composites as a read takes them: decoded through their fields, as
   // assembly decodes the root row. `create` composes the key from the value it holds, so a key
@@ -3019,7 +3156,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const tableConfig: TableConfig = yield* config.table.Tag
-      const pkValue = yield* composeOrFail("key", () => collectionPkOf(key))
+      const pkValue =
+        rekeyRead?.partition ?? (yield* composeOrFail("key", () => collectionPkOf(key)))
       const read = (partition: string) =>
         queryAllItems(
           client,
@@ -3027,7 +3165,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           config.collection.index,
           config.pk.field,
           partition,
-          consistentRead,
+          consistentRead || rekeyRead?.consistent === true,
           rejected,
           rekeyRead?.stored,
         )
@@ -3659,6 +3797,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     config.edges,
     config.pk.composite,
     config.timestamps,
+    versionField === undefined ? [] : [versionField],
   )
 
   /** A stored row's position: its partition and sort key. */
@@ -4245,8 +4384,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
-   * `[EDD-9160]` (#241): an update about to write a group one of whose values was read from a row
-   * stored under a sort key other than the one this configuration composes for that value, through
+   * `[EDD-9160]` (#241): an update about to send or delete a row (#168: judged per row, not per
+   * group) whose value was read from a row stored under a sort key other than the one this
+   * configuration composes for that value, through
    * the function the write itself keys rows with ({@link sortKeyOf}). Each value's row is the one a
    * read took it from ({@link rowsReadAt}). Such a row was written under the other `escapeKeys`
    * setting (`$`, `#` or another escaped character, a number other than a non-negative integer
@@ -4258,18 +4398,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
    */
   const refuseOtherSettingRows = (
     oldGroups: ReadonlyArray<TransactionGroup>,
-    written: (group: string) => boolean,
+    written: (group: string, sk: string) => boolean,
     readAt: ReadonlyMap<string, Record<string, unknown>>,
     moved: ReadonlyMap<string, ReadonlyArray<string>>,
   ): Effect.Effect<void, ValidationError> => {
     for (const group of oldGroups) {
-      if (!written(group.name)) continue
       for (const item of group.items) {
         if (item.path === undefined) continue
         const row = readAt.get(JSON.stringify(item.path))
         const stored = row?.sk
         const sk = sortKeyOf(config.schema, item)
         if (typeof stored !== "string" || sk === undefined || stored === sk) continue
+        if (!written(group.name, sk)) continue
         if (moved.get(group.name)?.includes(stored) === true) continue
         return Effect.fail(
           new ValidationError({
@@ -4296,13 +4436,37 @@ const makeAggregate = <TSchema extends Schema.Top>(
     mutationFn: (
       context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
+    options?: { readonly expectedVersion?: number | undefined },
   ): Effect.Effect<
     Schema.Schema.Type<TSchema>,
-    AggregateWriteError | BlobStoreError,
+    AggregateUpdateError | BlobStoreError,
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "update")
+      const expectedVersion = options?.expectedVersion
+      // `[EDD-9178]` (#168): an unversioned aggregate keeps no version to compare. Refused before
+      // anything is read.
+      if (expectedVersion !== undefined && versionField === undefined) {
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.update",
+          cause: new Error(
+            `[EDD-9178] Aggregate "${aggregateName}": \`expectedVersion\` on an aggregate that ` +
+              "isn't `versioned`, which keeps no version to compare it with. Turn on `versioned` " +
+              "in `Aggregate.make`, or drop `expectedVersion`. Nothing was read or written.",
+          ),
+        })
+      }
+
+      // The rows as stored, kept beside the ones read: each row the write sends is guarded on its
+      // stored form, never on a row unmarshalled and marshalled again (#168, §3.2). Read strongly
+      // consistent where the collection allows (D11 reversed): a guard on an out-of-date read fails
+      // on every attempt until the read catches up.
+      const stored: Array<Record<string, AttributeValue>> = []
+      const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "update", {
+        stored,
+        consistent: readConsistent,
+      })
 
       if (allItems.length === 0) {
         return yield* new AggregateAssemblyError({
@@ -4311,6 +4475,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
           key,
         })
       }
+      const rawBySk = new Map<string, Record<string, AttributeValue>>()
+      for (const row of stored) {
+        const sk = (row.sk as { S?: string } | undefined)?.S
+        if (sk !== undefined) rawBySk.set(sk, row)
+      }
+      const rawRoot = rawBySk.get(rootSortKey)
 
       // 1. Assemble current state
       const current = yield* assembleAggregate(
@@ -4323,6 +4493,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
         systemAttrs,
       )
 
+      // A versioned root's version and incarnation token as read (#168, §3.5): 0 and none on a root
+      // written before `versioned` was turned on.
+      const versionRead =
+        versionField === undefined ? undefined : storedRootVersion(rawRoot, versionField)
+      if (expectedVersion !== undefined && versionRead!.version !== expectedVersion) {
+        return yield* new OptimisticLockError({
+          entityType: aggregateName,
+          key,
+          expectedVersion,
+          actualVersion: versionRead!.version,
+        })
+      }
+
       const now = yield* DateTime.now
 
       // 2. Apply mutation — provide optics context for composable updates
@@ -4332,6 +4515,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         cursor: makeCursor(state, opticRoot),
         optic: opticRoot,
         current: current as Schema.Schema.Type<TSchema>,
+        ...(versionRead !== undefined && { version: versionRead.version }),
       })
       // An offloaded edge field takes its value, never a stream, handle, source or lazy value
       // (`[EDD-9120]`, #179).
@@ -4344,7 +4528,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
       //    update path), and a transformation with one type on both sides isn't
       //    applied again to a value it already made.
       //    A row the mutation added doesn't need the dates the library stamps.
-      const written = fillStamps(rootNode, updated, now, "required")
+      //    A version the root declares is the library's: the one read, whatever the mutation set.
+      const filled = fillStamps(rootNode, updated, now, "required")
+      const written =
+        versionDeclared &&
+        ownValue(filled as Record<string, unknown>, versionField!) !== versionRead!.version
+          ? { ...(filled as object), [versionField!]: versionRead!.version }
+          : filled
       const decoded = yield* Schema.decodeUnknownEffect(mutatedStateSchema)(written).pipe(
         Effect.mapError(
           (cause) =>
@@ -4539,25 +4729,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
       yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
       // The row each value of the state was read from (#241).
       const readAt = rowsReadAt(rootNode, allItems, systemAttrs)
-      yield* refuseOtherSettingRows(oldGroups, groupChanged, readAt, previousRows)
-
-      // Route and upload the offloaded attributes of the groups the write sends, every one afresh
-      // (#179, design §6.9), before the first transaction: decided on the decomposed values above,
-      // so an unchanged group uploads nothing, and no pointer read from the partition is written
-      // back (each changed group's values were read eagerly, and are uploaded again).
-      const sentDynamo = yield* routeBuiltGroups(
-        newDynamo.filter((g) => groupChanged(g.group)),
-        offloadInfoByType,
-        {
-          table: tableConfig.name,
-          pkAttribute: config.pk.field,
-          operation: "Aggregate.update",
-          escapeKeys: config.schema.escapeKeys === true,
-        },
-      )
-      const newItemsByGroup = new Map(sentDynamo.map((g) => [g.group, g.items]))
-      // The rows as built, values inline: what the result is assembled from (no store I/O).
-      const builtByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
       const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
       // Every sk that survives anywhere in the new decomposition — an old item is
       // an orphan to DELETE only if its key appears in no new group at all.
@@ -4566,17 +4737,77 @@ const makeAggregate = <TSchema extends Schema.Top>(
         for (const item of g.items) survivingSks.add(skOf(item))
       }
 
-      // 7. Per group (union of old + new names), collect PUTs + orphan DELETEs.
-      const groupWrites: Array<{
-        group: string
-        puts: ReadonlyArray<Record<string, AttributeValue>>
-        deletes: ReadonlyArray<Record<string, AttributeValue>>
-      }> = []
-      const groupNames = new Set<string>([...newGroupMap.keys(), ...oldGroupMap.keys()])
+      // 7. The rows the write sends (#168, D2, design §3.3). A changed group sends the rows whose
+      //    decomposed value changed, the rows the new value adds and its `Delete`s; an unchanged row
+      //    isn't sent and keeps its `updated`. Every row of a group is sent when a context field
+      //    changed or the group's copies of one are stale (#241). Rows are matched old to new by the
+      //    sort key they compose, not by group: an item can change group without changing key.
+      const oldBySk = new Map<string, Array<DecomposedItem>>()
+      oldGroups.forEach((group, g) => {
+        group.items.forEach((item, i) => {
+          const sk = skOf(oldDynamo[g]!.items[i]!)
+          oldBySk.set(sk, [...(oldBySk.get(sk) ?? []), item])
+        })
+      })
+      // Rows read under the sort key text 1.40.0 composed, which a changed group moves (#241).
+      const movedFrom = new Set([...previousRows.values()].flat())
+      /** The row a value was read from: by its place in the value, else at its key. */
+      const readFrom = (item: DecomposedItem, sk: string): Record<string, unknown> | undefined =>
+        (item.path === undefined ? undefined : readAt.get(JSON.stringify(item.path))) ??
+        readRows.get(sk)
+      /** Whether a new item is its row as read: one old item composes its key, alike, and was read. */
+      const unchanged = (item: DecomposedItem, sk: string): boolean => {
+        const olds = oldBySk.get(sk)
+        if (olds === undefined || olds.length !== 1) return false
+        const old = olds[0]!
+        if (old.entityType !== item.entityType || !deepEqual(old.attributes, item.attributes)) {
+          return false
+        }
+        const row = readFrom(old, sk)
+        return row !== undefined && !(typeof row.sk === "string" && movedFrom.has(row.sk))
+      }
+      type SentRow = {
+        readonly group: string
+        readonly g: number
+        readonly i: number
+        readonly item: DecomposedItem
+        readonly sk: string
+      }
+      type DeletedRow = { readonly group: string; readonly sk: string; readonly name: string }
+      // Every group's name, in order: the root's first, then the new value's, then the old one's.
+      const rootGroup = rootRead?.transactionGroup
+      const groupNames = [
+        ...new Set<string>([
+          ...(rootGroup === undefined ? [] : [rootGroup]),
+          ...newGroupMap.keys(),
+          ...oldGroupMap.keys(),
+        ]),
+      ]
+      const sentRows: Array<SentRow> = []
+      const deletedRows: Array<DeletedRow> = []
+      const changedGroups = new Set<string>()
+      // Each item's member path (D15): a `many` element by its sort key values.
+      const elementKeys = new Map<string, string>()
+      for (const item of [...oldGroups, ...newGroups].flatMap((group) => group.items)) {
+        const last = item.path?.at(-1)
+        if (typeof last === "number" && item.elementKey !== undefined) {
+          elementKeys.set(JSON.stringify(item.path), item.elementKey)
+        }
+      }
+      const nameOf = (item: DecomposedItem | undefined, sk: string): string =>
+        item === undefined ? sk : memberPath(item, elementKeys)
       for (const name of groupNames) {
         if (!groupChanged(name)) continue
-
-        const puts = newItemsByGroup.get(name) ?? []
+        changedGroups.add(name)
+        const whole = contextChanged || stale.has(name)
+        const g = newGroups.findIndex((group) => group.name === name)
+        if (g >= 0) {
+          newGroups[g]!.items.forEach((item, i) => {
+            const sk = skOf(newDynamo[g]!.items[i]!)
+            if (!whole && unchanged(item, sk)) return
+            sentRows.push({ group: name, g, i, item, sk })
+          })
+        }
         // Each row once: two old items can compose one key (rows stored under two keys, #241).
         const deleteSks = new Set(
           (oldItemsByGroup.get(name) ?? [])
@@ -4584,91 +4815,347 @@ const makeAggregate = <TSchema extends Schema.Top>(
             .filter((sk) => !survivingSks.has(sk)),
         )
         // A row read under the text 1.40.0 composed goes in the same transaction (#241).
-        const previous = (previousRows.get(name) ?? []).filter((sk) => !survivingSks.has(sk))
-        for (const sk of previous) deleteSks.add(sk)
-        const deletes = [...deleteSks].map((sk) => ({
-          [config.pk.field]: { S: pkValue } as AttributeValue,
-          sk: { S: sk } as AttributeValue,
-        }))
-        if (puts.length === 0 && deletes.length === 0) continue
-        groupWrites.push({
-          group: name,
-          puts,
-          deletes,
-          ...(previous.length > 0 && { previous: previous.length }),
-        })
+        for (const sk of previousRows.get(name) ?? []) {
+          if (!survivingSks.has(sk)) deleteSks.add(sk)
+        }
+        // Only a row read: a key nothing was read at holds nothing to delete.
+        for (const sk of deleteSks) {
+          if (rawBySk.has(sk)) {
+            deletedRows.push({ group: name, sk, name: nameOf(oldBySk.get(sk)?.[0], sk) })
+          }
+        }
       }
+      const sentSks = new Set(sentRows.map((row) => row.sk))
+      // `EDD-9160`, judged on the rows the write sends (§3.3): an unchanged row under the other
+      // setting's text in a changed group isn't sent, and stays for `rekey`.
+      yield* refuseOtherSettingRows(
+        oldGroups,
+        (group, sk) => changedGroups.has(group) && (sentSks.has(sk) || !survivingSks.has(sk)),
+        readAt,
+        previousRows,
+      )
 
       // With `ownsRows`, every row of its types in the partition is the aggregate's (DESIGN.md §7
-      // "Which rows in its partition are an aggregate's"). After the update's groups, the rows read
-      // of each node whose decomposition changed that the new value doesn't write are deleted too
-      // (`ownedRowsLeft`): a node's rows are what its decomposition writes.
+      // "Which rows in its partition are an aggregate's"): the rows read of each node whose
+      // decomposition changed that the new value doesn't write are deleted too (`ownedRowsLeft`),
+      // in the update's own transactions, each while it's gone or still as read (D10).
+      const touched = new Set([
+        ...sentRows.map(({ group }) => group),
+        ...deletedRows.map(({ group }) => group),
+      ])
       const cleanup = ownsRows
         ? ownedRowsLeft(
             allItems,
             pkValue,
             oldGroups,
             newGroups,
-            new Set(groupWrites.map(({ group }) => group)),
+            touched,
             survivingSks,
-            groupWrites.flatMap(({ deletes }) => deletes.map((item) => skOf(item))),
+            deletedRows.map(({ sk }) => sk),
           )
         : []
 
-      if (groupWrites.length > 0) {
-        yield* writeTransactionGroups(
-          client,
-          tableConfig.name,
-          groupWrites,
-          aggregateName,
-          groupKeys,
-        )
-      }
-      if (cleanup.length > 0) {
-        yield* deleteOwnedRows(client, tableConfig.name, config.pk.field, cleanup)
+      const anything = sentRows.length > 0 || deletedRows.length > 0 || cleanup.length > 0
+      // A versioned root moves by one on every write that sends anything (§3.5), under its token,
+      // or a fresh one on a root written before `versioned` was turned on.
+      const token =
+        versionRead === undefined || !anything
+          ? undefined
+          : (versionRead.token ?? (yield* freshIncarnationToken))
+      const nextVersion = versionRead === undefined ? undefined : versionRead.version + 1
+      const rootSent = sentRows.some((row) => row.sk === rootSortKey && row.item.node === rootNode)
+      /** A row as built, a versioned root's carrying its next version and token. */
+      const builtOf = (row: SentRow): Record<string, AttributeValue> => {
+        const built = newDynamo[row.g]!.items[row.i]!
+        if (versionField === undefined || row.sk !== rootSortKey || row.item.node !== rootNode) {
+          return built
+        }
+        return {
+          ...built,
+          [versionField]: { N: String(nextVersion) },
+          [INCARNATION_TOKEN]: { S: token! },
+        }
       }
 
-      if (!returnsStamps) {
+      // Route and upload the offloaded attributes of the rows the write sends, every one afresh
+      // (#179, design §6.9), before the first transaction: decided on the decomposed values above,
+      // so an unchanged row uploads nothing, and no pointer read from the partition is written
+      // back (each sent row's values were read eagerly, and are uploaded again).
+      const sentByGroup = new Map<string, Array<SentRow>>()
+      for (const row of sentRows) {
+        sentByGroup.set(row.group, [...(sentByGroup.get(row.group) ?? []), row])
+      }
+      const routed = yield* routeBuiltGroups(
+        [...sentByGroup].map(([group, rows]) => ({
+          group,
+          items: rows.map(builtOf),
+          written: rows.map((row) => newDynamo[row.g]!.written[row.i]!),
+          rows,
+        })),
+        offloadInfoByType,
+        {
+          table: tableConfig.name,
+          pkAttribute: config.pk.field,
+          operation: "Aggregate.update",
+          escapeKeys: config.schema.escapeKeys === true,
+        },
+      )
+
+      // 8. The write's units (§3.1): the root's group first, then each changed group, then each
+      //    cleanup `Delete`, every item guarded (§3.2) and asking for the row as stored when its
+      //    condition fails.
+      const tableName = tableConfig.name
+      const pkField = config.pk.field
+      const updatedPrefer = stampFields?.updatedAt ? [stampFields.updatedAt] : []
+      const preferFor = (entityType: string): ReadonlyArray<string> =>
+        versionField !== undefined && entityType === config.root.entityType
+          ? [versionField, INCARNATION_TOKEN, ...updatedPrefer]
+          : updatedPrefer
+      const absentFor = (entityType: string) => writableAttributes.get(entityType) ?? []
+      const keyAt = (sk: string) => toAttributeMap({ [pkField]: pkValue, sk })
+      const typeOf = (read: Record<string, AttributeValue>) =>
+        (read.__edd_e__ as { S?: string } | undefined)?.S ?? aggregateName
+      const putOf = (
+        row: SentRow,
+        item: Record<string, AttributeValue>,
+      ): AggregateWrite.PlannedItem => {
+        const read = rawBySk.get(row.sk)
+        const isRoot = row.sk === rootSortKey && row.item.node === rootNode
+        const name = nameOf(row.item, row.sk)
+        const expects = isRoot ? versionRead : undefined
+        if (read === undefined) {
+          return {
+            action: {
+              Put: AggregateWrite.withAllOld({
+                TableName: tableName,
+                Item: item,
+                ...AggregateWrite.absentGuard(pkField),
+              }),
+            },
+            role: isRoot ? "root" : "new",
+            name,
+            expects,
+          }
+        }
+        const entityType = typeOf(read)
+        const put = (bySize?: ReadonlySet<string>) => ({
+          Put: AggregateWrite.withAllOld({
+            TableName: tableName,
+            Item: item,
+            ...AggregateWrite.rowGuard(
+              read,
+              pkField,
+              preferFor(entityType),
+              absentFor(entityType),
+              bySize,
+            ),
+          }),
+        })
+        return { action: put(), role: isRoot ? "root" : "row", name, read, sized: put, expects }
+      }
+      const deleteOf = (row: DeletedRow): AggregateWrite.PlannedItem => {
+        const read = rawBySk.get(row.sk)!
+        const entityType = typeOf(read)
+        const remove = (bySize?: ReadonlySet<string>) => ({
+          Delete: AggregateWrite.withAllOld({
+            TableName: tableName,
+            Key: keyAt(row.sk),
+            ...AggregateWrite.rowGuard(
+              read,
+              pkField,
+              preferFor(entityType),
+              absentFor(entityType),
+              bySize,
+            ),
+          }),
+        })
+        return { action: remove(), role: "row", name: row.name, read, sized: remove }
+      }
+      const units: Array<AggregateWrite.PlannedUnit> = []
+      const routedByGroup = new Map(routed.map((group) => [group.group, group]))
+      for (const name of groupNames) {
+        const sent = routedByGroup.get(name)
+        const items: Array<AggregateWrite.PlannedItem> = [
+          ...(sent === undefined ? [] : sent.rows.map((row, k) => putOf(row, sent.items[k]!))),
+          ...deletedRows.filter((row) => row.group === name).map(deleteOf),
+        ]
+        if (items.length === 0) continue
+        // The root first in its unit: what a request holding it is fenced by.
+        items.sort((a, b) => Number(b.role === "root") - Number(a.role === "root"))
+        const previous = (previousRows.get(name) ?? []).filter((sk) => !survivingSks.has(sk))
+        units.push({
+          group: name,
+          items,
+          ...(previous.length > 0 && { previous: previous.length }),
+        })
+      }
+      // A versioned root not rewritten moves its version with an `Update` of the root, first (§3.4).
+      if (versionField !== undefined && anything && !rootSent) {
+        const condition = [
+          "attribute_exists(#pk)",
+          versionRead!.version === 0 ? "(attribute_not_exists(#ver) OR #ver = :v)" : "#ver = :v",
+          versionRead!.token === undefined ? "attribute_not_exists(#inc)" : "#inc = :inc",
+        ].join(" AND ")
+        const versionUpdate: AggregateWrite.PlannedItem = {
+          action: {
+            Update: AggregateWrite.withAllOld({
+              TableName: tableName,
+              Key: keyAt(rootSortKey),
+              UpdateExpression: "SET #ver = :v1, #inc = :inc",
+              ConditionExpression: condition,
+              ExpressionAttributeNames: {
+                "#pk": pkField,
+                "#ver": versionField,
+                "#inc": INCARNATION_TOKEN,
+              },
+              ExpressionAttributeValues: {
+                ":v": { N: String(versionRead!.version) },
+                ":v1": { N: String(nextVersion) },
+                ":inc": { S: token! },
+              },
+            }),
+          },
+          role: "root",
+          name: "",
+          read: rawRoot,
+          expects: versionRead,
+        }
+        const first = units.findIndex((unit) => unit.group === rootGroup)
+        if (first >= 0) {
+          const unit = units[first]!
+          units.splice(first, 1)
+          units.unshift({ ...unit, items: [versionUpdate, ...unit.items] })
+        } else {
+          units.unshift({ group: rootGroup ?? aggregateName, items: [versionUpdate] })
+        }
+      }
+      for (const row of cleanup) {
+        const read = rawBySk.get(row.sk)
+        if (read === undefined) continue
+        const remove = (bySize?: ReadonlySet<string>) => ({
+          Delete: AggregateWrite.withAllOld({
+            TableName: tableName,
+            Key: keyAt(row.sk),
+            ...AggregateWrite.goneOrAsReadGuard(
+              read,
+              pkField,
+              preferFor(row.entityType),
+              absentFor(row.entityType),
+              row.entityType,
+              bySize,
+            ),
+          }),
+        })
+        units.push({
+          group: row.sk,
+          items: [{ action: remove(), role: "cleanup", name: row.sk, read, sized: remove }],
+        })
+      }
+
+      // The fence (§3.4) on each request without the root: the root's next version and token on a
+      // versioned aggregate, its existence with `fence: true`, nothing otherwise.
+      const fence: AggregateWrite.PlannedItem | undefined =
+        versionField !== undefined && anything
+          ? {
+              action: {
+                ConditionCheck: AggregateWrite.withAllOld({
+                  TableName: tableName,
+                  Key: keyAt(rootSortKey),
+                  ConditionExpression: "#ver = :v1 AND #inc = :inc",
+                  ExpressionAttributeNames: { "#ver": versionField, "#inc": INCARNATION_TOKEN },
+                  ExpressionAttributeValues: {
+                    ":v1": { N: String(nextVersion) },
+                    ":inc": { S: token! },
+                  },
+                }),
+              },
+              role: "fence",
+              name: "",
+              expects: { version: nextVersion!, token, reported: versionRead!.version },
+            }
+          : fenced
+            ? {
+                action: {
+                  ConditionCheck: AggregateWrite.withAllOld({
+                    TableName: tableName,
+                    Key: keyAt(rootSortKey),
+                    ConditionExpression: "attribute_exists(#pk)",
+                    ExpressionAttributeNames: { "#pk": pkField },
+                  }),
+                },
+                role: "fence",
+                name: "",
+              }
+            : undefined
+
+      if (anything) {
+        yield* AggregateWrite.sendUnits(client, units, {
+          tableName,
+          aggregateName,
+          keys: groupKeys,
+          operation: "update",
+          fence,
+          verdict: AggregateWrite.updateVerdict({
+            aggregateName,
+            key,
+            pkField,
+            versioned:
+              versionField === undefined
+                ? undefined
+                : { field: versionField, read: versionRead!.version },
+          }),
+        })
+      }
+
+      if (!returnsStamps && !(versionDeclared && anything)) {
         // 1.40.0's result, the mutated state as decoded, with one change (#241): a member value's
         // copy of a context attribute is what its row now holds: the root's, on a row the write
-        // sent; what it held when read, on one it didn't.
+        // sent; what it held when read, on one it didn't (judged per row, #168).
+        const sentPaths = new Set(
+          sentRows.flatMap(({ item }) =>
+            item.path === undefined ? [] : [JSON.stringify(item.path)],
+          ),
+        )
         const rowsNow = new Map<string, RowNow>()
         for (const group of newGroups) {
-          const sent = groupChanged(group.name)
           for (const item of group.items) {
             if (item.path === undefined) continue
+            const path = JSON.stringify(item.path)
             let now: RowNow | undefined
-            if (sent) now = { written: true }
+            if (sentPaths.has(path)) now = { written: true }
             else {
-              // A group the write didn't send holds the values it was read as, each on its row.
-              const row = readAt.get(JSON.stringify(item.path))
+              // A row the write didn't send holds the value it was read as.
+              const row = readAt.get(path)
               if (row !== undefined) now = { row }
             }
-            if (now !== undefined) rowsNow.set(JSON.stringify(item.path), now)
+            if (now !== undefined) rowsNow.set(path, now)
           }
         }
         return withStoredContextCopies(decoded, (path) =>
           rowsNow.get(JSON.stringify(path)),
         ) as Schema.Schema.Type<TSchema>
       }
-      // A stamp the domain object holds: what's returned is what's stored, as `get` would read it,
-      // and no read is needed to know that. The partition as read, with these writes applied, as
-      // 1.40.0 assembled it.
-      const stored = new Map(allItems.map((item) => [String(item.sk), item]))
-      for (const { sk } of cleanup) stored.delete(sk)
-      for (const { group, deletes, puts } of groupWrites) {
-        for (const item of deletes) stored.delete(String((item.sk as { S?: string }).S))
-        // The rows as built, not as sent: an offloaded value is inline there (#179).
-        const written = (puts.length === 0 ? [] : (builtByGroup.get(group) ?? puts)).map(
-          (item) => fromAttributeMap(item) as Record<string, unknown>,
-        )
-        yield* unpackAggregateItems(written, dispatchByType, aggregateName)
-        for (const item of written) stored.set(String(item.sk), item)
+      // A stamp or a version the domain object holds: what's returned is what's stored, as `get`
+      // would read it, and no read is needed to know that. The partition as read, with these writes
+      // applied, as 1.40.0 assembled it.
+      const storedNow = new Map(allItems.map((item) => [String(item.sk), item]))
+      for (const { sk } of cleanup) storedNow.delete(sk)
+      for (const { sk } of deletedRows) storedNow.delete(sk)
+      // The rows as built, not as sent: an offloaded value is inline there (#179).
+      const writtenRows = sentRows.map(
+        (row) => fromAttributeMap(builtOf(row)) as Record<string, unknown>,
+      )
+      yield* unpackAggregateItems(writtenRows, dispatchByType, aggregateName)
+      for (const row of writtenRows) storedNow.set(String(row.sk), row)
+      if (versionDeclared && anything && !rootSent) {
+        const root = storedNow.get(rootSortKey)
+        if (root !== undefined)
+          storedNow.set(rootSortKey, { ...root, [versionField!]: nextVersion })
       }
       return (yield* assembleAggregate(
         assembly,
         rootNode,
-        [...stored.values()],
+        [...storedNow.values()],
         contextFields,
         key,
         aggregateName,
@@ -4710,6 +5197,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
       for (const child of node.children) walk(child)
     }
     walk(rootNode)
+    // A versioned root's version and incarnation token (#168): a guard checks each is as read.
+    if (versionField !== undefined) {
+      const root = byType.get(rootNode.entityType)!
+      root.add(versionField)
+      root.add(INCARNATION_TOKEN)
+    }
     return new Map([...byType].map(([entityType, names]) => [entityType, [...names].sort()]))
   })()
 
@@ -5132,8 +5625,30 @@ const makeAggregate = <TSchema extends Schema.Top>(
             : undefined
         const itemOf = (r: number): Record<string, AttributeValue> => {
           const row = rows[r]!
-          if (!row.custom) return built[r]!
           const at = row.placement === "old" ? row.old : row.current
+          if (!row.custom) {
+            const item = built[r]!
+            if (
+              versionField === undefined ||
+              item.sk?.S !== rootSortKey ||
+              item.__edd_e__?.S !== config.root.entityType
+            ) {
+              return item
+            }
+            // A versioned root moves with its version and incarnation token as read (#168): built
+            // from the model, it holds the version only where the model declares it, and the
+            // token never, so a moved root would read as version 0 and a new incarnation.
+            const read = storedAt.get(positionOf(at.pk, at.sk)) ?? {}
+            const held = [versionField, INCARNATION_TOKEN]
+            const moved: Record<string, AttributeValue> = Object.fromEntries(
+              Object.entries(item).filter(([name]) => !held.includes(name)),
+            )
+            for (const name of held) {
+              const value = read[name]
+              if (value !== undefined) moved[name] = value
+            }
+            return moved
+          }
           return {
             ...storedAt.get(positionOf(at.pk, at.sk)),
             [config.pk.field]: { S: row.current.pk },
@@ -5677,6 +6192,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         const items = rows
           .filter((item) => item[config.pk.field]?.S === pk)
           .map((item) => fromAttributeMap(item) as Record<string, unknown>)
+        withReadVersion(items)
         yield* loadAggregateItems(items, readPlans)
         const assembled = yield* assembleAggregate(
           assembly,
@@ -5834,7 +6350,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
           //    over what the input holds for it unless the root declares it
           //    optional, so what's composed and returned is what's stored.
           const now = yield* DateTime.now
-          const written = fillStamps(rootNode, hydrated, now, "declared")
+          const stamped = fillStamps(rootNode, hydrated, now, "declared")
+          // A versioned root starts at 1 (#168, §3.5): a version the root declares is the
+          // library's, whatever the input holds.
+          const written = versionDeclared ? { ...(stamped as object), [versionField!]: 1 } : stamped
           const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(written).pipe(
             Effect.mapError(
               (cause) =>
@@ -5906,77 +6425,153 @@ const makeAggregate = <TSchema extends Schema.Top>(
             escapeKeys: config.schema.escapeKeys === true,
           })
 
-          // 6. Write via sub-aggregate transactions. The root item goes first in
-          //    the first transaction, guarded by `attribute_not_exists` (#134):
-          //    an existing aggregate cancels it before any edge or sub-aggregate
-          //    row is written. Rows below the root need no guard of their own —
-          //    they are only ever written after the root's transaction commits.
-          const rootSk = composeKey(config.schema, config.root.entityType, [])
-          const isRoot = (item: Record<string, AttributeValue>) => item.sk?.S === rootSk
-          const ordered = [...sentGroups]
+          // 6. Write: every group in one transaction when they fit (#168, §3.7), else whole groups
+          //    in as few as fit, the root's first. The root item is guarded by
+          //    `attribute_not_exists` (#134): an existing aggregate cancels it before any edge or
+          //    sub-aggregate row is written. Rows below the root need no guard of their own: past one
+          //    transaction they are only ever written after the root's has committed. A versioned
+          //    root holds version 1 and a fresh incarnation token.
+          const token = versionField === undefined ? undefined : yield* freshIncarnationToken
+          const isRoot = (item: Record<string, AttributeValue>) => item.sk?.S === rootSortKey
+          const rootKey = { [config.pk.field]: pkValue, sk: rootSortKey }
+          const units: Array<AggregateWrite.PlannedUnit> = [...sentGroups]
             .sort((a, b) => Number(b.items.some(isRoot)) - Number(a.items.some(isRoot)))
-            .map((g) => ({
-              group: g.group,
-              puts: [...g.items].sort((a, b) => Number(isRoot(b)) - Number(isRoot(a))),
-              deletes: [],
+            .map((group) => ({
+              group: group.group,
+              items: [...group.items]
+                .sort((a, b) => Number(isRoot(b)) - Number(isRoot(a)))
+                .map(
+                  (item): AggregateWrite.PlannedItem =>
+                    isRoot(item)
+                      ? {
+                          action: {
+                            Put: {
+                              TableName: tableConfig.name,
+                              Item:
+                                versionField === undefined
+                                  ? item
+                                  : {
+                                      ...item,
+                                      [versionField]: { N: "1" },
+                                      [INCARNATION_TOKEN]: { S: token! },
+                                    },
+                              ...AggregateWrite.absentGuard(config.pk.field),
+                            },
+                          },
+                          role: "root",
+                          name: "",
+                        }
+                      : {
+                          action: { Put: { TableName: tableConfig.name, Item: item } },
+                          role: "new",
+                          name: item.sk?.S ?? "",
+                        },
+                ),
             }))
-          yield* writeTransactionGroups(
-            client,
-            tableConfig.name,
-            ordered,
+          yield* AggregateWrite.sendUnits(client, units, {
+            tableName: tableConfig.name,
             aggregateName,
-            groupKeys,
-            {
-              pkField: config.pk.field,
-              entityType: config.root.entityType,
-              key: { [config.pk.field]: pkValue, sk: rootSk },
-            },
-          )
+            keys: groupKeys,
+            operation: "create",
+            verdict: (reasons, items) =>
+              reasons.some(
+                (reason, i) =>
+                  reason?.Code === "ConditionalCheckFailed" && items[i]?.role === "root",
+              )
+                ? new ConditionalCheckFailed({ entityType: config.root.entityType, key: rootKey })
+                : undefined,
+          })
 
           return decoded as Schema.Schema.Type<TSchema>
         }),
 
-      update: (key, mutationFn) => updateCore(key, mutationFn),
+      update: (key, mutationFn, options) => updateCore(key, mutationFn, options),
 
       delete: (key) =>
         Effect.gen(function* () {
-          const { client, tableConfig, allItems } = yield* readPartitionRaw(
-            key,
-            // `delete` declares no `ValidationError`: a rejected read keeps
-            // DynamoDB's own tag, its message explained.
-            (diagnosis, original) =>
-              new DynamoValidationError({
-                operation: "Query",
-                cause: assemblyReadCause("delete", diagnosis, original),
-              }),
-          ).pipe(
-            // Nor a key with no value: nothing to read, reported as a key that finds nothing.
-            Effect.catchTag("ValidationError", (error) =>
-              Effect.fail(
-                new AggregateAssemblyError({
-                  aggregate: aggregateName,
-                  reason: String((error.cause as { message?: unknown })?.message ?? error.cause),
-                  key,
+          // `delete` declares no `ValidationError`: a rejected read keeps DynamoDB's own tag, its
+          // message explained; nor a key with no value, reported as a key that finds nothing.
+          // The caller's key is read once (#239): a second read of the partition is given its key.
+          const read = (consistent: boolean, partition?: string) =>
+            readPartitionRaw(
+              key,
+              (diagnosis, original) =>
+                new DynamoValidationError({
+                  operation: "Query",
+                  cause: assemblyReadCause("delete", diagnosis, original),
                 }),
+              consistent || partition !== undefined ? { consistent, partition } : undefined,
+            ).pipe(
+              Effect.catchTag("ValidationError", (error) =>
+                Effect.fail(
+                  new AggregateAssemblyError({
+                    aggregate: aggregateName,
+                    reason: String((error.cause as { message?: unknown })?.message ?? error.cause),
+                    key,
+                  }),
+                ),
               ),
-            ),
-          )
-
+            )
           // Only the aggregate's own rows (DESIGN.md §7 "delete"): a row of another entity type in
           // its partition is an entity's or another aggregate's, and stays. Nothing is keyed by
           // value, so every row of the aggregate's types is deleted, whoever wrote it.
-          const ownItems = allItems.filter(
-            (item) => typeof item.__edd_e__ === "string" && ownedTypes.has(item.__edd_e__),
-          )
-          if (ownItems.length === 0) {
-            return yield* new AggregateAssemblyError({
-              aggregate: aggregateName,
-              reason: "No items found for aggregate key",
-              key,
+          const ownOf = (items: ReadonlyArray<Record<string, unknown>>) =>
+            items.filter(
+              (item) => typeof item.__edd_e__ === "string" && ownedTypes.has(item.__edd_e__),
+            )
+          const isRootRow = (item: Record<string, unknown>) =>
+            item.__edd_e__ === config.root.entityType && item.sk === rootSortKey
+          const notFound = new AggregateAssemblyError({
+            aggregate: aggregateName,
+            reason: "No items found for aggregate key",
+            key,
+          })
+
+          if (fenced) {
+            // With the fence (#168, §3.8): the root first, so no update commits after it (each
+            // checks the root), then one read, consistent where the collection allows, and the rest.
+            const client = yield* Capacity.client
+            const tableConfig: TableConfig = yield* config.table.Tag
+            const pkValue = yield* composeOrFail("key", () => collectionPkOf(key)).pipe(
+              Effect.catchTag("ValidationError", (error) =>
+                Effect.fail(
+                  new AggregateAssemblyError({
+                    aggregate: aggregateName,
+                    reason: String((error.cause as { message?: unknown })?.message ?? error.cause),
+                    key,
+                  }),
+                ),
+              ),
+            )
+            const removed = yield* client.deleteItem({
+              TableName: tableConfig.name,
+              Key: toAttributeMap({ [config.pk.field]: pkValue, sk: rootSortKey }),
+              ReturnValues: "ALL_OLD",
             })
+            const { allItems } = yield* read(readConsistent, pkValue)
+            const ownItems = ownOf(allItems)
+            if (removed.Attributes === undefined && ownItems.length === 0) {
+              return yield* notFound
+            }
+            // A root found after the root was deleted is a `create` that reused the key in between:
+            // its aggregate is left as it is, as the sweep without the fence leaves it (§3.8).
+            if (ownItems.length > 0 && !ownItems.some(isRootRow)) {
+              yield* deleteAllItems(client, tableConfig.name, ownItems, config.pk.field)
+            }
+            return
           }
 
+          const { client, tableConfig, allItems, pkValue } = yield* read(false)
+          const ownItems = ownOf(allItems)
+          if (ownItems.length === 0) return yield* notFound
           yield* deleteAllItems(client, tableConfig.name, ownItems, config.pk.field)
+          // Without the fence (§2.6, §3.8): one more read, consistent where the collection allows,
+          // finds the rows a write added after the first, and deletes them, unless it finds a root:
+          // a `create` reused the key, and its aggregate is left as it is.
+          const swept = ownOf((yield* read(readConsistent, pkValue)).allItems)
+          if (swept.length > 0 && !swept.some(isRootRow)) {
+            yield* deleteAllItems(client, tableConfig.name, swept, config.pk.field)
+          }
         }),
 
       list: (filter, options) =>
@@ -6247,7 +6842,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
  * Each aggregate operation as a named operation for consumed-capacity
  * reports (#174); the entity ops and batches it composes nest under it.
  */
-const withOperations = <A extends Aggregate<any, any, any, any, any>>(
+const withOperations = <A extends Aggregate<any, any, any, any, any, any>>(
   aggregateName: string,
   ops: A,
 ): A => {
@@ -6259,8 +6854,12 @@ const withOperations = <A extends Aggregate<any, any, any, any, any>>(
     // by the one transaction that carries them.
     create: (input: any) =>
       Capacity.operation("Aggregate.create", target, BlobLedger.root(ops.create(input))),
-    update: (key: any, mutationFn: any) =>
-      Capacity.operation("Aggregate.update", target, BlobLedger.root(ops.update(key, mutationFn))),
+    update: (key: any, mutationFn: any, options?: any) =>
+      Capacity.operation(
+        "Aggregate.update",
+        target,
+        BlobLedger.root(ops.update(key, mutationFn, options)),
+      ),
     delete: (key: any) =>
       Capacity.operation("Aggregate.delete", target, BlobLedger.root(ops.delete(key))),
     list: (filter: any, options: any) =>
@@ -6284,10 +6883,11 @@ export const bind = <
   TInput,
   TCreate,
   TBlobErrors = never,
+  TVersioned extends boolean = boolean,
 >(
-  aggregate: Aggregate<TSchema, TKey, TInput, TCreate, TBlobErrors>,
+  aggregate: Aggregate<TSchema, TKey, TInput, TCreate, TBlobErrors, TVersioned>,
 ): Effect.Effect<
-  BoundAggregate<TSchema, TKey, TInput, TCreate, TBlobErrors>,
+  BoundAggregate<TSchema, TKey, TInput, TCreate, TBlobErrors, TVersioned>,
   never,
   DynamoClient | TableConfig
 > =>
@@ -6330,7 +6930,8 @@ export const bind = <
         mutationFn: (
           context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
         ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
-      ) => provide(aggregate.update(key, mutationFn)),
+        options?: AggregateUpdateOptions<TVersioned>,
+      ) => provide(aggregate.update(key, mutationFn, options)),
       delete: (key: TKey) => provide(aggregate.delete(key)),
       list: (
         filter?: Record<string, unknown>,
@@ -6340,7 +6941,7 @@ export const bind = <
       createSchema: aggregate.createSchema,
       updateSchema: aggregate.updateSchema,
       provide,
-    } as BoundAggregate<TSchema, TKey, TInput, TCreate, TBlobErrors>
+    } as BoundAggregate<TSchema, TKey, TInput, TCreate, TBlobErrors, TVersioned>
   })
 
 // ---------------------------------------------------------------------------
@@ -6932,6 +7533,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           cardinality: "one",
           edges: bound.aggregate.edges,
           parentFields: subFields,
+          valueSchema: bound.aggregate.schema,
           resolveRef,
           discriminator: inherited,
           ownDiscriminator: bound.discriminator,
@@ -7716,8 +8318,12 @@ const stampsToStrip = (
   systemAttrs: ReadonlySet<string>,
 ): ReadonlySet<string> => {
   const own = node.ownFields
-  if (own === undefined) return systemAttrs
-  const kept = [...systemAttrs].filter((name) => !Object.hasOwn(own, name))
+  const stored = node.storedNames
+  if (own === undefined && stored === undefined) return systemAttrs
+  // A value of members (a union, a suspended schema) declares a name when a member does.
+  const kept = [...systemAttrs].filter((name) =>
+    own === undefined ? !stored!.includes(name) : !Object.hasOwn(own, name),
+  )
   return kept.length === systemAttrs.size ? systemAttrs : new Set(kept)
 }
 
@@ -8512,6 +9118,11 @@ interface DecomposedItem {
    * row to); `undefined` when `node` composes none from it.
    */
   readonly skTextFor?: ((node: ResolvedNode, path: string) => string | undefined) | undefined
+  /**
+   * A `many` element only: its sort key values, as given, joined by `#`: what names the element in a
+   * conflict (`team1.lines[b]`, #168).
+   */
+  readonly elementKey?: string | undefined
   /** Edge field name (entity type for the root) — used to name the culprit in errors. */
   readonly member: string
   /** What the row does with each timestamp. */
@@ -9621,6 +10232,7 @@ const decomposeNode = (
           own,
           ...(elementInput !== undefined && { input: elementInput }),
           ...(node.decompose === undefined && { value: elem, path: [...path, index] }),
+          elementKey: values.map((value) => String(value)).join("#"),
           transactionGroup: parentGroup,
           skComposites: [
             ...parentDiscriminators.current,
@@ -10328,205 +10940,11 @@ interface BuiltGroup {
 // Internal: Write transaction groups to DynamoDB
 // ---------------------------------------------------------------------------
 
-type WriteGroups = ReadonlyArray<{
-  group: string
-  puts: ReadonlyArray<Record<string, AttributeValue>>
-  deletes: ReadonlyArray<Record<string, AttributeValue>>
-  /** How many of `deletes` are rows read under the sort key text 1.40.0 composed (#241). */
-  previous?: number | undefined
-}>
-
-/**
- * `create`: the first group's first Put is the root item, written only when it
- * doesn't exist (`attribute_not_exists`); its cancellation for that reason is
- * `ConditionalCheckFailed` (#134). A later group still commits on its own, as
- * every multi-group write always has.
- */
-interface RootGuard {
-  readonly pkField: string
-  readonly entityType: string
-  readonly key: Record<string, unknown>
-}
-
-type WriteGroupsError =
-  | AggregateTransactionOverflow
-  | DynamoClientError
-  | TransactionCancelled
-  | ValidationError
-  | BlobStoreError
-
 /** The aggregate's item keys, to name an item in a diagnosed rejection (#144). */
 interface GroupKeys {
   readonly pkField: string
   /** Key attributes the items carry: the table's, the collection index's and the list index's. */
   readonly keys: KeyAttributes
-}
-
-function writeTransactionGroups(
-  client: DynamoClientService,
-  tableName: string,
-  groups: WriteGroups,
-  aggregateName: string,
-  keys: GroupKeys,
-): Effect.Effect<void, WriteGroupsError>
-function writeTransactionGroups(
-  client: DynamoClientService,
-  tableName: string,
-  groups: WriteGroups,
-  aggregateName: string,
-  keys: GroupKeys,
-  rootGuard: RootGuard,
-): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed>
-function writeTransactionGroups(
-  client: DynamoClientService,
-  tableName: string,
-  groups: WriteGroups,
-  aggregateName: string,
-  keys: GroupKeys,
-  rootGuard?: RootGuard,
-): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed> {
-  return Effect.gen(function* () {
-    // Each group is its own transaction (DynamoDB: 100 items per
-    // TransactWriteItems, Puts AND Deletes together). DynamoDB's limits are
-    // not pre-checked (#144): a group over one is sent, rejected whole, and
-    // diagnosed — naming the sub-aggregates earlier groups already committed,
-    // since a multi-group write was never atomic.
-    const committed: Array<string> = []
-    for (const [groupIndex, group] of groups.entries()) {
-      // Each group is one transaction — Puts AND Deletes applied atomically, so an
-      // edge add and a sibling edge removal in the same sub-aggregate commit together.
-      const itemCount = group.puts.length + group.deletes.length
-      if (itemCount === 0) continue
-      // The root item, in the first transaction only.
-      const rootIndex =
-        rootGuard !== undefined && groupIndex === 0
-          ? group.puts.findIndex((item) => item.sk?.S === rootGuard.key.sk)
-          : -1
-
-      // Build TransactWriteItems request — Puts first, then Deletes for orphans.
-      const transactItems: Array<TransactWriteItem> = [
-        ...group.puts.map((item, i) => ({
-          Put: {
-            TableName: tableName,
-            Item: item,
-            ...(rootGuard !== undefined && i === rootIndex
-              ? {
-                  ConditionExpression: "attribute_not_exists(#pk)",
-                  ExpressionAttributeNames: { "#pk": rootGuard.pkField },
-                }
-              : {}),
-          },
-        })),
-        ...group.deletes.map((key) => ({ Delete: { TableName: tableName, Key: key } })),
-      ]
-
-      // Named once, for both diagnoses below.
-      const sent = () => ({
-        _tag: "Transaction" as const,
-        items: transactItems,
-        targets: () =>
-          transactItems.map((item) => {
-            const entityType = item.Put?.Item?.__edd_e__?.S ?? aggregateName
-            return transactItemTarget(
-              item,
-              tableName,
-              [keys.pkField, "sk"],
-              entityType,
-              `the ${item.Put !== undefined ? entityType : "removed"} item of ` +
-                `sub-aggregate "${group.group}"`,
-            )
-          }),
-      })
-      const already = [...committed]
-      const diagnosed = (
-        diagnosis: Diagnosis,
-        original: unknown,
-      ): AggregateTransactionOverflow | ValidationError =>
-        diagnosis._tag === "TooManyItems"
-          ? new AggregateTransactionOverflow({
-              aggregate: aggregateName,
-              subgraph: group.group,
-              itemCount: diagnosis.count,
-              limit: diagnosis.limit,
-              committed: already,
-              operation: rootGuard !== undefined ? "create" : "update",
-              // Over only because of the rows it moves off 1.40.0's text: `rekey` moves them.
-              ...(group.previous !== undefined &&
-                diagnosis.count - group.previous <= diagnosis.limit && {
-                  previousKeyText: group.previous,
-                }),
-              cause: original,
-            })
-          : diagnosedValidationError(diagnosis, original, {
-              operation: `Aggregate.write(${aggregateName})`,
-              entityType: aggregateName,
-              // Each group commits on its own: say exactly what already did.
-              ...(already.length > 0 && {
-                committed:
-                  `earlier transactions of this write already committed sub-aggregates ` +
-                  already.map((name) => `"${name}"`).join(", ") +
-                  (rootGuard !== undefined
-                    ? ", so a retried create fails on the existing root: update or delete " +
-                      "the partial aggregate instead"
-                    : ""),
-              }),
-            })
-
-      yield* client.transactWriteItems({ TransactItems: transactItems }).pipe(
-        // An upload over its store's `maxUploadAge` (#179, design §6.1) refuses the group before
-        // it is sent: say what earlier groups committed.
-        Effect.mapError((error) =>
-          already.length === 0
-            ? error
-            : expiredWithCommitted(
-                error,
-                "earlier transactions of this write already committed sub-aggregates " +
-                  already.map((name) => `"${name}"`).join(", "),
-              ),
-        ),
-        // One operation per item (#144): diagnosed BEFORE the root guard's
-        // mapping, which would read a repeat's conditional failure as an
-        // existing root.
-        diagnoseFailure({ sent, only: ["RepeatedItem"], rewrite: diagnosed }),
-        Effect.mapError((error) => {
-          if (
-            error.cause != null &&
-            typeof error.cause === "object" &&
-            "name" in error.cause &&
-            (error.cause as { name: unknown }).name === "TransactionCanceledException"
-          ) {
-            const cancelled = error.cause as {
-              CancellationReasons?: ReadonlyArray<{ Code?: string; Message?: string }>
-            }
-            const reasons = cancelled.CancellationReasons
-            if (
-              rootGuard !== undefined &&
-              rootIndex >= 0 &&
-              reasons?.[rootIndex]?.Code === "ConditionalCheckFailed"
-            ) {
-              return new ConditionalCheckFailed({
-                entityType: rootGuard.entityType,
-                key: rootGuard.key,
-              })
-            }
-            return new TransactionCancelled({
-              operation: "TransactWriteItems",
-              reasons: (cancelled.CancellationReasons ?? []).map((r) => ({
-                code: r?.Code,
-                message: r?.Message,
-              })),
-              cause: error.cause,
-            })
-          }
-          return error
-        }),
-        // A limit DynamoDB enforced (#144), named — after the root guard's
-        // mapping, which a conditional failure always takes.
-        diagnoseFailure({ sent, keys: () => keys.keys, rewrite: diagnosed }),
-      )
-      committed.push(group.group)
-    }
-  })
 }
 
 /** A row `update`'s cleanup deletes with `ownsRows`: its key, and the type it was read with. */
@@ -10535,64 +10953,6 @@ interface OwnedRow {
   readonly sk: string
   readonly entityType: string
 }
-
-/**
- * `update`'s cleanup Deletes with `ownsRows` (DESIGN.md §7 "Which rows in its partition are an
- * aggregate's"), sent after the update's groups have committed, up to {@link TRANSACT_WRITE_ITEMS_LIMIT} to a
- * request: Deletes of keys already stored reach no other limit of a transaction. Each holds while
- * its row is gone or still of the type read, so a row another write removed in between is fine,
- * and one replaced with a row of another type is left. A cancelled request is sent once more
- * without the Deletes whose condition failed; the mutation isn't run again and nothing is read
- * again. A failure is reported as a later group's is: the update's groups have committed, and the
- * rows it didn't delete stay until the next update of their node.
- */
-const deleteOwnedRows = (
-  client: DynamoClientService,
-  tableName: string,
-  pkField: string,
-  rows: ReadonlyArray<OwnedRow>,
-): Effect.Effect<void, DynamoClientError | TransactionCancelled> =>
-  Effect.gen(function* () {
-    const deleteOf = (row: OwnedRow): TransactWriteItem => ({
-      Delete: {
-        TableName: tableName,
-        Key: toAttributeMap({ [pkField]: row.pk, sk: row.sk }),
-        ConditionExpression: "attribute_not_exists(#pk) OR #e = :e",
-        ExpressionAttributeNames: { "#pk": pkField, "#e": "__edd_e__" },
-        ExpressionAttributeValues: { ":e": { S: row.entityType } },
-      },
-    })
-    for (let start = 0; start < rows.length; start += TRANSACT_WRITE_ITEMS_LIMIT) {
-      const chunk = rows.slice(start, start + TRANSACT_WRITE_ITEMS_LIMIT)
-      const reasons = yield* client
-        .transactWriteItems({ TransactItems: chunk.map((row) => deleteOf(row)) })
-        .pipe(
-          Effect.as(undefined),
-          Effect.catch((error: DynamoClientError) =>
-            isAwsTransactionCancelled(error.cause)
-              ? Effect.succeed(error.cause.CancellationReasons ?? [])
-              : Effect.fail(error),
-          ),
-        )
-      if (reasons === undefined) continue
-      const rest = chunk.filter((_, i) => reasons[i]?.Code !== "ConditionalCheckFailed")
-      if (rest.length === 0) continue
-      yield* client.transactWriteItems({ TransactItems: rest.map((row) => deleteOf(row)) }).pipe(
-        Effect.mapError((error) =>
-          isAwsTransactionCancelled(error.cause)
-            ? new TransactionCancelled({
-                operation: "TransactWriteItems",
-                reasons: (error.cause.CancellationReasons ?? []).map((r) => ({
-                  code: r?.Code,
-                  message: r?.Message,
-                })),
-                cause: error.cause,
-              })
-            : error,
-        ),
-      )
-    }
-  })
 
 // ---------------------------------------------------------------------------
 // Internal: Rows under other key text (#171, #183)
@@ -10800,8 +11160,15 @@ interface ListPartitionResult {
 interface RekeyRead {
   /** Each item as stored ({@link queryAllItems}). */
   readonly stored?: Array<Record<string, AttributeValue>> | undefined
+  /** Read strongly consistent, whatever `consistentRead` says (#168): `update`, `delete`'s sweep. */
+  readonly consistent?: boolean | undefined
   /** The partition the root was found in, when it isn't the current one. */
   readonly from?: string | undefined
+  /**
+   * The partition key, composed already (#168): `delete` reads its partition twice, and reads the
+   * caller's key once, as it did before.
+   */
+  readonly partition?: string | undefined
 }
 
 interface ListPartitionOptions {
@@ -10993,3 +11360,42 @@ const queryListPartition = (
 
     return { items, lastKey }
   })
+
+// ---------------------------------------------------------------------------
+// Internal: versioned roots and member paths (#168)
+// ---------------------------------------------------------------------------
+
+/**
+ * A versioned root's version and incarnation token as stored (`docs/designs/aggregate-concurrency.md`
+ * §3.5): 0 and none on a root written before `versioned` was turned on.
+ */
+const storedRootVersion = (
+  root: Record<string, AttributeValue> | undefined,
+  field: string,
+): { readonly version: number; readonly token: string | undefined } => {
+  const version = (root?.[field] as { N?: string } | undefined)?.N
+  return {
+    version: version === undefined ? 0 : Number(version),
+    token: (root?.[INCARNATION_TOKEN] as { S?: string } | undefined)?.S,
+  }
+}
+
+/**
+ * A row's member path in the aggregate (D15): its fields from the root, a `many` element by its
+ * sort key values (`team1.lines[b]`); `""` for the root. An element of a custom `decompose` has no
+ * place in the value: its edge and key.
+ */
+const memberPath = (item: DecomposedItem, elementKeys: ReadonlyMap<string, string>): string => {
+  const path = item.path
+  if (path === undefined) return `${item.member}[${item.elementKey ?? ""}]`
+  let name = ""
+  path.forEach((segment, j) => {
+    if (typeof segment === "number") {
+      const key = elementKeys.get(JSON.stringify(path.slice(0, j + 1)))
+      name += `[${key ?? segment}]`
+    } else {
+      name += name === "" ? segment : `.${segment}`
+    }
+  })
+  return name
+}

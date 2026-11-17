@@ -528,6 +528,17 @@ An inverted index over strings is broken in 1.37.0 and 1.38.0: a value with a sp
 
 Index keys belong in [dedicated attributes](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute): an inverted index is supported, not encouraged.
 
+## Reads held to their writes in 1.44
+
+Three paths that read a row and then wrote from what they read now hold the read to the write: the write carries a condition on the row as read, and a row changed in between is read again or refused. What a caller can see change:
+
+- **An update that sets nothing** (only on an entity with no timestamps, version or index key written on every update) reads its row consistently in every return mode. With `returnValues("none")` or `"updatedOld"` / `"updatedNew"` it sent nothing up to 1.43 and succeeded on a missing row; it now reads the row and fails with `ItemNotFound` when there is none. A `patch` that sets nothing fails with `ConditionalCheckFailed` on a missing row, as `patch` does on every other path (it was `ItemNotFound`). A `.condition()` or `.keepRefs()` on it was ignored; it is now checked, and fails with `ConditionalCheckFailed` when it doesn't hold. An immutable field it restates with a different value now fails with `ValidationError`, as the same update with something to set does; it returned the row up to 1.43.
+- **An update of a row a projection removed** (its tombstone, on a read model whose projection has `removal`) fails with `ItemNotFound` (`patch`: `ConditionalCheckFailed`) and writes nothing, standalone and in a transaction. Up to 1.43 an update with a payload wrote its attributes onto the tombstone and succeeded (with the default return mode, it failed decoding the tombstone after writing), and the rest of a transaction committed. Its existence condition gains a term on such read models: `__edd_e__` is not the tombstone's.
+- **In `Transaction.transactWrite`, an update restating an immutable value the row doesn't hold** fails with `ValidationError` before anything is sent, as it does standalone. Up to 1.43 it was sent, refused and retried, and failed with `ConcurrentModification` after three transactions.
+- **`Transaction.transactWrite`** adds a `ConditionCheck` item for each such update, so a transaction of only those updates now sends a transaction, and one at the 100-item limit can go over it.
+- **[`purge`](/effect-dynamodb/guides/lifecycle/#purge)** reads consistently, and on a `unique` entity can fail with `OptimisticLockError` or `ConcurrentModification` when another writer keeps changing the item while it runs (nothing is deleted then). Its error type gains both. A failure of its batch deletes counts the live row its transaction already deleted.
+- **[A cascade](/effect-dynamodb/guides/aggregates/#targets-that-change-during-the-cascade)** leaves a target that was deleted or pointed at another source after its query; it used to re-create the deleted one as a partial item, or overwrite the other one.
+
 ## Unique constraints over a ref in 1.42
 
 - **`EDD-9172`**: a `unique` constraint naming a ref (`"team"` for `refs: { team }`) now throws at `Entity.make`, and is a compile error. Up to 1.41.0 every record composed the same sentinel from it (`…#[object object]#…`), so the first record took the value for all of them. Name the ref's id instead (`"teamId"`), which 1.41.0 refused (`EDD-9002`) and 1.42 takes, as an index composite does.

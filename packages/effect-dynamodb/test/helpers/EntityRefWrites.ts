@@ -35,6 +35,7 @@ import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
+import { withCascadeGuard } from "./CascadeGuard.js"
 import type { Harness } from "./EntityRefKeys.js"
 
 type Row = Record<string, AttributeValue>
@@ -53,12 +54,33 @@ type Recorded = {
   readonly cascadeRows: ReadonlyArray<Row>
 }
 
-const published = JSON.parse(
+/** A recording's cascade, each update guarded on its target still naming the team (#132). */
+const guardingCascade = (recorded: Recorded): Recorded => {
+  const cascade = recorded.steps.cascade
+  return cascade === undefined
+    ? recorded
+    : {
+        ...recorded,
+        steps: {
+          ...recorded.steps,
+          cascade: { ...cascade, requests: withCascadeGuard(cascade.requests) },
+        },
+      }
+}
+const guardingEach = (shapes: Record<string, Recorded>) =>
+  Object.fromEntries(Object.entries(shapes).map(([name, shape]) => [name, guardingCascade(shape)]))
+
+const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/entity-ref-writes-1.40.0.json", import.meta.url), "utf8"),
 ) as {
   readonly generatedFrom: string
   readonly keys: Record<string, Recorded>
   readonly optional: Record<string, Recorded>
+}
+const published = {
+  ...fixture,
+  keys: guardingEach(fixture.keys),
+  optional: guardingEach(fixture.optional),
 }
 
 const schema = DynamoSchema.make({ name: "refw", version: 1 })

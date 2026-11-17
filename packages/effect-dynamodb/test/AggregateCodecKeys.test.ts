@@ -16,6 +16,7 @@ import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
+import { asBefore168 } from "./helpers/Before168.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 type Row = Record<string, AttributeValue>
@@ -157,8 +158,22 @@ describe("an aggregate keyed by a codec encode takes on its own output keeps 1.3
             const steps = yield* run(codec, setting)
             const expected = fixture.shapes[codec][setting]
             expect(Object.keys(steps)).toEqual(Object.keys(expected))
+            // Requests compared as #168 changed them (`asBefore168`), each step against the rows
+            // stored before it.
+            let before: ReadonlyArray<unknown> = []
             for (const [name, step] of Object.entries(expected)) {
-              expect({ name, ...steps[name] }).toEqual({ name, ...step })
+              const was = step as Step
+              const now = steps[name]!
+              expect({
+                name,
+                ...now,
+                requests: asBefore168(now.requests as never, { stored: before }),
+              }).toEqual({
+                name,
+                ...was,
+                requests: asBefore168(was.requests as never, { stored: before }),
+              })
+              before = was.rows as ReadonlyArray<unknown>
             }
           }),
       )

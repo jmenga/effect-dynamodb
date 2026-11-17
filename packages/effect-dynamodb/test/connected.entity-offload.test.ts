@@ -742,7 +742,7 @@ describeConnected("Entity offloaded fields (#179)", () => {
         ),
     )
 
-    it.effect("update rewrites, and re-uploads, only the changed group", () =>
+    it.effect("update rewrites, and re-uploads, only the changed rows (#168)", () =>
       provide(
         Effect.gen(function* () {
           const db = yield* client
@@ -756,19 +756,29 @@ describeConnected("Entity offloaded fields (#179)", () => {
           } as never)
           const page = (yield* edgeRows("al-2", "AlbumDoc"))[0]!
           let before = blobs.inspect().calls
-          // A root-only change: the root group (album + cover) only.
+          // A root-only change rewrites the root alone: the cover's values aren't uploaded again.
           yield* db.aggregates.Albums.update({ albumId: "al-2" }, ({ state }) => ({
             ...state,
             title: "Road trip",
           }))
-          expect(blobs.inspect().calls.put - before.put).toBe(2)
-          expect((yield* edgeRows("al-2", "AlbumDoc"))[0]!.scan).toEqual(page.scan)
-
-          // A page change re-uploads the page's values (no read pointer is reused).
+          expect(blobs.inspect().calls.put - before.put).toBe(0)
+          // The page's own row changes; its doc row doesn't, so it keeps its pointers.
           before = blobs.inspect().calls
           yield* db.aggregates.Albums.update({ albumId: "al-2" }, ({ state }) => ({
             ...state,
             page: { ...state.page, label: "Mountains" },
+          }))
+          expect(blobs.inspect().calls.put - before.put).toBe(0)
+          expect((yield* edgeRows("al-2", "AlbumDoc"))[0]!.scan).toEqual(page.scan)
+
+          // A doc's change re-uploads that row's values (no read pointer is reused).
+          before = blobs.inspect().calls
+          yield* db.aggregates.Albums.update({ albumId: "al-2" }, ({ state }) => ({
+            ...state,
+            page: {
+              ...state.page,
+              docs: state.page.docs.map((doc) => ({ ...doc, scan: bytes(3, 9) })),
+            },
           }))
           expect(blobs.inspect().calls.put - before.put).toBe(2)
           const rewritten = (yield* edgeRows("al-2", "AlbumDoc"))[0]!
@@ -776,7 +786,7 @@ describeConnected("Entity offloaded fields (#179)", () => {
           const album = yield* db.aggregates.Albums.get({ albumId: "al-2" })
           expect(album.title).toBe("Road trip")
           expect(album.page.label).toBe("Mountains")
-          expect(album.page.docs[0]).toMatchObject({ body: text(2_001), scan: bytes(3, 2) })
+          expect(album.page.docs[0]).toMatchObject({ body: text(2_001), scan: bytes(3, 9) })
         }),
       ),
     )

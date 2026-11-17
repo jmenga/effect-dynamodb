@@ -2201,9 +2201,10 @@ export type TypedClient<
       infer TKey,
       infer TInput,
       infer TCreate,
-      infer TBlobErrors
+      infer TBlobErrors,
+      infer TVersioned
     >
-      ? BoundAggregate<S, TKey, TInput, TCreate, TBlobErrors>
+      ? BoundAggregate<S, TKey, TInput, TCreate, TBlobErrors, TVersioned>
       : never
   }
 

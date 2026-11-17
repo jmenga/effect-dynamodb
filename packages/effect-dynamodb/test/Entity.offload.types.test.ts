@@ -21,7 +21,7 @@ import type {
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, type Option, Schema, Stream } from "effect"
 import { describe, expect, expectTypeOf, it } from "vitest"
-import type { AggregateCreateError, AggregateWriteError } from "../src/Aggregate.js"
+import type { AggregateCreateError, AggregateUpdateError } from "../src/Aggregate.js"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import * as Collection from "../src/Collection.js"
@@ -933,7 +933,7 @@ describe("the aggregate error parameter (#179, design §9.3)", () => {
       AggregateCreateError | BlobStoreError
     >()
     expectTypeOf<Effect.Error<ReturnType<A["update"]>>>().toEqualTypeOf<
-      AggregateWriteError | BlobStoreError
+      AggregateUpdateError | BlobStoreError
     >()
     expectTypeOf<Effect.Error<ReturnType<A["delete"]>>>().toEqualTypeOf<
       AggregateAssemblyError | DynamoClientError
@@ -955,7 +955,7 @@ describe("the aggregate error parameter (#179, design §9.3)", () => {
     expectTypeOf<Effect.Error<ReturnType<P["get"]>>>().toEqualTypeOf<ReadErrors>()
     expectTypeOf<Effect.Error<ReturnType<P["list"]>>>().toEqualTypeOf<ReadErrors>()
     expectTypeOf<Effect.Error<ReturnType<P["create"]>>>().toEqualTypeOf<AggregateCreateError>()
-    expectTypeOf<Effect.Error<ReturnType<P["update"]>>>().toEqualTypeOf<AggregateWriteError>()
+    expectTypeOf<Effect.Error<ReturnType<P["update"]>>>().toEqualTypeOf<AggregateUpdateError>()
     // Type-erased edges add nothing; the parameter defaults to `never`.
     expectTypeOf<Aggregate.AggregateBlobErrors<any>>().toBeNever()
     expectTypeOf<
@@ -980,7 +980,7 @@ describe("the aggregate error parameter (#179, design §9.3)", () => {
         expectTypeOf<Effect.Error<typeof read>>().toEqualTypeOf<ReadErrors>()
         const bound = yield* Aggregate.bind(Offloading)
         expectTypeOf<Effect.Error<ReturnType<typeof bound.update>>>().toEqualTypeOf<
-          AggregateWriteError | BlobStoreError
+          AggregateUpdateError | BlobStoreError
         >()
       }),
     )

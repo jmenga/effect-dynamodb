@@ -356,27 +356,35 @@ export const packRequests = <U>(
   units: ReadonlyArray<U>,
   unitOf: (unit: U) => RequestUnit,
   shape: RequestShape,
+  /**
+   * The first request's shape, when it differs from the rest's: an aggregate write's first request
+   * holds its root, and every later one also carries an item on the root (#168), so only those are
+   * packed against `shape` less that item.
+   */
+  first: RequestShape = shape,
 ): Array<Array<U>> => {
   const requests: Array<Array<U>> = []
   let request: Array<U> = []
+  let current = first
   let count = 0
   let bytes = 0
-  let wire = shape.envelope
+  let wire = current.envelope
   let shared = new Set<string>()
   for (const unit of units) {
     const sized = unitOf(unit)
     const sharedWire = (open: ReadonlySet<string>) =>
       sized.shared === undefined || open.has(sized.shared.key) ? 0 : sized.shared.wire
     const fits =
-      count + sized.count <= shape.count &&
-      (shape.bytes === undefined || bytes + sized.bytes <= shape.bytes) &&
+      count + sized.count <= current.count &&
+      (current.bytes === undefined || bytes + sized.bytes <= current.bytes) &&
       wire + sharedWire(shared) + sized.wire <= REQUEST_MAX_BYTES
     if (request.length > 0 && !fits) {
       requests.push(request)
       request = []
+      current = shape
       count = 0
       bytes = 0
-      wire = shape.envelope
+      wire = current.envelope
       shared = new Set()
     }
     wire += sharedWire(shared) + sized.wire

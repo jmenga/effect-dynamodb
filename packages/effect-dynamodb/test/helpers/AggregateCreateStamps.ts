@@ -373,25 +373,27 @@ export const aggregateCreateStampsSuite = (open: OpenTable) => {
             expect(create.rows).toEqual(stampedRows(created.rows, keeps, stamp, isRoot))
             expect(create.outcome).toEqual(stampedOver(created.outcome, stamp))
           }
-          // An update re-stamps `updated` on each row holding it and keeps `created`. 1.39.0 did on
-          // each row it re-stamped (it left a date the root declares optional as it was), and
-          // couldn't read an edge declaring a stamped date back (`Missing key`).
+          // An update re-stamps `updated` on each row it writes and keeps `created`. 1.39.0
+          // rewrote, and re-stamped, every row of a changed group (it left a date the root
+          // declares optional as it was), and couldn't read an edge declaring a stamped date back
+          // (`Missing key`). It changes the root alone, which is the only row sent now: an
+          // unchanged row keeps its `updated` (#168, D2).
           const later = stamp + 5_000
-          const rewritten = stampedRows(create.rows, [definition.updated], later, () => true)
+          const rewritten = stampedRows(create.rows, [definition.updated], later, isRoot)
           // The update's stamp takes the form `create` stored the field in (`AggregateStampForms.ts`).
           expect(update.rows).toEqual(
             rewritten.map((row) => (isRoot(row) ? { ...row, name: { S: "o" } } : row)),
           )
           if ("ok" in updated.outcome && keeps.length === 0) {
-            expect(update.rows).toEqual(updated.rows)
+            expect(update.rows.filter(isRoot)).toEqual(updated.rows.filter(isRoot))
           }
-          expect(update.outcome).toEqual(
-            JSON.parse(
-              JSON.stringify(create.outcome, (key, held) =>
-                key === definition.updated ? { date: later } : key === "name" ? "o" : held,
-              ),
-            ),
-          )
+          // The root's own fields re-stamped; an edge's stamp is its row's, unchanged.
+          const outcome = JSON.parse(JSON.stringify(create.outcome))
+          if ("ok" in outcome) {
+            outcome.ok.name = "o"
+            if (definition.updated in outcome.ok) outcome.ok[definition.updated] = { date: later }
+          }
+          expect(update.outcome).toEqual(outcome)
         }),
       )
     }

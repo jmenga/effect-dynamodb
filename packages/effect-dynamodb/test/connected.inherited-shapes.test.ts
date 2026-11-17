@@ -108,6 +108,73 @@ const digest = (requests: unknown) =>
     .update(JSON.stringify(sorted(requests)))
     .digest("hex")}`
 
+/**
+ * An outcome as the fixture holds it, but for its requests, which #168 changed and the fixture
+ * holds only a digest of: they're compared by {@link sameRequests}.
+ */
+const asRecordedBut = (outcome: Outcome | Recorded): Omit<Recorded, "requests"> => {
+  const { requests: _, ...rest } =
+    typeof outcome.requests === "string" ? (outcome as Recorded) : asRecorded(outcome as Outcome)
+  return rest
+}
+
+/**
+ * The requests 1.40.0 sent for what this run sent: #168 made `update`'s partition read consistent,
+ * guards each row it writes and sends only the rows that changed
+ * (`docs/designs/aggregate-concurrency.md` §3.2, §3.3). So the aggregate's update step's `Query`
+ * loses its `ConsistentRead`, its items their guards, and the rows the create stored that it left
+ * as they were are put back in their place (the aggregate is one group: 1.40.0 rewrote it whole,
+ * in the create's order, then its new rows). Nothing else changed.
+ */
+const as140 = (outcome: Outcome): ReadonlyArray<unknown> => {
+  const out: Array<unknown> = []
+  const keyOf = (item: any) => JSON.stringify([item.pk, item.sk])
+  let created: Array<any> = []
+  let at = 0
+  for (const [label, commands] of Object.entries(outcome.sentBy ?? {})) {
+    for (const request of outcome.requests.slice(at, at + commands.length) as Array<any>) {
+      if (label === "create an aggregate") {
+        created = request.input.TransactItems.map(({ Put }: any) => ({
+          Put: { TableName: Put.TableName, Item: Put.Item },
+        }))
+      }
+      if (label !== "update the aggregate") {
+        out.push(request)
+      } else if (request.command === "Query") {
+        const { ConsistentRead: _, ...input } = request.input
+        out.push({ ...request, input })
+      } else {
+        const sent = new Map<string, unknown>()
+        for (const item of request.input.TransactItems) {
+          const [kind, action] = Object.entries(item)[0] as [string, Record<string, any>]
+          const {
+            ConditionExpression: _c,
+            ExpressionAttributeNames: _n,
+            ExpressionAttributeValues: _v,
+            ReturnValuesOnConditionCheckFailure: _r,
+            ...rest
+          } = action
+          sent.set(keyOf(rest.Item ?? rest.Key), { [kind]: rest })
+        }
+        const items: Array<unknown> = []
+        for (const row of created) {
+          const key = keyOf(row.Put.Item)
+          items.push(sent.get(key) ?? row)
+          sent.delete(key)
+        }
+        items.push(...sent.values())
+        out.push({ ...request, input: { ...request.input, TransactItems: items } })
+      }
+    }
+    at += commands.length
+  }
+  return out
+}
+
+/** The requests the case sent are those 1.40.0 sent, but for what #168 changed ({@link as140}). */
+const sameRequests = (outcome: Outcome, recorded: Recorded) =>
+  expect(digest(as140(outcome))).toEqual(recorded.requests)
+
 /** An outcome as the fixture holds it. */
 const asRecorded = (outcome: Outcome): Recorded => ({
   ...(outcome.refused === undefined ? {} : { refused: outcome.refused }),
@@ -159,8 +226,10 @@ describeConnected("a name every object inherits, in every shape, on every write 
           const outcome = await run(position, name)
           expect(JSON.stringify(outcome)).not.toContain("[native code]")
           if (!parserReads(as, name)) {
-            // The parser doesn't read the name: every step, request and row is 1.40.0's.
-            expect(asRecorded(outcome)).toEqual(recorded)
+            // The parser doesn't read the name: every step, request (but for #168's changes) and row
+            // is 1.40.0's.
+            expect(asRecordedBut(outcome)).toEqual(asRecordedBut(recorded))
+            sameRequests(outcome, recorded)
             return
           }
           const ordinaryKey = caseKey(position, CONTROL)
@@ -192,12 +261,18 @@ describeConnected("a name every object inherits, in every shape, on every write 
           expect(Object.keys(outcome.steps)).toEqual(Object.keys(base.steps))
           expect(outcome.refused).toEqual(base.refused)
           if (misread.length === 0) {
-            expect(asRecorded(outcome)).toEqual(base)
+            expect(asRecordedBut(outcome)).toEqual(asRecordedBut(base))
+            sameRequests(outcome, base)
           } else {
             expect(outcome.sentBy).toEqual(ordinary.sentBy)
-            expect(JSON.parse(asControl(JSON.stringify(outcome.requests), name))).toEqual(
-              ordinary.requests,
-            )
+            // The ordinary name's requests, the name standing in for it; guards aside, which name
+            // the row's attributes in name order (the rows they're built from are compared).
+            expect(
+              as140({
+                ...outcome,
+                requests: JSON.parse(asControl(JSON.stringify(outcome.requests), name)),
+              }),
+            ).toEqual(as140(ordinary))
             expect(outcome.rows).toEqual(ordinary.rows)
           }
         })

@@ -6,7 +6,7 @@
  * the stale-context repair never takes it for one: ten no-op updates send ten `Query`s and nothing
  * else, before and after an update of the root alone, and every request is 1.40.0's
  * (`fixtures/aggregate-managed-context-1.40.0.json`), on the rows 1.40.0 wrote and on this
- * release's own.
+ * release's own. Requests are compared as #168 changed them (`helpers/Before168.ts`).
  */
 
 import { readFileSync } from "node:fs"
@@ -25,6 +25,7 @@ import {
   sortRows,
   steps,
 } from "./helpers/AggregateManagedContext.js"
+import { asBefore168 } from "./helpers/Before168.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const published: {
@@ -83,6 +84,27 @@ const run = (name: string, created?: ReadonlyArray<Row>) => {
  */
 const REFUSED_AT_CREATE = new Set(["the key attribute: the list partition key attribute status"])
 
+/** Each step's requests as #168 changed them (`helpers/Before168.ts`). */
+const as168 = (now: Recorded, stored: ReadonlyArray<Row>) =>
+  stamped(
+    now.steps.map((step) => ({
+      ...step,
+      requests: asBefore168(step.requests, { stored, same: stamped }),
+    })),
+  )
+
+const rowKey = (row: any) => `${row?.pk?.S}|${row?.sk?.S}`
+
+/** The keys of the rows each step's transactions put. */
+const putKeys = (steps: unknown): Array<string> =>
+  (steps as Array<{ requests: Array<any> }>).flatMap((step) =>
+    step.requests.flatMap((request) =>
+      ((request.input?.TransactItems ?? []) as Array<any>).flatMap((item) =>
+        item.Put === undefined ? [] : [rowKey(item.Put.Item)],
+      ),
+    ),
+  )
+
 const commands = (now: Recorded) =>
   now.steps.map(({ step, requests }) => ({ step, sent: requests.map((r) => r.command) }))
 
@@ -107,7 +129,35 @@ describe("context naming an attribute the library manages: a healthy aggregate's
     it(`${name}, on 1.40.0's rows: each no-op sends one Query, the root's update one transaction`, async () => {
       const now = await run(name, then.created)
       expect(commands(now)).toEqual(commands(then))
-      expect(stamped(now.steps)).toEqual(stamped(then.steps))
+      if (!REFUSED_AT_CREATE.has(name)) {
+        expect(as168(now, then.created)).toEqual(as168(then, then.created))
+        return
+      }
+      // 1.40.0's state read the root's `status` back as its key text and rewrote the rows below
+      // it, their copy of `status` unchanged. Their decomposed value didn't change, so they are
+      // not sent now (#168, D2): 1.40.0's `Put`s of them are left out.
+      const sent = new Set(putKeys(as168(now, then.created)))
+      const was = as168(then, then.created) as Array<{ requests: Array<any> }>
+      const unsent = putKeys(was).filter((key) => !sent.has(key))
+      expect(unsent).toEqual(["$mgd#v1#agg#a|$mgd#v1#note"])
+      expect(as168(now, then.created)).toEqual(
+        was.map((step) => ({
+          ...step,
+          requests: step.requests.map((request) =>
+            request.command !== "TransactWriteItems"
+              ? request
+              : {
+                  ...request,
+                  input: {
+                    ...request.input,
+                    TransactItems: request.input.TransactItems.filter(
+                      (item: any) => item.Put === undefined || sent.has(rowKey(item.Put.Item)),
+                    ),
+                  },
+                },
+          ),
+        })),
+      )
     })
     if (REFUSED_AT_CREATE.has(name)) {
       it(`${name}, created by this release: refused (EDD-9159)`, async () => {
@@ -122,7 +172,7 @@ describe("context naming an attribute the library manages: a healthy aggregate's
       expect(now.create).toEqual({ ok: true })
       expect(stamped(now.created)).toEqual(stamped(then.created))
       expect(commands(now)).toEqual(commands(then))
-      expect(stamped(now.steps)).toEqual(stamped(then.steps))
+      expect(as168(now, now.created)).toEqual(as168(then, then.created))
     })
   }
 })

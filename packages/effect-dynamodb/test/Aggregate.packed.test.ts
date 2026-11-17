@@ -197,15 +197,16 @@ describe("Aggregate — packed edge fields", () => {
       yield* Matches.create({ matchId: "m-3", name: "Final", venueId: "v-1" } as never)
       const before = venueItems()[0]!.layout!.B!
 
-      // A root change rewrites the root group (a `one` edge lives in it): the
-      // edge is re-packed from its decomposed value — the same bytes.
+      // A root change sends the root alone (#168, D2): the edge, unchanged, isn't rewritten
+      // and keeps its packed bytes.
       transactions.length = 0
       yield* Matches.update({ matchId: "m-3" }, ({ state }) => ({ ...state, name: "Grand Final" }))
       const puts = () =>
         transactions
           .flat()
           .flatMap((entry) => (entry.Put?.Item !== undefined ? [entry.Put.Item] : []))
-      expect(puts().find((item) => item.__edd_e__?.S === "MatchVenue")!.layout?.B).toEqual(before)
+      expect(puts().find((item) => item.__edd_e__?.S === "MatchVenue")).toBeUndefined()
+      expect(venueItems()[0]!.layout?.B).toEqual(before)
 
       // Changing the edge's packed value rewrites it, packed.
       transactions.length = 0
@@ -403,19 +404,32 @@ describe("Aggregate — packed many-edge elements", () => {
       yield* Tours.update({ tourId: "t-1" }, ({ state }) => ({ ...state, name: "Autumn" }))
       expect(stopPuts()).toEqual([])
 
-      // A change in leg 1's group: its element is rewritten, packed (the same
-      // bytes — it was diffed before packing); leg 2's elements are not.
+      // A change in leg 1's group sends the leg's own row alone (#168, D2): its element,
+      // unchanged, isn't rewritten and keeps its packed bytes; leg 2's elements are not sent.
       transactions.length = 0
       yield* Tours.update({ tourId: "t-1" }, ({ state }) => ({
         ...state,
         leg1: { ...state.leg1, label: "Far North" },
       }))
+      expect(stopPuts()).toEqual([])
+      expect(new Map(stopItems().map((item) => [item.stopId!.S!, item.plan!.B!]))).toEqual(stored)
+
+      // Changing the element's packed value rewrites that element alone, packed.
+      transactions.length = 0
+      yield* Tours.update({ tourId: "t-1" }, ({ state }) => ({
+        ...state,
+        leg1: {
+          ...state.leg1,
+          stops: state.leg1.stops.map((stop) => ({ ...stop, plan: plan(9) })),
+        },
+      }))
       const puts = stopPuts()
       expect(puts.map((item) => item.stopId?.S)).toEqual(["s-1"])
-      expect(puts[0]!.plan?.B).toEqual(stored.get("s-1"))
+      expect(puts[0]!.plan?.B).toBeInstanceOf(Uint8Array)
+      expect(puts[0]!.plan?.B).not.toEqual(stored.get("s-1"))
       const read = yield* Tours.get({ tourId: "t-1" })
       expect(read.leg1.label).toBe("Far North")
-      expect(read.leg1.stops[0]!.plan).toEqual(plan(1))
+      expect(read.leg1.stops[0]!.plan).toEqual(plan(9))
       expect(read.leg2.stops.map((stop) => stop.plan)).toEqual([plan(2), plan(3)])
     }).pipe(Effect.provide(TestLayer)),
   )

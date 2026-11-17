@@ -329,7 +329,13 @@ export const aggregateStampFormsSuite = (open: OpenTable) => {
         Effect.gen(function* () {
           const steps: ReadonlyArray<Step> = yield* replay(open, build(position, date, supplied))
           expect(steps[0]!.rows).toEqual(create.rows)
-          expect(steps[1]!.rows).toEqual(update.rows)
+          // 1.39.0 rewrote, and re-stamped, the venue row the update leaves unchanged; it is not
+          // sent now and keeps the stamp `create` stored (#168, D2). The root is 1.39.0's.
+          const isRoot = (row: Row) => row.__edd_e__?.S === "Match"
+          expect(steps[1]!.rows.filter(isRoot)).toEqual(update.rows.filter(isRoot))
+          expect(steps[1]!.rows.filter((row) => !isRoot(row))).toEqual(
+            create.rows.filter((row) => !isRoot(row)),
+          )
         }),
       )
     } else if (wrap === "optional" && supplied === "a value supplied") {

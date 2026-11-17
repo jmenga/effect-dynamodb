@@ -136,6 +136,11 @@ Products.condition({ status: "active", role: "admin" })
   transaction back: no tombstone, no released sentinel. The sentinel releases carry
   only their own condition — that the item still owns the sentinel — and one that fails
   is a `ConcurrentModification`, never your condition.
+  An update that sets nothing still checks its condition. It sends its own `UpdateItem`
+  with no update expression, which DynamoDB evaluates and which changes nothing; the item
+  comes back in the same response. A missing row is `ItemNotFound` (`ConditionalCheckFailed`
+  for `patch`) and nothing is created. In `Transaction.transactWrite` the condition becomes
+  a `ConditionCheck` item of the transaction.
   `purge()` is the one operation that refuses a condition (`ValidationError`, `EDD-9047`)
   — it deletes a whole partition across batched writes, so no single `ConditionExpression`
   could guard it atomically.

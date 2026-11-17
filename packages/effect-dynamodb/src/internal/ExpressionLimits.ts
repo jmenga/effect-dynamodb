@@ -130,6 +130,29 @@ export const substitutionsFit = (
   values: Readonly<Record<string, AttributeValue>>,
 ): boolean => substitutionBytes(names, values) <= EXPRESSION_MAX_SUBSTITUTION_BYTES
 
+const NONE: ReadonlySet<string> = new Set()
+
+/**
+ * What `size(#a)` answers for `value`, as a number operand, or undefined where it is not a measure
+ * to rely on (#168, D18): a binary value's bytes, a list's, map's or set's members, an ASCII
+ * string's length. A string holding any other character is left to be compared by value: its
+ * UTF-8 bytes, UTF-16 code units and code points differ, and which one `size` counts was measured
+ * on DynamoDB Local only, so a count of the wrong one would fail the condition on every attempt.
+ * A number, boolean or null has no size.
+ */
+export const sizeOperand = (value: AttributeValue): AttributeValue | undefined => {
+  const n = (count: number): AttributeValue => ({ N: String(count) })
+  if (value.B !== undefined) return n(value.B.length)
+  if (value.L !== undefined) return n(value.L.length)
+  if (value.M !== undefined) return n(Object.keys(value.M).length)
+  if (value.SS !== undefined) return n(value.SS.length)
+  if (value.NS !== undefined) return n(value.NS.length)
+  if (value.BS !== undefined) return n(value.BS.length)
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: the ASCII range, NUL included
+  if (value.S !== undefined) return /[^\x00-\x7F]/.test(value.S) ? undefined : n(value.S.length)
+  return undefined
+}
+
 /**
  * The condition that a stored row is still as it was read (#171): it exists,
  * and every attribute but its table key (`pkField`, `sk`) holds the value
@@ -145,6 +168,12 @@ export const asReadGuard = (
   pkField: string,
   prefer: ReadonlyArray<string>,
   absent: ReadonlyArray<string> = [],
+  /**
+   * Attributes compared by their size instead of their value ({@link sizeOperand}): an aggregate
+   * unit over 4 MB only because of its guards (#168, D18). Empty: every attribute by value, the
+   * request every other caller sends.
+   */
+  bySize: ReadonlySet<string> = NONE,
 ): {
   readonly ConditionExpression: string
   readonly ExpressionAttributeNames: Record<string, string>
@@ -163,10 +192,11 @@ export const asReadGuard = (
   // Its substitutions stay far below EXPRESSION_MAX_SUBSTITUTION_BYTES: a row's names and values
   // are at most 400 KB, and an expression that fits names at most a few hundred placeholders.
   for (const [i, attr] of attrs.entries()) {
-    const clause = `#g${i} = :g${i}`
+    const sized = bySize.has(attr) ? sizeOperand(ownValue(stored, attr)!) : undefined
+    const clause = sized === undefined ? `#g${i} = :g${i}` : `size(#g${i}) = :g${i}`
     if (!expressionFits(`${expression} AND ${clause}`)) continue
     names[`#g${i}`] = attr
-    values[`:g${i}`] = ownValue(stored, attr)!
+    values[`:g${i}`] = sized ?? ownValue(stored, attr)!
     expression = `${expression} AND ${clause}`
   }
   return {
@@ -191,6 +221,8 @@ export const wholeRowGuard = (
   prefer: ReadonlyArray<string>,
   absent: ReadonlyArray<string>,
   extra: ReadonlyArray<string>,
+  /** Attributes compared by size, as {@link asReadGuard} takes them. */
+  bySize: ReadonlySet<string> = NONE,
 ):
   | {
       readonly ConditionExpression: string
@@ -200,7 +232,7 @@ export const wholeRowGuard = (
   | undefined => {
   const keyed = (attr: string) => attr !== pkField && attr !== "sk"
   const held = new Set([...prefer, ...Object.keys(stored)].filter((attr) => keyed(attr)))
-  const guard = asReadGuard(stored, pkField, prefer, absent)
+  const guard = asReadGuard(stored, pkField, prefer, absent, bySize)
   const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
   const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
   // `asReadGuard` leaves out what doesn't fit: whole, it named every attribute the read had.
@@ -237,12 +269,14 @@ export const preferredGuard = (
   pkField: string,
   prefer: ReadonlyArray<string>,
   absent: ReadonlyArray<string>,
+  /** Attributes compared by size, as {@link asReadGuard} takes them. */
+  bySize: ReadonlySet<string> = NONE,
 ): {
   readonly ConditionExpression: string
   readonly ExpressionAttributeNames: Record<string, string>
   readonly ExpressionAttributeValues?: Record<string, AttributeValue>
 } => {
-  const guard = asReadGuard(stored, pkField, prefer, prefer)
+  const guard = asReadGuard(stored, pkField, prefer, prefer, bySize)
   const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
   const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
   let expression = guard.ConditionExpression

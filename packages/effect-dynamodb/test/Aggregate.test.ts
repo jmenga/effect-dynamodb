@@ -1614,7 +1614,8 @@ describe("Aggregate write path", () => {
       },
     }
 
-    it.effect("writes sub-aggregates as separate transaction groups", () =>
+    // The groups fit one transaction, so they go in one (#168, D3); 1.40.0 sent one per group.
+    it.effect("writes its sub-aggregates' groups in one transaction when they fit", () =>
       Effect.gen(function* () {
         mockRefs()
         mockTransactWrite.mockResolvedValue({})
@@ -1630,8 +1631,8 @@ describe("Aggregate write path", () => {
         expect(result.team1.players[0]!.player.displayName).toBe("Steve Smith")
         expect(result.team2.team.name).toBe("India")
 
-        // Should produce 3 transaction groups: root, team1, team2
-        expect(mockTransactWrite).toHaveBeenCalledTimes(3)
+        // The root's group, team1's and team2's, in one request.
+        expect(mockTransactWrite).toHaveBeenCalledTimes(1)
       }).pipe(Effect.provide(WriteLayer)),
     )
 
@@ -1776,32 +1777,61 @@ describe("Aggregate write path", () => {
         }).pipe(Effect.provide(WriteLayer)),
       )
 
-      it.effect("a later group's oversized item: ValidationError naming the committed groups", () =>
-        Effect.gen(function* () {
-          mockRefs()
-          mockTransactWrite.mockResolvedValueOnce({})
-          const rejection = awsValidationException(DDB_ITEM_SIZE)
-          mockTransactWrite.mockRejectedValueOnce(rejection)
-          const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
-          expect(error._tag).toBe("ValidationError")
-          const text = String((error as ValidationError).cause)
-          expect(text).toContain("This request wrote nothing; earlier transactions of this write")
-          expect(text).toMatch(/already committed sub-aggregates "[^"]+"/)
-          // A create's root is among them: a retry would fail on it.
-          expect(text).toContain("update or delete the partial aggregate")
-          expect(mockTransactWrite).toHaveBeenCalledTimes(2)
-        }).pipe(Effect.provide(WriteLayer)),
+      // The groups go in one transaction when they fit (#168, D3): with 95 players they don't,
+      // so the root's group goes first, and the rejected request is a later one.
+      it.effect(
+        "a later request's oversized item: ValidationError naming the committed groups",
+        () =>
+          Effect.gen(function* () {
+            mockAnyRefs()
+            const rejection = awsValidationException(DDB_ITEM_SIZE)
+            let requests = 0
+            mockTransactWrite.mockImplementation(async () => {
+              if (++requests === 2) throw rejection
+              return {}
+            })
+            const error = yield* MatchAggregate.create(manyPlayers(95)).pipe(Effect.flip)
+            // The root's group with team1's, then team2's.
+            expect(
+              mockTransactWrite.mock.calls.map((call: any) => call[0].TransactItems.length),
+            ).toEqual([99, 3])
+            expect(error._tag).toBe("ValidationError")
+            const text = String((error as ValidationError).cause)
+            expect(text).toContain("This request wrote nothing; earlier transactions of this write")
+            expect(text).toMatch(/already committed sub-aggregates "[^"]+"/)
+            // A create's root is among them: a retry would fail on it.
+            expect(text).toContain("update or delete the partial aggregate")
+            expect(mockTransactWrite).toHaveBeenCalledTimes(2)
+          }).pipe(Effect.provide(WriteLayer)),
+      )
+
+      it.effect(
+        "an oversized item in the one transaction: ValidationError, nothing committed",
+        () =>
+          Effect.gen(function* () {
+            mockRefs()
+            const rejection = awsValidationException(DDB_ITEM_SIZE)
+            mockTransactWrite.mockRejectedValueOnce(rejection)
+            const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
+            expect(error._tag).toBe("ValidationError")
+            const text = String((error as ValidationError).cause)
+            expect(text).toContain('of sub-aggregate "')
+            expect(text).toContain("Nothing was written.")
+            expect(text).not.toContain("already committed")
+            expect(mockTransactWrite).toHaveBeenCalledTimes(1)
+          }).pipe(Effect.provide(WriteLayer)),
       )
     })
 
-    it.effect("a later group's cancellation stays TransactionCancelled (#134)", () =>
+    // The groups are one transaction (#168, D3): a reason anywhere but at the root's guard is no
+    // existing root, and stays TransactionCancelled.
+    it.effect("a cancellation not at the root's guard stays TransactionCancelled (#134)", () =>
       Effect.gen(function* () {
         mockRefs()
-        mockTransactWrite.mockResolvedValueOnce({})
         mockTransactWrite.mockRejectedValueOnce(
           Object.assign(new Error("cancelled"), {
             name: "TransactionCanceledException",
-            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+            CancellationReasons: [{ Code: "None" }, { Code: "TransactionConflict" }],
           }),
         )
         const error = yield* MatchAggregate.create(matchInput).pipe(Effect.flip)
@@ -1847,6 +1877,11 @@ describe("Aggregate write path", () => {
           LastEvaluatedKey: undefined,
         })
 
+        // The sweep (#168, design §3.8): the partition read once more, finding nothing left. On a
+        // collection index it reads as `consistentRead` says (an index keyed on the table's
+        // partition key may be a GSI), so eventually consistent here.
+        mockWriteQuery.mockResolvedValueOnce({ Items: [] })
+
         mockBatchWrite.mockResolvedValueOnce({})
 
         yield* SimpleAggregate.delete({ articleId: "a-1" })
@@ -1855,6 +1890,10 @@ describe("Aggregate write path", () => {
         const call = mockBatchWrite.mock.calls[0]![0]
         expect(call.RequestItems["test-table"]).toHaveLength(1)
         expect(call.RequestItems["test-table"][0].DeleteRequest).toBeDefined()
+        expect(mockWriteQuery.mock.calls.map((query: any) => query[0].ConsistentRead)).toEqual([
+          undefined,
+          undefined,
+        ])
       }).pipe(Effect.provide(WriteLayer)),
     )
 
@@ -1878,6 +1917,7 @@ describe("Aggregate write path", () => {
       Effect.gen(function* () {
         const secondRow = { ...articleRow, sk: { S: "$myapp#v1#articleitem#2" } }
         mockWriteQuery.mockResolvedValueOnce({ Items: [articleRow, secondRow] })
+        mockWriteQuery.mockResolvedValueOnce({ Items: [] })
         mockBatchWrite
           .mockResolvedValueOnce(stillUnprocessed)
           .mockResolvedValueOnce(stillUnprocessed)
@@ -2444,7 +2484,8 @@ describe("Aggregate write path", () => {
       (mockTransactWrite.mock.calls[0]![0] as { TransactItems: Array<any> }).TransactItems
     const skOf = (x: { S?: string } | undefined): string => x?.S ?? ""
 
-    it.effect("removing one element emits a Delete for the orphan + Puts for survivors", () =>
+    // A survivor unchanged is not sent (#168, D2): 1.40.0 put every row of the changed group.
+    it.effect("removing one element emits a Delete for the orphan, no Put for the survivor", () =>
       Effect.gen(function* () {
         yield* seed({
           postId: "p",
@@ -2466,12 +2507,11 @@ describe("Aggregate write path", () => {
         const puts = ti.filter((x) => x.Put)
         expect(deletes).toHaveLength(1)
         expect(skOf(deletes[0].Delete.Key.sk)).toMatch(/#c1$/)
-        expect(puts.some((p) => /#c2$/.test(skOf(p.Put.Item.sk)))).toBe(true)
-        expect(puts.some((p) => /#c1$/.test(skOf(p.Put.Item.sk)))).toBe(false)
+        expect(puts).toEqual([])
       }).pipe(Effect.provide(WriteLayer)),
     )
 
-    it.effect("removing all elements emits a Delete per orphan, only root remains a Put", () =>
+    it.effect("removing all elements emits a Delete per orphan, and no Put", () =>
       Effect.gen(function* () {
         yield* seed({
           postId: "p",
@@ -2486,9 +2526,8 @@ describe("Aggregate write path", () => {
 
         const ti = lastTransactItems()
         expect(ti.filter((x) => x.Delete)).toHaveLength(2)
-        const puts = ti.filter((x) => x.Put)
-        expect(puts).toHaveLength(1) // root only
-        expect(skOf(puts[0].Put.Item.sk)).toMatch(/postxroot$/)
+        // The root is unchanged (#168, D2): 1.40.0 put it with the group.
+        expect(ti.filter((x) => x.Put)).toEqual([])
       }).pipe(Effect.provide(WriteLayer)),
     )
 

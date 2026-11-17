@@ -473,8 +473,12 @@ describe("create at run time, for each input its type refuses or newly takes, be
         Effect.gen(function* () {
           const { create, requests, get } = yield* run(maker, input)
           expect(Exit.isSuccess(create) && json(create.value)).toBe(was.create.replace(/^ok /, ""))
+          // Its groups' transactions one now that they fit one (#168, D3).
           expect(requests.map((command) => command[0]!.toLowerCase() + command.slice(1))).toEqual(
-            was.requests,
+            was.requests.filter(
+              (command, i) =>
+                !(command === "transactWriteItems" && was.requests[i - 1] === "transactWriteItems"),
+            ),
           )
           expect(Exit.isSuccess(get) && json(get.value)).toBe(was.get.replace(/^ok /, ""))
         }),
