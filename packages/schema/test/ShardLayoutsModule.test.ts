@@ -67,6 +67,23 @@ describe("ShardLayouts.Table", () => {
       expect(decode(table)._tag).toBe("Failure")
     }
   })
+
+  it("refuses a key it doesn't declare, at every level", () => {
+    // Stripped, a misspelt `previous` would leave a table read without it.
+    for (const [table, key] of [
+      [{ default: 1, defualt: 2 }, "defualt"],
+      [{ default: { count: 8, previuos: 1 } }, "previuos"],
+      [{ default: 1, values: [{ match: { tenantId: "a" }, layout: 2, layuot: 4 }] }, "layuot"],
+      [
+        { default: 1, values: [{ match: { tenantId: "a" }, layout: { count: 8, previuos: 1 } }] },
+        "previuos",
+      ],
+    ] as const) {
+      const exit = decode(table)
+      expect(exit._tag).toBe("Failure")
+      expect(String(exit)).toContain(key)
+    }
+  })
 })
 
 describe("ShardLayouts.make", () => {

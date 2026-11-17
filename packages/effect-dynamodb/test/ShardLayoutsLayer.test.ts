@@ -498,6 +498,32 @@ describe("tables from configuration", () => {
     }),
   )
 
+  it.effect("a JSON table with a key it doesn't declare is a ConfigError naming the key", () =>
+    Effect.gen(function* () {
+      for (const table of [
+        { ...hot({ count: 8, previous: 1 }), defualt: 2 },
+        hot({ count: 8, previuos: 1 } as never),
+        { default: 1, values: [{ match: { tenantId: "T-BIG" }, layout: 8, layuot: 4 }] },
+      ]) {
+        const layer = ShardLayouts.layer([
+          ShardLayouts.of(Devices, {
+            byTenant: Config.schema(Schema.fromJsonString(ShardLayouts.Table), "DEVICE_SHARDS"),
+          }),
+        ]).pipe(
+          Layer.provide(
+            ConfigProvider.layer(
+              ConfigProvider.fromUnknown({ DEVICE_SHARDS: JSON.stringify(table) }),
+            ),
+          ),
+        )
+        const exit = yield* Effect.exit(Layer.build(layer).pipe(Effect.scoped))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(defectOf(exit)).toContain("DEVICE_SHARDS")
+        expect(defectOf(exit)).toMatch(/defualt|previuos|layuot/)
+      }
+    }),
+  )
+
   it.effect("layerEffect: a table loaded at startup", () => {
     const table = makeTable()
     const layer = ShardLayouts.layerEffect(

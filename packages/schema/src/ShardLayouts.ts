@@ -48,30 +48,59 @@ export interface ShardLayoutsRegistry {
 
 const Count = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 256 }))
 
+/**
+ * `struct`, refusing a key it doesn't declare. Decoding strips one by default, and a
+ * stripped `previuos` would leave a table read as if it had no `previous`: its rows
+ * written before the migration are never found. Checked on the input, before the
+ * struct, so it holds whatever parse options the decode is given.
+ */
+const closed = <S extends Schema.Top>(keys: ReadonlyArray<string>, struct: S) =>
+  Schema.Unknown.check(
+    Schema.makeFilter((input) =>
+      typeof input !== "object" || input === null || Array.isArray(input)
+        ? undefined // The struct refuses it.
+        : Object.keys(input)
+            .filter((key) => !keys.includes(key))
+            .map((key) => ({
+              path: [key],
+              issue: `unknown key: this takes ${keys.map((k) => JSON.stringify(k)).join(", ")}`,
+            })),
+    ),
+  ).pipe(Schema.decodeTo(struct))
+
 const LayoutSchema = Schema.Union([
   Count,
-  Schema.Struct({ count: Count, previous: Schema.optionalKey(Count) }).check(
-    Schema.makeFilter((layout) =>
-      layout.previous === undefined || layout.previous !== layout.count
-        ? undefined
-        : `previous must differ from count (both ${layout.count})`,
+  closed(
+    ["count", "previous"],
+    Schema.Struct({ count: Count, previous: Schema.optionalKey(Count) }).check(
+      Schema.makeFilter((layout) =>
+        layout.previous === undefined || layout.previous !== layout.count
+          ? undefined
+          : `previous must differ from count (both ${layout.count})`,
+      ),
     ),
   ),
 ])
 
 const MatchValue = Schema.Union([Schema.String, Schema.Number, Schema.Boolean])
 
-const TableSchema = Schema.Struct({
-  default: LayoutSchema,
-  values: Schema.optionalKey(
-    Schema.Array(
-      Schema.Struct({
-        match: Schema.Record(Schema.String, MatchValue),
-        layout: LayoutSchema,
-      }),
+const TableSchema = closed(
+  ["default", "values"],
+  Schema.Struct({
+    default: LayoutSchema,
+    values: Schema.optionalKey(
+      Schema.Array(
+        closed(
+          ["match", "layout"],
+          Schema.Struct({
+            match: Schema.Record(Schema.String, MatchValue),
+            layout: LayoutSchema,
+          }),
+        ),
+      ),
     ),
-  ),
-}).pipe(Schema.brand("@effect-dynamodb/ShardLayouts.Table"))
+  }),
+).pipe(Schema.brand("@effect-dynamodb/ShardLayouts.Table"))
 
 // ---------------------------------------------------------------------------
 // Types
@@ -321,8 +350,9 @@ export class ShardLayouts extends Context.Service<ShardLayouts, ShardLayoutsRegi
  * A Schema for one shard table: `{ default, values? }`, each layout a count in
  * 1..256 or `{ count, previous? }`. For `Config.schema(Schema.fromJsonString(
  * ShardLayouts.Table), "NAME")`, or as a field of an entity holding tables. It
- * checks the shape and the ranges; what needs the entity (the `match` names, the
- * key text, two entries for one key) is checked when the layer is built.
+ * checks the shape and the ranges, and refuses a key it doesn't declare at every
+ * level; what needs the entity (the `match` names, the key text, two entries for
+ * one key) is checked when the layer is built.
  */
 export const Table = TableSchema
 
