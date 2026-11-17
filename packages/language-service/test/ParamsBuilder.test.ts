@@ -395,6 +395,34 @@ describe("ParamsBuilder", () => {
       expect(params.Item!.gsi5pk).toBe("$fleet#v1#device#!{count}.{shard}#tenantid_t")
     })
 
+    it("an index moved back to 1 shows the unsharded key, as the library writes (#287)", () => {
+      const unsharding: ResolvedEntity = {
+        ...entity,
+        indexes: {
+          ...entity.indexes,
+          byTenant: {
+            ...entity.indexes.byTenant!,
+            shards: { count: 1, by: ["groupId"], previous: 20 },
+          },
+        },
+      }
+      const put = buildParamsOrThrow({
+        entity: unsharding,
+        type: "put",
+        arguments: { channel: "c", deviceId: "d", tenantId: "t", groupId: "g" },
+      })
+      expect(put.Item!.gsi5pk).toBe("$fleet#v1#device#tenantid_t")
+      const read = buildParamsOrThrow({
+        entity: unsharding,
+        type: "entity-query-accessor",
+        indexName: "byTenant",
+        arguments: { tenantId: "t" },
+      })
+      expect(read.ExpressionAttributeValues![":pk"]).toBe("$fleet#v1#device#tenantid_t")
+      expect(read.info).toContain("Shards: 1, the unsharded key")
+      expect(read.info).toContain("previous layout of 20")
+    })
+
     it("an accessor's hover says how it reads", () => {
       const params = buildParamsOrThrow({
         entity,

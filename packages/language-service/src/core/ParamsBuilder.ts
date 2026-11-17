@@ -559,9 +559,12 @@ function composePkValue(
 /** What a sharded partition key's shard shows: a hover has no item to hash (#183). */
 export const SHARD_PLACEHOLDER = "{shard}"
 
-/** Mirrors `Shards.shardMarker`, with the shard as a placeholder. No casing reaches it. */
-const shardMarkerText = (shards: IndexShards): string =>
-  `!${shards.count ?? "{count}"}.${SHARD_PLACEHOLDER}`
+/**
+ * Mirrors `Shards.shardMarker`, with the shard as a placeholder. No casing reaches it. A count
+ * of 1 has no marker: the library composes the unsharded key (#287).
+ */
+const shardMarkerText = (shards: IndexShards): string | undefined =>
+  shards.count === 1 ? undefined : `!${shards.count ?? "{count}"}.${SHARD_PLACEHOLDER}`
 
 /** A hover's line about a sharded index. */
 const shardsInfo = (shards: IndexShards): string => {
@@ -588,7 +591,8 @@ const shardsInfo = (shards: IndexShards): string => {
       `reads one unsharded partition.`
     )
   }
-  return `  Shards: ${shards.count ?? "{count}"}${source}${
+  const count = shards.count === 1 ? "1, the unsharded key," : (shards.count ?? "{count}")
+  return `  Shards: ${count}${source}${
     shards.previous === undefined ? "" : `; also reads previous layout of ${shards.previous}`
   }`
 }
