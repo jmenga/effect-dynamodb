@@ -548,6 +548,7 @@ const plan = yield* db.entities.TaskEntity.byProject({ projectId: "proj-alpha" }
 | `rowChecks` | The fields checked on each row in the client |
 | `sizing` | `"adaptive"`, `"budget"` (the items still owed), `"fixed"` (`pageSize(n)`) or `"natural"` |
 | `zorder`, `maxSkips` | The Z-order box and address width; the skip-scan probe budget |
+| `shards` | On a sharded index: the pinned value's [layout](/effect-dynamodb/guides/sharding/#per-value-layouts) (`count`, `previous`) and the partitions read. A value at 1 reads one unsharded partition |
 | `fanOut` | A [sharded index's](/effect-dynamodb/guides/sharding/#concurrency-and-inspection) partitions, whether a pin reduced them to one shard, and the requests in flight at once |
 
 `.onRequest(observer)` runs `observer` after every request a terminal sends, probes included, in the terminal's fiber and in the order the observers were added. Each event carries:

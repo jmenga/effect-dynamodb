@@ -272,7 +272,7 @@ import { Entity } from "effect-dynamodb"
 | `model` | `Schema.Class \| Schema.Struct \| ConfiguredModel` | Yes | Domain model schema (or configured model with field overrides) |
 | `entityType` | `string` | Yes | Discriminator stored as `__edd_e__` |
 | `primaryKey` | `{ pk: KeyDef, sk: KeyDef, casing? }` | Yes | Primary key composition rules. Optional `casing` overrides the schema's for the primary key |
-| `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection`, `type`, `casing` (overrides the schema's for that index — collection members must agree, `EDD-9055`), `indexPolicy` and `shards` (`n` or `{ count, by?, previous? }`, see [Write Sharding](/effect-dynamodb/guides/sharding/)) |
+| `indexes` | `Record<string, GsiIndexDef>` | No | GSI index definitions with `name`, `pk`, `sk`, optional `collection`, `type`, `casing` (overrides the schema's for that index — collection members must agree, `EDD-9055`), `indexPolicy` and `shards` (`n`, `{ count, by?, previous? }`, or `{ by?, layouts }` with `layouts` a table `{ default, values?: [{ match, layout }] }` or `"provided"`, see [Write Sharding](/effect-dynamodb/guides/sharding/) and [Per-value layouts](/effect-dynamodb/guides/sharding/#per-value-layouts)) |
 | `timestamps` | `boolean \| { created?, updated? }` | No | Auto-managed `createdAt`/`updatedAt`. Each slot takes a field name, a `DynamoModel` date schema (storage only), or `{ field?, schema? }`. A `schema` without a `DynamoEncoding` annotation throws `EDD-9044` at make() time |
 | `versioned` | `boolean \| { retain?, field?, ttl? }` | No | Auto-increment version with optional snapshot retention |
 | `softDelete` | `boolean \| { ttl?, preserveUnique? }` | No | Soft delete with optional TTL |
@@ -551,7 +551,7 @@ Used in entity-level `filter()`:
 |------|-------------|
 | `Page<A>` | `{ items: Array<A>, cursor: Option<string> }` — `cursor` is `None` on the last page; `startFrom` takes the string inside a `Some` |
 | `PlanMode` | `"key" \| "skip-scan" \| "filter" \| "naive" \| "jump" \| "precise" \| "empty"` |
-| `QueryExplain` | `{ index, plan: PlanMode, reason, keyConditions: { lower, upper, exact }[], filter, rowChecks, sizing: "fixed" \| "natural" \| "budget" \| "adaptive", zorder?: { bits, box, fill, exactRanges }, fanOut?: { partitions, pruned, concurrency }, maxSkips? }` |
+| `QueryExplain` | `{ index, plan: PlanMode, reason, keyConditions: { lower, upper, exact }[], filter, rowChecks, sizing: "fixed" \| "natural" \| "budget" \| "adaptive", zorder?: { bits, box, fill, exactRanges }, shards?: { count, previous, partitions }, fanOut?: { partitions, pruned, concurrency }, maxSkips? }`. `shards` is set on every query of a sharded index: the pinned value's resolved layout and the partitions read ([Per-value layouts](/effect-dynamodb/guides/sharding/#per-value-layouts)) |
 | `QueryRequestEvent` | `{ kind: "read" \| "probe" \| "count", request, lower, upper, limit, scannedCount, count, accepted, discarded }` |
 | `ZOrderOptions` | `{ strategy?: "auto" \| "naive" \| "jump" \| "precise", maxRanges?, pageSize?, concurrency? }` — see [Z-order Indexes](/effect-dynamodb/guides/zorder/#strategies) |
 
@@ -1064,8 +1064,8 @@ import { KeyComposer } from "effect-dynamodb"
 | Export | Type | Description |
 |--------|------|-------------|
 | `composePk` | `(schema, entity, index, record) => string` | Compose partition key value. On a [sharded index](/effect-dynamodb/guides/sharding/) it adds the shard marker, and throws `EDD-9100` when a source value is missing |
-| `composeReadPartitions` | `(schema, entity, index, record, { prune? }?) => { partitions, fanOut }` | The partition keys a query on this index reads, in merge order: the current shards (one when every attribute of the shard source is pinned, `by` or the primary key alike), then a `previous` layout's. One partition on an unsharded index, with `fanOut: undefined` |
-| `assertCollectionShardsAgreement` | `(collectionName, members) => void` | Throw `EDD-9103` when a collection's members disagree on `shards.count` or `shards.previous` |
+| `composeReadPartitions` | `(schema, entity, index, record, { prune? }?) => { partitions, fanOut, layout? }` | The partition keys a query on this index reads, in merge order: the current shards (one when every attribute of the shard source is pinned, `by` or the primary key alike), then a `previous` layout's. One partition on an unsharded index, with `fanOut: undefined`, and on a value whose [layout](/effect-dynamodb/guides/sharding/#per-value-layouts) is a count of 1 with no `previous`. `layout` is the pinned value's resolved layout. Throws `EDD-9180` for a `"provided"` index with no table |
+| `assertCollectionShardsAgreement` | `(collectionName, members) => void` | Throw `EDD-9103` when a collection's members disagree on their layouts, tables compared by content (the same default, the same layout for each key their entries compose). A member without `shards` never agrees with one that has them |
 | `composeSk` | `(schema, entity, index, record) => string` | Compose a string sort key value (a defect on a Z-order half) |
 | `composeZOrderSk` | `(schema, index, record) => Uint8Array` | Compose a Z-order sort key: prefix segments, then the interleaved address. Throws `EDD-9092` for a value a dimension can't place |
 | `composeSkValue` | `(schema, entityType, entityVersion, index, record) => KeyValue` | `composeSk` for a string half, `composeZOrderSk` for a Z-order half |
@@ -1107,8 +1107,13 @@ import { KeyComposer } from "effect-dynamodb"
 | `KeyValue` | `string \| Uint8Array` — text for a string half, bytes for a Z-order half |
 | `IndexDefinition` | `{ pk: KeyPart, sk: KeyPart \| ZOrderSkPart, index?, collection?, type?, casing?, indexPolicy?, shards? }` |
 | `ShardsConfig` | `{ count: number, by?: F[], previous?: number }` — write sharding as declared on a secondary index |
-| `IndexShards` | A normalised `ShardsConfig`: `{ count, by, previous, source }`, where `source` is `by` or, once `Entity.make` binds it, the primary key composites |
-| `ReadPartitions` | `{ partitions: string[], fanOut: ReadFanOut \| undefined }` — what `composeReadPartitions` returns |
+| `ShardsTableConfig` | `{ by?: F[], layouts: ShardTableConfig \| "provided" }` — a [layout per value](/effect-dynamodb/guides/sharding/#per-value-layouts), declared or supplied at run time by `ShardLayouts` |
+| `ShardTableConfig` | `{ default: ShardLayoutConfig, values?: { match, layout: ShardLayoutConfig }[] }` — `match` names every partition key composite of the index |
+| `ShardLayoutConfig` | `number \| { count: number, previous?: number }` — one layout; a count of 1 is the unsharded key |
+| `IndexShards` | A normalised `ShardsConfig` or `ShardsTableConfig`: `{ count, by, previous, source, layouts? }`, where `source` is `by` or, once `Entity.make` binds it, the primary key composites, and `layouts` the compiled table (`ShardTable`) or `"provided"` |
+| `ShardTable` | `{ default: ShardLayout, values: { match, keyRecord, layout: ShardLayout }[] }` — a compiled table, looked up by the unsharded partition key text a value composes |
+| `ShardLayout` | `{ count: number, previous: number \| undefined }` — a normalised layout |
+| `ReadPartitions` | `{ partitions: string[], fanOut: ReadFanOut \| undefined, layout?: ShardLayout }` — what `composeReadPartitions` returns |
 | `IndexPolicyKey` | `"sparse" \| "preserve"` |
 | `IndexPolicy` | `{ pk?: IndexPolicyKey, sk?: IndexPolicyKey }` (each key defaults to `"preserve"` when omitted) |
 | `GsiUpdateResult` | `{ sets: Record<string, KeyValue>, removes: ReadonlyArray<string> }` |
@@ -1736,6 +1741,27 @@ import { StorageEncoding } from "effect-dynamodb"
 | `valueBytesSync` | `({ schema, value, storedAs?, compressors? }) => number` | `valueBytes`, synchronously, for pure planning code: the schema encode runs synchronously, compressors are passed in (none by default), and a failure throws the `ValidationError` `valueBytes` fails with |
 | `encodeSync` / `decodeSync` / `decodeUnmarshalledSync` | `(…, options?: { compressors? }) => …` | Synchronous twins of `encode` / `decode` / `decodeUnmarshalled` for pure code: compressors are passed explicitly (a `Compression.make(...)` registry or a list; none by default) and a failure **throws** the `ValidationError` the Effect form fails with. They do no I/O, so a blob pointer is refused (a `ValidationError`) |
 | `limits` | `{ item: 409_600, transaction: 4_194_304, request: 16_777_216 }` | DynamoDB's item and `TransactWriteItems` size limits, and the request body limit (AWS documents 16 MB for `BatchWriteItem`; DynamoDB Local rejects any request body over 16 MiB, HTTP 413), in bytes |
+
+## ShardLayouts
+
+The tables of indexes declared `shards: { layouts: "provided" }`, supplied by the application at run time ([Tables supplied at run time](/effect-dynamodb/guides/sharding/#tables-supplied-at-run-time)). AWS-free: it lives in `@effect-dynamodb/schema` and is re-exported by `effect-dynamodb`.
+
+```typescript
+import { ShardLayouts } from "effect-dynamodb"
+```
+
+| Export | Description |
+|--------|-------------|
+| `ShardLayouts` | `Context.Service` (`@effect-dynamodb/ShardLayouts`) holding a `ShardLayoutsRegistry` (`tables`: each provided index's compiled `ShardTable`). `DynamoClient.make` reads it when it binds, so bound operations keep `R = never`; every path without a bound client (unbound ops in `Transaction`, `Batch` and `EventStore.append({ additionalItems })`, projection rows, unbound queries and collections, `rekey`) reads it from the context it runs in. A provided index with no table is a defect, `[EDD-9180]`, at bind or before the operation sends anything: never a fallback |
+| `of(entity, tables)` | `Entry` — one entity's tables: one for every index declared `"provided"`, each a table (`{ default, values? }`, `match` typed by that index's partition key composites), a decoded `Table`, or a `Config` of either. The types accept only the provided indexes and require each of them |
+| `layer(entries)` | `Layer<ShardLayouts, ConfigError>` — reads each `Config`, then checks each table against its entity and index. A malformed table (`[EDD-9099]`) or a misuse of `of` (`[EDD-9181]`: an index not declared `"provided"`, an unknown index, a provided index left out, one entity given twice, an entity registered on no table) is a defect when the layer is built. Build one layer with an `of` per entity: of two, the one provided last is used |
+| `layerEffect(effect)` | `Layer<ShardLayouts, E \| ConfigError, R>` — from an `Effect` producing entries, run once when the layer is built: a table loaded at startup (a config item, SSM, AppConfig). Its failure is the layer's |
+| `Table` | A branded `Schema` for one table, `{ default: Layout, values?: { match: Record<string, string \| number \| boolean>, layout: Layout }[] }`, each count an integer from 1 to 256 and `previous` not equal to `count`. For `Config.schema(Schema.fromJsonString(ShardLayouts.Table), "NAME")`, or a field of an entity holding tables. What needs the entity is checked by `of` when the layer is built |
+| `make(entries)` | `ShardLayoutsRegistry` — a registry from entries holding no `Config`, for tests and tools; throws what `layer` dies with |
+| `Layout` | `number \| { count, previous? }` |
+| `TypedTable<P>` | A table whose `match` names the partition key composites `P` |
+
+A table is read once per process: the service is built with its layer and never changes.
 
 ## Compression
 

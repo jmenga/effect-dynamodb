@@ -1,6 +1,6 @@
 ---
 title: "Write Sharding"
-description: "Spread one logical GSI partition over N physical ones: the shards option, merged reads, per-shard cursors, pruning with by, and adopting sharding on a populated index"
+description: "Spread one logical GSI partition over N physical ones: the shards option, merged reads, per-shard cursors, pruning with by, adopting sharding on a populated index, and per-value layouts supplied in code or at run time"
 ---
 
 import { Aside } from "@astrojs/starlight/components"
@@ -63,6 +63,7 @@ const Devices = Entity.make({
 | `count` | The number of shards, an integer from 2 to 256 |
 | `by` | The sort key composites to hash in place of the primary key composites. See [Pruning](#pruning) |
 | `previous` | The count of the layout being moved away from: `1` for an unsharded index. See [Adopting sharding](#adopting-sharding-on-a-populated-index) |
+| `layouts` | In place of `count` and `previous`: a layout per value, or `"provided"` for a table the application supplies at run time. See [Per-value layouts](#per-value-layouts) |
 
 Nothing else changes: `db.entities.Devices.byTenant({ tenantId })` is the same accessor with the same types, and an index without `shards` composes the same keys and sends the same requests as before.
 
@@ -418,15 +419,264 @@ Changing `count` later is the same migration: `{ count: 40, previous: 20 }`, `re
 - **Adding `by`** at the same count isn't supported: pruned queries would miss the rows that have not moved, and `previous` can't equal `count`. Change the count too.
 - **Rows under other key text** aren't read until they've moved: `previous` reads the old layout, under the text the setting composes. `rekey` moves them along with the layout, in one run.
 
+## Per-value layouts
+
+Usually one value of an index is hot: one big tenant among thousands. `shards: 20` would make every tenant pay 20 requests per query to protect one. A **table of layouts** shards only the values that need it:
+
+```typescript region="layouts-entity" example="guide-sharding.ts"
+const TenantDevices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: deviceKey,
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      // One busy tenant takes 8 shards. Every other tenant keeps one unsharded partition.
+      shards: {
+        layouts: {
+          default: 1,
+          values: [{ match: { tenantId: "t-big" }, layout: 8 }],
+        },
+      },
+    },
+  },
+})
+```
+
+| Field | Meaning |
+|---|---|
+| `default` | The layout of every value without an entry |
+| `values` | Entries `{ match, layout }`. `match` names every partition key composite of the index, and nothing else: the type system offers exactly those, with completions and a compile error for a typo |
+| `by` | Beside `layouts`, as on a static index: the sort key composites to hash |
+
+A **layout** is a count, or `{ count, previous }` while a value [moves](#moving-a-value). The static forms are a table with only a default: `shards: 8` is `{ layouts: { default: 8 } }`, and `{ count: 8, by, previous: 1 }` is `{ by, layouts: { default: { count: 8, previous: 1 } } }`. `previous` lives only inside a layout, so a table has no `previous` of its own.
+
+- **A count of 1 is the unsharded key.** A value at 1 composes the same key text as an index without `shards`, and its query is one plain query with the same requests and cursor. `{ count: 1, previous: 8 }` moves a value (or, as the default, a whole index) back to unsharded. A bare `shards: 1` is still refused (`EDD-9099`).
+- **Entries are looked up by key text.** When the table is built, each entry's `match` composes its unsharded partition key, and a value finds its entry by the key it composes. So every spelling of one key gets one layout: under the default `lowercase` casing `"T-BIG"` and `"t-big"` are one key, and one entry serves both. A write, a query and `rekey` hold a value in different forms (the decoded input, the caller's pins, the stored row), and they all agree. Two entries that compose one key are refused (`EDD-9099`).
+- **A malformed table fails before anything runs:** at `Entity.make`, or when the layer supplying it is built (`EDD-9099`).
+
+`explain()` reports the layout of the pinned value:
+
+```typescript region="layouts-explain" example="guide-sharding.ts"
+// "T-BIG" composes the same key as "t-big" under the default lowercase casing,
+// so it gets the same layout.
+const busy = yield* layoutsDb.entities.Devices.byTenant({ tenantId: "T-BIG" }).explain()
+// busy.shards?.count             → 8
+// busy.shards?.partitions.length → 8
+
+// Any other tenant: one unsharded partition, the same keys and requests as an
+// index without shards.
+const quiet = yield* layoutsDb.entities.Devices.byTenant({ tenantId: TENANT }).explain()
+// quiet.shards?.count      → 1
+// quiet.shards?.partitions → ["$guide-sharding#v1#device#tenantid_t-123"]
+// quiet.fanOut             → undefined
+```
+
+`shards` is `{ count, previous, partitions }`: the resolved count and `previous`, and the partition key of each partition the query reads. A sharded value also gets `fanOut`, as on a static index.
+
+### The rules stay per index
+
+What a table changes is key text and requests. The rules of a sharded index apply to **every** value of an index with a table, those at 1 included:
+
+- `.within()`, skip-scan and `.zorder()` are refused (`EDD-9104`), and so is a `GeoIndex` over the index.
+- `EDD-9101` and `EDD-9106` apply.
+- A `put` without a value for a `by` attribute writes no index entry.
+- The update rules of [Updates](#updates) apply: a `by`-only update fails with `EDD-9100`, on a cold value too.
+
+If these followed each value's count, a query or an update that works today would fail the day its value turned hot. So switching an index to a table costs `.within()` for every value, and a cold value's `by`-only update fails as it does on any sharded index. Keeping `by` mandatory also means any value can be sharded later without leaving rows `rekey` can't move.
+
+### Tables supplied at run time
+
+The hot values often differ per environment: a production tenant id isn't a staging one. An entity is a module-level constant and can't read configuration, so it declares that the table is supplied at run time, with no default:
+
+```typescript region="layouts-provided" example="guide-sharding.ts"
+// The busy tenant's id differs per environment, so the table comes from the
+// application at run time, through a ShardLayouts layer.
+const ProvidedDevices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: deviceKey,
+  indexes: {
+    byTenant: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["tenantId"] },
+      sk: { field: "gsi1sk", composite: ["deviceId"] },
+      shards: { layouts: "provided" },
+    },
+  },
+})
+```
+
+The application supplies the table with a `ShardLayouts` layer, as `Compression.layer` supplies codecs. From configuration:
+
+```typescript region="layouts-layer" example="guide-sharding.ts"
+// BIG_TENANT_ID holds the busy tenant's id: t-big here, another id in staging.
+const ShardsLayer = ShardLayouts.layer([
+  ShardLayouts.of(ProvidedDevices, {
+    byTenant: Config.String("BIG_TENANT_ID").pipe(
+      Config.map((id) => ({ default: 1, values: [{ match: { tenantId: id }, layout: 8 }] })),
+    ),
+  }),
+])
+
+// Or the whole table as one JSON variable, for several tenants or one mid-migration.
+const JsonShardsLayer = ShardLayouts.layer([
+  ShardLayouts.of(ProvidedDevices, {
+    byTenant: Config.schema(Schema.fromJsonString(ShardLayouts.Table), "DEVICE_SHARDS"),
+  }),
+])
+```
+
+`ShardLayouts.of(entity, { ... })` takes one table for every index of the entity declared `"provided"`: a table, a decoded `ShardLayouts.Table`, or a `Config` of either. The types accept only those indexes and require each of them, and a literal table's `match` names that index's partition key composites. `ShardLayouts.Table` is a `Schema` for a table, so a JSON variable that isn't one is a `ConfigError` naming the variable. When the layer is built, each table is checked against its entity: its `match` names and the keys its entries compose (`EDD-9099`). An index that isn't declared `"provided"`, an unknown index, a provided index left out, or one entity given twice is `EDD-9181`. Build one layer with an `of` per entity: of two `ShardLayouts` layers, the one provided last is the only one used.
+
+The layer goes in the application layer, beside the client:
+
+```typescript
+const AppLayer = Layer.mergeAll(
+  DynamoClient.layerConfig({ region: Config.String("AWS_REGION") }),
+  ShardsLayer,
+  MainTable.layer({ name: "main" }),
+)
+```
+
+`DynamoClient.make` reads the tables when it binds, so bound operations keep `R = never` and calling code doesn't change. Every path that composes keys without a bound client reads the layer from the context it runs in: unbound ops in `Transaction`, `Batch` and `EventStore.append({ additionalItems })`, projection rows, unbound queries and collections, and `rekey`.
+
+A missing table is an error, never a fallback to a default:
+
+```typescript region="layouts-missing" example="guide-sharding.ts"
+// Without a ShardLayouts layer, binding fails with EDD-9180, naming the entity
+// and index. Nothing falls back to a default.
+const missing = yield* DynamoClient.make({
+  entities: { Devices: ProvidedDevices },
+  tables: { MainTable: ProvidedTable },
+}).pipe(Effect.exit)
+// missing → a defect: "[EDD-9180] DynamoClient.make: Device.byTenant declares
+//           shards: { layouts: "provided" }, but no ShardLayouts layer supplies its table…"
+```
+
+```typescript region="layouts-provided-use" example="guide-sharding.ts"
+// The layer goes in the application layer, beside the client. Bound operations
+// keep the table DynamoClient.make read, so their types don't change.
+const providedDb = yield* DynamoClient.make({
+  entities: { Devices: ProvidedDevices },
+  tables: { MainTable: ProvidedTable },
+}).pipe(Effect.provide(ShardsLayer))
+const fromConfig = yield* providedDb.entities.Devices.byTenant({ tenantId: BIG }).explain()
+// fromConfig.shards?.count → 8
+```
+
+`EDD-9180` is raised at `DynamoClient.make`, naming every bound entity and index without a table, or at the first operation on a path without a bound client, before anything is sent. A `rekey` run fails before it scans.
+
+**From a config item.** A layer can be built from any Effect, so a table can also come from a DynamoDB item, SSM or AppConfig. `ShardLayouts.Table` is a field type:
+
+```typescript region="layouts-config-item" example="guide-sharding.ts"
+class ShardConfig extends Schema.Class<ShardConfig>("ShardConfig")({
+  name: Schema.String, // "Devices.byTenant"
+  layouts: ShardLayouts.Table,
+}) {}
+
+const ShardConfigs = Entity.make({
+  model: ShardConfig,
+  entityType: "ShardConfig",
+  primaryKey: {
+    pk: { field: "pk", composite: ["name"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+const ConfigTable = Table.make({ schema: AppSchema, entities: { ShardConfigs } })
+```
+
+```typescript region="layouts-layer-effect" example="guide-sharding.ts"
+// Read once, when the layer is built. A failed read or a missing item fails the
+// layer: the application doesn't start, rather than run unsharded.
+const ItemShardsLayer = ShardLayouts.layerEffect(
+  Effect.gen(function* () {
+    const db = yield* DynamoClient.make({ entities: { ShardConfigs }, tables: { ConfigTable } })
+    const devices = yield* db.entities.ShardConfigs.get({ name: "Devices.byTenant" })
+    return [ShardLayouts.of(ProvidedDevices, { byTenant: devices.layouts })]
+  }),
+)
+```
+
+The layer needs the client and the config table's configuration, so provide them to it:
+
+```typescript
+const AppLayer = ItemShardsLayer.pipe(
+  Layer.provideMerge(
+    Layer.mergeAll(
+      DynamoClient.layerConfig({ region: Config.String("AWS_REGION") }),
+      MainTable.layer({ name: "main" }),
+      ConfigTable.layer({ name: "config" }),
+    ),
+  ),
+)
+```
+
+- **A table is read once per process.** The service is built with its layer and never changes: an edited config item changes nothing until the process restarts. There is no hot reload, since a table that changed while a process ran could let one `rekey` run judge rows against two tables.
+- **The config entity can't use a provided layout itself.** Nothing supplies its table yet when it is read, so its first operation fails with `EDD-9180`.
+
+### Moving a value
+
+A change to a value's entry is a migration for that value, whether the table is in code or in configuration. It takes the three steps of [adopting sharding](#adopting-sharding-on-a-populated-index), on that value alone:
+
+| From → to | Step 1 | Step 2 | Step 3 |
+|---|---|---|---|
+| unsharded → 20 | `{ count: 20, previous: 1 }` | `rekey` | `20` |
+| 20 → unsharded | `{ count: 1, previous: 20 }` | `rekey` | `1`, or remove the entry when the default is 1 |
+| 20 → 40 | `{ count: 40, previous: 20 }` | `rekey` | `40` |
+
+```typescript region="layouts-migrate" example="guide-sharding.ts"
+// Moving t-123 from its one partition to 4 shards, while t-big keeps 8. Each step
+// is a deploy or a configuration change, finished once every process runs it.
+const tablesOf = (byTenant: ShardLayouts.TypedTable<"tenantId">) =>
+  ShardLayouts.layer([ShardLayouts.of(ProvidedDevices, { byTenant })])
+const bindWith = (byTenant: ShardLayouts.TypedTable<"tenantId">) =>
+  DynamoClient.make({
+    entities: { Devices: ProvidedDevices },
+    tables: { MainTable: ProvidedTable },
+  }).pipe(Effect.provide(tablesOf(byTenant)))
+const busyTenant = { match: { tenantId: "t-big" }, layout: 8 }
+
+// Step 1: t-123 writes 4 shards, and reads them and its old partition.
+const step1 = yield* bindWith({
+  default: 1,
+  values: [busyTenant, { match: { tenantId: TENANT }, layout: { count: 4, previous: 1 } }],
+})
+const pending = yield* step1.tables.MainTable.rekey({ dryRun: true })
+// pending.indexKeysRewritten → 200: t-123's rows, still in the old partition
+
+// Step 2: rekey, then check again.
+yield* step1.tables.MainTable.rekey()
+const settled = yield* step1.tables.MainTable.rekey({ dryRun: true })
+// settled.indexKeysRewritten → 0, settled.conflicts → []: step 3 can go out
+
+// Step 3: remove `previous`.
+const step3 = yield* bindWith({
+  default: 1,
+  values: [busyTenant, { match: { tenantId: TENANT }, layout: 4 }],
+})
+const moved = yield* step3.entities.Devices.byTenant({ tenantId: TENANT }).collect()
+```
+
+- **A step is finished only when every running process has it.** For a table in code or bundled configuration, that is when the deploy finishes. For a table read from a config item, an edit changes nothing until processes restart, so the step is finished once every process has restarted since the edit, warm Lambda containers included.
+- **Run `rekey`, or start the next step, only after that.** An old process still writing the old layout after `rekey` leaves rows that the next step strands once `previous` goes.
+- **Check each step with `rekey({ dryRun: true })` once it has settled.** It reports the rows that aren't in their value's layout. Remove `previous` only after a run that moves nothing and reports no conflicts.
+- **Reads stay complete at every step:** step 1 reads both layouts of that value, step 3 one.
+- **A cursor taken before a step fails with `EDD-9094`** for that value only. Cursors of other values keep working.
+- **Other values are untouched.** `rekey` judges every row of an index with a table by its own value's layout, and moves only the rows whose stored key differs from it.
+- **Switching an index from `shards: 20` to a table** whose default is 20 moves nothing. Switching an unsharded index to a table with `default: 1` moves nothing either, but takes on [the rules of a sharded index](#the-rules-stay-per-index).
+
 ## Collections
 
-Members of a collection on a sharded index must agree on `count` and `previous` (`EDD-9103`), since the partitions read are shared. They may differ on `by`, since each member hashes its own source. Collection queries always read every shard.
+Members of a collection on a sharded index must agree on their layouts (`EDD-9103`), since the partitions read are shared. Tables are compared by content: the same default, and the same layout for every key their entries compose, so two members spelling one value differently (`T-BIG` and `t-big` under `lowercase`) agree. A provided table is compared once the layer has supplied it: at `DynamoClient.make`, or when an unbound collection query resolves its partitions. A member without `shards` never agrees with one that has them, a table whose default is 1 included. Members may differ on `by`, since each member hashes its own source. Collection queries always read every shard.
 
 ## What isn't supported
 
 | | |
 |---|---|
-| `.within()` and skip-scan on a sharded accessor | `EDD-9104`. So is `.zorder()`, which only configures a `.within()` read |
+| `.within()` and skip-scan on a sharded accessor | `EDD-9104`, for every value of an index with a table, those at 1 included. So is `.zorder()`, which only configures a `.within()` read |
 | A `GeoIndex` over a sharded index | `EDD-9104` |
 | `shards` on the primary key | `EDD-9099` |
 | An index with nothing to spread: every primary key composite is also a partition key composite of the index | `EDD-9101` |
@@ -440,16 +690,18 @@ Aggregates compose their own attributes and write no index keys of an entity's i
 
 | Code | When | Raised by |
 |---|---|---|
-| `EDD-9099` | Malformed `shards`: `count` not an integer from 2 to 256, `previous` not a positive integer or equal to `count`, an unknown option, or `shards` on the primary key | `Entity.make` |
+| `EDD-9099` | Malformed `shards`: `count` not an integer from 2 to 256 (a layout in a table may be 1), `previous` not a positive integer or equal to `count`, an unknown option, `shards` on the primary key, or a malformed table: a `match` not naming exactly the partition key composites, or two entries composing one key | `Entity.make`, and building a `ShardLayouts` layer |
 | `EDD-9100` | A shard source value is missing when the partition key is composed, or an update changes `by` and the sort key can't be recomposed | Every write path, as a `ValidationError` |
 | `EDD-9101` | Nothing to spread: every primary key composite is also a partition key composite of the index | `Entity.make` |
 | `EDD-9102` | `by` is empty, duplicated, not a sort key composite of this index, or on a Z-order sort key | Types and `Entity.make` |
-| `EDD-9103` | Collection members disagree on `count` or `previous` | `DynamoClient.make`, `Collections.make` |
+| `EDD-9103` | Collection members disagree on their layouts, compared by content | `DynamoClient.make`, `Collections.make`, and an unbound collection query over a provided table |
 | `EDD-9104` | `.within()`, skip-scan, `.zorder()` or a `GeoIndex` on a sharded index | The call |
 | `EDD-9105` | `concurrency` isn't a positive integer | The call |
 | `EDD-9106` | Two key halves of one entity stored in one attribute, sharded or not, without the same fields, in the same order and casing, or a sharded partition key with one sharded differently | Types, for a sharded half they can see, `Entity.make`, and `Table.make` for a casing left to the schema |
 | `EDD-9108` | One entity uses one physical index twice, even over the same fields | `Entity.make` |
 | `EDD-9094` | A cursor from another query or layout, or a corrupted one | The terminal, as a `ValidationError` |
+| `EDD-9180` | An index declares `shards: { layouts: "provided" }` and no `ShardLayouts` layer supplies its table | `DynamoClient.make`, or the first operation on a path without a bound client, before anything is sent |
+| `EDD-9181` | `ShardLayouts.of` misused: an index not declared `"provided"`, an unknown index, a provided index left out, one entity given twice, or an entity on no table | Types, and building the layer |
 
 ## What's Next?
 
