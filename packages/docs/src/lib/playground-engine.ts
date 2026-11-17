@@ -58,7 +58,9 @@ export const composeAllKeys = (
         record,
       )
       for (const [attribute, value] of Object.entries(keys)) {
-        result[attribute] = typeof value === "string" ? placeholders(index, value) : (value as string)
+        // A Z-order sort key is bytes, shown as composed (as before #287).
+        result[attribute] =
+          typeof value === "string" ? placeholders(index, value) : (value as unknown as string)
       }
     } catch {
       // Skip indexes with missing composites (sparse GSI)

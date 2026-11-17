@@ -154,9 +154,11 @@ type ProvidedTablesGuardOf<E, T> = {
             readonly values: {
               readonly [I in keyof V]: V[I] extends { readonly match: infer M }
                 ? {
-                    readonly match: {
-                      readonly [X in Exclude<keyof M, PartitionComposites<E, K>>]: never
-                    }
+                    // Every key of the entry is kept, so a fresh literal's other
+                    // properties (`layout`) pass the excess property check.
+                    readonly [P in keyof V[I]]: P extends "match"
+                      ? { readonly [X in Exclude<keyof M, PartitionComposites<E, K>>]: never }
+                      : unknown
                   }
                 : unknown
             }
