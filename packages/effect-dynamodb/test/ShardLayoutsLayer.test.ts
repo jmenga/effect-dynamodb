@@ -911,22 +911,30 @@ describe("collections over a provided index", () => {
   it.effect("an unbound collection with one member's table missing is EDD-9181", () =>
     Effect.gen(function* () {
       const Assignments = Collection.make("assignments", { Tasks, Employees })
-      const recording = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
-      const exit = yield* Effect.exit(
-        Assignments.query({ employee: "dana" }).pipe(
-          Query.collect,
-          Effect.provide(
-            Layer.mergeAll(
-              recording.layer,
-              People.layer({ name: "t" }),
-              ShardLayouts.layer([ShardLayouts.of(Tasks, { assignments: dana(1) })]),
+      // The whole collection and each member's selector: one rule for the collection.
+      for (const query of [
+        Assignments.query({ employee: "dana" }),
+        Assignments.Tasks({ employee: "dana" }),
+        Assignments.Employees({ employee: "dana" }),
+      ]) {
+        const recording = makeRecordingTable({
+          indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } },
+        })
+        const exit = yield* Effect.exit(
+          Query.collect(query as Query.Query<unknown>).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                recording.layer,
+                People.layer({ name: "t" }),
+                ShardLayouts.layer([ShardLayouts.of(Tasks, { assignments: dana(1) })]),
+              ),
             ),
-          ),
-        ) as Effect.Effect<unknown>,
-      )
-      expect(defectOf(exit)).toContain("[EDD-9181]")
-      expect(defectOf(exit)).toContain("Employee.assignments")
-      expect(recording.requests).toHaveLength(0)
+          ) as Effect.Effect<unknown>,
+        )
+        expect(defectOf(exit)).toContain("[EDD-9181]")
+        expect(defectOf(exit)).toContain("Employee.assignments")
+        expect(recording.requests).toHaveLength(0)
+      }
     }),
   )
 

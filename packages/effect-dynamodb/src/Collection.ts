@@ -456,25 +456,27 @@ export const make = <
   // path uses — see `internal/CompositeCodec.ts`. Members are checked for
   // agreement at `Collections.make()` time, so the first member's form speaks
   // for all.
+  // A member's table supplied at run time (#287): the members agree only once the tables in
+  // context are known, so they are compared as a query's partitions are composed, the whole
+  // collection's or one member's. Every member's table must be there, not only the one
+  // composing them: one rule for the collection.
+  const checkProvidedTables = () => {
+    const missing = entityEntries.flatMap(([, entity]) => {
+      const own = memberIndexes.get(entity)
+      return own === undefined
+        ? []
+        : KeyComposer.missingShardTables(entity._schema, { [own.name]: own.index }).map(
+            (indexName) => ({ entity: entity.entityType, index: indexName }),
+          )
+    })
+    if (missing.length > 0) {
+      throw new Error(KeyComposer.missingShardTablesMessage(`Collection "${name}"`, missing))
+    }
+    checkShardsAgreement()
+  }
   const collectionPartitions = (pkComposites: Record<string, unknown>) => {
     const leadIndex = indexOf(lead)!
-    // A member's table supplied at run time (#287): the members agree only once the tables
-    // in context are known, so they are compared as the partitions are composed. Every
-    // member's table must be there, not only the first's, whose table composes them.
-    if (provided) {
-      const missing = entityEntries.flatMap(([, entity]) => {
-        const own = memberIndexes.get(entity)
-        return own === undefined
-          ? []
-          : KeyComposer.missingShardTables(entity._schema, { [own.name]: own.index }).map(
-              (indexName) => ({ entity: entity.entityType, index: indexName }),
-            )
-      })
-      if (missing.length > 0) {
-        throw new Error(KeyComposer.missingShardTablesMessage(`Collection "${name}"`, missing))
-      }
-      checkShardsAgreement()
-    }
+    if (provided) checkProvidedTables()
     // Members share the partitions, whatever each hashes: never pruned (#183).
     return KeyComposer.composeReadPartitions(
       sharedSchema!,
@@ -584,7 +586,7 @@ export const make = <
                 Query.orRefusal<KeyComposer.ReadPartitions | ValidationError>(
                   { name: "Collection.query", target: name },
                   () => {
-                    checkShardsAgreement()
+                    checkProvidedTables()
                     return compose()
                   },
                   (refusal) => refusal,
