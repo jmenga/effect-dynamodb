@@ -653,6 +653,18 @@ reads the service and returns a copy of the schema whose `shardTables` maps each
 `[EDD-9180]` when the service or the entry is missing. Every composing site in §5 takes the schema
 from one `_schemaNow` at the start of its operation. Index definitions are never copied (D36).
 
+**As built.** `_schemaNow` was not needed: the same effect comes from where a composition runs.
+`KeyComposer.shardTableOf` returns the table the schema carries (`DynamoSchema.shardTables`, set by
+`withShardTables`: what `DynamoClient.make` hands its accessors and collections), else the table of
+the `ShardLayouts` service in the context of the fiber the composition runs in
+(`Fiber.getCurrent()`), else throws `[EDD-9180]`. A bound op runs in its binding's captured context,
+which `DynamoClient.make` and `capturedServices` give the service, so it composes with the bind's
+table whatever the caller holds; an unbound op runs in the caller's. Every entry point without a
+bound client checks its entity's provided indexes as it starts (`requireShardTables`, through
+`entity._requireShardTables`, `undefined` on an entity with none, which therefore reads nothing), so a
+missing table sends nothing even on a write that wouldn't compose that index. The sites of §5
+needed no change.
+
 **Missing is always an error, never a fallback** (D11). The message, per the review:
 
 ```
@@ -761,7 +773,8 @@ in one attribute is the inverted-index case #183 D68 already discourages.
   item, the missing-table error, and the migration recipe of §15 with its rules. "Error codes" gains
   `EDD-9180` and `EDD-9181`, and the `EDD-9099` / `EDD-9103` rows are reworded.
 - **Example** `packages/effect-dynamodb/examples/guide-sharding.ts` gains regions (`layouts-entity`,
-  `layouts-explain`, `layouts-provided`, `layouts-layer`, `layouts-layer-effect`, `layouts-migrate`),
+  `layouts-explain`, `layouts-provided`, `layouts-layer`, `layouts-config-item`,
+  `layouts-layer-effect`, `layouts-missing`, `layouts-provided-use`, `layouts-migrate`),
   run against DynamoDB Local. Configuration comes from `ConfigProvider.fromUnknown` / a map in the
   example, never from `process` (owner rule).
 - **API reference** (`reference/api-reference.mdx`): `ShardLayouts`, its `layer`, `layerEffect`,
