@@ -665,11 +665,20 @@ from one `_schemaNow` at the start of its operation. Index definitions are never
 the `ShardLayouts` service in the context of the fiber the composition runs in
 (`Fiber.getCurrent()`), else throws `[EDD-9181]`. A bound op runs in its binding's captured context,
 which `DynamoClient.make` and `capturedServices` give the service, so it composes with the bind's
-table whatever the caller holds; an unbound op runs in the caller's. Every entry point without a
-bound client checks its entity's provided indexes as it starts (`requireShardTables`, through
-`entity._requireShardTables`, `undefined` on an entity with none, which therefore reads nothing), so a
-missing table sends nothing even on a write that wouldn't compose that index. The sites of §5
-needed no change.
+table whatever the caller holds; an unbound op runs in the caller's. A bound builder handed to
+`Transaction.transactWrite` or `EventStore.append({ additionalItems })` is prepared wholly under its
+captured services (`prepareEntityOp`: its update's operands composed before any read included), and
+its put's reads, guarded plan (which composes the keys again when they hold a version or creation
+time it carries over), upload and item run under them too (`buildPut`), as do its planned update's
+or delete's plan; `Batch.write` builds its put item under them, and composes nothing else of a
+secondary index. Every entry point without a bound client checks its entity's provided indexes as
+it starts (`requireShardTables`, through `entity._requireShardTables`, `undefined` on an entity with
+none, which therefore reads nothing), so a missing table sends nothing even on a write that wouldn't
+compose that index: the write ops as they run (`refuseEmptyParts`), `append`, `restore` (get-shaped,
+so its builder checks), a projection's row before it is read (`applyRow`; its row writes can bypass
+the entity op's own check), and the multi-item entry points per op. Reads that compose only the
+primary key (`get`, `getVersion`, `deleted.get`, `versions`, `deleted.list`, `history`,
+`Transaction.check`) check nothing. The sites of §5 needed no change.
 
 **Missing is always an error, never a fallback** (D11). The message, per the review:
 
@@ -738,6 +747,12 @@ Where it runs, after runtime tables are applied:
 A collection query reads the pinned value's layout from the first member, as it reads the first
 member's key form today (`Collection.ts:417`), which the comparison makes equivalent. Collection
 queries never prune (#183 D10).
+
+**Each member's own index.** Members name their indexes for their own accessors, so only the
+physical index is shared, not the logical name. Every check (`EDD-9050`, `EDD-9055`, `EDD-9103`,
+`EDD-9181`) and every composition of `Collections.make` reads a member's index by the collection it
+declares, never by the first member's name for it; `DynamoClient.make` groups its auto-discovered
+collections by each member's own index already.
 
 ## 12. `EDD-9106` and a shared attribute
 
