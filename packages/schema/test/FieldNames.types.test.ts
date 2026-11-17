@@ -1242,25 +1242,27 @@ describe("shards.layouts match (#287)", () => {
         },
       }),
     ).toThrow("[EDD-9099]")
-    Entity.make({
-      model: Listing,
-      entityType: "Listing",
-      primaryKey: byListingId,
-      indexes: {
-        byRegion: {
-          ...byRegion,
-          shards: {
-            layouts: {
-              default: 1,
-              values: [
-                // @ts-expect-error agencyId is a string
-                { match: { region: "eu", agencyId: 5 }, layout: 20 },
-              ],
+    expect(() =>
+      Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: {
+            ...byRegion,
+            shards: {
+              layouts: {
+                default: 1,
+                values: [
+                  // @ts-expect-error agencyId is a string
+                  { match: { region: "eu", agencyId: 5 }, layout: 20 },
+                ],
+              },
             },
           },
         },
-      },
-    })
+      }),
+    ).toThrow("[EDD-9099]")
   })
 
   it("count and previous beside layouts, and no default, are errors", () => {
