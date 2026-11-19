@@ -7407,6 +7407,16 @@ and returns the same object, `previous` and `state` are the same reference and
 `previous` already reflects the new events; a projection that needs a pristine
 `previous` needs an `evolve` that returns new state.
 
+The fold of the new events starts from the object `decide` was given, which is
+handed over as is, not copied. The contract therefore holds only for a `decide`
+that leaves its input alone: a change `decide` makes to it is folded into the
+returned state, the function-form items and the snapshot, and a later command
+that loads that snapshot starts from it. The same goes for the state's other
+sources, which are handed over as is too: `initialState` (if `decide` or
+`evolve` mutates, declare it as a getter returning a fresh value, or a change
+becomes every later new stream's starting state) and a `loadState` record (an
+object held across calls keeps the changes, a failed attempt's included).
+
 ### Event Metadata (#144)
 
 Full design: [`docs/designs/eventstore-event-metadata.md`](docs/designs/eventstore-event-metadata.md).

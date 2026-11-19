@@ -196,14 +196,22 @@ import {
 /**
  * A Decider encodes the command-event-state triad for an aggregate.
  *
- * - `decide` — given a command and current state, produce events (or fail with E)
+ * - `decide` — given a command and current state, produce events (or fail with E).
+ *   The state is handed over as is, not copied, and the new events are folded
+ *   onto that same object: a `decide` that mutates it puts the change into the
+ *   state the handler returns, the items a function-form `additionalItems`
+ *   commits and the snapshot it writes — and a later command that loads that
+ *   snapshot starts from the change. The library neither prevents nor detects
+ *   this (#142); a `decide` that needs scratch state works on its own copy.
  * - `evolve` — left fold: apply one event to a state. It may return new state or
  *   mutate the given state in place and return it; the library requires
  *   neither. State the library persists, returns or projects is always this
- *   fold, never anything produced inside `decide`.
- * - `initialState` — starting state for a new aggregate. An `evolve` that
- *   mutates in place must not mutate a shared `initialState` object (declare it
- *   as a getter that returns a fresh value).
+ *   fold of the stored and new events, never a state `decide` builds; the new
+ *   events are folded onto the object `decide` was given.
+ * - `initialState` — starting state for a new aggregate, handed to `decide` and
+ *   `evolve` as is. If either mutates the state it is given, declare
+ *   `initialState` as a getter that returns a fresh value: a mutated shared
+ *   object becomes the starting state of every later new stream.
  */
 export interface Decider<State, Command, Event, E = never> {
   readonly decide: (command: Command, state: State) => Effect.Effect<ReadonlyArray<Event>, E>
@@ -7681,6 +7689,11 @@ export interface CommandHandlerOptions<State = any, TStreamId = any> {
    * - **Read strongly consistent.** An eventually consistent read can return
    *   a record behind the head; the append then fails with `VersionConflict`
    *   and burns a retry (nothing is corrupted).
+   * - **Return a fresh state object on every call** if `decide` or `evolve`
+   *   mutates the state it is given. The record's `state` is handed to them as
+   *   is, so an object held across calls (an in-memory cache) keeps their
+   *   changes — those of a command whose append then failed included, and a
+   *   retry that loads it again starts from them.
    * - Without {@link headProof} the append still writes the
    *   version-contiguity check, so a record that is stale or ahead of the
    *   head conflicts rather than opening a gap. With
