@@ -7354,7 +7354,9 @@ load → [expectedVersion check] → decide → fold new events → derive items
   `ValidationError`, raised before anything is read.
 - **Fold before append (#137).** The new events are folded into state before
   the append, so the returned, snapshotted and projected state is always the
-  `evolve` fold — never anything produced inside `decide`.
+  `evolve` fold of the stored and new events, never a state `decide` builds.
+  The fold starts from the object `decide` was given, so this holds only for a
+  `decide` that leaves it alone (see the evolve-fold state contract below).
 - **Decision-derived items (#137).** `CommandOptions.additionalItems` takes a
   static array or a function of the `Decision`
   (`{ events, state, previous, version }`) returning the ops or an `Effect` of

@@ -140,8 +140,8 @@ The previous order was `… → decide → append → fold`.
 - **The fold is the only source of state.** The `state` returned by the
   handler, written as a snapshot (§4) and passed to `additionalItems` is always
   the `evolve` fold of stored and new events, never a state `decide` builds.
-  The new events are folded onto the object `decide` was given, so this holds
-  only for a `decide` that leaves its input alone (§8).
+  The fold of the new events starts from the object `decide` was given, so this
+  holds only for a `decide` that leaves its input alone (§8).
 
 ## 4. Inline snapshots and single-request state load (#138)
 
@@ -548,8 +548,8 @@ The only commitment is the contract in §3: persisted, returned and projected
 state is the `evolve` fold, never a state `decide` builds.
 
 That contract assumes `decide` leaves its input alone. The state is handed to
-`decide` as is, not copied, and the new events are folded onto the same object,
-so a change `decide` makes to it is folded into the returned state, the
+`decide` as is, not copied, and the fold of the new events starts from the same
+object, so a change `decide` makes to it is folded into the returned state, the
 function-form items and the snapshot, and a later command that loads that
 snapshot starts from it. The same holds for the state's other sources, handed
 over as is: a shared `initialState` (declare it as a getter returning a fresh

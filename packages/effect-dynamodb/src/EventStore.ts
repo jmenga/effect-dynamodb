@@ -197,17 +197,18 @@ import {
  * A Decider encodes the command-event-state triad for an aggregate.
  *
  * - `decide` — given a command and current state, produce events (or fail with E).
- *   The state is handed over as is, not copied, and the new events are folded
- *   onto that same object: a `decide` that mutates it puts the change into the
- *   state the handler returns, the items a function-form `additionalItems`
- *   commits and the snapshot it writes — and a later command that loads that
- *   snapshot starts from the change. The library neither prevents nor detects
- *   this (#142); a `decide` that needs scratch state works on its own copy.
+ *   The state is handed over as is, not copied, and the fold of the new events
+ *   starts from that same object: a `decide` that mutates it puts the change
+ *   into the state the handler returns, the items a function-form
+ *   `additionalItems` commits and the snapshot it writes — and a later command
+ *   that loads that snapshot starts from the change. The library neither
+ *   prevents nor detects this (#142); a `decide` that needs scratch state works
+ *   on its own copy.
  * - `evolve` — left fold: apply one event to a state. It may return new state or
  *   mutate the given state in place and return it; the library requires
  *   neither. State the library persists, returns or projects is always this
- *   fold of the stored and new events, never a state `decide` builds; the new
- *   events are folded onto the object `decide` was given.
+ *   fold of the stored and new events, never a state `decide` builds; the fold
+ *   of the new events starts from the object `decide` was given.
  * - `initialState` — starting state for a new aggregate, handed to `decide` and
  *   `evolve` as is. If either mutates the state it is given, declare
  *   `initialState` as a getter that returns a fresh value: a mutated shared
@@ -8524,7 +8525,10 @@ const makeCommandHandlerImpl = <
         // 5. Fold the new events BEFORE appending (#137): the post-decision
         //    state is what a function-form `additionalItems` projects, what a
         //    snapshot records, and what the handler returns — always the
-        //    `evolve` fold, never anything produced inside `decide`.
+        //    `evolve` fold of the stored and new events, never a state
+        //    `decide` builds. The fold starts from the object `decide` was
+        //    given (not a copy), so this holds only for a `decide` that
+        //    leaves it alone (#142).
         const previous = state
         let next = state
         for (const event of newEvents) {
