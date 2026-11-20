@@ -7354,7 +7354,9 @@ load → [expectedVersion check] → decide → fold new events → derive items
   `ValidationError`, raised before anything is read.
 - **Fold before append (#137).** The new events are folded into state before
   the append, so the returned, snapshotted and projected state is always the
-  `evolve` fold — never anything produced inside `decide`.
+  `evolve` fold of the stored and new events, never a state `decide` builds.
+  The fold starts from the object `decide` was given, so this holds only for a
+  `decide` that leaves it alone (see the evolve-fold state contract below).
 - **Decision-derived items (#137).** `CommandOptions.additionalItems` takes a
   static array or a function of the `Decision`
   (`{ events, state, previous, version }`) returning the ops or an `Effect` of
@@ -7406,6 +7408,16 @@ decision left to the application; see the design doc §8). When `evolve` mutates
 and returns the same object, `previous` and `state` are the same reference and
 `previous` already reflects the new events; a projection that needs a pristine
 `previous` needs an `evolve` that returns new state.
+
+The fold of the new events starts from the object `decide` was given, which is
+handed over as is, not copied. The contract therefore holds only for a `decide`
+that leaves its input alone: a change `decide` makes to it is folded into the
+returned state, the function-form items and the snapshot, and a later command
+that loads that snapshot starts from it. The same goes for the state's other
+sources, which are handed over as is too: `initialState` (if `decide` or
+`evolve` mutates, declare it as a getter returning a fresh value, or a change
+becomes every later new stream's starting state) and a `loadState` record (an
+object held across calls keeps the changes, a failed attempt's included).
 
 ### Event Metadata (#144)
 
