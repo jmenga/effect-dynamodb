@@ -154,6 +154,7 @@ import {
 import { createPathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
 import { notReadBack, type ReadBack, readBackOf } from "./internal/RoundTrip.js"
+import * as StateUseCheck from "./internal/StateUseCheck.js"
 import { marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type AppendWriteOp,
@@ -201,9 +202,11 @@ import {
  *   starts from that same object: a `decide` that mutates it puts the change
  *   into the state the handler returns, the items a function-form
  *   `additionalItems` commits and the snapshot it writes — and a later command
- *   that loads that snapshot starts from the change. The library neither
- *   prevents nor detects this (#142); a `decide` that needs scratch state works
- *   on its own copy.
+ *   that loads that snapshot starts from the change. By default the library
+ *   neither prevents nor detects this (#142); a `decide` that needs scratch
+ *   state works on its own copy. {@link CommandHandlerOptions.checkStateUse}
+ *   turns such a change, and a changed shared `initialState`, into a defect
+ *   (#290) — for tests.
  * - `evolve` — left fold: apply one event to a state. It may return new state or
  *   mutate the given state in place and return it; the library requires
  *   neither. State the library persists, returns or projects is always this
@@ -2348,6 +2351,22 @@ type HeadAboveProbeFn = (
 /** @internal */
 const headAboveProbeOf = (stream: object): HeadAboveProbeFn | undefined =>
   (stream as { [HeadAboveProbe]?: HeadAboveProbeFn })[HeadAboveProbe]
+
+/**
+ * @internal Carries the stream's snapshot state encoder (the state schema,
+ * with the `decode → encode` fallback snapshots use), so
+ * {@link CommandHandlerOptions.checkStateUse} compares a state as the snapshot
+ * would store it (#290). Attached by `makeStream` and `bind` on a stream with a
+ * snapshot config; a stream without one, or a hand-built stream, compares
+ * with the plain walk.
+ */
+const SnapshotStateEncoder: unique symbol = Symbol.for(
+  "effect-dynamodb/EventStream/SnapshotStateEncoder",
+)
+
+/** @internal */
+const snapshotStateEncoderOf = (stream: object): StateUseCheck.StateEncoder | undefined =>
+  (stream as { [SnapshotStateEncoder]?: StateUseCheck.StateEncoder })[SnapshotStateEncoder]
 
 /**
  * @internal `[EDD-9068]`: `verifySnapshot: false` is accepted only by a stream
@@ -6872,6 +6891,11 @@ export const makeStream = <
     [StreamIdFormatter]: composeStreamIdString,
     [CommandSentinelProbe]: checked(hasCommandSentinel),
     [HeadAboveProbe]: checked(headAbove),
+    // A state as the snapshot would store it: the snapshot's own encoding.
+    [SnapshotStateEncoder]:
+      snapshot === undefined
+        ? undefined
+        : (state: unknown) => encodeSnapshotState(state, "EventStore.commandHandler.checkStateUse"),
     [Rekey.RekeyHandler]: rekeyHandler,
     [GcSupport.GcSupportId]: gcSupport,
   } as unknown as EventStream<
@@ -7319,6 +7343,8 @@ export const bind = <
           ? undefined
           : (id: Record<string, unknown>, floorVersion: number, options?: ReadOptions) =>
               provide(headProbe(id, floorVersion, options)),
+      // Pure: needs no services.
+      [SnapshotStateEncoder]: snapshotStateEncoderOf(stream),
       // `rekey` runs it with the table's services, as it runs every member's.
       [Rekey.RekeyHandler]: Rekey.handlerOf(stream),
     } as BoundEventStream<
@@ -7694,7 +7720,8 @@ export interface CommandHandlerOptions<State = any, TStreamId = any> {
    *   mutates the state it is given. The record's `state` is handed to them as
    *   is, so an object held across calls (an in-memory cache) keeps their
    *   changes — those of a command whose append then failed included, and a
-   *   retry that loads it again starts from them.
+   *   retry that loads it again starts from them. {@link checkStateUse}
+   *   checks the record's state as it checks any other.
    * - Without {@link headProof} the append still writes the
    *   version-contiguity check, so a record that is stale or ahead of the
    *   head conflicts rather than opening a gap. With
@@ -7745,6 +7772,43 @@ export interface CommandHandlerOptions<State = any, TStreamId = any> {
    * read or written.
    */
   readonly headProof?: Exclude<HeadProof, "none"> | undefined
+
+  /**
+   * Check that the state contract holds for every command (#290): `decide`
+   * only reads the state it is given, and a shared `initialState` is never
+   * changed. Off by default — then the handler does nothing extra: no copy, no
+   * fingerprint, no extra read. Meant for tests; leaving it on in production
+   * costs a fingerprint of the state before and after `decide`.
+   *
+   * - **`decide` changed its state** → a defect, `[EDD-9183]`, naming the
+   *   stream, the command and the first changed path, e.g.
+   *   `at innings[1].overs (was 3, now 4)`. Checked on every state `decide`
+   *   is given: a stream load, a snapshot, a `loadState` record or the
+   *   initial state, and both decisions when {@link verifySnapshot}`: false`
+   *   decides twice. Checked whether `decide` succeeds or fails with its own
+   *   error; nothing is appended.
+   * - **A shared `initialState` changed** → a defect, `[EDD-9184]`, telling
+   *   you to declare `initialState` as a getter. When `decider.initialState`
+   *   reads as the same object twice (a value, not a getter), it is checked
+   *   after the load and after the new events are folded, before the append:
+   *   an `evolve` that changes its state in place changes this object when a
+   *   fold starts from it, and every later new stream would start from the
+   *   change.
+   *
+   * A state is compared as the stream's snapshot would store it when the
+   * stream declares a snapshot schema and the state encodes, so a value is
+   * compared by what it means. Otherwise it is compared field by field: an
+   * object's own enumerable properties, arrays by index, `Map`, `Set`,
+   * `HashMap`, `HashSet` and `Chunk` by their contents, and `Date`,
+   * `DateTime`, `BigDecimal`, `Option` and `Result` by value. A class that
+   * caches values in its own enumerable fields can then be reported when only
+   * its cache changed.
+   *
+   * The check proves what `decide` did with the object it was given. It does
+   * not cover a function-form `additionalItems`, `eventMetadata` or
+   * `eventTimestamps` changing the `Decision` it receives.
+   */
+  readonly checkStateUse?: boolean | undefined
 }
 
 /** @internal The error of a handler config's {@link CommandHandlerOptions.loadState}. */
@@ -8303,6 +8367,10 @@ const makeCommandHandlerImpl = <
   // state that misses acknowledged events (#139).
   const readOptions: ReadLatestOptions = { consistentRead: options?.consistentRead ?? true }
   const unverifiedReadOptions: ReadLatestOptions = { ...readOptions, verifySnapshot: false }
+  // `checkStateUse` (#290): built only when on, so without it every command
+  // runs exactly as before.
+  const stateCheck =
+    options?.checkStateUse === true ? StateUseCheck.make(snapshotStateEncoderOf(stream)) : undefined
 
   return (
     streamId: StreamIdInput<TStreamIdFields>,
@@ -8350,6 +8418,23 @@ const makeCommandHandlerImpl = <
      */
     const isOwnConflict = (error: VersionConflict): boolean =>
       error.streamName === stream.streamName && error.streamId === ownStreamId
+
+    /** What a `checkStateUse` defect names (#290). */
+    const checkSubject = (): StateUseCheck.Subject => ({
+      streamName: stream.streamName,
+      streamId: ownStreamId,
+      command,
+    })
+
+    // `decide` on `state` — checked under `checkStateUse` (#290), with the
+    // attempt's watch on a shared `initialState`.
+    const decideOn = (
+      state: State,
+      initial: StateUseCheck.InitialStateWatch | undefined,
+    ): Effect.Effect<ReadonlyArray<TEvent>, E> =>
+      stateCheck === undefined
+        ? decider.decide(command, state)
+        : stateCheck.decide(checkSubject(), state, initial, () => decider.decide(command, state))
 
     // A redelivery of a command that already committed: `append` ranks
     // `DuplicateCommand` above `VersionConflict` and `StreamSealed`, so the
@@ -8507,6 +8592,7 @@ const makeCommandHandlerImpl = <
       loaded: Loaded,
       newEvents: ReadonlyArray<TEvent>,
       returnAppendConflict: boolean,
+      initial: StateUseCheck.InitialStateWatch | undefined,
     ) =>
       Effect.gen(function* () {
         const baseVersion = loaded.version
@@ -8534,6 +8620,9 @@ const makeCommandHandlerImpl = <
         for (const event of newEvents) {
           next = decider.evolve(next, event)
         }
+        // `checkStateUse` (#290): an in-place `evolve` folding a new stream
+        // from a shared `initialState` changed it — refused before the append.
+        if (initial !== undefined) yield* initial.check("fold")
 
         // 6. Derive the caller's per-event metadata, then per-event
         //    timestamps, then items, from the decision — in that order
@@ -8788,14 +8877,29 @@ const makeCommandHandlerImpl = <
         })
       }
 
+      // `checkStateUse` (#290): watch a shared `initialState` over this
+      // attempt — checked after each load (before a seal is refused) and
+      // after the new events are folded.
+      const initial =
+        stateCheck === undefined
+          ? undefined
+          : yield* stateCheck.watchInitialState(checkSubject(), () => decider.initialState)
+      const loadChecked = (verify: boolean) =>
+        initial === undefined
+          ? load(verify)
+          : Effect.flatMap(
+              Effect.tap(loadUnchecked(verify), () => initial.check("load")),
+              (loaded) => refuseSealed(loaded),
+            )
+
       // 1. Load (see `load`).
-      let loaded = yield* load(!unverifiedLoads)
+      let loaded = yield* loadChecked(!unverifiedLoads)
 
       // An unverified snapshot at another version than the caller's If-Match
       // may merely lag the head: re-read verified, so only a genuine mismatch
       // is reported, with the verified head as its `actualVersion`.
       if (expectedVersion !== undefined && !loaded.verified && loaded.version !== expectedVersion) {
-        loaded = yield* load(true)
+        loaded = yield* loadChecked(true)
       }
 
       // 2. If-Match (#136): the caller saw a different version, so `decide`
@@ -8808,8 +8912,11 @@ const makeCommandHandlerImpl = <
       //    append-time conflict is its answer (never re-read or retried), and
       //    a verified load's conflict is a lost race.
       if (loaded.verified) {
-        const newEvents = yield* decider.decide(command, loaded.state)
-        return (yield* commit(loaded, newEvents, false)) as CommandHandlerResult<State, TEvent>
+        const newEvents = yield* decideOn(loaded.state, initial)
+        return (yield* commit(loaded, newEvents, false, initial)) as CommandHandlerResult<
+          State,
+          TEvent
+        >
       }
 
       // 3'. Decide on an unverified snapshot. It is normally at the head, but
@@ -8819,10 +8926,10 @@ const makeCommandHandlerImpl = <
       //    the head is confirmed: an append confirms it by succeeding; a
       //    decision that appends nothing (a `decide` failure or a no-op) and
       //    an append conflict are confirmed with one more read.
-      const decided = yield* Effect.result(decider.decide(command, loaded.state))
+      const decided = yield* Effect.result(decideOn(loaded.state, initial))
       const first =
         Result.isSuccess(decided) && decided.success.length > 0
-          ? yield* commit(loaded, decided.success, true)
+          ? yield* commit(loaded, decided.success, true, initial)
           : undefined
       if (first !== undefined && !(first instanceof VersionConflict)) return first
 
@@ -8865,15 +8972,18 @@ const makeCommandHandlerImpl = <
       // A lagging snapshot is decided on again, once: only a successful inline
       // append rewrites the snapshot, so surfacing the conflict would fail
       // every command on the stream until something else repaired it.
-      const verified = yield* load(true)
+      const verified = yield* loadChecked(true)
       if (first !== undefined && verified.eventsAfterSnapshot === 0) return yield* first
 
       // The first decision was made on stale state: decide again on the
       // verified state — `decide` (and a function-form `additionalItems`)
       // runs a second time in this attempt. Its own conflict follows the
       // retry policy.
-      const newEvents = yield* decider.decide(command, verified.state)
-      return (yield* commit(verified, newEvents, false)) as CommandHandlerResult<State, TEvent>
+      const newEvents = yield* decideOn(verified.state, initial)
+      return (yield* commit(verified, newEvents, false, initial)) as CommandHandlerResult<
+        State,
+        TEvent
+      >
     })
 
     // A caller-supplied `expectedVersion` is a conditional write: its
@@ -8943,6 +9053,9 @@ const makeCommandHandlerImpl = <
  *
  * // Load state from the inline snapshot alone (mode "inline" without `every`)
  * const handle = EventStore.commandHandler(decider, stream, { verifySnapshot: false })
+ *
+ * // In tests: a decide that changes its state, or a changed shared initialState, is a defect
+ * const handle = EventStore.commandHandler(decider, stream, { checkStateUse: true })
  *
  * // If-Match: fail with VersionConflict (never retried) unless the stream is at v7
  * yield* handle({ matchId: "m-1" }, command, { expectedVersion: 7 })

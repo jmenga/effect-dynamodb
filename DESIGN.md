@@ -7419,6 +7419,30 @@ sources, which are handed over as is too: `initialState` (if `decide` or
 becomes every later new stream's starting state) and a `loadState` record (an
 object held across calls keeps the changes, a failed attempt's included).
 
+**Enforcing the contract — `checkStateUse` (#290).** Off by default, and then
+the command path is exactly as above: no copy, no fingerprint. With
+`CommandHandlerOptions.checkStateUse: true` (meant for tests), the handler
+fingerprints every state `decide` is given — a stream load, a snapshot, a
+`loadState` record or the initial state, and both decisions of a
+`verifySnapshot: false` re-decision — before calling it and again when it
+finishes (with success or its own failure), and dies with `[EDD-9183]` on a
+difference, naming the stream, the command and the first changed path, e.g.
+`at innings[1].overs (was 3, now 4)`. When `decider.initialState` reads as
+the same object twice (a value, not a getter), it is fingerprinted as each
+attempt starts and checked after each load and after the fold of the new
+events, before the append: a change dies with `[EDD-9184]`, which says to
+declare `initialState` as a getter. Nothing is appended after either defect,
+and neither is retried. A state is compared as the snapshot would store it
+(the snapshot state schema's encoding) when the stream declares one and the
+state encodes on both sides; otherwise field by field
+(`internal/StateFingerprint.ts`: own enumerable string-keyed properties and
+the prototype, arrays by index, `Map` / `Set` / `HashMap` / `HashSet` /
+`Chunk` by iteration, `Date` / `DateTime` / `BigDecimal` / `Option` /
+`Result` by value, functions by identity; symbol-keyed and non-enumerable
+properties are not read). It does not cover a function-form
+`additionalItems`, `eventMetadata` or `eventTimestamps` changing the
+`Decision` it receives. See the design doc §8.
+
 ### Event Metadata (#144)
 
 Full design: [`docs/designs/eventstore-event-metadata.md`](docs/designs/eventstore-event-metadata.md).
@@ -9345,6 +9369,7 @@ for unrelated errors and the collision was caught only at review.
 | 9173–9176 | Reads held to their writes (#132): reserved, none allocated (every outcome is an existing tagged error) |
 | 9177–9180 | Aggregate concurrency: `versioned`, `expectedVersion` (#168) |
 | 9181–9182 | Per-value shard layouts: tables supplied at run time (#287) |
+| 9183–9184 | EventStore `commandHandler` `checkStateUse`: the state contract checked (#290) |
 
 | Code | Raised in | Condition |
 |------|-----------|-----------|
@@ -9503,11 +9528,13 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9179` | `Aggregate.ts` (`make`, pure and operational; #168, `docs/designs/aggregate-concurrency.md` §0) | An aggregate's `fence` setting it can't be kept under: `fence: false` beside `versioned` (the version `Update` on the root is itself the fence, so a versioned aggregate is always fenced), or a `fence` that isn't a boolean. Refused at load. |
 | `EDD-9181` | #287 (`docs/designs/shard-layouts.md` §10.4): `KeyComposer.ts` (`shardTableOf`, `requireShardTables`, `missingShardTablesMessage`), through `DynamoClient.make` (bind, naming every bound member and index without a table), every operation without a bound client as it starts (unbound writes in `Transaction`, `Batch` and `EventStore.append({ additionalItems })`, projection rows, a cascade's targets), a deferred query's or collection's terminal, `explain` and `asParams`, and `rekey` before its scan (a defect; nothing is sent) | An index declares `shards: { layouts: "provided" }` and no `ShardLayouts` service in context supplies its table: no layer, or no `ShardLayouts.of` for the entity. Never a fallback to a default |
 | `EDD-9182` | #287 (`docs/designs/shard-layouts.md` §10.3, §10.5): `ShardLayouts.of` / `ShardLayouts.layer` / `ShardLayouts.layerEffect`, when the layer is built (a defect), and the types of `of` | `ShardLayouts.of` misused: an index not declared `layouts: "provided"`, an unknown index, a provided index of the entity left out, the same entity given twice in one layer, or an entity registered on no table |
+| `EDD-9183` | `internal/StateUseCheck.ts` (`decide`), through `EventStore.commandHandler` with `checkStateUse: true` (#290, `docs/designs/eventstore-command-path.md` §8); a defect, nothing appended, not retried | `decide` changed the state it was given (a stream load, a snapshot, a `loadState` record or the initial state): the fingerprint taken before `decide` was called differs from the one taken when it finished (with success or its own failure). The message names the stream, the command and the first changed path with its values before and after, and adds when the state was the shared `initialState` itself. |
+| `EDD-9184` | `internal/StateUseCheck.ts` (`watchInitialState`), through `EventStore.commandHandler` with `checkStateUse: true` (#290, `docs/designs/eventstore-command-path.md` §8); a defect after a load or after the fold of the new events, before the append; not retried | `decider.initialState` is a value (it read as the same object twice) and it changed during the attempt: an `evolve` changing its state in place changed it when a fold started from it, so every later new stream would start from the change. The message names the stream, the command, the first changed path and whether the load or the fold changed it, and says to declare `initialState` as a getter or have `evolve` return new state. |
 
 `EDD-9076` and `EDD-9077` also cover `DynamoModel.External` binary fields from #179 (the same
 condition — an attribute DynamoDB sees as one opaque value — raised by the same walker).
 
-Next free code: `9183` (`9173`–`9176` and `9180` are reserved for #132 and #168 and left unallocated; `9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: `9185` (`9173`–`9176` and `9180` are reserved for #132 and #168 and left unallocated; `9132` and `9135`–`9139` are taken on branches in flight, and a code skipped between `9141` and `9172` may be too: check before taking one; `9107` and `9113` are retired, don't reuse them), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 
