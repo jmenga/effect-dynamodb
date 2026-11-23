@@ -77,8 +77,11 @@ export const make = (encode: StateEncoder | undefined): StateUseCheck => {
     const raw = Effect.sync(() => StateFingerprint.of(state))
     if (encode === undefined)
       return Effect.map(raw, (fingerprint) => ({ raw: fingerprint, encoded: undefined }))
-    return Effect.flatMap(raw, (fingerprint) =>
-      Effect.map(Effect.result(encode(state)), (encoded) => ({
+    // Encode first: an encoding can fill a cache the state keeps (a getter
+    // that memoises), and the walk must see that on both sides, or the check's
+    // own encoding would be reported as a change `decide` made.
+    return Effect.flatMap(Effect.result(encode(state)), (encoded) =>
+      Effect.map(raw, (fingerprint) => ({
         raw: fingerprint,
         encoded: Result.isSuccess(encoded) ? StateFingerprint.of(encoded.success) : undefined,
       })),

@@ -12,18 +12,26 @@
  * contents, so an added or removed member is reported at the container.
  *
  * What is read:
- * - an object's prototype and its own enumerable string-keyed properties. An
- *   accessor is recorded by its getter, never called. Symbol-keyed and
- *   non-enumerable properties, where Effect keeps its caches (`DateTime`'s
- *   parts, a hash), are not read;
- * - arrays by index, and `Map`, `Set`, `HashMap`, `HashSet` and `Chunk` by
- *   iteration. A `Chunk` caches its array form in an own field, so its fields
+ * - an object's prototype and its own enumerable string-keyed properties, and
+ *   an array's elements, by their property descriptors: an accessor is
+ *   recorded by its getter, never called. Symbol-keyed and non-enumerable
+ *   properties, where Effect keeps its caches (`DateTime`'s parts, a hash),
  *   are not read;
- * - `Date`, `DateTime` and `BigDecimal` by value (a `BigDecimal` caches its
- *   normal form in an own field), typed arrays and `ArrayBuffer`s by their
- *   bytes, `Option` and `Result` by tag and contents;
- * - functions and symbols by identity. A reference back to an object on the
- *   current path is recorded as a cycle and not walked again.
+ * - `Map`, `Set`, `HashMap` and `HashSet` by iteration, and `Chunk` by index
+ *   (`Chunk.getUnsafe`, which does not build the array form a `Chunk` caches
+ *   in an own field), so its fields are not read;
+ * - `Date`, `DateTime` and `BigDecimal` by value (a `BigDecimal` from its
+ *   digits and scale, without the normal form it caches in an own field),
+ *   typed arrays and `ArrayBuffer`s by their bytes, `Option` and `Result` by
+ *   tag and contents;
+ * - functions and symbols by identity.
+ *
+ * Nothing is written, so a frozen value reads as any other. A container
+ * (an array, a `Map` or `Set`, a `HashMap`, `HashSet` or `Chunk`, any other
+ * object) reached a second time, through a cycle or a second path to the same
+ * object, is recorded by the path it was first reached at and not walked
+ * again, so a fingerprint grows with the number of distinct values, not paths.
+ * Replacing such a reference with an equal copy is a change.
  */
 
 import { BigDecimal, Chunk, DateTime, HashMap, HashSet, Option, Result } from "effect"
@@ -51,7 +59,7 @@ export interface Difference {
 /** @internal Take the fingerprint of `value`. */
 export const of = (value: unknown): Fingerprint => {
   const entries: Array<Entry> = []
-  walk(value, "", [], entries)
+  walk(value, "", new Map(), entries)
   return entries
 }
 
@@ -105,11 +113,15 @@ const MAX_TEXT = 40
 const truncate = (text: string): string =>
   text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}…` : text
 
-/** A primitive as it reads in a message or a path. */
-const primitiveLabel = (value: unknown): string => {
+/** A primitive as it reads in a message. */
+const primitiveLabel = (value: unknown): string =>
+  typeof value === "string" ? JSON.stringify(truncate(value)) : keyLabel(value)
+
+/** A primitive in full, as a path names a `Map` key. */
+const keyLabel = (value: unknown): string => {
   switch (typeof value) {
     case "string":
-      return JSON.stringify(truncate(value))
+      return JSON.stringify(value)
     case "bigint":
       return `${value}n`
     case "symbol":
@@ -125,7 +137,25 @@ const hex = (bytes: Uint8Array): string => {
   return text
 }
 
-const walk = (value: unknown, path: string, ancestors: Array<object>, out: Array<Entry>): void => {
+/** The decimal text of a `BigDecimal`, read from its fields without normalising it. */
+const decimalText = (value: BigDecimal.BigDecimal): string => {
+  let digits = value.value
+  let scale = value.scale
+  if (digits === 0n) return "0"
+  while (digits % 10n === 0n) {
+    digits /= 10n
+    scale--
+  }
+  if (scale <= 0) return scale === 0 ? `${digits}` : `${digits}e${-scale}`
+  const negative = digits < 0n
+  const text = (negative ? -digits : digits).toString().padStart(scale + 1, "0")
+  return `${negative ? "-" : ""}${text.slice(0, -scale)}.${text.slice(-scale)}`
+}
+
+/** Paths at which each container was first reached. */
+type Seen = Map<object, string>
+
+const walk = (value: unknown, path: string, seen: Seen, out: Array<Entry>): void => {
   if (value === null) {
     out.push({ path, kind: "null", identity: null, detail: "" })
     return
@@ -138,28 +168,37 @@ const walk = (value: unknown, path: string, ancestors: Array<object>, out: Array
     out.push({ path, kind: typeof value, identity: value, detail: "" })
     return
   }
-  const depth = ancestors.indexOf(value)
-  if (depth >= 0) {
-    out.push({ path, kind: "cycle", identity: undefined, detail: String(depth) })
-    return
-  }
-  ancestors.push(value)
-  try {
-    walkObject(value, path, ancestors, out)
-  } finally {
-    ancestors.pop()
+  walkObject(value, path, seen, out)
+}
+
+/** A property or an element, by its descriptor: an accessor is never called. */
+const walkProperty = (
+  owner: object,
+  key: string,
+  at: string,
+  seen: Seen,
+  out: Array<Entry>,
+): void => {
+  const descriptor = Object.getOwnPropertyDescriptor(owner, key)
+  if (descriptor === undefined) {
+    // An array hole, or gone between `Object.keys` and here (a proxy).
+    out.push({ path: at, kind: "absent", identity: undefined, detail: "" })
+  } else if ("value" in descriptor) {
+    walk(descriptor.value, at, seen, out)
+  } else {
+    out.push({ path: at, kind: "accessor", identity: descriptor.get, detail: "" })
   }
 }
 
 const walkIterable = (
   items: Iterable<unknown>,
   path: string,
-  ancestors: Array<object>,
+  seen: Seen,
   out: Array<Entry>,
 ): void => {
   let i = 0
   for (const item of items) {
-    walk(item, `${path}[${i}]`, ancestors, out)
+    walk(item, `${path}[${i}]`, seen, out)
     i++
   }
 }
@@ -167,27 +206,22 @@ const walkIterable = (
 const walkEntries = (
   entries: Iterable<readonly [unknown, unknown]>,
   path: string,
-  ancestors: Array<object>,
+  seen: Seen,
   out: Array<Entry>,
 ): void => {
   let i = 0
   for (const [key, member] of entries) {
-    if (isPrimitive(key)) {
-      walk(member, child(path, `.get(${primitiveLabel(key)})`), ancestors, out)
+    if (isPrimitive(key) && typeof key !== "symbol") {
+      walk(member, child(path, `.get(${keyLabel(key)})`), seen, out)
     } else {
-      walk(key, child(path, `.keys()[${i}]`), ancestors, out)
-      walk(member, child(path, `.values()[${i}]`), ancestors, out)
+      walk(key, child(path, `.keys()[${i}]`), seen, out)
+      walk(member, child(path, `.values()[${i}]`), seen, out)
     }
     i++
   }
 }
 
-const walkObject = (
-  value: object,
-  path: string,
-  ancestors: Array<object>,
-  out: Array<Entry>,
-): void => {
+const walkObject = (value: object, path: string, seen: Seen, out: Array<Entry>): void => {
   if (value instanceof Date) {
     const time = value.getTime()
     const detail = Number.isNaN(time) ? "Invalid Date" : new Date(time).toISOString()
@@ -205,18 +239,18 @@ const walkObject = (
     return
   }
   if (BigDecimal.isBigDecimal(value)) {
-    out.push({ path, kind: "BigDecimal", identity: undefined, detail: BigDecimal.format(value) })
+    out.push({ path, kind: "BigDecimal", identity: undefined, detail: decimalText(value) })
     return
   }
   if (Option.isOption(value)) {
     out.push({ path, kind: "Option", identity: undefined, detail: value._tag })
-    if (Option.isSome(value)) walk(value.value, child(path, ".value"), ancestors, out)
+    if (Option.isSome(value)) walk(value.value, child(path, ".value"), seen, out)
     return
   }
   if (Result.isResult(value)) {
     out.push({ path, kind: "Result", identity: undefined, detail: value._tag })
-    if (Result.isSuccess(value)) walk(value.success, child(path, ".success"), ancestors, out)
-    else walk(value.failure, child(path, ".failure"), ancestors, out)
+    if (Result.isSuccess(value)) walk(value.success, child(path, ".success"), seen, out)
+    else walk(value.failure, child(path, ".failure"), seen, out)
     return
   }
   if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
@@ -231,6 +265,13 @@ const walkObject = (
     })
     return
   }
+  // A container: walked once, however many paths reach it.
+  const first = seen.get(value)
+  if (first !== undefined) {
+    out.push({ path, kind: "seen", identity: undefined, detail: first })
+    return
+  }
+  seen.set(value, path)
   if (Array.isArray(value)) {
     out.push({
       path,
@@ -238,7 +279,8 @@ const walkObject = (
       identity: Object.getPrototypeOf(value),
       detail: `length ${value.length}`,
     })
-    for (let i = 0; i < value.length; i++) walk(value[i], `${path}[${i}]`, ancestors, out)
+    for (let i = 0; i < value.length; i++)
+      walkProperty(value, String(i), `${path}[${i}]`, seen, out)
     return
   }
   if (value instanceof Map) {
@@ -248,12 +290,12 @@ const walkObject = (
       identity: Object.getPrototypeOf(value),
       detail: `size ${value.size}`,
     })
-    walkEntries(value, path, ancestors, out)
+    walkEntries(value, path, seen, out)
     return
   }
   if (HashMap.isHashMap(value)) {
     out.push({ path, kind: "HashMap", identity: undefined, detail: `size ${HashMap.size(value)}` })
-    walkEntries(value as Iterable<readonly [unknown, unknown]>, path, ancestors, out)
+    walkEntries(value as Iterable<readonly [unknown, unknown]>, path, seen, out)
     return
   }
   if (value instanceof Set) {
@@ -263,17 +305,18 @@ const walkObject = (
       identity: Object.getPrototypeOf(value),
       detail: `size ${value.size}`,
     })
-    walkIterable(value, path, ancestors, out)
+    walkIterable(value, path, seen, out)
     return
   }
   if (HashSet.isHashSet(value)) {
     out.push({ path, kind: "HashSet", identity: undefined, detail: `size ${HashSet.size(value)}` })
-    walkIterable(value as Iterable<unknown>, path, ancestors, out)
+    walkIterable(value as Iterable<unknown>, path, seen, out)
     return
   }
   if (Chunk.isChunk(value)) {
-    out.push({ path, kind: "Chunk", identity: undefined, detail: `length ${Chunk.size(value)}` })
-    walkIterable(value as Iterable<unknown>, path, ancestors, out)
+    const length = Chunk.size(value)
+    out.push({ path, kind: "Chunk", identity: undefined, detail: `length ${length}` })
+    for (let i = 0; i < length; i++) walk(Chunk.getUnsafe(value, i), `${path}[${i}]`, seen, out)
     return
   }
   const keys = Object.keys(value)
@@ -283,18 +326,7 @@ const walkObject = (
     identity: Object.getPrototypeOf(value),
     detail: JSON.stringify(keys),
   })
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)
-    const at = propertyPath(path, key)
-    if (descriptor === undefined) {
-      // Gone between `Object.keys` and here (a proxy): nothing to read.
-      out.push({ path: at, kind: "absent", identity: undefined, detail: "" })
-    } else if ("value" in descriptor) {
-      walk(descriptor.value, at, ancestors, out)
-    } else {
-      out.push({ path: at, kind: "accessor", identity: descriptor.get, detail: "" })
-    }
-  }
+  for (const key of keys) walkProperty(value, key, propertyPath(path, key), seen, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -324,8 +356,10 @@ const describe = (entry: Entry | undefined): string => {
       const name = (entry.identity as { readonly name?: unknown }).name
       return typeof name === "string" && name !== "" ? `function ${name}` : "a function"
     }
-    case "cycle":
-      return "a reference back to an enclosing object"
+    case "seen":
+      return entry.detail === ""
+        ? "a reference to the state itself"
+        : `the same object as at ${truncate(entry.detail)}`
     case "accessor":
       return "an accessor property"
     case "absent":

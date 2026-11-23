@@ -270,6 +270,35 @@ describe("checkStateUse — decide changing its state (EDD-9183)", () => {
     ),
   )
 
+  it.effect("on a Map key changed past its first 40 characters", () =>
+    provided(
+      Effect.gen(function* () {
+        type Ledger = { readonly byAccount: Map<string, number> }
+        const prefix = "tenants/0123456789/accounts/0123456789/"
+        const record: Ledger = { byAccount: new Map([[`${prefix}old`, 1]]) }
+        const rekeying: EventStore.Decider<Ledger, MatchCommand, MatchEvent, Late> = {
+          get initialState(): Ledger {
+            return { byAccount: new Map() }
+          },
+          decide: (command, state) =>
+            Effect.sync(() => {
+              state.byAccount.delete(`${prefix}old`)
+              state.byAccount.set(`${prefix}new`, 1)
+            }).pipe(Effect.andThen(decide(command))),
+          evolve: (state) => state,
+        }
+        const message = yield* defectOf(
+          EventStore.commandHandler(rekeying, Plain, {
+            checkStateUse: true,
+            loadState: () => Effect.succeed(Option.some({ state: record, version: 0 })),
+          })({ matchId: "m-6b" }, { _tag: "Start", venue: "Lord's" }),
+        )
+        expect(message).toContain(`at byAccount.get("${prefix}old")`)
+        expect(yield* Plain.currentVersion({ matchId: "m-6b" })).toBe(0)
+      }),
+    ),
+  )
+
   it.effect("when decide changes the state before returning its Effect, or fails after", () =>
     provided(
       Effect.gen(function* () {
@@ -545,6 +574,77 @@ describe("checkStateUse — well-behaved deciders", () => {
         expect(message).toContain(
           "at the state itself (was { status, innings }, now { status, innings, scratch })",
         )
+      }),
+    ),
+  )
+
+  it.effect("a frozen state, Effect data types included, is read without being written", () =>
+    provided(
+      Effect.gen(function* () {
+        type Frozen = {
+          readonly amount: BigDecimal.BigDecimal
+          readonly overs: Chunk.Chunk<number>
+          readonly at: DateTime.Zoned
+        }
+        const reader: EventStore.Decider<Frozen, MatchCommand, MatchEvent, Late> = {
+          get initialState(): Frozen {
+            return Object.freeze({
+              amount: Object.freeze(BigDecimal.make(1500n, 3)),
+              overs: Object.freeze(Chunk.appendAll(Chunk.make(1), Chunk.make(2))),
+              at: Object.freeze(DateTime.makeZonedUnsafe(0, { timeZone: "Europe/London" })),
+            })
+          },
+          decide: () => Effect.succeed([]),
+          evolve: (state) => state,
+        }
+        const result = yield* EventStore.commandHandler(reader, Plain, { checkStateUse: true })(
+          { matchId: "f-1" },
+          { _tag: "Start", venue: "Lord's" },
+        )
+        expect(result.version).toBe(0)
+      }),
+    ),
+  )
+
+  it.effect("a cache the snapshot encoding fills is not taken for a change decide made", () =>
+    provided(
+      Effect.gen(function* () {
+        // A state that memoises on read, and that the snapshot schema refuses
+        // (count must be positive), so the walk is the comparison.
+        class Tally {
+          cached: number | undefined = undefined
+          get count(): number {
+            this.cached ??= 0
+            return this.cached
+          }
+        }
+        const Tallies = EventStore.makeStream({
+          table: MatchTable,
+          streamName: "Tally",
+          events: [Started, Scored],
+          streamId: { composite: ["matchId"] },
+          snapshot: {
+            schema: Schema.Struct({ count: Schema.Number.check(Schema.isGreaterThan(0)) }),
+            mode: "inline",
+          },
+        })
+        const reader: EventStore.Decider<
+          { readonly count: number },
+          MatchCommand,
+          MatchEvent,
+          Late
+        > = {
+          get initialState(): Tally {
+            return new Tally()
+          },
+          decide: () => Effect.succeed([]),
+          evolve: (state) => state,
+        }
+        const result = yield* EventStore.commandHandler(reader, Tallies, { checkStateUse: true })(
+          { matchId: "t-1" },
+          { _tag: "Start", venue: "Lord's" },
+        )
+        expect(result.version).toBe(0)
       }),
     ),
   )

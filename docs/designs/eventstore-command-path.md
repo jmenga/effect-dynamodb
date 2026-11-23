@@ -581,13 +581,19 @@ state schema's encoding, with its `decode → encode` fallback) when the stream
 declares one and the state encodes on both sides, so values are compared by
 what they mean and a field the schema doesn't declare is not compared.
 Otherwise the fingerprint walks the value: own enumerable string-keyed
-properties and the prototype; arrays by index; `Map`, `Set`, `HashMap`,
-`HashSet` and `Chunk` by iteration; `Date`, `DateTime`, `BigDecimal`,
-`Option` and `Result` by value; functions by identity. Symbol-keyed and
-non-enumerable properties are not read, so Effect's own caches (`DateTime`
-parts, hashes) are invisible, and `Chunk` and `BigDecimal`, which cache in own
-fields, are read by value. A class that caches in its own enumerable fields can
-be reported when only its cache changed.
+properties and the prototype; array elements by their descriptors; `Map`,
+`Set`, `HashMap` and `HashSet` by iteration and `Chunk` by index; `Date`,
+`DateTime`, `BigDecimal`, `Option` and `Result` by value; functions by
+identity. Symbol-keyed and non-enumerable properties are not read, so Effect's
+own caches (`DateTime` parts, hashes) are invisible, and `Chunk` and
+`BigDecimal`, which cache in own fields, are read without filling them. The
+walk calls no accessor and writes nothing, so a frozen state reads as any
+other. An object reached by two paths (or a cycle) is walked once and named by
+the path it was first reached at, so the walk is linear in distinct values;
+replacing such a reference with an equal copy is a change. The snapshot
+encoding runs before the walk, so a cache the encoding fills (a memoising
+getter) is on both sides and not blamed on `decide`. A class that caches in its
+own enumerable fields can be reported when only its cache changed.
 
 The defaults stay as above. The check is a tool the application chooses.
 

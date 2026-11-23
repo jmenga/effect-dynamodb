@@ -7436,10 +7436,14 @@ and neither is retried. A state is compared as the snapshot would store it
 (the snapshot state schema's encoding) when the stream declares one and the
 state encodes on both sides; otherwise field by field
 (`internal/StateFingerprint.ts`: own enumerable string-keyed properties and
-the prototype, arrays by index, `Map` / `Set` / `HashMap` / `HashSet` /
-`Chunk` by iteration, `Date` / `DateTime` / `BigDecimal` / `Option` /
-`Result` by value, functions by identity; symbol-keyed and non-enumerable
-properties are not read). It does not cover a function-form
+the prototype, array elements by descriptor, `Map` / `Set` / `HashMap` /
+`HashSet` by iteration, `Chunk` by index, `Date` / `DateTime` /
+`BigDecimal` / `Option` / `Result` by value, functions by identity;
+symbol-keyed and non-enumerable properties are not read, no accessor is
+called and nothing is written, so a frozen state reads as any other; an
+object reached by two paths is walked once and named by its first, so the
+walk is linear in distinct values). The snapshot encoding runs before the
+walk, so a cache the encoding fills is seen on both sides. It does not cover a function-form
 `additionalItems`, `eventMetadata` or `eventTimestamps` changing the
 `Decision` it receives. See the design doc §8.
 

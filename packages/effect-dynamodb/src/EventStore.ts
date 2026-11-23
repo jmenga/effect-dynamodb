@@ -7776,9 +7776,10 @@ export interface CommandHandlerOptions<State = any, TStreamId = any> {
   /**
    * Check that the state contract holds for every command (#290): `decide`
    * only reads the state it is given, and a shared `initialState` is never
-   * changed. Off by default — then the handler does nothing extra: no copy, no
-   * fingerprint, no extra read. Meant for tests; leaving it on in production
-   * costs a fingerprint of the state before and after `decide`.
+   * changed. Off by default — then there is no copy, no fingerprint, no extra
+   * read of `initialState` and no extra request. Meant for tests; leaving it
+   * on in production costs a fingerprint of the state before and after
+   * `decide`.
    *
    * - **`decide` changed its state** → a defect, `[EDD-9183]`, naming the
    *   stream, the command and the first changed path, e.g.
@@ -7800,9 +7801,11 @@ export interface CommandHandlerOptions<State = any, TStreamId = any> {
    * compared by what it means. Otherwise it is compared field by field: an
    * object's own enumerable properties, arrays by index, `Map`, `Set`,
    * `HashMap`, `HashSet` and `Chunk` by their contents, and `Date`,
-   * `DateTime`, `BigDecimal`, `Option` and `Result` by value. A class that
-   * caches values in its own enumerable fields can then be reported when only
-   * its cache changed.
+   * `DateTime`, `BigDecimal`, `Option` and `Result` by value. Nothing is
+   * written and no accessor is called, so a frozen state reads as any other;
+   * an object reached by two paths is walked once, and replacing one such
+   * reference with an equal copy is a change. A class that caches values in
+   * its own enumerable fields can be reported when only its cache changed.
    *
    * The check proves what `decide` did with the object it was given. It does
    * not cover a function-form `additionalItems`, `eventMetadata` or

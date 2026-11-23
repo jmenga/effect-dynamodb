@@ -174,6 +174,11 @@ describe("StateFingerprint (#290)", () => {
         s.name = "b"
       }),
     ).toEqual({ path: "name", before: '"a"', after: '"b"' })
+    expect(
+      changed(node, (s) => {
+        s.self = { name: "b" }
+      }),
+    ).toEqual({ path: "self", before: "a reference to the state itself", after: "{ name }" })
 
     let reads = 0
     const withGetter = Object.defineProperty({}, "computed", {
@@ -185,6 +190,94 @@ describe("StateFingerprint (#290)", () => {
     })
     StateFingerprint.of(withGetter)
     expect(reads).toBe(0)
+  })
+
+  it("reads frozen values, Effect data types included, without writing to them", () => {
+    const frozen = Object.freeze({
+      amount: Object.freeze(BigDecimal.make(1500n, 3)),
+      overs: Object.freeze(Chunk.appendAll(Chunk.make(1, 2), Chunk.make(3))),
+      at: Object.freeze(DateTime.makeZonedUnsafe(0, { timeZone: "Europe/London" })),
+      tags: Object.freeze(HashSet.make("a")),
+    })
+    expect(
+      StateFingerprint.firstDifference(StateFingerprint.of(frozen), StateFingerprint.of(frozen)),
+    ).toBeUndefined()
+    // A BigDecimal reads as its value, whatever its scale.
+    expect(
+      StateFingerprint.firstDifference(
+        StateFingerprint.of({ amount: BigDecimal.make(1500n, 3) }),
+        StateFingerprint.of({ amount: BigDecimal.make(15n, 1) }),
+      ),
+    ).toBeUndefined()
+    expect(
+      changed(
+        { amounts: [BigDecimal.make(5n, 3), BigDecimal.make(-5n, -2), BigDecimal.make(0n, 4)] },
+        (s) => {
+          s.amounts[0] = BigDecimal.make(-1205n, 2)
+        },
+      ),
+    ).toEqual({
+      path: "amounts[0]",
+      before: "BigDecimal(0.005)",
+      after: "BigDecimal(-12.05)",
+    })
+  })
+
+  it("compares Map keys in full, and symbol keys by identity", () => {
+    const prefix = "tenants/0123456789/accounts/0123456789/"
+    expect(
+      changed({ byId: new Map([[`${prefix}old`, 1]]) }, (s) => {
+        s.byId.delete(`${prefix}old`)
+        s.byId.set(`${prefix}new`, 1)
+      }),
+    ).toMatchObject({ path: `byId.get("${prefix}old")` })
+    const key = Symbol("k")
+    expect(
+      changed({ bySymbol: new Map([[key, 1]]) }, (s) => {
+        s.bySymbol.delete(key)
+        s.bySymbol.set(Symbol("k"), 1)
+      }),
+    ).toMatchObject({ path: "bySymbol.keys()[0]" })
+  })
+
+  it("reads array elements by descriptor: an accessor is not called, a hole is absent", () => {
+    let reads = 0
+    const lazy = Object.defineProperty([] as Array<unknown>, "0", {
+      enumerable: true,
+      get: () => {
+        reads++
+        throw new Error("not read")
+      },
+    })
+    StateFingerprint.of(lazy)
+    expect(reads).toBe(0)
+    const slots = new Array<number | undefined>(3)
+    slots[0] = 1
+    slots[2] = 3
+    expect(
+      changed({ slots }, (s) => {
+        s.slots[1] = undefined
+      }),
+    ).toEqual({ path: "slots[1]", before: "absent", after: "undefined" })
+  })
+
+  it("walks an object reached by several paths once, and names it by its first", () => {
+    let shared: object = { n: 1 }
+    for (let i = 0; i < 32; i++) shared = { left: shared, right: shared }
+    // 33 distinct objects: one entry per object, property and repeat.
+    expect(StateFingerprint.of(shared).length).toBeLessThan(200)
+
+    const innings = { overs: 3 }
+    expect(
+      changed({ first: innings, current: innings as { overs: number } }, (s) => {
+        s.current = { overs: 3 }
+      }),
+    ).toEqual({ path: "current", before: "the same object as at first", after: "{ overs }" })
+    expect(
+      changed({ first: innings, current: innings }, (s) => {
+        s.current.overs = 4
+      }),
+    ).toEqual({ path: "first.overs", before: "3", after: "4" })
   })
 
   it("compares functions and prototypes by identity", () => {
