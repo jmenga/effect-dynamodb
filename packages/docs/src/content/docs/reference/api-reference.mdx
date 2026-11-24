@@ -1400,9 +1400,9 @@ A `Decider<State, Command, Event, E = never>` encodes one aggregate's command-ev
 
 | Field | Type |
 |-------|------|
-| `decide` | `(command: Command, state: State) => Effect<ReadonlyArray<Event>, E>` |
-| `evolve` | `(state: State, event: Event) => State` — may mutate `state` in place; the handler's state is always the `evolve` fold |
-| `initialState` | `State` |
+| `decide` | `(command: Command, state: State) => Effect<ReadonlyArray<Event>, E>` — receives the state as is, not a copy; the fold of the new events starts from that object, so a change `decide` makes to it is returned, projected and snapshotted (not prevented or detected) |
+| `evolve` | `(state: State, event: Event) => State` — may mutate `state` in place; the handler's state is always the `evolve` fold, starting from the object `decide` was given |
+| `initialState` | `State` — handed to `decide` and `evolve` as is; if either mutates its state, declare it as a getter returning a fresh value, or a change becomes every later new stream's starting state |
 
 ### Operations
 
