@@ -2,7 +2,7 @@
 
 Status: accepted · Target: 1.24.0 (minor) · Issues: #136, #137, #138, #139, #140
 (#141 — referenced, **not implemented**: large commands are stepped commands,
-see §5; #142 — out of scope, see §8)
+see §5; #142 — out of scope by default, opt-in check #290, see §8)
 
 This document is the specification for five EventStore extensions delivered in
 one PR. They converge on `append` and `commandHandler` in
@@ -539,10 +539,11 @@ table's own `pk` / `sk` are not included, and empty index lists are omitted.
 
 ## 8. Out of scope — #142 (read-only `decide` state)
 
-The library will not enforce `decide` purity, neither with `DeepReadonly`
-types nor with a runtime freeze or verify. Whether state is mutable, and how
-`decide` treats it, is the application's design decision. `evolve` mutating in
-place is explicitly supported (§3).
+By default the library does not enforce `decide` purity, neither with
+`DeepReadonly` types nor with a runtime freeze or verify. Whether state is
+mutable, and how `decide` treats it, is the application's design decision.
+`evolve` mutating in place is explicitly supported (§3). An application can
+opt in to a check instead (#290, at the end of this section).
 
 The only commitment is the contract in §3: persisted, returned and projected
 state is the `evolve` fold, never a state `decide` builds.
@@ -554,7 +555,47 @@ function-form items and the snapshot, and a later command that loads that
 snapshot starts from it. The same holds for the state's other sources, handed
 over as is: a shared `initialState` (declare it as a getter returning a fresh
 value if `decide` or `evolve` mutates) and a `loadState` record held across
-calls. The docs say so; the library does not copy, freeze or check.
+calls. The docs say so; by default the library does not copy, freeze or check.
+
+An application that wants the contract enforced, typically in its tests, turns
+on `CommandHandlerOptions.checkStateUse` (#290). Off, the command path is
+unchanged: no copy, no fingerprint. On, the handler:
+
+- fingerprints the state `decide` is given (a stream load, a snapshot, a
+  `loadState` record or the initial state) before calling it and again when it
+  finishes, and dies with `[EDD-9183]` on a difference, naming the stream, the
+  command and the first changed path (`at innings[1].overs (was 3, now 4)`).
+  A failure of `decide`'s own is checked too; a defect or interruption of
+  `decide` passes through. Nothing is appended;
+- when `decider.initialState` reads as the same object twice (a value, not a
+  getter), fingerprints it as the attempt starts and checks it after each load
+  and after the fold of the new events, before the append, dying with
+  `[EDD-9184]`, which says to declare `initialState` as a getter. This is
+  narrower than "the fold returned the same object", which an `evolve` that
+  ignores an event also does without changing anything, and broader, since an
+  `evolve` that changes a nested value and returns a new top-level object is
+  caught.
+
+A state is compared as the stream's snapshot would store it (the snapshot
+state schema's encoding, with its `decode → encode` fallback) when the stream
+declares one and the state encodes on both sides, so values are compared by
+what they mean and a field the schema doesn't declare is not compared.
+Otherwise the fingerprint walks the value: own enumerable string-keyed
+properties and the prototype; array elements by their descriptors; `Map`,
+`Set`, `HashMap` and `HashSet` by iteration and `Chunk` by index; `Date`,
+`DateTime`, `BigDecimal`, `Option` and `Result` by value; functions by
+identity. Symbol-keyed and non-enumerable properties are not read, so Effect's
+own caches (`DateTime` parts, hashes) are invisible, and `Chunk` and
+`BigDecimal`, which cache in own fields, are read without filling them. The
+walk calls no accessor and writes nothing, so a frozen state reads as any
+other. An object reached by two paths (or a cycle) is walked once and named by
+the path it was first reached at, so the walk is linear in distinct values;
+replacing such a reference with an equal copy is a change. The snapshot
+encoding runs before the walk, so a cache the encoding fills (a memoising
+getter) is on both sides and not blamed on `decide`. A class that caches in its
+own enumerable fields can be reported when only its cache changed.
+
+The defaults stay as above. The check is a tool the application chooses.
 
 ## 9. Test matrix
 
