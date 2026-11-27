@@ -55,6 +55,7 @@ export type SortOrder = "ASC" | "DESC"
 
 const describeBucket = (bucket: unknown): string => {
   if (typeof bucket === "string") return JSON.stringify(bucket)
+  if (typeof bucket === "number") return String(bucket)
   if (typeof bucket === "bigint") return `${bucket}n`
   if (Duration.isDuration(bucket)) return `Duration(${Duration.format(bucket)})`
   try {
@@ -79,13 +80,16 @@ export const bucketMillis = (bucket: TimeBucket): number => {
         `got ${describeBucket(bucket)}.`,
     )
   }
-  // `Duration.fromInput` reads a `NaN` number as zero, which the check below
-  // refuses anyway; it is checked first so the message names what was given.
-  if (typeof bucket === "number" && Number.isNaN(bucket)) return fail()
   const duration = Duration.fromInput(bucket)
-  if (Option.isNone(duration) || !Duration.isFinite(duration.value)) return fail()
-  const ms = Duration.toMillis(duration.value)
-  return Number.isSafeInteger(ms) && ms > 0 ? ms : fail()
+  if (Option.isNone(duration)) return fail()
+  // Checked on exact nanoseconds: converting a bigint of nanoseconds to
+  // milliseconds goes through floating point, which can make a fractional
+  // width whole or a whole one fractional. `toNanos` is `None` when infinite;
+  // `fromInput` reads a `NaN` number as zero.
+  const nanos = Duration.toNanos(duration.value)
+  if (Option.isNone(nanos) || nanos.value <= 0n || nanos.value % 1_000_000n !== 0n) return fail()
+  const ms = nanos.value / 1_000_000n
+  return ms <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(ms) : fail()
 }
 
 /**

@@ -249,11 +249,19 @@ describe("time bucket width (#292)", () => {
     ["a fractional duration string", "1.5 millis"],
     ["an empty duration object", {}],
     ["a width past the safe integers", Number.MAX_VALUE],
+    ["a bigint of nanoseconds one past a whole millisecond", 9_072_000_000_000_001n],
   ] as const)("refuses %s with [EDD-9185]", (_label, bucket) => {
     expect(() => geoWith(bucket as GeoIndex.TimeBucket)).toThrow("[EDD-9185]")
   })
 
+  it("reads a bigint of nanoseconds exactly", () => {
+    // Through floating point, this whole number of milliseconds came out fractional.
+    expect(GeoIndex.bucketMillis(576_460_752_305_000_000n)).toBe(576_460_752_305)
+    expect(GeoIndex.bucketMillis(86_400_000_000_000n)).toBe(DAY_MS)
+  })
+
   it("refuses a value that is not a duration, naming it", () => {
+    expect(() => geoWith(Number.NaN)).toThrow(/got NaN\.$/)
     expect(() => geoWith("daily" as never)).toThrow(/\[EDD-9185\].*got "daily"/)
     expect(() => geoWith(null as never)).toThrow("[EDD-9185]")
   })
