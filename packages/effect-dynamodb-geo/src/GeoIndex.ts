@@ -16,7 +16,7 @@
  * needs a `BlobStore` in its context (`[EDD-9115]`).
  */
 
-import { type Context, Effect, type Semaphore } from "effect"
+import { type Context, Duration, Effect, Option, type Semaphore } from "effect"
 import type {
   BlobStoreError,
   ConcurrentModification,
@@ -39,11 +39,53 @@ import type { LatLng } from "./Spherical.js"
 
 export type { LatLng } from "./Spherical.js"
 
-export type TimeBucket = "hourly"
+/**
+ * The width of a time partition (#292): `"hourly"` (one hour, the width every
+ * release before 1.47 used) or any `Duration` input — `"1 day"`,
+ * `Duration.days(1)`, `{ hours: 6 }`, or a number of milliseconds. It must be a
+ * positive whole number of milliseconds (`[EDD-9185]`, thrown by `make`).
+ *
+ * Partitions are `floor(timestamp / width)`, counted from the Unix epoch, so a
+ * daily bucket is a UTC day. The partition value does not record the width:
+ * changing the width of an index that holds data leaves its rows under
+ * partition values the new width never reads, until each item is written again.
+ */
+export type TimeBucket = "hourly" | Duration.Input
 export type SortOrder = "ASC" | "DESC"
 
-const BUCKET_MS: Record<TimeBucket, number> = {
-  hourly: H3.HOURLY_BUCKET_MS,
+const describeBucket = (bucket: unknown): string => {
+  if (typeof bucket === "string") return JSON.stringify(bucket)
+  if (typeof bucket === "bigint") return `${bucket}n`
+  if (Duration.isDuration(bucket)) return `Duration(${Duration.format(bucket)})`
+  try {
+    return JSON.stringify(bucket) ?? String(bucket)
+  } catch {
+    return String(bucket)
+  }
+}
+
+/**
+ * A time bucket's width in milliseconds (#292): `"hourly"` is one hour, and any
+ * other value is read as a `Duration` input. Throws `[EDD-9185]` for a value
+ * that is not a positive, finite, whole number of milliseconds (zero, negative,
+ * fractional, infinite, `NaN`, or not a duration at all).
+ */
+export const bucketMillis = (bucket: TimeBucket): number => {
+  if (bucket === "hourly") return H3.HOURLY_BUCKET_MS
+  const fail = (): never => {
+    throw new Error(
+      `[EDD-9185] GeoIndex: fields.timePartition.bucket must be "hourly" or a Duration of a ` +
+        `positive whole number of milliseconds (for example "1 day" or Duration.hours(6)); ` +
+        `got ${describeBucket(bucket)}.`,
+    )
+  }
+  // `Duration.fromInput` reads a `NaN` number as zero, which the check below
+  // refuses anyway; it is checked first so the message names what was given.
+  if (typeof bucket === "number" && Number.isNaN(bucket)) return fail()
+  const duration = Duration.fromInput(bucket)
+  if (Option.isNone(duration) || !Duration.isFinite(duration.value)) return fail()
+  const ms = Duration.toMillis(duration.value)
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : fail()
 }
 
 /**
@@ -253,7 +295,9 @@ export const make = <
         `index isn't supported: its search plans read one partition per cell and time bucket.`,
     )
   }
-  const bucketMs = BUCKET_MS[config.fields.timePartition.bucket]
+  // Resolved once: `enrich` composes each row's partition with it, and `nearby`
+  // enumerates the partitions of its window with it (#292).
+  const bucketMs = bucketMillis(config.fields.timePartition.bucket)
 
   const enrich = (input: Item): Item => {
     const coords = config.coordinates(input)

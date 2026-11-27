@@ -1,8 +1,9 @@
-import { Effect, Schema } from "effect"
+import { Duration, Effect, Schema } from "effect"
 import { Entity } from "effect-dynamodb"
 import * as h3 from "h3-js"
 import { describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
+import * as H3 from "../src/H3.js"
 
 // Mock entity with minimal structural interface matching GeoEntity
 const mockEntity: GeoIndex.GeoEntity<any, any> = {
@@ -172,6 +173,99 @@ describe("GeoIndex", () => {
       const enriched = geoIndex.enrich(input)
       expect(h3.cellToParent(enriched.cell!, 3)).toBe(enriched.parentCell)
     })
+  })
+})
+
+describe("time bucket width (#292)", () => {
+  const DAY_MS = 86_400_000
+  const timestamp = 1_700_000_000_000
+
+  type Row = VehicleInput & Record<string, unknown>
+  const geoWith = (bucket: GeoIndex.TimeBucket, field = "timePartition") =>
+    GeoIndex.make<Row, any>({
+      entity: mockEntity,
+      index: "byCell",
+      coordinates: (item) =>
+        item.location
+          ? { latitude: item.location.latitude, longitude: item.location.longitude }
+          : undefined,
+      fields: {
+        cell: { field: "cell", resolution: 15 },
+        parentCell: { field: "parentCell", resolution: 3 },
+        timePartition: { field, source: "timestamp", bucket },
+      },
+    })
+
+  const input = (ts: number): Row => ({
+    vehicleId: "v-1",
+    location: { latitude: SF_LAT, longitude: SF_LNG },
+    timestamp: ts,
+  })
+
+  it("a daily bucket composes the partition from floor(ts / 86_400_000)", () => {
+    for (const bucket of ["1 day", Duration.days(1), { days: 1 }, DAY_MS] as const) {
+      expect(geoWith(bucket).enrich(input(timestamp)).timePartition).toBe(
+        String(Math.floor(timestamp / DAY_MS)),
+      )
+    }
+  })
+
+  it("a daily partition holds a whole UTC day", () => {
+    const geo = geoWith("1 day")
+    const dayStart = Math.floor(timestamp / DAY_MS) * DAY_MS
+    const partition = (ts: number) => geo.enrich(input(ts)).timePartition
+    expect(partition(dayStart)).toBe(partition(dayStart + DAY_MS - 1))
+    expect(partition(dayStart - 1)).not.toBe(partition(dayStart))
+    expect(partition(dayStart + DAY_MS)).not.toBe(partition(dayStart))
+  })
+
+  it('"hourly" and a one-hour Duration compose the partitions every earlier release did', () => {
+    for (const bucket of ["hourly", "1 hour", Duration.hours(1), H3.HOURLY_BUCKET_MS] as const) {
+      expect(GeoIndex.bucketMillis(bucket)).toBe(3_600_000)
+      expect(geoWith(bucket).enrich(input(timestamp)).timePartition).toBe(
+        String(Math.floor(timestamp / (1000 * 60 * 60))),
+      )
+    }
+  })
+
+  it("other widths divide the epoch the same way", () => {
+    expect(GeoIndex.bucketMillis({ hours: 6 })).toBe(6 * 3_600_000)
+    expect(GeoIndex.bucketMillis("15 minutes")).toBe(900_000)
+    expect(GeoIndex.bucketMillis("1 week")).toBe(7 * DAY_MS)
+    expect(geoWith("15 minutes").enrich(input(timestamp)).timePartition).toBe(
+      String(Math.floor(timestamp / 900_000)),
+    )
+  })
+
+  it.each([
+    ["zero", 0],
+    ["a negative number", -5],
+    ["a fractional number of milliseconds", 1.5],
+    ["NaN", Number.NaN],
+    ["Infinity (number)", Number.POSITIVE_INFINITY],
+    ['"Infinity"', "Infinity"],
+    ["a duration under a millisecond", Duration.nanos(1n)],
+    ["a bigint of nanoseconds under a millisecond", 5n],
+    ["a fractional duration string", "1.5 millis"],
+    ["an empty duration object", {}],
+    ["a width past the safe integers", Number.MAX_VALUE],
+  ] as const)("refuses %s with [EDD-9185]", (_label, bucket) => {
+    expect(() => geoWith(bucket as GeoIndex.TimeBucket)).toThrow("[EDD-9185]")
+  })
+
+  it("refuses a value that is not a duration, naming it", () => {
+    expect(() => geoWith("daily" as never)).toThrow(/\[EDD-9185\].*got "daily"/)
+    expect(() => geoWith(null as never)).toThrow("[EDD-9185]")
+  })
+
+  it("two geo indexes on one entity, with different widths, write their own attributes", () => {
+    const hourly = geoWith("hourly", "hourPartition")
+    const daily = geoWith("1 day", "dayPartition")
+    const enriched = hourly.enrich(daily.enrich(input(timestamp)))
+    expect(enriched.hourPartition).toBe(String(Math.floor(timestamp / 3_600_000)))
+    expect(enriched.dayPartition).toBe(String(Math.floor(timestamp / DAY_MS)))
+    // The order the two are applied in doesn't matter.
+    expect(daily.enrich(hourly.enrich(input(timestamp)))).toEqual(enriched)
   })
 })
 

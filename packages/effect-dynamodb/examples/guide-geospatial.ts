@@ -8,6 +8,7 @@
  *   - Writing items with automatic geo field enrichment
  *   - Proximity search (nearby) with time windows
  *   - Enriching items for use in transactions/batch writes
+ *   - Time buckets other than hourly, and two geo indexes on one entity
  *   - A geo entity with an offloaded (binary) field
  *
  * Prerequisites:
@@ -17,7 +18,7 @@
  *   npx tsx examples/guide-geospatial.ts
  */
 
-import { Config, Console, Effect, Layer, Schema } from "effect"
+import { Config, Console, Duration, Effect, Layer, Schema } from "effect"
 // Import from geo package source (use "@effect-dynamodb/geo" when published)
 import { GeoIndex, H3 } from "../../effect-dynamodb-geo/src/index.js"
 // Import from source (use "effect-dynamodb" when published)
@@ -69,6 +70,70 @@ const Vehicles = Entity.make({
 })
 
 const MainTable = Table.make({ schema: AppSchema, entities: { Vehicles } })
+// #endregion
+
+// ---------------------------------------------------------------------------
+// Time buckets: an hourly and a daily geo index on one entity
+// ---------------------------------------------------------------------------
+
+// #region time-buckets
+class Sighting extends Schema.Class<Sighting>("Sighting")({
+  sightingId: Schema.String,
+  latitude: Schema.Number,
+  longitude: Schema.Number,
+  seenAt: Schema.Number,
+  cell: Schema.optional(Schema.String),
+  parentCell: Schema.optional(Schema.String),
+  hourPartition: Schema.optional(Schema.String),
+  dayPartition: Schema.optional(Schema.String),
+}) {}
+
+const Sightings = Entity.make({
+  model: Sighting,
+  entityType: "Sighting",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sightingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    sightingsByHour: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["parentCell", "hourPartition"] },
+      sk: { field: "gsi1sk", composite: ["cell"] },
+    },
+    sightingsByDay: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["parentCell", "dayPartition"] },
+      sk: { field: "gsi2sk", composite: ["cell"] },
+    },
+  },
+})
+
+// Each index writes its own partition attribute; both share the cell fields,
+// at the same resolutions.
+const SightingsByHour = GeoIndex.make({
+  entity: Sightings,
+  index: "sightingsByHour",
+  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: { field: "hourPartition", source: "seenAt", bucket: "hourly" },
+  },
+})
+
+const SightingsByDay = GeoIndex.make({
+  entity: Sightings,
+  index: "sightingsByDay",
+  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: { field: "dayPartition", source: "seenAt", bucket: "1 day" },
+  },
+})
+
+const SightingsTable = Table.make({ schema: AppSchema, entities: { Sightings } })
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -246,6 +311,52 @@ const program = Effect.gen(function* () {
   yield* Console.log(`  parentCell=${enriched.parentCell?.slice(0, 12)}...`)
   yield* Console.log(`  timePartition=${enriched.timePartition}\n`)
 
+  // --- Time buckets ---
+  yield* Console.log("=== Time Buckets ===\n")
+
+  const sightings = yield* DynamoClient.make({ entities: { Sightings } })
+  yield* sightings.tables["fleet-sightings"]!.delete().pipe(
+    Effect.catchTag("ResourceNotFoundError", () => Effect.void),
+  )
+  yield* sightings.tables["fleet-sightings"]!.create()
+
+  // #region time-buckets-usage
+  const byHour = yield* GeoIndex.bind(SightingsByHour)
+  const byDay = yield* GeoIndex.bind(SightingsByDay)
+
+  // One write fills both indexes: each enrich adds its own partition
+  yield* byHour.put(
+    byDay.enrich({
+      sightingId: "s-1",
+      latitude: 37.7749,
+      longitude: -122.4194,
+      seenAt: now - Duration.toMillis(Duration.hours(20)),
+    }),
+  )
+
+  // A 24-hour window reads at most two daily partitions per cell range
+  const today = yield* byDay.nearby({
+    center: { latitude: 37.7749, longitude: -122.4194 },
+    radius: 1000,
+    timeWindow: { start: now - Duration.toMillis(Duration.days(1)), end: now },
+  })
+  // #endregion
+
+  if (today.length !== 1 || today[0]!.item.sightingId !== "s-1") {
+    throw new Error("expected the 20-hour-old sighting from the daily index")
+  }
+  const lastHour = yield* byHour.nearby({
+    center: { latitude: 37.7749, longitude: -122.4194 },
+    radius: 1000,
+    timeWindow: { start: now - H3.HOURLY_BUCKET_MS, end: now },
+  })
+  if (lastHour.length !== 0) {
+    throw new Error("expected no sighting in the last hour")
+  }
+  yield* Console.log(`Daily index: ${today.length} sighting in the last 24 hours`)
+  yield* Console.log(`Hourly index: ${lastHour.length} sightings in the last hour\n`)
+  yield* sightings.tables["fleet-sightings"]!.delete()
+
   // --- Offloaded fields ---
   yield* Console.log("=== Offloaded Fields ===\n")
   const landmarks = yield* DynamoClient.make({ entities: { Landmarks } })
@@ -300,6 +411,7 @@ const AppLayer = Layer.mergeAll(
     credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MainTable.layer({ name: "fleet-table" }),
+  SightingsTable.layer({ name: "fleet-sightings" }),
   LandmarksTable.layer({ name: "fleet-landmarks" }),
   // Where Landmarks' photos live (S3 in production: effect-dynamodb/blob/s3)
   BlobStore.layerMemory(),

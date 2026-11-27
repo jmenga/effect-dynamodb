@@ -3,7 +3,7 @@
  * entity, so a misspelled index, geo field or timestamp source is a compile
  * error. The runtime check on the index stays for untyped callers.
  */
-import { Schema } from "effect"
+import { Duration, Schema } from "effect"
 import { DynamoSchema, Entity, Table } from "effect-dynamodb"
 import { describe, expect, it } from "vitest"
 import * as GeoIndex from "../src/GeoIndex.js"
@@ -57,6 +57,37 @@ describe("GeoIndex.make names are typed from the entity", () => {
       },
     })
     expect(typeof geo.nearby).toBe("function")
+  })
+
+  it('accepts "hourly" or any Duration as the bucket (#292)', () => {
+    const at = (bucket: GeoIndex.TimeBucket) =>
+      GeoIndex.make({
+        entity: Vehicles,
+        index: "byCell",
+        coordinates,
+        fields: {
+          cell: { field: "cell", resolution: 15 },
+          parentCell: { field: "parentCell", resolution: 3 },
+          timePartition: { field: "timePartition", source: "timestamp", bucket },
+        },
+      })
+    for (const bucket of ["hourly", "1 day", Duration.days(1), { hours: 6 }, 3_600_000] as const) {
+      expect(typeof at(bucket).nearby).toBe("function")
+    }
+    const typeOnly = (_: () => unknown) => undefined
+    typeOnly(() =>
+      GeoIndex.make({
+        entity: Vehicles,
+        index: "byCell",
+        coordinates,
+        fields: {
+          cell: { field: "cell", resolution: 15 },
+          parentCell: { field: "parentCell", resolution: 3 },
+          // @ts-expect-error neither "hourly" nor a Duration input
+          timePartition: { field: "timePartition", source: "timestamp", bucket: "daily" },
+        },
+      }),
+    )
   })
 
   it("refuses a misspelled index, field or source", () => {

@@ -212,13 +212,15 @@ export const computeParentCell = (cell: string, resolution: number): string =>
   h3.cellToParent(cell, resolution)
 
 /**
- * Compute the hourly time partition string for a timestamp.
+ * Compute the time partition string for a timestamp: the number of whole
+ * `bucketMs` periods since the Unix epoch, in decimal.
  */
 export const computeTimePartition = (timestampMs: number, bucketMs: number): string =>
   String(Math.floor(timestampMs / bucketMs))
 
 /**
- * Generate all time partition strings covering a time window.
+ * Generate all time partition strings covering a time window, oldest first:
+ * every `bucketMs` period that `[startMs, endMs]` touches.
  */
 export const getTimePartitions = (startMs: number, endMs: number, bucketMs: number): string[] => {
   const partitions = new Set<string>()

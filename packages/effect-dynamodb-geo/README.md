@@ -22,7 +22,7 @@ pnpm add @effect-dynamodb/geo effect-dynamodb effect
 - **Geo-enriched writes** — `put` computes the item's H3 cell, parent cell and time partition and writes through the entity's own `put`; `enrich` computes them for a `Transaction` or `Batch` write
 - **Proximity search** — `nearby` finds items within a radius of a point, inside a time window, sorted by great-circle distance
 
-Implemented as a GSI overlay keyed by a coarse H3 parent cell and time partition, with the fine cell as the sort key, so a search queries only the cells and hours it covers instead of scanning the table. Entities with fields [offloaded to a blob store](https://jmenga.github.io/effect-dynamodb/guides/blob-offload) work too, on a table whose schema sets `escapeKeys: true` (`GeoIndex.bind` refuses one that doesn't, `[EDD-9146]`): `nearby` reads their values eagerly.
+Implemented as a GSI overlay keyed by a coarse H3 parent cell and time partition, with the fine cell as the sort key, so a search queries only the cells and time partitions it covers instead of scanning the table. Entities with fields [offloaded to a blob store](https://jmenga.github.io/effect-dynamodb/guides/blob-offload) work too, on a table whose schema sets `escapeKeys: true` (`GeoIndex.bind` refuses one that doesn't, `[EDD-9146]`): `nearby` reads their values eagerly.
 
 See the [Geospatial guide](https://jmenga.github.io/effect-dynamodb/guides/geospatial) for setup, indexing strategy, and tradeoffs.
 
