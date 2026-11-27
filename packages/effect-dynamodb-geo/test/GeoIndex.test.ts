@@ -181,9 +181,15 @@ describe("time bucket width (#292)", () => {
   const timestamp = 1_700_000_000_000
 
   type Row = VehicleInput & Record<string, unknown>
-  const geoWith = (bucket: GeoIndex.TimeBucket, field = "timePartition") =>
+  // A definition of its own per index: one entity's geo indexes can't write
+  // one attribute at two widths ([EDD-9186]).
+  const geoWith = (
+    bucket: GeoIndex.TimeBucket,
+    field = "timePartition",
+    entity: GeoIndex.GeoEntity<any, any> = { ...mockEntity },
+  ) =>
     GeoIndex.make<Row, any>({
-      entity: mockEntity,
+      entity,
       index: "byCell",
       coordinates: (item) =>
         item.location
@@ -267,13 +273,172 @@ describe("time bucket width (#292)", () => {
   })
 
   it("two geo indexes on one entity, with different widths, write their own attributes", () => {
-    const hourly = geoWith("hourly", "hourPartition")
-    const daily = geoWith("1 day", "dayPartition")
+    const entity = { ...mockEntity }
+    const hourly = geoWith("hourly", "hourPartition", entity)
+    const daily = geoWith("1 day", "dayPartition", entity)
     const enriched = hourly.enrich(daily.enrich(input(timestamp)))
     expect(enriched.hourPartition).toBe(String(Math.floor(timestamp / 3_600_000)))
     expect(enriched.dayPartition).toBe(String(Math.floor(timestamp / DAY_MS)))
     // The order the two are applied in doesn't matter.
     expect(daily.enrich(hourly.enrich(input(timestamp)))).toEqual(enriched)
+  })
+})
+
+describe("one entity's geo indexes write each attribute one way (#292, [EDD-9186])", () => {
+  const entityWithTwoIndexes = (): GeoIndex.GeoEntity<any, any> => ({
+    ...mockEntity,
+    indexes: {
+      ...mockEntity.indexes,
+      byDay: {
+        index: "gsi2",
+        pk: { field: "gsi2pk", composite: ["parentCell", "dayPartition"] },
+        sk: { field: "gsi2sk", composite: ["cell"] },
+      },
+    },
+  })
+  type Fields = {
+    readonly cell?: { readonly field: string; readonly resolution: number }
+    readonly parentCell?: { readonly field: string; readonly resolution: number }
+    readonly timePartition?: {
+      readonly field: string
+      readonly source: string
+      readonly bucket: GeoIndex.TimeBucket
+    }
+  }
+  const geoOn = (entity: GeoIndex.GeoEntity<any, any>, index: string, fields: Fields = {}) =>
+    GeoIndex.make<Record<string, unknown>, any>({
+      entity,
+      index,
+      coordinates: () => undefined,
+      fields: {
+        cell: fields.cell ?? { field: "cell", resolution: 15 },
+        parentCell: fields.parentCell ?? { field: "parentCell", resolution: 3 },
+        timePartition: fields.timePartition ?? {
+          field: "timePartition",
+          source: "timestamp",
+          bucket: "hourly",
+        },
+      },
+    })
+
+  it("refuses a second index writing one time partition attribute at another width", () => {
+    const entity = entityWithTwoIndexes()
+    geoOn(entity, "byCell")
+    expect(() =>
+      geoOn(entity, "byDay", {
+        timePartition: { field: "timePartition", source: "timestamp", bucket: "1 day" },
+      }),
+    ).toThrow(
+      '[EDD-9186] GeoIndex: "timePartition" of entity "Vehicle" would be written as a time ' +
+        'partition of 1d from "timestamp" by index "byDay" and written as a time partition of 1h ' +
+        'from "timestamp" by index "byCell".',
+    )
+  })
+
+  it("refuses the same index made again at another width", () => {
+    const entity = entityWithTwoIndexes()
+    geoOn(entity, "byCell")
+    expect(() =>
+      geoOn(entity, "byCell", {
+        timePartition: { field: "timePartition", source: "timestamp", bucket: "1 day" },
+      }),
+    ).toThrow(
+      'and written as a time partition of 1h from "timestamp" by another GeoIndex over index "byCell"',
+    )
+  })
+
+  it("refuses one attribute partitioned from two sources", () => {
+    const entity = entityWithTwoIndexes()
+    geoOn(entity, "byCell")
+    expect(() =>
+      geoOn(entity, "byDay", {
+        timePartition: { field: "timePartition", source: "seenAt", bucket: "hourly" },
+      }),
+    ).toThrow("[EDD-9186]")
+  })
+
+  it("refuses a shared cell attribute at another resolution", () => {
+    const entity = entityWithTwoIndexes()
+    geoOn(entity, "byCell")
+    expect(() => geoOn(entity, "byDay", { cell: { field: "cell", resolution: 12 } })).toThrow(
+      '"cell" of entity "Vehicle" would be written as an H3 cell at resolution 12 by index "byDay"',
+    )
+    expect(() =>
+      geoOn(entity, "byDay", { parentCell: { field: "parentCell", resolution: 4 } }),
+    ).toThrow("[EDD-9186]")
+  })
+
+  it("refuses writing the attribute another index reads its timestamp from, either way round", () => {
+    const first = entityWithTwoIndexes()
+    geoOn(first, "byCell")
+    expect(() =>
+      geoOn(first, "byDay", {
+        timePartition: { field: "timestamp", source: "seenAt", bucket: "1 day" },
+      }),
+    ).toThrow('and read as the timestamp source by index "byCell"')
+
+    const second = entityWithTwoIndexes()
+    geoOn(second, "byCell", {
+      timePartition: { field: "dayPartition", source: "seenAt", bucket: "1 day" },
+    })
+    expect(() =>
+      geoOn(second, "byDay", {
+        timePartition: { field: "timePartition", source: "dayPartition", bucket: "hourly" },
+      }),
+    ).toThrow(
+      '"dayPartition" of entity "Vehicle" would be read as the timestamp source by index "byDay"',
+    )
+  })
+
+  it("refuses one index writing one attribute two ways, or over its own source", () => {
+    expect(() =>
+      geoOn(entityWithTwoIndexes(), "byCell", { parentCell: { field: "cell", resolution: 3 } }),
+    ).toThrow("by the same index")
+    expect(() =>
+      geoOn(entityWithTwoIndexes(), "byCell", {
+        timePartition: { field: "timestamp", source: "timestamp", bucket: "hourly" },
+      }),
+    ).toThrow("by the same index")
+  })
+
+  it("accepts indexes sharing attributes computed the same way, however the width is spelled", () => {
+    const entity = entityWithTwoIndexes()
+    geoOn(entity, "byCell")
+    geoOn(entity, "byDay", {
+      timePartition: { field: "timePartition", source: "timestamp", bucket: Duration.hours(1) },
+    })
+    geoOn(entity, "byCell", {
+      timePartition: { field: "timePartition", source: "timestamp", bucket: "1 hour" },
+    })
+    // Two indexes reading one source, each writing its own partition.
+    geoOn(entity, "byDay", {
+      timePartition: { field: "dayPartition", source: "timestamp", bucket: "1 day" },
+    })
+  })
+
+  it("records nothing from a refused definition", () => {
+    const entity = entityWithTwoIndexes()
+    geoOn(entity, "byCell")
+    // Refused for its partition, after naming a new cell attribute.
+    expect(() =>
+      geoOn(entity, "byDay", {
+        cell: { field: "fineCell", resolution: 10 },
+        parentCell: { field: "coarseCell", resolution: 3 },
+        timePartition: { field: "timePartition", source: "timestamp", bucket: "1 day" },
+      }),
+    ).toThrow('"timePartition" of entity "Vehicle"')
+    // So "fineCell" and "coarseCell" are still free for another resolution.
+    geoOn(entity, "byDay", {
+      cell: { field: "fineCell", resolution: 12 },
+      parentCell: { field: "coarseCell", resolution: 3 },
+    })
+  })
+
+  it("checks each entity definition against its own indexes only", () => {
+    geoOn(entityWithTwoIndexes(), "byCell")
+    geoOn(entityWithTwoIndexes(), "byCell", {
+      timePartition: { field: "timePartition", source: "timestamp", bucket: "1 day" },
+    })
   })
 })
 

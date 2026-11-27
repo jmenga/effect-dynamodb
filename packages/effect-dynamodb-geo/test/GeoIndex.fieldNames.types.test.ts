@@ -71,10 +71,12 @@ describe("GeoIndex.make names are typed from the entity", () => {
           timePartition: { field: "timePartition", source: "timestamp", bucket },
         },
       })
-    for (const bucket of ["hourly", "1 day", Duration.days(1), { hours: 6 }, 3_600_000] as const) {
-      expect(typeof at(bucket).nearby).toBe("function")
-    }
+    // One width at run time: one entity's indexes write an attribute one way ([EDD-9186]).
+    expect(typeof at("hourly").nearby).toBe("function")
     const typeOnly = (_: () => unknown) => undefined
+    for (const bucket of ["1 day", Duration.days(1), { hours: 6 }, 3_600_000] as const) {
+      typeOnly(() => at(bucket))
+    }
     typeOnly(() =>
       GeoIndex.make({
         entity: Vehicles,

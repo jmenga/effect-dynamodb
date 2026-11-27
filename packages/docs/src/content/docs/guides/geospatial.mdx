@@ -163,10 +163,10 @@ for (const { item, distance } of results) {
 
 Match the width to the windows you search:
 
-- **Too narrow.** A search runs one query per partition per contiguous cell range. A 24-hour window on an hourly index is 24 or 25 partitions; on a daily index it is at most two. Items written once and searched for hours afterwards suit a wide bucket. Whatever the width, a window finds only items whose timestamp it contains, so such searches need long windows; a wide bucket makes a long window cheap.
+- **Too narrow.** A search runs one query per partition per contiguous cell range, all in parallel, with no cap. A 24-hour window on an hourly index is 24 or 25 partitions; on a daily index it is at most two, and on a one-minute index 1,440 or 1,441. To see what a search sends, turn on [consumed-capacity reporting](/effect-dynamodb/guides/consumed-capacity/): its `GeoIndex.nearby` report counts the queries in `requests`. Items written once and searched for hours afterwards suit a wide bucket. Whatever the width, a window finds only items whose timestamp it contains, so such searches need long windows; a wide bucket makes a long window cheap.
 - **Too wide.** Each partition the window touches is read whole, and items outside the window are dropped after they are read, so they still consume read capacity. A 15-minute window (the default) on a daily index reads a whole day of items for each cell range, or two days when the window crosses midnight UTC. Items written often and searched over minutes suit a narrow bucket.
 
-When you need both, give one entity two geo indexes, each writing its own partition attribute. Fields they share (`cell`, `parentCell`) must use the same resolutions, or each index needs its own:
+When you need both, give one entity two geo indexes, each writing its own partition attribute. Attributes they share (`cell`, `parentCell`, the timestamp `source`) must be computed the same way. `GeoIndex.make` throws `[EDD-9186]` if two geo indexes of one entity would write one attribute differently (a cell at another resolution, or a partition of another width or from another source), or if one writes the attribute another reads its timestamp from. A row holds one value per attribute, so one index would overwrite what the other needs:
 
 ```typescript region="time-buckets" example="guide-geospatial.ts"
 class Sighting extends Schema.Class<Sighting>("Sighting")({
