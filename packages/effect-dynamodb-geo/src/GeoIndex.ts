@@ -16,7 +16,7 @@
  * needs a `BlobStore` in its context (`[EDD-9115]`).
  */
 
-import { type Context, Effect, type Semaphore } from "effect"
+import { type Context, Duration, Effect, Option, type Semaphore } from "effect"
 import type {
   BlobStoreError,
   ConcurrentModification,
@@ -39,11 +39,133 @@ import type { LatLng } from "./Spherical.js"
 
 export type { LatLng } from "./Spherical.js"
 
-export type TimeBucket = "hourly"
+/**
+ * The width of a time partition (#292): `"hourly"` (one hour, the width every
+ * release before 1.47 used) or any `Duration` input — `"1 day"`,
+ * `Duration.days(1)`, `{ hours: 6 }`, or a number of milliseconds. It must be a
+ * positive whole number of milliseconds (`[EDD-9185]`, thrown by `make`).
+ *
+ * Partitions are `floor(timestamp / width)`, counted from the Unix epoch, so a
+ * daily bucket is a UTC day. The partition value does not record the width:
+ * changing the width of an index that holds data leaves its rows under
+ * partition values the new width never reads, until each item is written again.
+ */
+export type TimeBucket = "hourly" | Duration.Input
 export type SortOrder = "ASC" | "DESC"
 
-const BUCKET_MS: Record<TimeBucket, number> = {
-  hourly: H3.HOURLY_BUCKET_MS,
+const describeBucket = (bucket: unknown): string => {
+  if (typeof bucket === "string") return JSON.stringify(bucket)
+  if (typeof bucket === "number") return String(bucket)
+  if (typeof bucket === "bigint") return `${bucket}n`
+  if (Duration.isDuration(bucket)) return `Duration(${Duration.format(bucket)})`
+  try {
+    return JSON.stringify(bucket) ?? String(bucket)
+  } catch {
+    return String(bucket)
+  }
+}
+
+/**
+ * What each entity's geo indexes write and read, by attribute (#292,
+ * `[EDD-9186]`). A row holds one value per attribute, so two geo indexes
+ * writing one attribute differently (time partitions of different widths or
+ * sources, cells of different resolutions), or one writing the attribute
+ * another reads its timestamp from, would write over each other, and one of
+ * them could never find the row. Keyed by the entity definition, so the same
+ * index made again with the same fields is accepted, and a separate entity
+ * definition is checked against its own indexes only.
+ */
+type FieldClaim =
+  | { readonly kind: "write"; readonly what: string; readonly index: string }
+  | { readonly kind: "read"; readonly index: string }
+
+const claimedFields = new WeakMap<object, Map<string, FieldClaim>>()
+
+const describeClaim = (claim: FieldClaim, by: string): string =>
+  claim.kind === "write" ? `written as ${claim.what} ${by}` : `read as the timestamp source ${by}`
+
+/** Two claims on one attribute agree when both read it, or both write the same value. */
+const agree = (a: FieldClaim, b: FieldClaim): boolean =>
+  a.kind === "read" ? b.kind === "read" : b.kind === "write" && a.what === b.what
+
+const claimFields = (
+  entity: { readonly entityType: string },
+  index: string,
+  fields: GeoFields,
+  bucketMs: number,
+): void => {
+  const { cell, parentCell, timePartition } = fields
+  const width = Duration.format(Duration.millis(bucketMs))
+  const wanted: ReadonlyArray<readonly [string, FieldClaim]> = [
+    [cell.field, { kind: "write", what: `an H3 cell at resolution ${cell.resolution}`, index }],
+    [
+      parentCell.field,
+      {
+        kind: "write",
+        what: `the resolution-${parentCell.resolution} parent of a resolution-${cell.resolution} cell`,
+        index,
+      },
+    ],
+    [
+      timePartition.field,
+      {
+        kind: "write",
+        what: `a time partition of ${width} from "${timePartition.source}"`,
+        index,
+      },
+    ],
+    [timePartition.source, { kind: "read", index }],
+  ]
+  const known = claimedFields.get(entity) ?? new Map<string, FieldClaim>()
+  // Checked against this index's own claims too, and recorded only when all
+  // agree, so a refused definition leaves nothing behind.
+  const next = new Map(known)
+  for (const [field, claim] of wanted) {
+    const prior = next.get(field)
+    if (prior === undefined) {
+      next.set(field, claim)
+    } else if (!agree(prior, claim)) {
+      const priorBy = !known.has(field)
+        ? "by the same index"
+        : prior.index === index
+          ? `by another GeoIndex over index "${index}"`
+          : `by index "${prior.index}"`
+      throw new Error(
+        `[EDD-9186] GeoIndex: "${field}" of entity "${entity.entityType}" would be ` +
+          `${describeClaim(claim, `by index "${index}"`)} and ${describeClaim(prior, priorBy)}. ` +
+          `A row holds one value per attribute, so one would overwrite what the other needs: ` +
+          `give each its own field.`,
+      )
+    }
+  }
+  claimedFields.set(entity, next)
+}
+
+/**
+ * A time bucket's width in milliseconds (#292): `"hourly"` is one hour, and any
+ * other value is read as a `Duration` input. Throws `[EDD-9185]` for a value
+ * that is not a positive, finite, whole number of milliseconds (zero, negative,
+ * fractional, infinite, `NaN`, under a millisecond, or not a duration at all).
+ */
+export const bucketMillis = (bucket: TimeBucket): number => {
+  if (bucket === "hourly") return H3.HOURLY_BUCKET_MS
+  const fail = (): never => {
+    throw new Error(
+      `[EDD-9185] GeoIndex: fields.timePartition.bucket must be "hourly" or a Duration of a ` +
+        `positive whole number of milliseconds (for example "1 day" or Duration.hours(6)); ` +
+        `got ${describeBucket(bucket)}.`,
+    )
+  }
+  const duration = Duration.fromInput(bucket)
+  if (Option.isNone(duration)) return fail()
+  // Checked on exact nanoseconds: converting a bigint of nanoseconds to
+  // milliseconds goes through floating point, which can make a fractional
+  // width whole or a whole one fractional. `toNanos` is `None` when infinite;
+  // `fromInput` reads a `NaN` number as zero.
+  const nanos = Duration.toNanos(duration.value)
+  if (Option.isNone(nanos) || nanos.value <= 0n || nanos.value % 1_000_000n !== 0n) return fail()
+  const ms = nanos.value / 1_000_000n
+  return ms <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(ms) : fail()
 }
 
 /**
@@ -253,7 +375,10 @@ export const make = <
         `index isn't supported: its search plans read one partition per cell and time bucket.`,
     )
   }
-  const bucketMs = BUCKET_MS[config.fields.timePartition.bucket]
+  // Resolved once: `enrich` composes each row's partition with it, and `nearby`
+  // enumerates the partitions of its window with it (#292).
+  const bucketMs = bucketMillis(config.fields.timePartition.bucket)
+  claimFields(config.entity, config.index, config.fields, bucketMs)
 
   const enrich = (input: Item): Item => {
     const coords = config.coordinates(input)

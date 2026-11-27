@@ -99,7 +99,7 @@ const VehicleGeo = GeoIndex.make({
 | `coordinates` | Extractor function — returns `{ latitude, longitude }` or `undefined` for items without location |
 | `fields.cell` | Fine-grained H3 cell (sort key). Resolution 15 is ~1m precision |
 | `fields.parentCell` | Coarse H3 cell (partition key). Resolution 3 is ~12km hexagons |
-| `fields.timePartition` | Time bucketing for temporal scoping. `source` names the timestamp field, `bucket` is `"hourly"` |
+| `fields.timePartition` | Time bucketing for temporal scoping. `source` names the timestamp field (epoch ms); `bucket` is the partition width, `"hourly"` or any `Duration` (see [Time buckets](#time-buckets)) |
 
 ## Usage
 
@@ -155,7 +155,104 @@ for (const { item, distance } of results) {
 
 **Returns:** `Array<{ item, distance: number }>`, sorted by distance and filtered to the exact radius using great-circle distance. Each `item` is decoded as the entity's own queries decode a row (a model class instance for a `Schema.Class` model), typed as the GeoIndex's item type: the entity's put input, with binary fields as bytes (see [Offloaded fields](#offloaded-fields)).
 
-`timeWindow` filters items, not just partitions. The search queries every hourly partition the window touches, then keeps only the items whose `timePartition.source` timestamp lies within `[start, end]`, so a 30-second window returns only items from those 30 seconds, never the rest of the hour. The filtered-out items are still read from those partitions and consume read capacity, so cost scales with the number of hours the window touches, not with how long the window is.
+`timeWindow` filters items, not just partitions. The search queries every time partition the window touches, then keeps only the items whose `timePartition.source` timestamp lies within `[start, end]`, so a 30-second window on an hourly index returns only items from those 30 seconds, never the rest of the hour. The filtered-out items are still read from those partitions and consume read capacity, so cost scales with the number of partitions the window touches, not with how long the window is.
+
+### Time buckets
+
+`bucket` sets the width of a time partition: `"hourly"` or any `Duration` input, such as `"1 day"`, `"6 hours"`, `Duration.days(1)`, `{ hours: 6 }` or a number of milliseconds. It must be a positive whole number of milliseconds; anything else makes `GeoIndex.make` throw `[EDD-9185]`. A row's partition is `floor(timestamp / width)`, counted from the Unix epoch, so a daily bucket is a UTC day.
+
+Match the width to the windows you search:
+
+- **Too narrow.** A search runs one query per partition per contiguous cell range, all in parallel, with no cap. A 24-hour window on an hourly index is 24 or 25 partitions; on a daily index it is at most two, and on a one-minute index 1,440 or 1,441. To see what a search sends, turn on [consumed-capacity reporting](/effect-dynamodb/guides/consumed-capacity/): its `GeoIndex.nearby` report counts the queries in `requests`. Items written once and searched for hours afterwards suit a wide bucket. Whatever the width, a window finds only items whose timestamp it contains, so such searches need long windows; a wide bucket makes a long window cheap.
+- **Too wide.** Each partition the window touches is read whole, and items outside the window are dropped after they are read, so they still consume read capacity. A 15-minute window (the default) on a daily index reads a whole day of items for each cell range, or two days when the window crosses midnight UTC. Items written often and searched over minutes suit a narrow bucket.
+
+When you need both, give one entity two geo indexes, each writing its own partition attribute. Attributes they share (`cell`, `parentCell`, the timestamp `source`) must be computed the same way. `GeoIndex.make` throws `[EDD-9186]` if two geo indexes of one entity would write one attribute differently (a cell at another resolution, or a partition of another width or from another source), or if one writes the attribute another reads its timestamp from. A row holds one value per attribute, so one index would overwrite what the other needs:
+
+```typescript region="time-buckets" example="guide-geospatial.ts"
+class Sighting extends Schema.Class<Sighting>("Sighting")({
+  sightingId: Schema.String,
+  latitude: Schema.Number,
+  longitude: Schema.Number,
+  seenAt: Schema.Number,
+  cell: Schema.optional(Schema.String),
+  parentCell: Schema.optional(Schema.String),
+  hourPartition: Schema.optional(Schema.String),
+  dayPartition: Schema.optional(Schema.String),
+}) {}
+
+const Sightings = Entity.make({
+  model: Sighting,
+  entityType: "Sighting",
+  primaryKey: {
+    pk: { field: "pk", composite: ["sightingId"] },
+    sk: { field: "sk", composite: [] },
+  },
+  indexes: {
+    sightingsByHour: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["parentCell", "hourPartition"] },
+      sk: { field: "gsi1sk", composite: ["cell"] },
+    },
+    sightingsByDay: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["parentCell", "dayPartition"] },
+      sk: { field: "gsi2sk", composite: ["cell"] },
+    },
+  },
+})
+
+// Each index writes its own partition attribute; both share the cell fields,
+// at the same resolutions.
+const SightingsByHour = GeoIndex.make({
+  entity: Sightings,
+  index: "sightingsByHour",
+  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: { field: "hourPartition", source: "seenAt", bucket: "hourly" },
+  },
+})
+
+const SightingsByDay = GeoIndex.make({
+  entity: Sightings,
+  index: "sightingsByDay",
+  coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+  fields: {
+    cell: { field: "cell", resolution: 15 },
+    parentCell: { field: "parentCell", resolution: 3 },
+    timePartition: { field: "dayPartition", source: "seenAt", bucket: "1 day" },
+  },
+})
+
+const SightingsTable = Table.make({ schema: AppSchema, entities: { Sightings } })
+```
+
+`put` enriches only its own index's fields, so a write through both enriches with the other first:
+
+```typescript region="time-buckets-usage" example="guide-geospatial.ts"
+const byHour = yield* GeoIndex.bind(SightingsByHour)
+const byDay = yield* GeoIndex.bind(SightingsByDay)
+
+// One write fills both indexes: each enrich adds its own partition
+yield* byHour.put(
+  byDay.enrich({
+    sightingId: "s-1",
+    latitude: 37.7749,
+    longitude: -122.4194,
+    seenAt: now - Duration.toMillis(Duration.hours(20)),
+  }),
+)
+
+// A 24-hour window reads at most two daily partitions per cell range
+const today = yield* byDay.nearby({
+  center: { latitude: 37.7749, longitude: -122.4194 },
+  radius: 1000,
+  timeWindow: { start: now - Duration.toMillis(Duration.days(1)), end: now },
+})
+```
+
+**Changing the width of an index that holds data.** The partition value doesn't record the width, so after a change, searches read partition values the existing rows don't have, and those rows can't be found until each item is written again. To change the width without a gap, add a second index with the new width on its own partition attribute, write through both until every item searched for has been written again, then search the new index and drop the old one.
 
 ### Enriching for Transactions
 
@@ -253,7 +350,7 @@ Given a nearby search with `center` and `radius`:
 2. **Grid disk** — Concentric rings of H3 cells are generated around the center
 3. **Edge pruning** — Cells whose nearest edge exceeds the radius are removed
 4. **Contiguous chunking** — Adjacent H3 cells (numerically sequential) are grouped into `BETWEEN` range queries on the sort key, reducing the number of DynamoDB queries
-5. **Time partitions** — The time window is divided into hourly buckets
+5. **Time partitions** — The time window is divided into the index's time buckets (`bucket`)
 6. **Parallel execution** — All (partition × chunk) query combinations execute in parallel
 7. **Time-window filter** — Items whose source timestamp falls outside `[start, end]` are dropped, since the first and last partitions extend past the window
 8. **Great-circle filter** — Results are post-filtered using haversine distance to the exact radius

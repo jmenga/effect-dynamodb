@@ -1,5 +1,7 @@
 # @effect-dynamodb/language-service
 
+## 1.47.0
+
 ## 1.46.0
 
 ### Minor Changes
